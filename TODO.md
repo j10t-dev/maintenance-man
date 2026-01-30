@@ -1,0 +1,2 @@
+- Document `uv tool install -e .` for global `mm` command availability
+- Create a test project with known vulnerabilities and outdated dependencies for manual/integration testing of scan and update commands
