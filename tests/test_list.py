@@ -1,19 +1,20 @@
 from pathlib import Path
 
-from typer.testing import CliRunner
+import pytest
 
 from maintenance_man.cli import app
 
-runner = CliRunner()
-
 
 class TestListCommand:
-    def test_list_no_projects(self, mm_home: Path):
-        result = runner.invoke(app, ["list"])
-        assert result.exit_code == 0
-        assert "no projects" in result.output.lower()
+    def test_list_no_projects(self, mm_home: Path, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list"])
+        assert exc_info.value.code == 0
+        assert "no projects" in capsys.readouterr().out.lower()
 
-    def test_list_shows_projects(self, mm_home: Path):
+    def test_list_shows_projects(
+        self, mm_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
         project_dir = mm_home.parent / "myproject"
         project_dir.mkdir()
         mm_home.mkdir(parents=True)
@@ -22,7 +23,9 @@ class TestListCommand:
         (mm_home / "config.toml").write_text(
             f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "bun"\n'
         )
-        result = runner.invoke(app, ["list"])
-        assert result.exit_code == 0
-        assert "myapp" in result.output
-        assert "bun" in result.output
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "myapp" in output
+        assert "bun" in output

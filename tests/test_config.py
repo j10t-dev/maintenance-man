@@ -2,7 +2,6 @@ import tomllib
 from pathlib import Path
 
 import pytest
-import typer
 from pydantic import ValidationError
 
 from maintenance_man.config import (
@@ -164,7 +163,7 @@ class TestLoadConfig:
     def test_invalid_config_raises_system_exit(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "config.toml").write_text("[defaults]\nbogus_key = true\n")
-        with pytest.raises((SystemExit, typer.Exit)):
+        with pytest.raises(SystemExit):
             load_config()
 
 
@@ -188,7 +187,7 @@ class TestResolveProject:
         (mm_home / "worktrees").mkdir()
         (mm_home / "config.toml").write_text("[defaults]\n")
         config = load_config()
-        with pytest.raises((SystemExit, typer.Exit)):
+        with pytest.raises(SystemExit):
             resolve_project(config, "nonexistent")
 
     def test_missing_path_raises_system_exit(self, mm_home: Path):
@@ -199,5 +198,5 @@ class TestResolveProject:
             '[projects.myapp]\npath = "/nonexistent/path"\npackage_manager = "bun"\n'
         )
         config = load_config()
-        with pytest.raises((SystemExit, typer.Exit)):
+        with pytest.raises(SystemExit):
             resolve_project(config, "myapp")

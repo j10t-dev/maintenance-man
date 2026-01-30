@@ -9,7 +9,7 @@ Reference: [Design Document](main-DESIGN.md)
 
 **Deliverables:**
 - `uv init` with appropriate Python version, project metadata
-- Typer app entry point with Rich markup enabled
+- Cyclopts app entry point with Rich output
 - `mm --help` renders correctly
 - `mm --version` works
 - Stub commands for `scan`, `update`, `deploy` (just print "not implemented" and exit)
@@ -116,7 +116,7 @@ Reference: [Design Document](main-DESIGN.md)
 - What does the commit message look like? Should it reference the CVE or the bump details?
 - If multiple updates are selected, do they each get their own worktree sequentially, or can we batch bumps into one branch?
 - How do we handle the case where the project's main branch has diverged since the worktree was created?
-- Interactive prompts — Typer's built-in `typer.confirm`/`typer.prompt`, or something richer?
+- Interactive prompts — Rich prompts, or something else?
 
 **Depends on:** #4
 
