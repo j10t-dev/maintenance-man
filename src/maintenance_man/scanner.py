@@ -100,16 +100,22 @@ def scan_project(name: str, project: ProjectConfig) -> ScanResult:
         "trivy", "fs", "--format", "json",
         "--scanners", scanners, ".",
     ]
-    completed = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=project_path,
-    )
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=project_path, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        raise TrivyScanError(f"Trivy timed out scanning {project_path}")
 
     if completed.returncode != 0:
         raise TrivyScanError(
             f"Trivy exited with code {completed.returncode}: {completed.stderr.strip()}"
         )
 
-    trivy_output = json.loads(completed.stdout)
+    try:
+        trivy_output = json.loads(completed.stdout)
+    except json.JSONDecodeError as e:
+        raise TrivyScanError(f"Failed to parse Trivy output: {e}") from e
     results = trivy_output.get("Results", [])
 
     vulns = _parse_vulns(results)
@@ -123,10 +129,13 @@ def scan_project(name: str, project: ProjectConfig) -> ScanResult:
         secrets=secrets,
     )
 
-    # Write results to disk
+    # Write results to disk — sanitise name to prevent path traversal
     results_dir = MM_HOME / "scan-results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    results_file = results_dir / f"{name}.json"
+    safe_name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
+    results_file = results_dir / f"{safe_name}.json"
+    if not results_file.resolve().is_relative_to(results_dir.resolve()):
+        raise ValueError(f"Invalid project name for results file: {name!r}")
     results_file.write_text(scan_result.model_dump_json(indent=2))
 
     return scan_result

@@ -111,6 +111,10 @@ def scan(
         rprint(f"[bold red]Error:[/] {e}")
         sys.exit(1)
 
+    if not config.projects:
+        print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        return
+
     if project:
         # Single project scan
         proj_config = resolve_project(config, project)

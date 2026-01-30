@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pytest
 
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
 
 @pytest.fixture()
 def mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -19,16 +21,19 @@ def mm_home_with_projects(mm_home: Path) -> Path:
     (mm_home / "scan-results").mkdir(exist_ok=True)
     (mm_home / "worktrees").mkdir(exist_ok=True)
 
-    config_text = """\
+    vuln_path = FIXTURES_DIR / "vulnerable-project"
+    clean_path = FIXTURES_DIR / "clean-project"
+
+    config_text = f"""\
 [defaults]
 min_version_age_days = 7
 
-[projects.feetfax]
-path = "/home/glykon/dev/feetfax"
-package_manager = "bun"
+[projects.vulnerable]
+path = "{vuln_path}"
+package_manager = "uv"
 
-[projects.lifts]
-path = "/home/glykon/dev/lifts"
+[projects.clean]
+path = "{clean_path}"
 package_manager = "uv"
 """
     (mm_home / "config.toml").write_text(config_text)

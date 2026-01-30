@@ -11,8 +11,10 @@ from maintenance_man.scanner import (
     scan_project,
 )
 
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-def _make_project(path: str, pm: str = "uv") -> ProjectConfig:
+
+def _make_project(path: str | Path, pm: str = "uv") -> ProjectConfig:
     return ProjectConfig(path=Path(path), package_manager=pm)
 
 
@@ -30,13 +32,12 @@ class TestCheckTrivyAvailable:
 @pytest.mark.integration
 class TestScanProject:
     def test_scan_project_with_vulns(self, scan_results_dir: Path):
-        """Scan lifts — known to have vulnerabilities."""
-        project = _make_project("/home/glykon/dev/lifts")
-        result = scan_project("lifts", project)
+        """Scan vulnerable fixture — known to have vulnerabilities."""
+        project = _make_project(FIXTURES_DIR / "vulnerable-project")
+        result = scan_project("vulnerable", project)
 
         assert isinstance(result, ScanResult)
-        assert result.project == "lifts"
-        assert result.trivy_target == "/home/glykon/dev/lifts"
+        assert result.project == "vulnerable"
         assert result.scanned_at is not None
         assert len(result.vulnerabilities) > 0
         assert result.has_actionable_vulns is True
@@ -51,31 +52,31 @@ class TestScanProject:
             assert v.status
 
     def test_scan_project_clean(self, scan_results_dir: Path):
-        """Scan feetfax — expected to be clean."""
-        project = _make_project("/home/glykon/dev/feetfax", "bun")
-        result = scan_project("feetfax", project)
+        """Scan clean fixture — expected to have no vulnerabilities."""
+        project = _make_project(FIXTURES_DIR / "clean-project")
+        result = scan_project("clean", project)
 
         assert isinstance(result, ScanResult)
-        assert result.project == "feetfax"
+        assert result.project == "clean"
         assert len(result.vulnerabilities) == 0
         assert result.has_actionable_vulns is False
 
     def test_scan_writes_results_file(self, scan_results_dir: Path):
         """Scan should write JSON results to scan-results dir."""
-        project = _make_project("/home/glykon/dev/lifts")
-        scan_project("lifts", project)
+        project = _make_project(FIXTURES_DIR / "vulnerable-project")
+        scan_project("vulnerable", project)
 
-        results_file = scan_results_dir / "lifts.json"
+        results_file = scan_results_dir / "vulnerable.json"
         assert results_file.exists()
 
         data = json.loads(results_file.read_text())
-        assert data["project"] == "lifts"
+        assert data["project"] == "vulnerable"
         assert "vulnerabilities" in data
         assert "secrets" in data
 
         # Round-trip: the JSON should deserialise back into a ScanResult
         reloaded = ScanResult.model_validate(data)
-        assert reloaded.project == "lifts"
+        assert reloaded.project == "vulnerable"
 
     def test_scan_nonexistent_path(self, scan_results_dir: Path):
         """Scan a path that doesn't exist — should raise."""

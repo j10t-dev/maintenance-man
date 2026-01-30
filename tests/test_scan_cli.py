@@ -7,11 +7,11 @@ from maintenance_man.cli import app
 from maintenance_man.models.scan import ScanResult, Severity, VulnFinding
 
 
-def _make_lifts_result() -> ScanResult:
+def _make_vulnerable_result() -> ScanResult:
     return ScanResult(
-        project="lifts",
+        project="vulnerable",
         scanned_at=datetime.now(tz=timezone.utc),
-        trivy_target="/home/glykon/dev/lifts",
+        trivy_target="tests/fixtures/vulnerable-project",
         vulnerabilities=[
             VulnFinding(
                 vuln_id="CVE-2024-0001",
@@ -27,11 +27,11 @@ def _make_lifts_result() -> ScanResult:
     )
 
 
-def _make_feetfax_result() -> ScanResult:
+def _make_clean_result() -> ScanResult:
     return ScanResult(
-        project="feetfax",
+        project="clean",
         scanned_at=datetime.now(tz=timezone.utc),
-        trivy_target="/home/glykon/dev/feetfax",
+        trivy_target="tests/fixtures/clean-project",
     )
 
 
@@ -41,10 +41,10 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
 
     def _fake_scan(name: str, project_config: object) -> ScanResult:
-        if name == "lifts":
-            return _make_lifts_result()
-        if name == "feetfax":
-            return _make_feetfax_result()
+        if name == "vulnerable":
+            return _make_vulnerable_result()
+        if name == "clean":
+            return _make_clean_result()
         raise FileNotFoundError(f"Unknown project: {name}")
 
     monkeypatch.setattr("maintenance_man.cli.scan_project", _fake_scan)
@@ -52,9 +52,9 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestScanSingleProject:
     def test_scan_project_with_vulns_exits_2(self, mm_home_with_projects: Path):
-        """mm scan lifts — has vulns, should exit 2."""
+        """mm scan vulnerable — has vulns, should exit 2."""
         with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "lifts"])
+            app(["scan", "vulnerable"])
         assert exc_info.value.code == 2
 
     def test_scan_project_with_vulns_shows_findings(
@@ -62,14 +62,14 @@ class TestScanSingleProject:
     ):
         """Output should contain vulnerability information."""
         with pytest.raises(SystemExit):
-            app(["scan", "lifts"])
+            app(["scan", "vulnerable"])
         output = capsys.readouterr().out
         assert "CVE-" in output or "vuln" in output.lower()
 
     def test_scan_clean_project_exits_0(self, mm_home_with_projects: Path):
-        """mm scan feetfax — clean, should exit 0."""
+        """mm scan clean — clean, should exit 0."""
         with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "feetfax"])
+            app(["scan", "clean"])
         assert exc_info.value.code == 0
 
     def test_scan_unknown_project_exits_1(self, mm_home_with_projects: Path):
@@ -84,5 +84,5 @@ class TestScanAllProjects:
         """mm scan (no args) — should exit 2 if any project has vulns."""
         with pytest.raises(SystemExit) as exc_info:
             app(["scan"])
-        # lifts has vulns, so worst case is 2
+        # vulnerable has vulns, so worst case is 2
         assert exc_info.value.code == 2

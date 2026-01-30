@@ -1,0 +1,2 @@
+# Intentionally pinned to a version with known CVEs for integration testing.
+cryptography==3.3.2
