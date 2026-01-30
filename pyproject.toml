@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "cyclopts>=4.5",
     "pydantic>=2.0",
+    "rich>=13.0",
 ]
 
 [project.scripts]
@@ -30,3 +31,5 @@ select = ["E", "F", "I", "W"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: tests that call external tools (Trivy)"]
+addopts = "-m 'not integration'"

@@ -27,19 +27,6 @@ class TestVersion:
         assert "0.1.0" in capsys.readouterr().out
 
 
-class TestScanStub:
-    def test_scan_stub_no_args(self):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan"])
-        assert exc_info.value.code == 1
-
-    def test_scan_stub_with_project(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "feetfax"])
-        assert exc_info.value.code == 1
-        assert "not implemented" in capsys.readouterr().out.lower()
-
-
 class TestUpdateStub:
     def test_update_requires_project(self):
         with pytest.raises(SystemExit) as exc_info:

@@ -15,6 +15,7 @@ class ProjectConfig(BaseModel):
 
     path: Path
     package_manager: Literal["bun", "uv", "mvn"]
+    scan_secrets: bool = True
 
 
 class MmConfig(BaseModel):
