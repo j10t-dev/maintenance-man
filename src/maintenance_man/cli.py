@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timezone
 
 import cyclopts
 from rich import print as rprint
@@ -30,8 +31,9 @@ def _print_scan_result(result: ScanResult) -> None:
     actionable = [v for v in result.vulnerabilities if v.actionable]
     advisories = [v for v in result.vulnerabilities if not v.actionable]
     secrets = result.secrets
+    updates = result.updates
 
-    total = len(actionable) + len(advisories) + len(secrets)
+    total = len(actionable) + len(advisories) + len(secrets) + len(updates)
 
     if total == 0:
         rprint(f"[bold green]{result.project}[/] — clean")
@@ -46,6 +48,9 @@ def _print_scan_result(result: ScanResult) -> None:
         parts.append(f"{n} advisor{'y' if n == 1 else 'ies'}")
     if secrets:
         parts.append(f"{len(secrets)} secret{'s' if len(secrets) != 1 else ''}")
+    if updates:
+        n = len(updates)
+        parts.append(f"{n} update{'s' if n != 1 else ''}")
 
     rprint(f"\n[bold]{result.project}[/] — {', '.join(parts)}")
 
@@ -91,6 +96,29 @@ def _print_scan_result(result: ScanResult) -> None:
         for s in secrets:
             rprint(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
 
+    if updates:
+        table = Table(show_header=True, show_edge=False, pad_edge=False, box=None)
+        table.add_column("", style="bold cyan", width=4)
+        table.add_column("Package")
+        table.add_column("Installed")
+        table.add_column("Latest")
+        table.add_column("Tier")
+        table.add_column("Age")
+        for u in updates:
+            age = ""
+            if u.published_date:
+                days = (datetime.now(timezone.utc) - u.published_date).days
+                age = f"({days} days old)"
+            table.add_row(
+                "UPDATE",
+                u.pkg_name,
+                u.installed_version,
+                u.latest_version,
+                u.semver_tier.value,
+                age,
+            )
+        console.print(table)
+
 
 @app.command
 def scan(
@@ -119,16 +147,24 @@ def scan(
         # Single project scan
         proj_config = resolve_project(config, project)
         try:
-            result = scan_project(project, proj_config)
+            result = scan_project(
+                project, proj_config, config.defaults.min_version_age_days
+            )
         except TrivyScanError as e:
             rprint(f"[bold red]Error:[/] {e}")
             sys.exit(1)
 
         _print_scan_result(result)
-        sys.exit(2 if result.has_actionable_vulns else 0)
+        if result.has_actionable_vulns:
+            sys.exit(2)
+        elif result.has_updates:
+            sys.exit(3)
+        else:
+            sys.exit(0)
 
     # Scan all projects
     has_vulns = False
+    has_updates = False
     for name, proj_config in config.projects.items():
         if not proj_config.path.exists():
             rprint(
@@ -137,7 +173,9 @@ def scan(
             )
             continue
         try:
-            result = scan_project(name, proj_config)
+            result = scan_project(
+                name, proj_config, config.defaults.min_version_age_days
+            )
         except TrivyScanError as e:
             rprint(f"[bold red]Error:[/] {name} — {e}")
             continue
@@ -145,8 +183,15 @@ def scan(
         _print_scan_result(result)
         if result.has_actionable_vulns:
             has_vulns = True
+        if result.has_updates:
+            has_updates = True
 
-    sys.exit(2 if has_vulns else 0)
+    if has_vulns:
+        sys.exit(2)
+    elif has_updates:
+        sys.exit(3)
+    else:
+        sys.exit(0)
 
 
 @app.command

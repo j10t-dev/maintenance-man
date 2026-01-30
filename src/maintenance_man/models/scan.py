@@ -12,6 +12,13 @@ class Severity(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class SemverTier(StrEnum):
+    PATCH = "patch"
+    MINOR = "minor"
+    MAJOR = "major"
+    UNKNOWN = "unknown"
+
+
 class VulnFinding(BaseModel):
     vuln_id: str
     pkg_name: str
@@ -36,13 +43,26 @@ class SecretFinding(BaseModel):
     severity: str
 
 
+class UpdateFinding(BaseModel):
+    pkg_name: str
+    installed_version: str
+    latest_version: str
+    semver_tier: SemverTier
+    published_date: datetime | None = None
+
+
 class ScanResult(BaseModel):
     project: str
     scanned_at: datetime
     trivy_target: str
     vulnerabilities: list[VulnFinding] = []
     secrets: list[SecretFinding] = []
+    updates: list[UpdateFinding] = []
 
     @property
     def has_actionable_vulns(self) -> bool:
         return any(v.actionable for v in self.vulnerabilities)
+
+    @property
+    def has_updates(self) -> bool:
+        return len(self.updates) > 0

@@ -4,7 +4,13 @@ from pathlib import Path
 import pytest
 
 from maintenance_man.cli import app
-from maintenance_man.models.scan import ScanResult, Severity, VulnFinding
+from maintenance_man.models.scan import (
+    UpdateFinding,
+    ScanResult,
+    SemverTier,
+    Severity,
+    VulnFinding,
+)
 
 
 def _make_vulnerable_result() -> ScanResult:
@@ -35,16 +41,36 @@ def _make_clean_result() -> ScanResult:
     )
 
 
+def _make_bumps_only_result() -> ScanResult:
+    return ScanResult(
+        project="outdated",
+        scanned_at=datetime.now(tz=timezone.utc),
+        trivy_target="tests/fixtures/clean-project",
+        updates=[
+            UpdateFinding(
+                pkg_name="axios",
+                installed_version="1.6.0",
+                latest_version="1.7.2",
+                semver_tier=SemverTier.MINOR,
+            ),
+        ],
+    )
+
+
 @pytest.fixture(autouse=True)
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
     monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
 
-    def _fake_scan(name: str, project_config: object) -> ScanResult:
+    def _fake_scan(
+        name: str, project_config: object, min_version_age_days: int = 7
+    ) -> ScanResult:
         if name == "vulnerable":
             return _make_vulnerable_result()
         if name == "clean":
             return _make_clean_result()
+        if name == "outdated":
+            return _make_bumps_only_result()
         raise FileNotFoundError(f"Unknown project: {name}")
 
     monkeypatch.setattr("maintenance_man.cli.scan_project", _fake_scan)
@@ -85,4 +111,45 @@ class TestScanAllProjects:
         with pytest.raises(SystemExit) as exc_info:
             app(["scan"])
         # vulnerable has vulns, so worst case is 2
+        assert exc_info.value.code == 2
+
+
+class TestScanUpdatesExitCodes:
+    def test_scan_updates_only_exits_3(self, mm_home_with_projects: Path):
+        """mm scan outdated — updates only, no vulns, should exit 3."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan", "outdated"])
+        assert exc_info.value.code == 3
+
+    def test_scan_updates_output_shows_update_rows(
+        self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Output should contain update information."""
+        with pytest.raises(SystemExit):
+            app(["scan", "outdated"])
+        output = capsys.readouterr().out
+        assert "UPDATE" in output or "update" in output.lower()
+        assert "axios" in output
+
+    def test_scan_clean_still_exits_0(self, mm_home_with_projects: Path):
+        """Clean project (no vulns, no updates) still exits 0."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan", "clean"])
+        assert exc_info.value.code == 0
+
+    def test_scan_vulns_and_updates_exits_2(self, mm_home_with_projects: Path):
+        """If project has both vulns and updates, exit 2 (vulns take precedence)."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan", "vulnerable"])
+        assert exc_info.value.code == 2
+
+
+class TestScanAllWithUpdates:
+    def test_scan_all_updates_takes_precedence_over_clean(
+        self, mm_home_with_projects: Path
+    ):
+        """mm scan (all) — worst case includes updates, but vulns override."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan"])
+        # vulnerable has vulns → exit 2 takes precedence
         assert exc_info.value.code == 2

@@ -35,6 +35,10 @@ package_manager = "uv"
 [projects.clean]
 path = "{clean_path}"
 package_manager = "uv"
+
+[projects.outdated]
+path = "{clean_path}"
+package_manager = "bun"
 """
     (mm_home / "config.toml").write_text(config_text)
     return mm_home

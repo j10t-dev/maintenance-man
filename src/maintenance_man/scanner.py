@@ -1,12 +1,21 @@
 import json
+import logging
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from maintenance_man.config import MM_HOME
+from maintenance_man.dependency_age import filter_by_age
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import ScanResult, SecretFinding, Severity, VulnFinding
+from maintenance_man.models.scan import (
+    UpdateFinding,
+    ScanResult,
+    SecretFinding,
+    Severity,
+    VulnFinding,
+)
+from maintenance_man.outdated import get_outdated
 
 
 class TrivyNotFoundError(Exception):
@@ -21,8 +30,7 @@ def check_trivy_available() -> None:
     """Raise TrivyNotFoundError if trivy is not on PATH."""
     if shutil.which("trivy") is None:
         raise TrivyNotFoundError(
-            "Trivy is not installed or not on PATH. "
-            "Install it from https://trivy.dev/"
+            "Trivy is not installed or not on PATH. Install it from https://trivy.dev/"
         )
 
 
@@ -82,8 +90,12 @@ def _parse_secrets(results: list[dict]) -> list[SecretFinding]:
     return findings
 
 
-def scan_project(name: str, project: ProjectConfig) -> ScanResult:
-    """Run Trivy against a project and return parsed results.
+def scan_project(
+    name: str,
+    project: ProjectConfig,
+    min_version_age_days: int = 7,
+) -> ScanResult:
+    """Run Trivy and outdated checks against a project and return parsed results.
 
     Also writes the results JSON to ~/.mm/scan-results/<name>.json.
 
@@ -95,14 +107,24 @@ def scan_project(name: str, project: ProjectConfig) -> ScanResult:
     if not project_path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
 
+    # --- Trivy scan (existing) ---
     scanners = "vuln,secret" if project.scan_secrets else "vuln"
     cmd = [
-        "trivy", "fs", "--format", "json",
-        "--scanners", scanners, ".",
+        "trivy",
+        "fs",
+        "--format",
+        "json",
+        "--scanners",
+        scanners,
+        ".",
     ]
     try:
         completed = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=project_path, timeout=300,
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=project_path,
+            timeout=300,
         )
     except subprocess.TimeoutExpired:
         raise TrivyScanError(f"Trivy timed out scanning {project_path}")
@@ -121,12 +143,32 @@ def scan_project(name: str, project: ProjectConfig) -> ScanResult:
     vulns = _parse_vulns(results)
     secrets = _parse_secrets(results)
 
+    # --- Outdated check (new) ---
+    updates: list[UpdateFinding] = []
+    try:
+        raw_updates = get_outdated(project)
+        aged_updates = filter_by_age(
+            raw_updates,
+            manager=project.package_manager,
+            min_age_days=min_version_age_days,
+        )
+        # Dedup: drop updates for packages already flagged as vulns
+        vuln_pkgs = {v.pkg_name for v in vulns}
+        updates = [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
+    except Exception:
+        # Outdated check failure is non-fatal — Trivy results still reported
+        logging.getLogger(__name__).warning(
+            "Outdated check failed for %s — skipping update results", name,
+            exc_info=True,
+        )
+
     scan_result = ScanResult(
         project=name,
         scanned_at=datetime.now(timezone.utc),
         trivy_target=str(project_path),
         vulnerabilities=vulns,
         secrets=secrets,
+        updates=updates,
     )
 
     # Write results to disk — sanitise name to prevent path traversal
@@ -136,6 +178,6 @@ def scan_project(name: str, project: ProjectConfig) -> ScanResult:
     results_file = results_dir / f"{safe_name}.json"
     if not results_file.resolve().is_relative_to(results_dir.resolve()):
         raise ValueError(f"Invalid project name for results file: {name!r}")
-    results_file.write_text(scan_result.model_dump_json(indent=2))
+    results_file.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
 
     return scan_result
