@@ -1,7 +1,7 @@
+import sys
 import tomllib
 from pathlib import Path
 
-import typer
 from pydantic import ValidationError
 from rich import print as rprint
 
@@ -41,13 +41,13 @@ def load_config() -> MmConfig:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         rprint(f"[bold red]Config error:[/] Failed to parse {config_path}\n{e}")
-        raise typer.Exit(code=1)
+        sys.exit(1)
 
     try:
         return MmConfig(**raw)
     except ValidationError as e:
         rprint(f"[bold red]Config error:[/] Invalid config in {config_path}\n{e}")
-        raise typer.Exit(code=1)
+        sys.exit(1)
 
 
 def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
@@ -57,7 +57,7 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
             f"[bold red]Error:[/] Unknown project [bold]{name}[/]. "
             f"Known projects: {', '.join(config.projects) or '(none)'}"
         )
-        raise typer.Exit(code=1)
+        sys.exit(1)
 
     project = config.projects[name]
 
@@ -66,6 +66,6 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
             f"[bold red]Error:[/] Project [bold]{name}[/] path does not exist: "
             f"{project.path}"
         )
-        raise typer.Exit(code=1)
+        sys.exit(1)
 
     return project

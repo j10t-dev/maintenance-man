@@ -4,7 +4,7 @@
 
 `mm` is a config-driven CLI tool for performing routine maintenance across multiple software projects. It wraps existing tooling (Trivy, native package managers) to provide a consistent workflow for vulnerability scanning, dependency updates, testing, and deployment.
 
-**Stack:** Python + uv + Typer (with Rich output)
+**Stack:** Python + uv + Cyclopts (with Rich output)
 **Config format:** TOML (`~/.mm/config.toml`)
 **Target user:** Solo developer maintaining multiple projects across languages, deployed to self-hosted infrastructure.
 
@@ -50,7 +50,7 @@ Reads scan results from disk. Presents findings and applies selected updates.
   3. Applies the update via native tooling (`bun update <pkg>`, `uv lock --upgrade-package <pkg>`, `mvn versions:use-dep-version`).
   4. Runs **unit tests**, then **integration tests** (test commands from config).
   5. If tests pass: commits, merges branch to main (fast-forward), cleans up worktree. Updates scan results JSON to mark finding as `resolved`.
-  6. If tests fail: leaves branch in place, marks finding as `failed`, reports failure with Typer exit codes. User (or future Claude agent) investigates manually.
+  6. If tests fail: leaves branch in place, marks finding as `failed`, reports failure with Cyclopts exit codes. User (or future Claude agent) investigates manually.
 - Vuln updates should be isolated — one branch per vulnerability by default. Generic bumps can be combined.
 
 ### `mm deploy [project]`
@@ -151,7 +151,7 @@ Semver-based tiers with a time delay for supply chain protection:
 
 ## Exit Codes
 
-Typer exit codes for scriptability and Claude integration:
+Cyclopts exit codes for scriptability and Claude integration:
 
 | Code | Meaning |
 |---|---|
@@ -167,7 +167,7 @@ Exact codes TBD during implementation, but the principle is: distinct exit codes
 
 - **Vulnerability scanning:** Trivy — local, CLI-first, multi-language, JSON output, broadest single-tool coverage.
 - **Dependency updates:** Native package manager commands — `bun update`, `uv lock --upgrade-package`, `mvn versions:use-dep-version`. No Renovate — its local mode is limited and unstable.
-- **CLI framework:** Typer with Rich output.
+- **CLI framework:** Cyclopts with Rich output.
 - **Config:** TOML.
 - **Build isolation:** Git worktrees.
 
@@ -185,4 +185,4 @@ Exact codes TBD during implementation, but the principle is: distinct exit codes
 - [Trivy vs Grype comparison](https://opsdigest.com/digests/trivy-vs-grype-choosing-the-right-vulnerability-scanner/)
 - [OWASP dep-scan](https://owasp.org/www-project-dep-scan/) — alternative with reachability analysis
 - [Renovate local platform limitations](https://github.com/renovatebot/renovate/discussions/24846)
-- [Typer](https://typer.tiangolo.com/) — CLI framework
+- [Cyclopts](https://cyclopts.readthedocs.io/) — CLI framework

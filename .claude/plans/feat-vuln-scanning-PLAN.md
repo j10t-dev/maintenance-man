@@ -6,7 +6,7 @@
 
 **Architecture:** Trivy is invoked as a subprocess. Its JSON output is parsed into Pydantic models (`VulnFinding`, `SecretFinding`, `ScanResult`) and written to `~/.mm/scan-results/<project>.json`. The CLI loads config, resolves projects, calls the scanner module, displays results via Rich, and exits with appropriate codes.
 
-**Tech Stack:** Python 3.12, Pydantic v2, Typer, Rich, subprocess (Trivy)
+**Tech Stack:** Python 3.12, Pydantic v2, Cyclopts, Rich, subprocess (Trivy)
 
 **Skills to Use:**
 - 1337-skills:test-driven-development
@@ -499,6 +499,8 @@ Wire the scanner into the existing `scan` CLI command with Rich output.
 - Modify: `tests/test_cli.py` (remove old scan stubs, add new tests)
 - Create: `tests/test_scan_cli.py`
 
+**Note:** The CLI uses cyclopts (not Typer). Commands use `sys.exit()` for exit codes. Tests use `pytest.raises(SystemExit)` and `capsys` for output capture — there is no `CliRunner`.
+
 ### Subtask 3.1: Write failing integration tests for the scan command
 
 **Step 1:** Create `tests/test_scan_cli.py`. These test the full CLI flow end-to-end.
@@ -507,33 +509,37 @@ Wire the scanner into the existing `scan` CLI command with Rich output.
 import json
 from pathlib import Path
 
-from typer.testing import CliRunner
+import pytest
 
 from maintenance_man.cli import app
 from maintenance_man.models.scan import ScanResult
-
-runner = CliRunner()
 
 
 class TestScanSingleProject:
     def test_scan_project_with_vulns_exits_2(self, mm_home: Path):
         """mm scan lifts — has vulns, should exit 2."""
-        result = runner.invoke(app, ["scan", "lifts"])
-        assert result.exit_code == 2
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan", "lifts"])
+        assert exc_info.value.code == 2
 
-    def test_scan_project_with_vulns_shows_findings(self, mm_home: Path):
+    def test_scan_project_with_vulns_shows_findings(
+        self, mm_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """Output should contain vulnerability information."""
-        result = runner.invoke(app, ["scan", "lifts"])
-        assert "CVE-" in result.output or "vuln" in result.output.lower()
+        with pytest.raises(SystemExit):
+            app(["scan", "lifts"])
+        assert "CVE-" in capsys.readouterr().out or "vuln" in capsys.readouterr().out.lower()
 
     def test_scan_clean_project_exits_0(self, mm_home: Path):
         """mm scan feetfax — clean, should exit 0."""
-        result = runner.invoke(app, ["scan", "feetfax"])
-        assert result.exit_code == 0
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan", "feetfax"])
+        assert exc_info.value.code == 0
 
     def test_scan_writes_results_file(self, mm_home: Path):
         """mm scan lifts should write results JSON."""
-        runner.invoke(app, ["scan", "lifts"])
+        with pytest.raises(SystemExit):
+            app(["scan", "lifts"])
         results_file = mm_home / "scan-results" / "lifts.json"
         assert results_file.exists()
         data = json.loads(results_file.read_text())
@@ -541,27 +547,30 @@ class TestScanSingleProject:
 
     def test_scan_unknown_project_exits_1(self, mm_home: Path):
         """mm scan nonexistent — should exit 1."""
-        result = runner.invoke(app, ["scan", "nonexistent"])
-        assert result.exit_code == 1
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan", "nonexistent"])
+        assert exc_info.value.code == 1
 
 
 class TestScanAllProjects:
     def test_scan_all_exits_worst_case(self, mm_home: Path):
         """mm scan (no args) — should exit 2 if any project has vulns."""
-        result = runner.invoke(app, ["scan"])
+        with pytest.raises(SystemExit) as exc_info:
+            app(["scan"])
         # lifts has vulns, so worst case is 2
-        assert result.exit_code == 2
+        assert exc_info.value.code == 2
 
     def test_scan_all_writes_results_for_each(self, mm_home: Path):
         """mm scan should write a results file per project."""
-        runner.invoke(app, ["scan"])
+        with pytest.raises(SystemExit):
+            app(["scan"])
         results_dir = mm_home / "scan-results"
         # Should have at least one results file
         json_files = list(results_dir.glob("*.json"))
         assert len(json_files) > 0
 ```
 
-Note: These tests rely on the `mm_home` fixture from `conftest.py` which redirects `MM_HOME` to a temp dir. However, the CLI calls `load_config()` which reads from `MM_HOME / "config.toml"`. The test fixture needs to create a config file with real project paths. Update `conftest.py` accordingly (see Subtask 3.2).
+Note: These tests rely on the `mm_home` fixture from `conftest.py` which redirects `MM_HOME` to a temp dir. The test fixture needs to create a config file with real project paths. Update `conftest.py` accordingly (see Subtask 3.2).
 
 **Step 2:** Run tests to verify they fail.
 
@@ -604,64 +613,76 @@ package_manager = "uv"
     return home
 ```
 
-**Step 2:** Update `tests/test_cli.py` — remove the scan stub tests since scan is now implemented. Remove `test_scan_stub_no_args` and `test_scan_stub_with_project`. Keep all other tests.
-
-The file should become:
+**Step 2:** Update `tests/test_cli.py` — remove the scan stub tests since scan is now implemented. Remove `test_scan_stub_no_args` and `test_scan_stub_with_project`. Keep all other tests. Use `pytest.raises(SystemExit)` and `capsys` (no `CliRunner`).
 
 ```python
-from typer.testing import CliRunner
+import pytest
 
 from maintenance_man.cli import app
 
-runner = CliRunner()
+
+class TestHelp:
+    def test_help_exits_zero(self):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["--help"])
+        assert exc_info.value.code == 0
+
+    def test_help_contains_description(self, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(SystemExit):
+            app(["--help"])
+        assert "maintenance" in capsys.readouterr().out.lower()
 
 
-def test_help_exits_zero():
-    result = runner.invoke(app, ["--help"])
-    assert result.exit_code == 0
+class TestVersion:
+    def test_version_exits_zero(self):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["--version"])
+        assert exc_info.value.code == 0
+
+    def test_version_prints_version(self, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(SystemExit):
+            app(["--version"])
+        assert "0.1.0" in capsys.readouterr().out
 
 
-def test_help_contains_description():
-    result = runner.invoke(app, ["--help"])
-    assert "maintenance" in result.output.lower()
+class TestUpdateStub:
+    def test_update_requires_project(self):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update"])
+        assert exc_info.value.code != 0
+
+    def test_update_stub_with_project(self, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "feetfax"])
+        assert exc_info.value.code == 1
+        assert "not implemented" in capsys.readouterr().out.lower()
 
 
-def test_version_exits_zero():
-    result = runner.invoke(app, ["--version"])
-    assert result.exit_code == 0
+class TestDeployStub:
+    def test_deploy_requires_project(self):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy"])
+        assert exc_info.value.code != 0
 
-
-def test_version_prints_version():
-    result = runner.invoke(app, ["--version"])
-    assert "0.1.0" in result.output
-
-
-def test_update_requires_project():
-    result = runner.invoke(app, ["update"])
-    assert result.exit_code != 0
-
-
-def test_update_stub_with_project():
-    result = runner.invoke(app, ["update", "feetfax"])
-    assert result.exit_code == 1
-    assert "not implemented" in result.output.lower()
-
-
-def test_deploy_requires_project():
-    result = runner.invoke(app, ["deploy"])
-    assert result.exit_code != 0
-
-
-def test_deploy_stub_with_project():
-    result = runner.invoke(app, ["deploy", "feetfax"])
-    assert result.exit_code == 1
-    assert "not implemented" in result.output.lower()
+    def test_deploy_stub_with_project(self, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy", "feetfax"])
+        assert exc_info.value.code == 1
+        assert "not implemented" in capsys.readouterr().out.lower()
 ```
 
-**Step 3:** Replace the `scan` function in `src/maintenance_man/cli.py`. The full updated file:
+**Step 3:** Implement the `scan` command in `src/maintenance_man/cli.py`. The CLI uses cyclopts. Key patterns:
+- `@app.command` (no parentheses) for commands
+- `sys.exit(code)` for exit codes
+- Numpydoc-style docstrings for parameter help
+- `print()` for output (Rich `rprint` for styled output)
+
+The full updated `cli.py`:
 
 ```python
-import typer
+import sys
+
+import cyclopts
 from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
@@ -671,31 +692,12 @@ from maintenance_man.config import load_config, resolve_project
 from maintenance_man.models.scan import ScanResult
 from maintenance_man.scanner import TrivyNotFoundError, TrivyScanError, scan_project
 
-app = typer.Typer(
+app = cyclopts.App(
     name="mm",
     help="Config-driven CLI for routine software project maintenance.",
-    rich_markup_mode="markdown",
+    version=__version__,
+    version_flags=["--version", "-v"],
 )
-
-
-def _version_callback(value: bool) -> None:
-    if value:
-        print(f"mm {__version__}")
-        raise typer.Exit()
-
-
-@app.callback()
-def main(
-    version: bool | None = typer.Option(
-        None,
-        "--version",
-        "-v",
-        help="Show version and exit.",
-        callback=_version_callback,
-        is_eager=True,
-    ),
-) -> None:
-    """Config-driven CLI for routine software project maintenance."""
 
 
 def _print_scan_result(result: ScanResult) -> None:
@@ -765,21 +767,24 @@ def _print_scan_result(result: ScanResult) -> None:
             rprint(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
 
 
-@app.command()
+@app.command
 def scan(
-    project: str | None = typer.Argument(
-        None, help="Project name to scan. Scans all if omitted."
-    ),
+    project: str | None = None,
 ) -> None:
-    """Scan projects for vulnerabilities and available updates."""
+    """Scan projects for vulnerabilities and available updates.
+
+    Parameters
+    ----------
+    project: str | None
+        Project name to scan. Scans all if omitted.
+    """
     config = load_config()
 
     try:
-        from maintenance_man.scanner import check_trivy_available
         check_trivy_available()
     except TrivyNotFoundError as e:
         rprint(f"[bold red]Error:[/] {e}")
-        raise typer.Exit(code=1)
+        sys.exit(1)
 
     if project:
         # Single project scan
@@ -788,10 +793,10 @@ def scan(
             result = scan_project(project, proj_config)
         except TrivyScanError as e:
             rprint(f"[bold red]Error:[/] {e}")
-            raise typer.Exit(code=1)
+            sys.exit(1)
 
         _print_scan_result(result)
-        raise typer.Exit(code=2 if result.has_actionable_vulns else 0)
+        sys.exit(2 if result.has_actionable_vulns else 0)
 
     # Scan all projects
     has_vulns = False
@@ -809,25 +814,37 @@ def scan(
         if result.has_actionable_vulns:
             has_vulns = True
 
-    raise typer.Exit(code=2 if has_vulns else 0)
+    sys.exit(2 if has_vulns else 0)
 
 
-@app.command()
+@app.command
 def update(
-    project: str = typer.Argument(..., help="Project name to update."),
+    project: str,
 ) -> None:
-    """Apply updates from scan results to a project."""
-    typer.echo("Not implemented.")
-    raise typer.Exit(code=1)
+    """Apply updates from scan results to a project.
+
+    Parameters
+    ----------
+    project: str
+        Project name to update.
+    """
+    print("Not implemented.")
+    sys.exit(1)
 
 
-@app.command()
+@app.command
 def deploy(
-    project: str = typer.Argument(..., help="Project name to deploy."),
+    project: str,
 ) -> None:
-    """Deploy a project."""
-    typer.echo("Not implemented.")
-    raise typer.Exit(code=1)
+    """Deploy a project.
+
+    Parameters
+    ----------
+    project: str
+        Project name to deploy.
+    """
+    print("Not implemented.")
+    sys.exit(1)
 
 
 @app.command(name="list")
@@ -836,7 +853,7 @@ def list_projects() -> None:
     config = load_config()
 
     if not config.projects:
-        typer.echo("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
     console = Console()
@@ -849,6 +866,10 @@ def list_projects() -> None:
         table.add_row(name, str(project.path), project.package_manager)
 
     console.print(table)
+
+
+def main() -> None:
+    app()
 ```
 
 **Step 4:** Run the new scan CLI tests.

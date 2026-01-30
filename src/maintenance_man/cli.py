@@ -1,64 +1,63 @@
-import typer
+import sys
+
+import cyclopts
 from rich.console import Console
 from rich.table import Table
 
 from maintenance_man import __version__
 from maintenance_man.config import load_config
 
-app = typer.Typer(
+app = cyclopts.App(
     name="mm",
     help="Config-driven CLI for routine software project maintenance.",
-    rich_markup_mode="markdown",
+    version=__version__,
+    version_flags=["--version", "-v"],
 )
 
 
-def _version_callback(value: bool) -> None:
-    if value:
-        print(f"mm {__version__}")
-        raise typer.Exit()
-
-
-@app.callback()
-def main(
-    version: bool | None = typer.Option(
-        None,
-        "--version",
-        "-v",
-        help="Show version and exit.",
-        callback=_version_callback,
-        is_eager=True,
-    ),
-) -> None:
-    """Config-driven CLI for routine software project maintenance."""
-
-
-@app.command()
+@app.command
 def scan(
-    project: str | None = typer.Argument(
-        None, help="Project name to scan. Scans all if omitted."
-    ),
+    project: str | None = None,
 ) -> None:
-    """Scan projects for vulnerabilities and available updates."""
-    typer.echo("Not implemented.")
-    raise typer.Exit(code=1)
+    """Scan projects for vulnerabilities and available updates.
+
+    Parameters
+    ----------
+    project: str | None
+        Project name to scan. Scans all if omitted.
+    """
+    print("Not implemented.")
+    sys.exit(1)
 
 
-@app.command()
+@app.command
 def update(
-    project: str = typer.Argument(..., help="Project name to update."),
+    project: str,
 ) -> None:
-    """Apply updates from scan results to a project."""
-    typer.echo("Not implemented.")
-    raise typer.Exit(code=1)
+    """Apply updates from scan results to a project.
+
+    Parameters
+    ----------
+    project: str
+        Project name to update.
+    """
+    print("Not implemented.")
+    sys.exit(1)
 
 
-@app.command()
+@app.command
 def deploy(
-    project: str = typer.Argument(..., help="Project name to deploy."),
+    project: str,
 ) -> None:
-    """Deploy a project."""
-    typer.echo("Not implemented.")
-    raise typer.Exit(code=1)
+    """Deploy a project.
+
+    Parameters
+    ----------
+    project: str
+        Project name to deploy.
+    """
+    print("Not implemented.")
+    sys.exit(1)
 
 
 @app.command(name="list")
@@ -67,7 +66,7 @@ def list_projects() -> None:
     config = load_config()
 
     if not config.projects:
-        typer.echo("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
     console = Console()
@@ -80,3 +79,7 @@ def list_projects() -> None:
         table.add_row(name, str(project.path), project.package_manager)
 
     console.print(table)
+
+
+def main() -> None:
+    app()
