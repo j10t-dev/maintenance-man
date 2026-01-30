@@ -1,6 +1,9 @@
 import typer
+from rich.console import Console
+from rich.table import Table
 
 from maintenance_man import __version__
+from maintenance_man.config import load_config
 
 app = typer.Typer(
     name="mm",
@@ -56,3 +59,24 @@ def deploy(
     """Deploy a project."""
     typer.echo("Not implemented.")
     raise typer.Exit(code=1)
+
+
+@app.command(name="list")
+def list_projects() -> None:
+    """List all configured projects."""
+    config = load_config()
+
+    if not config.projects:
+        typer.echo("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        return
+
+    console = Console()
+    table = Table(title="Configured Projects")
+    table.add_column("Name", style="bold")
+    table.add_column("Path")
+    table.add_column("Package Manager")
+
+    for name, project in sorted(config.projects.items()):
+        table.add_row(name, str(project.path), project.package_manager)
+
+    console.print(table)
