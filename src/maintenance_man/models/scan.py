@@ -65,4 +65,4 @@ class ScanResult(BaseModel):
 
     @property
     def has_updates(self) -> bool:
-        return len(self.updates) > 0
+        return bool(self.updates)

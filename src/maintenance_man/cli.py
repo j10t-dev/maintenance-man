@@ -1,4 +1,5 @@
 import sys
+import time
 from datetime import datetime, timezone
 
 import cyclopts
@@ -16,6 +17,14 @@ from maintenance_man.scanner import (
     scan_project,
 )
 
+
+def _pluralise(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
+_TABLE_STYLE = dict(show_edge=False, pad_edge=False, box=None)
+
+
 app = cyclopts.App(
     name="mm",
     help="Config-driven CLI for routine software project maintenance.",
@@ -24,7 +33,7 @@ app = cyclopts.App(
 )
 
 
-def _print_scan_result(result: ScanResult) -> None:
+def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
     """Print a Rich-formatted summary of scan results for one project."""
     console = Console()
 
@@ -34,28 +43,26 @@ def _print_scan_result(result: ScanResult) -> None:
     updates = result.updates
 
     total = len(actionable) + len(advisories) + len(secrets) + len(updates)
+    timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
 
     if total == 0:
-        rprint(f"[bold green]{result.project}[/] — clean")
+        rprint(f"[bold green]{result.project}[/] — clean{timing}")
         return
 
     parts = []
     if actionable:
-        n = len(actionable)
-        parts.append(f"{n} vulnerabilit{'y' if n == 1 else 'ies'}")
+        parts.append(_pluralise(len(actionable), "vulnerability", "vulnerabilities"))
     if advisories:
-        n = len(advisories)
-        parts.append(f"{n} advisor{'y' if n == 1 else 'ies'}")
+        parts.append(_pluralise(len(advisories), "advisory", "advisories"))
     if secrets:
-        parts.append(f"{len(secrets)} secret{'s' if len(secrets) != 1 else ''}")
+        parts.append(_pluralise(len(secrets), "secret", "secrets"))
     if updates:
-        n = len(updates)
-        parts.append(f"{n} update{'s' if n != 1 else ''}")
+        parts.append(_pluralise(len(updates), "update", "updates"))
 
-    rprint(f"\n[bold]{result.project}[/] — {', '.join(parts)}")
+    rprint(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
 
     if actionable:
-        table = Table(show_header=True, show_edge=False, pad_edge=False, box=None)
+        table = Table(show_header=True, **_TABLE_STYLE)
         table.add_column("", style="bold red", width=4)
         table.add_column("Package")
         table.add_column("Installed")
@@ -74,7 +81,7 @@ def _print_scan_result(result: ScanResult) -> None:
         console.print(table)
 
     if advisories:
-        table = Table(show_header=False, show_edge=False, pad_edge=False, box=None)
+        table = Table(show_header=False, **_TABLE_STYLE)
         table.add_column("", style="bold yellow", width=4)
         table.add_column("Package")
         table.add_column("Installed")
@@ -97,7 +104,7 @@ def _print_scan_result(result: ScanResult) -> None:
             rprint(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
 
     if updates:
-        table = Table(show_header=True, show_edge=False, pad_edge=False, box=None)
+        table = Table(show_header=True, **_TABLE_STYLE)
         table.add_column("", style="bold cyan", width=4)
         table.add_column("Package")
         table.add_column("Installed")
@@ -147,14 +154,16 @@ def scan(
         # Single project scan
         proj_config = resolve_project(config, project)
         try:
+            t0 = time.monotonic()
             result = scan_project(
                 project, proj_config, config.defaults.min_version_age_days
             )
+            elapsed = time.monotonic() - t0
         except TrivyScanError as e:
             rprint(f"[bold red]Error:[/] {e}")
             sys.exit(1)
 
-        _print_scan_result(result)
+        _print_scan_result(result, elapsed_s=elapsed)
         if result.has_actionable_vulns:
             sys.exit(2)
         elif result.has_updates:
@@ -173,14 +182,16 @@ def scan(
             )
             continue
         try:
+            t0 = time.monotonic()
             result = scan_project(
                 name, proj_config, config.defaults.min_version_age_days
             )
+            elapsed = time.monotonic() - t0
         except TrivyScanError as e:
             rprint(f"[bold red]Error:[/] {name} — {e}")
             continue
 
-        _print_scan_result(result)
+        _print_scan_result(result, elapsed_s=elapsed)
         if result.has_actionable_vulns:
             has_vulns = True
         if result.has_updates:
