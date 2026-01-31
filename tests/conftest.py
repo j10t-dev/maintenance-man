@@ -11,6 +11,7 @@ def mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".mm"
     monkeypatch.setattr("maintenance_man.config.MM_HOME", home)
     monkeypatch.setattr("maintenance_man.scanner.MM_HOME", home)
+    monkeypatch.setattr("maintenance_man.cli.MM_HOME", home)
     return home
 
 
@@ -32,13 +33,22 @@ min_version_age_days = 7
 path = "{vuln_path}"
 package_manager = "uv"
 
+[projects.vulnerable.test]
+unit = "uv run pytest"
+
 [projects.clean]
 path = "{clean_path}"
 package_manager = "uv"
 
+[projects.clean.test]
+unit = "uv run pytest"
+
 [projects.outdated]
 path = "{clean_path}"
 package_manager = "bun"
+
+[projects.outdated.test]
+unit = "bun test"
 """
     (mm_home / "config.toml").write_text(config_text)
     return mm_home
