@@ -1,6 +1,7 @@
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Annotated
 
 import cyclopts
 from rich import print as rprint
@@ -10,7 +11,12 @@ from rich.table import Table
 
 from maintenance_man import __version__
 from maintenance_man.config import MM_HOME, load_config, resolve_project
-from maintenance_man.models.scan import BumpFinding, ScanResult, VulnFinding
+from maintenance_man.models.scan import (
+    UpdateFinding,
+    ScanResult,
+    UpdateStatus,
+    VulnFinding,
+)
 from maintenance_man.scanner import (
     TrivyNotFoundError,
     TrivyScanError,
@@ -21,12 +27,18 @@ from maintenance_man.updater import (
     GraphiteNotFoundError,
     NoScanResultsError,
     RepoDirtyError,
+    _branch_slug,
     check_graphite_available,
     check_repo_clean,
+    get_current_branch,
     load_scan_results,
-    process_bumps,
+    process_updates,
     process_vulns,
+    reset_to_main,
+    run_test_phases,
+    save_scan_results,
     submit_stack,
+    sync_graphite,
 )
 
 
@@ -218,10 +230,10 @@ def scan(
 
 
 def _print_numbered_findings(
-    vulns: list[VulnFinding], bumps: list[BumpFinding]
-) -> list[tuple[str, VulnFinding | BumpFinding]]:
+    vulns: list[VulnFinding], updates: list[UpdateFinding]
+) -> list[tuple[str, VulnFinding | UpdateFinding]]:
     """Print numbered list of findings. Returns ordered list of (kind, finding)."""
-    numbered: list[tuple[str, VulnFinding | BumpFinding]] = []
+    numbered: list[tuple[str, VulnFinding | UpdateFinding]] = []
     idx = 1
     for v in vulns:
         rprint(
@@ -230,40 +242,40 @@ def _print_numbered_findings(
         )
         numbered.append(("vuln", v))
         idx += 1
-    for b in bumps:
+    for u in updates:
         rprint(
-            f"  [dim]{idx:>3}.[/] [bold cyan]BUMP[/] {b.pkg_name} "
-            f"{b.installed_version} -> {b.latest_version} "
-            f"({b.semver_tier.value})"
+            f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {u.pkg_name} "
+            f"{u.installed_version} -> {u.latest_version} "
+            f"({u.semver_tier.value})"
         )
-        numbered.append(("bump", b))
+        numbered.append(("update", u))
         idx += 1
     return numbered
 
 
 def _parse_selection(
     selection: str,
-    numbered: list[tuple[str, VulnFinding | BumpFinding]],
+    numbered: list[tuple[str, VulnFinding | UpdateFinding]],
     actionable_vulns: list[VulnFinding],
-    bumps: list[BumpFinding],
-) -> tuple[list[VulnFinding], list[BumpFinding]]:
-    """Parse user selection string into vuln and bump lists."""
+    updates: list[UpdateFinding],
+) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+    """Parse user selection string into vuln and update lists."""
     if selection == "none":
         return [], []
     if selection == "all":
-        return actionable_vulns, bumps
+        return actionable_vulns, updates
     if selection == "vulns":
         return actionable_vulns, []
-    if selection == "bumps":
-        return [], bumps
+    if selection == "updates":
+        return [], updates
 
     # Try comma-separated numbers
     selected_vulns: list[VulnFinding] = []
-    selected_bumps: list[BumpFinding] = []
+    selected_updates: list[UpdateFinding] = []
     try:
         indices = [int(s.strip()) for s in selection.split(",")]
     except ValueError:
-        return actionable_vulns, bumps  # fallback to all
+        return actionable_vulns, updates  # fallback to all
 
     for i in indices:
         if 1 <= i <= len(numbered):
@@ -271,14 +283,16 @@ def _parse_selection(
             if kind == "vuln":
                 selected_vulns.append(finding)
             else:
-                selected_bumps.append(finding)
+                selected_updates.append(finding)
 
-    return selected_vulns, selected_bumps
+    return selected_vulns, selected_updates
 
 
 @app.command
 def update(
     project: str,
+    *,
+    continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
 ) -> None:
     """Apply updates from scan results to a project.
 
@@ -286,6 +300,8 @@ def update(
     ----------
     project: str
         Project name to update.
+    continue_: bool
+        Re-test a manually fixed failed finding on the current branch.
     """
     config = load_config()
     proj_config = resolve_project(config, project)
@@ -297,11 +313,22 @@ def update(
         rprint(f"[bold red]Error:[/] {e}")
         sys.exit(1)
 
-    try:
-        check_repo_clean(proj_config.path)
-    except RepoDirtyError as e:
-        rprint(f"[bold red]Error:[/] {e}")
-        sys.exit(1)
+    if not continue_:
+        try:
+            check_repo_clean(proj_config.path)
+        except RepoDirtyError as e:
+            rprint(f"[bold yellow]Warning:[/] {e}")
+            if Confirm.ask(
+                "  Discard changes and reset to main?", default=False
+            ):
+                reset_to_main(proj_config.path)
+            else:
+                sys.exit(1)
+
+        # Sync trunk and clean up branches whose PRs have been merged/closed
+        if not sync_graphite(proj_config.path):
+            rprint("[bold red]Error:[/] Failed to sync trunk. Check network and gt auth.")
+            sys.exit(1)
 
     results_dir = MM_HOME / "scan-results"
     try:
@@ -317,11 +344,82 @@ def update(
         )
         sys.exit(1)
 
+    if continue_:
+        # Find failed findings
+        failed_vulns = [
+            v for v in scan_result.vulnerabilities
+            if v.update_status == UpdateStatus.FAILED
+        ]
+        failed_updates = [
+            u for u in scan_result.updates
+            if u.update_status == UpdateStatus.FAILED
+        ]
+        if not failed_vulns and not failed_updates:
+            rprint("[bold red]Error:[/] No failed findings to continue.")
+            sys.exit(1)
+
+        # Match current branch to a failed finding
+        branch = get_current_branch(proj_config.path)
+        finding = None
+        for v in failed_vulns:
+            if branch == f"fix/{_branch_slug(v.pkg_name)}":
+                finding = v
+                break
+        if finding is None:
+            for u in failed_updates:
+                if branch == f"bump/{_branch_slug(u.pkg_name)}":
+                    finding = u
+                    break
+        if finding is None:
+            rprint(
+                f"[bold red]Error:[/] Current branch '{branch}' does not "
+                f"match any failed finding."
+            )
+            sys.exit(1)
+
+        # Re-test
+        rprint(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
+        passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
+
+        if passed:
+            finding.update_status = UpdateStatus.COMPLETED
+            save_scan_results(project, results_dir, scan_result)
+            rprint(f"  [bold green]PASS[/] {finding.pkg_name}")
+
+            # Check remaining failures
+            remaining = [
+                v for v in scan_result.vulnerabilities
+                if v.update_status == UpdateStatus.FAILED
+            ] + [
+                u for u in scan_result.updates
+                if u.update_status == UpdateStatus.FAILED
+            ]
+            if not remaining:
+                ok, output = submit_stack(proj_config.path)
+                if ok:
+                    rprint("  [bold green]Stack submitted.[/]")
+                    if output:
+                        rprint(f"  [dim]{output}[/]")
+                else:
+                    rprint("  [bold red]Submit failed.[/]")
+                    if output:
+                        rprint(f"  [dim]{output}[/]")
+                sys.exit(0)
+            else:
+                pkg_names = [f.pkg_name for f in remaining]
+                rprint(f"\n  [dim]Still failed: {', '.join(pkg_names)}[/]")
+                sys.exit(4)
+        else:
+            rprint(
+                f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed"
+            )
+            sys.exit(4)
+
     # Collect actionable findings
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
-    bumps = scan_result.bumps
+    updates = scan_result.updates
 
-    if not actionable_vulns and not bumps:
+    if not actionable_vulns and not updates:
         rprint(f"[bold green]{project}[/] — nothing to update.")
         sys.exit(0)
 
@@ -329,63 +427,69 @@ def update(
     _print_scan_result(scan_result)
 
     # Numbered listing
-    numbered = _print_numbered_findings(actionable_vulns, bumps)
+    numbered = _print_numbered_findings(actionable_vulns, updates)
 
     # Interactive selection
     choices = "all"
-    if actionable_vulns and bumps:
-        choices = "all/vulns/bumps/1,2,.../none"
+    if actionable_vulns and updates:
+        choices = "all/vulns/updates/1,2,.../none"
     elif actionable_vulns:
         choices = "all/vulns/1,2,.../none"
-    elif bumps:
-        choices = "all/bumps/1,2,.../none"
+    elif updates:
+        choices = "all/updates/1,2,.../none"
 
     selection = Prompt.ask(
         f"\n  Select updates [{choices}]",
         default="all",
     )
 
-    selected_vulns, selected_bumps = _parse_selection(
-        selection, numbered, actionable_vulns, bumps,
+    selected_vulns, selected_updates = _parse_selection(
+        selection, numbered, actionable_vulns, updates,
     )
 
-    if not selected_vulns and not selected_bumps:
+    if not selected_vulns and not selected_updates:
         sys.exit(0)
 
     # Process vulns (independent branches)
     vuln_results = []
     if selected_vulns:
         rprint(f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]")
-        vuln_results = process_vulns(selected_vulns, proj_config)
+        vuln_results = process_vulns(
+            selected_vulns, proj_config,
+            scan_result=scan_result, project_name=project,
+            results_dir=results_dir,
+        )
 
-    # Process bumps (stacked, risk-ascending)
-    bump_results = []
-    if selected_bumps:
-        rprint(f"\n[bold]Processing {len(selected_bumps)} bump(s)...[/]")
-        bump_results = process_bumps(selected_bumps, proj_config)
+    # Process updates (stacked, risk-ascending)
+    update_results = []
+    if selected_updates:
+        rprint(f"\n[bold]Processing {len(selected_updates)} update(s)...[/]")
+        update_results = process_updates(
+            selected_updates, proj_config,
+            scan_result=scan_result, project_name=project,
+            results_dir=results_dir,
+        )
 
     # Summary
-    all_results = vuln_results + bump_results
+    all_results = vuln_results + update_results
     passed = [r for r in all_results if r.passed]
-    failed = [r for r in all_results if not r.passed and not r.skipped]
-    skipped = [r for r in all_results if r.skipped]
+    failed = [r for r in all_results if not r.passed]
 
-    rprint("\n[bold]Summary:[/]")
+    rprint("\n" + "─" * 40)
+    rprint("[bold]Summary:[/]")
     if passed:
         rprint(f"  [green]{len(passed)} passed[/]")
     if failed:
-        rprint(f"  [red]{len(failed)} failed[/]")
-    if skipped:
-        rprint(f"  [dim]{len(skipped)} skipped[/]")
+        phase_labels = {
+            "apply": "install failed",
+            "gt-create": "branch creation failed",
+        }
+        for r in failed:
+            label = phase_labels.get(r.failed_phase, r.failed_phase or "unknown")
+            rprint(f"  [red]FAIL[/] {r.pkg_name} — {label}")
+    rprint("─" * 40)
 
-    # Submit prompt
-    if passed and Confirm.ask("\n  Submit stack?", default=False):
-        if submit_stack(proj_config.path):
-            rprint("  [bold green]Stack submitted.[/]")
-        else:
-            rprint("  [bold red]Submit failed.[/]")
-
-    has_failures = any(not r.passed and not r.skipped for r in all_results)
+    has_failures = any(not r.passed for r in all_results)
     sys.exit(4 if has_failures else 0)
 
 

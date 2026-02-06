@@ -19,6 +19,12 @@ class SemverTier(StrEnum):
     UNKNOWN = "unknown"
 
 
+class UpdateStatus(StrEnum):
+    STARTED = "started"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class VulnFinding(BaseModel):
     vuln_id: str
     pkg_name: str
@@ -30,6 +36,7 @@ class VulnFinding(BaseModel):
     status: str
     primary_url: str | None = None
     published_date: datetime | None = None
+    update_status: UpdateStatus | None = None
 
     @property
     def actionable(self) -> bool:
@@ -49,6 +56,7 @@ class UpdateFinding(BaseModel):
     latest_version: str
     semver_tier: SemverTier
     published_date: datetime | None = None
+    update_status: UpdateStatus | None = None
 
 
 class ScanResult(BaseModel):

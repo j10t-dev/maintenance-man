@@ -8,14 +8,31 @@ via Graphite stacked branches. Vuln fixes are independent branches; bumps are
 a risk-ascending stack. Each update is tested through configured test phases
 before being committed.
 
-## Flow
+## Finding status tracking
+
+Each `VulnFinding` and `BumpFinding` carries an `update_status` field persisted
+in the scan results JSON:
+
+| Status      | Meaning                                    |
+|-------------|--------------------------------------------|
+| `null`      | Not yet attempted                          |
+| `"started"` | Update in progress (useful for crash debug) |
+| `"completed"` | Update applied and tests passed          |
+| `"failed"`  | Update applied but tests failed            |
+
+- `mm scan` always writes findings with `null` status (clean slate).
+- `mm update` writes status back to the scan results file after each finding.
+- `--continue` reads `failed` findings to know what needs retesting.
+
+## Flow — fresh run (`mm update <project>`)
 
 ### 1. Pre-checks
 
 1. Load config, resolve project via `resolve_project()`.
 2. Load scan results from `~/.mm/scan-results/<project>.json` — error if
    missing, tell user to run `mm scan <project>` first.
-3. Verify `git status` is clean in the project repo — abort if dirty.
+3. Verify `git status` is clean in the project repo — if dirty, offer to
+   reset to main (interactive confirm). Abort if declined.
 4. Verify `gt` (Graphite CLI) is available on PATH — abort with install
    instructions if missing.
 5. Verify `unit` test command is configured for the project — refuse to
@@ -33,19 +50,21 @@ before being committed.
   - `1,3,5` — comma-separated finding numbers
   - `none` — abort
 
-### 3. Process vulns (independent branches)
+### 3. Process vulns (Graphite stack)
 
-Each vuln fix is an independent branch off main. Failures in one do not block
-others.
+Vuln fixes are stacked branches, submitted as a single Graphite stack.
+Failures are removed from the stack and processing continues.
 
 For each selected vuln:
-1. `gt create -m "fix: upgrade <pkg> <old> → <new> for <CVE-ID>"`
-2. Apply update via package manager command.
-3. Run test phases: unit → integration (if configured) → component (if configured).
-4. **Green:** continue to next vuln.
-5. **Red:** report failure, continue to next vuln.
+1. Stack on the previous fix branch (or main for the first).
+2. Apply update via package manager command. Mark as `started`.
+3. `gt create fix/<pkg> -a -m "fix: upgrade <pkg> <old> → <new> for <CVE-ID>"`.
+4. Run test phases: unit → integration (if configured) → component (if configured).
+5. **Green:** mark `completed`, continue to next vuln.
+6. **Red:** mark `failed`, `gt delete -f fix/<pkg>`, continue to next vuln.
 
-After all vulns: `gt checkout main` to return to main before processing bumps.
+After all vulns: submit the fix stack via `gt submit --stack` from the tip,
+then `gt checkout main` to return to main before processing bumps.
 
 ### 4. Process bumps (Graphite stack, risk-ascending)
 
@@ -54,18 +73,21 @@ maximises the number of safe updates that land before a breaking change halts
 the stack.
 
 For each selected bump:
-1. `gt create -m "bump: <pkg> <old> → <new> (<tier>)"` — stacks on previous.
-2. Apply update via package manager command.
+1. Apply update via package manager command. Mark as `started`.
+2. `gt create bump/<pkg> -a -m "bump: <pkg> <old> → <new> (<tier>)"` — stacks
+   on previous.
 3. Run test phases: unit → integration → component.
-4. **Green:** continue to next bump.
-5. **Red:** stop immediately. Report what passed and what was skipped.
+4. **Green:** mark `completed`, continue to next bump.
+5. **Red:** mark `failed`, `gt delete -f bump/<pkg>` (removes tip of stack,
+   returns to previous good branch), continue with next bump.
 
-### 5. Submit prompt
+The resulting stack contains only passing bumps. Failed bumps are removed from
+the stack but remain marked as `failed` in scan results for `--continue`.
 
-If any updates passed:
-- Prompt: "N updates passed. Submit stack? [y/n]"
-- Yes: `gt submit --stack`
-- No: leave stack locally for user inspection.
+### 5. Submit
+
+If all selected findings passed → `gt submit --stack`.
+If any failed → report summary, no submit.
 
 ### 6. Exit codes
 
@@ -73,6 +95,22 @@ If any updates passed:
 |------|-----------------------------------|
 | 0    | All selected updates passed tests |
 | 4    | One or more updates failed tests  |
+
+## Flow — continue after fix (`mm update <project> --continue`)
+
+Used after manually fixing a failed update branch.
+
+1. Load scan results, find findings with `failed` status. Error if none found.
+2. Detect current git branch, match it to a failed finding by branch name
+   (`fix/<pkg>` or `bump/<pkg>`). Error if no match.
+3. Re-run test phases against the current working state.
+4. **Green:** mark `completed`, write scan results.
+   - If no `failed` findings remain → `gt submit --stack`.
+   - If `failed` findings remain → report what's outstanding.
+5. **Red:** report failure, leave as `failed`.
+
+`--continue` does **not** re-apply the package update — the user has already
+fixed the branch manually. It only re-tests and optionally submits.
 
 ## Test configuration
 
@@ -125,12 +163,14 @@ bump: <pkg> <old> → <new> (<tier>)
 | Condition | Behaviour |
 |-----------|-----------|
 | No scan results | Error: "run `mm scan <project>` first" |
-| Dirty git status | Abort before doing anything |
+| Dirty git status | Offer reset to main; abort if declined |
 | `gt` not installed | Abort with install instructions |
 | No `unit` test configured | Refuse to proceed |
 | Package manager command fails | Mark update as failed, report |
 | Test failure (vuln) | Report, continue to next vuln (independent) |
-| Test failure (bump) | Stop the stack, report passed + skipped |
+| Test failure (bump) | Delete branch from stack, continue with remaining bumps |
+| `--continue` no failed findings | Error: nothing to continue |
+| `--continue` branch mismatch | Error: current branch doesn't match a failed finding |
 
 ## Model changes
 

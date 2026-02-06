@@ -19,16 +19,16 @@ def _make_project(pm: str, path: str = "/tmp/fake") -> ProjectConfig:
 
 
 class TestClassifySemver:
-    def test_patch_bump(self):
+    def test_patch_update(self):
         assert classify_semver("1.2.3", "1.2.4") == SemverTier.PATCH
 
-    def test_minor_bump(self):
+    def test_minor_update(self):
         assert classify_semver("1.2.3", "1.3.0") == SemverTier.MINOR
 
-    def test_major_bump(self):
+    def test_major_update(self):
         assert classify_semver("1.2.3", "2.0.0") == SemverTier.MAJOR
 
-    def test_major_bump_no_reset(self):
+    def test_major_update_no_reset(self):
         assert classify_semver("1.2.3", "2.1.0") == SemverTier.MAJOR
 
     def test_same_version(self):

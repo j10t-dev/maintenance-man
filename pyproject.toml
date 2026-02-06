@@ -32,5 +32,8 @@ select = ["E", "F", "I", "W"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: tests that call external tools (Trivy)"]
-addopts = "-m 'not integration'"
+markers = [
+    "integration: tests with real external web-dependencies",
+    "component: tests that require Docker or full service stack",
+]
+addopts = "-m 'not integration and not component'"
