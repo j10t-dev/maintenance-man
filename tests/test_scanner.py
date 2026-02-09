@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import ScanResult, Severity
+from maintenance_man.models.scan import UpdateFinding, ScanResult, SemverTier, Severity
 from maintenance_man.scanner import (
     TrivyNotFoundError,
     check_trivy_available,
@@ -83,3 +84,80 @@ class TestScanProject:
         project = _make_project("/nonexistent/path")
         with pytest.raises(FileNotFoundError):
             scan_project("ghost", project)
+
+
+class TestScanProjectWithUpdates:
+    def test_scan_includes_updates(self, scan_results_dir: Path):
+        """When outdated check returns updates, they appear in ScanResult."""
+        project = _make_project(FIXTURES_DIR / "clean-project")
+        fake_updates = [
+            UpdateFinding(
+                pkg_name="requests",
+                installed_version="2.28.0",
+                latest_version="2.31.0",
+                semver_tier=SemverTier.MINOR,
+            ),
+        ]
+        with patch("maintenance_man.scanner.get_outdated", return_value=fake_updates):
+            with patch(
+                "maintenance_man.scanner.filter_by_age", return_value=fake_updates
+            ):
+                result = scan_project("clean", project)
+
+        assert result.has_updates is True
+        assert len(result.updates) == 1
+        assert result.updates[0].pkg_name == "requests"
+
+    def test_scan_deduplicates_vuln_and_update(self, scan_results_dir: Path):
+        """If a package is both a vuln and an update, only the vuln appears."""
+        project = _make_project(FIXTURES_DIR / "vulnerable-project")
+        fake_updates = [
+            UpdateFinding(
+                pkg_name="cryptography",
+                installed_version="42.0.0",
+                latest_version="43.0.0",
+                semver_tier=SemverTier.MAJOR,
+            ),
+            UpdateFinding(
+                pkg_name="brand-new-pkg",
+                installed_version="1.0.0",
+                latest_version="2.0.0",
+                semver_tier=SemverTier.MAJOR,
+            ),
+        ]
+        with patch("maintenance_man.scanner.get_outdated", return_value=fake_updates):
+            with patch(
+                "maintenance_man.scanner.filter_by_age", return_value=fake_updates
+            ):
+                result = scan_project("vulnerable", project)
+
+        vuln_pkg_names = {v.pkg_name for v in result.vulnerabilities}
+        update_pkg_names = {u.pkg_name for u in result.updates}
+        assert "cryptography" in vuln_pkg_names
+        assert "cryptography" not in update_pkg_names
+        assert "brand-new-pkg" in update_pkg_names
+
+    def test_scan_outdated_failure_does_not_crash(self, scan_results_dir: Path):
+        """If the outdated check fails, scan still returns Trivy results."""
+        project = _make_project(FIXTURES_DIR / "clean-project")
+        with patch(
+            "maintenance_man.scanner.get_outdated",
+            side_effect=Exception("bun not found"),
+        ):
+            result = scan_project("clean", project)
+
+        assert isinstance(result, ScanResult)
+        assert result.updates == []
+
+    def test_scan_passes_min_version_age_days(self, scan_results_dir: Path):
+        """min_version_age_days parameter is forwarded to filter_by_age."""
+        project = _make_project(FIXTURES_DIR / "clean-project")
+        with patch("maintenance_man.scanner.get_outdated", return_value=[]):
+            with patch(
+                "maintenance_man.scanner.filter_by_age", return_value=[]
+            ) as mock_age:
+                scan_project("clean", project, min_version_age_days=14)
+
+        mock_age.assert_called_once()
+        call_kwargs = mock_age.call_args
+        assert call_kwargs[1].get("min_age_days") == 14 or call_kwargs[0][2] == 14
