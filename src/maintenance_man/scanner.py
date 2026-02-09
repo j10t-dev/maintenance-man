@@ -107,7 +107,7 @@ def scan_project(
     if not project_path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
 
-    # --- Trivy scan (existing) ---
+    # --- Trivy scan ---
     scanners = "vuln,secret" if project.scan_secrets else "vuln"
     cmd = [
         "trivy",
@@ -143,7 +143,7 @@ def scan_project(
     vulns = _parse_vulns(results)
     secrets = _parse_secrets(results)
 
-    # --- Outdated check (new) ---
+    # --- Outdated check ---
     updates: list[UpdateFinding] = []
     try:
         raw_updates = get_outdated(project)
@@ -151,6 +151,7 @@ def scan_project(
             raw_updates,
             manager=project.package_manager,
             min_age_days=min_version_age_days,
+            project_path=project.path,
         )
         # Dedup: drop updates for packages already flagged as vulns
         vuln_pkgs = {v.pkg_name for v in vulns}

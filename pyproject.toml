@@ -7,7 +7,7 @@ name = "maintenance-man"
 version = "0.1.0"
 description = "Config-driven CLI for routine software project maintenance"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "cyclopts>=4.5",
     "packaging>=24.0",

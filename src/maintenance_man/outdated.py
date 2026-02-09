@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
@@ -12,6 +13,32 @@ class OutdatedCheckError(Exception):
     pass
 
 
+def _run_checked(
+    cmd: list[str],
+    cwd: str | Path,
+    timeout: int,
+    *,
+    label: str,
+    allow_nonzero_with_stdout: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess with common error handling."""
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise OutdatedCheckError(f"{label} timed out") from e
+
+    if completed.returncode != 0:
+        if allow_nonzero_with_stdout and completed.stdout.strip():
+            return completed
+        raise OutdatedCheckError(
+            f"{label} failed (exit {completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
+    return completed
+
+
 def classify_semver(installed: str, latest: str) -> SemverTier:
     """Compare two version strings and return the semver tier of the change."""
     try:
@@ -19,35 +46,26 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
         new = Version(latest)
     except InvalidVersion:
         return SemverTier.UNKNOWN
-    
+
     if old == new:
         return SemverTier.UNKNOWN
-    
-    # Version objects have .major, .minor, .micro attributes
+
     if old.major != new.major:
         return SemverTier.MAJOR
     if old.minor != new.minor:
         return SemverTier.MINOR
     return SemverTier.PATCH
 
+
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `uv pip list --outdated --format json` and parse results."""
-    try:
-        completed = subprocess.run(
-            ["uv", "pip", "list", "--outdated", "--format", "json"],
-            capture_output=True,
-            text=True,
-            cwd=project.path,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        raise OutdatedCheckError("uv pip list --outdated timed out")
-
-    if completed.returncode != 0:
-        raise OutdatedCheckError(
-            f"uv pip list --outdated failed (exit {completed.returncode}): "
-            f"{completed.stderr.strip()}"
-        )
+    venv_python = Path(project.path) / ".venv" / "bin" / "python"
+    cmd = ["uv", "pip", "list", "--outdated", "--format", "json"]
+    if venv_python.exists():
+        cmd += ["--python", str(venv_python)]
+    completed = _run_checked(
+        cmd, cwd=project.path, timeout=120, label="uv pip list --outdated",
+    )
 
     try:
         entries = json.loads(completed.stdout)
@@ -62,8 +80,9 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
             semver_tier=classify_semver(entry["version"], entry["latest_version"]),
         )
         for entry in entries
-        if entry.get("version") and entry.get("latest_version") 
-           and entry["version"] != entry["latest_version"]
+        if (cur := entry.get("version"))
+        and (lat := entry.get("latest_version"))
+        and cur != lat
     ]
 
 
@@ -71,41 +90,31 @@ def _parse_bun_table(output: str) -> list[dict[str, str]]:
     """Parse bun outdated table output into list of dicts."""
     lines = (line.strip() for line in output.strip().splitlines())
     table_lines = (
-        line for line in lines 
+        line for line in lines
         if line.startswith("|") and "---" not in line
     )
-    
+
     rows = []
     for line in table_lines:
         cells = [c.strip() for c in line.split("|") if c.strip()]
-        if len(cells) >= 4 and cells[0].lower() != "package":
-            rows.append({
-                "package": cells[0],
-                "current": cells[1],
-                "update": cells[2],
-                "latest": cells[3],
-            })
+        if len(cells) < 4 or cells[0].lower() == "package":
+            continue
+        rows.append({
+            "package": re.sub(r"\s*\(dev\)$", "", cells[0]),
+            "current": cells[1],
+            "update": cells[2],
+            "latest": cells[3],
+        })
     return rows
 
 
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `bun outdated` and parse the table output."""
-    try:
-        completed = subprocess.run(
-            ["bun", "outdated"],
-            capture_output=True,
-            text=True,
-            cwd=project.path,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        raise OutdatedCheckError("bun outdated timed out")
-
-    if completed.returncode != 0 and not completed.stdout.strip():
-        raise OutdatedCheckError(
-            f"bun outdated failed (exit {completed.returncode}): "
-            f"{completed.stderr.strip()}"
-        )
+    cmd = ["bun", "outdated"]
+    completed = _run_checked(
+        cmd, cwd=project.path, timeout=120, label="bun outdated",
+        allow_nonzero_with_stdout=True,
+    )
 
     if not completed.stdout.strip():
         return []
@@ -135,26 +144,15 @@ _MVN_UPDATE_RE = re.compile(
 
 def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `mvn versions:display-dependency-updates` and parse text output."""
-    try:
-        completed = subprocess.run(
-            [
-                "mvn",
-                "versions:display-dependency-updates",
-                "-DprocessDependencyManagement=false",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=project.path,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        raise OutdatedCheckError("mvn versions:display-dependency-updates timed out")
-
-    if completed.returncode != 0:
-        raise OutdatedCheckError(
-            f"mvn versions:display-dependency-updates failed "
-            f"(exit {completed.returncode}): {completed.stderr.strip()}"
-        )
+    cmd = [
+        "mvn",
+        "versions:display-dependency-updates",
+        "-DprocessDependencyManagement=false",
+    ]
+    completed = _run_checked(
+        cmd, cwd=project.path, timeout=300,
+        label="mvn versions:display-dependency-updates",
+    )
 
     return [
         UpdateFinding(

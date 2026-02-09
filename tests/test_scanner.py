@@ -98,11 +98,11 @@ class TestScanProjectWithUpdates:
                 semver_tier=SemverTier.MINOR,
             ),
         ]
-        with patch("maintenance_man.scanner.get_outdated", return_value=fake_updates):
-            with patch(
-                "maintenance_man.scanner.filter_by_age", return_value=fake_updates
-            ):
-                result = scan_project("clean", project)
+        with (
+            patch("maintenance_man.scanner.get_outdated", return_value=fake_updates),
+            patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
+        ):
+            result = scan_project("clean", project)
 
         assert result.has_updates is True
         assert len(result.updates) == 1
@@ -125,11 +125,11 @@ class TestScanProjectWithUpdates:
                 semver_tier=SemverTier.MAJOR,
             ),
         ]
-        with patch("maintenance_man.scanner.get_outdated", return_value=fake_updates):
-            with patch(
-                "maintenance_man.scanner.filter_by_age", return_value=fake_updates
-            ):
-                result = scan_project("vulnerable", project)
+        with (
+            patch("maintenance_man.scanner.get_outdated", return_value=fake_updates),
+            patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
+        ):
+            result = scan_project("vulnerable", project)
 
         vuln_pkg_names = {v.pkg_name for v in result.vulnerabilities}
         update_pkg_names = {u.pkg_name for u in result.updates}
@@ -152,11 +152,11 @@ class TestScanProjectWithUpdates:
     def test_scan_passes_min_version_age_days(self, scan_results_dir: Path):
         """min_version_age_days parameter is forwarded to filter_by_age."""
         project = _make_project(FIXTURES_DIR / "clean-project")
-        with patch("maintenance_man.scanner.get_outdated", return_value=[]):
-            with patch(
-                "maintenance_man.scanner.filter_by_age", return_value=[]
-            ) as mock_age:
-                scan_project("clean", project, min_version_age_days=14)
+        with (
+            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch("maintenance_man.scanner.filter_by_age", return_value=[]) as mock_age,
+        ):
+            scan_project("clean", project, min_version_age_days=14)
 
         mock_age.assert_called_once()
         call_kwargs = mock_age.call_args
