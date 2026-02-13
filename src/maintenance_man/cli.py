@@ -1,19 +1,21 @@
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Annotated
+from enum import IntEnum
+from pathlib import Path
+from typing import Annotated, NoReturn
 
 import cyclopts
-from rich import print as rprint
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from maintenance_man import __version__
 from maintenance_man.config import MM_HOME, load_config, resolve_project
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
-    UpdateFinding,
     ScanResult,
+    UpdateFinding,
     UpdateStatus,
     VulnFinding,
 )
@@ -44,12 +46,17 @@ from maintenance_man.vcs import (
 )
 
 
-def _pluralise(n: int, singular: str, plural: str) -> str:
-    return f"{n} {singular if n == 1 else plural}"
+class ExitCode(IntEnum):
+    OK = 0
+    ERROR = 1
+    VULNS_FOUND = 2
+    UPDATES_FOUND = 3
+    UPDATE_FAILED = 4
 
+
+console = Console()
 
 _TABLE_STYLE = dict(show_edge=False, pad_edge=False, box=None)
-
 
 app = cyclopts.App(
     name="mm",
@@ -59,10 +66,17 @@ app = cyclopts.App(
 )
 
 
+def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
+    console.print(f"[bold red]Error:[/] {msg}")
+    sys.exit(code)
+
+
+def _pluralise(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
 def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
     """Print a Rich-formatted summary of scan results for one project."""
-    console = Console()
-
     actionable = [v for v in result.vulnerabilities if v.actionable]
     advisories = [v for v in result.vulnerabilities if not v.actionable]
     secrets = result.secrets
@@ -72,20 +86,18 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
     timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
 
     if total == 0:
-        rprint(f"[bold green]{result.project}[/] — clean{timing}")
+        console.print(f"[bold green]{result.project}[/] — clean{timing}")
         return
 
-    parts = []
-    if actionable:
-        parts.append(_pluralise(len(actionable), "vulnerability", "vulnerabilities"))
-    if advisories:
-        parts.append(_pluralise(len(advisories), "advisory", "advisories"))
-    if secrets:
-        parts.append(_pluralise(len(secrets), "secret", "secrets"))
-    if updates:
-        parts.append(_pluralise(len(updates), "update", "updates"))
+    categories = [
+        (actionable, "vulnerability", "vulnerabilities"),
+        (advisories, "advisory", "advisories"),
+        (secrets, "secret", "secrets"),
+        (updates, "update", "updates"),
+    ]
+    parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
 
-    rprint(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
+    console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
 
     if actionable:
         table = Table(show_header=True, **_TABLE_STYLE)
@@ -127,7 +139,7 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
 
     if secrets:
         for s in secrets:
-            rprint(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
+            console.print(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
 
     if updates:
         table = Table(show_header=True, **_TABLE_STYLE)
@@ -153,6 +165,17 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
         console.print(table)
 
 
+def _scan_one(
+    name: str, proj_config: ProjectConfig, min_age_days: int
+) -> ScanResult:
+    """Scan a single project with timing output."""
+    t0 = time.monotonic()
+    result = scan_project(name, proj_config, min_age_days)
+    elapsed = time.monotonic() - t0
+    _print_scan_result(result, elapsed_s=elapsed)
+    return result
+
+
 @app.command
 def scan(
     project: str | None = None,
@@ -169,66 +192,57 @@ def scan(
     try:
         check_trivy_available()
     except TrivyNotFoundError as e:
-        rprint(f"[bold red]Error:[/] {e}")
-        sys.exit(1)
+        _fatal(str(e))
 
     if not config.projects:
-        print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        console.print(
+            "No projects configured. Edit ~/.mm/config.toml to add projects."
+        )
         return
 
     if project:
-        # Single project scan
         proj_config = resolve_project(config, project)
         try:
-            t0 = time.monotonic()
-            result = scan_project(
+            result = _scan_one(
                 project, proj_config, config.defaults.min_version_age_days
             )
-            elapsed = time.monotonic() - t0
         except TrivyScanError as e:
-            rprint(f"[bold red]Error:[/] {e}")
-            sys.exit(1)
+            _fatal(str(e))
 
-        _print_scan_result(result, elapsed_s=elapsed)
         if result.has_actionable_vulns:
-            sys.exit(2)
+            sys.exit(ExitCode.VULNS_FOUND)
         elif result.has_updates:
-            sys.exit(3)
+            sys.exit(ExitCode.UPDATES_FOUND)
         else:
-            sys.exit(0)
+            sys.exit(ExitCode.OK)
 
     # Scan all projects
     has_vulns = False
     has_updates = False
     for name, proj_config in config.projects.items():
         if not proj_config.path.exists():
-            rprint(
+            console.print(
                 f"[bold yellow]Warning:[/] {name} — "
                 f"path does not exist: {proj_config.path}"
             )
             continue
         try:
-            t0 = time.monotonic()
-            result = scan_project(
+            result = _scan_one(
                 name, proj_config, config.defaults.min_version_age_days
             )
-            elapsed = time.monotonic() - t0
         except TrivyScanError as e:
-            rprint(f"[bold red]Error:[/] {name} — {e}")
+            console.print(f"[bold red]Error:[/] {name} — {e}")
             continue
 
-        _print_scan_result(result, elapsed_s=elapsed)
-        if result.has_actionable_vulns:
-            has_vulns = True
-        if result.has_updates:
-            has_updates = True
+        has_vulns |= result.has_actionable_vulns
+        has_updates |= result.has_updates
 
     if has_vulns:
-        sys.exit(2)
+        sys.exit(ExitCode.VULNS_FOUND)
     elif has_updates:
-        sys.exit(3)
+        sys.exit(ExitCode.UPDATES_FOUND)
     else:
-        sys.exit(0)
+        sys.exit(ExitCode.OK)
 
 
 def _print_numbered_findings(
@@ -236,22 +250,19 @@ def _print_numbered_findings(
 ) -> list[tuple[str, VulnFinding | UpdateFinding]]:
     """Print numbered list of findings. Returns ordered list of (kind, finding)."""
     numbered: list[tuple[str, VulnFinding | UpdateFinding]] = []
-    idx = 1
-    for v in vulns:
-        rprint(
+    for idx, v in enumerate(vulns, 1):
+        console.print(
             f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {v.pkg_name} "
             f"{v.installed_version} -> {v.fixed_version} ({v.vuln_id})"
         )
         numbered.append(("vuln", v))
-        idx += 1
-    for u in updates:
-        rprint(
+    for idx, u in enumerate(updates, len(vulns) + 1):
+        console.print(
             f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {u.pkg_name} "
             f"{u.installed_version} -> {u.latest_version} "
             f"({u.semver_tier.value})"
         )
         numbered.append(("update", u))
-        idx += 1
     return numbered
 
 
@@ -260,24 +271,27 @@ def _parse_selection(
     numbered: list[tuple[str, VulnFinding | UpdateFinding]],
     actionable_vulns: list[VulnFinding],
     updates: list[UpdateFinding],
-) -> tuple[list[VulnFinding], list[UpdateFinding]]:
-    """Parse user selection string into vuln and update lists."""
-    if selection == "none":
-        return [], []
-    if selection == "all":
-        return actionable_vulns, updates
-    if selection == "vulns":
-        return actionable_vulns, []
-    if selection == "updates":
-        return [], updates
+) -> tuple[list[VulnFinding], list[UpdateFinding]] | None:
+    """Parse user selection string into vuln and update lists.
 
-    # Try comma-separated numbers
+    Returns None if the selection string is invalid.
+    """
+    match selection:
+        case "none":
+            return [], []
+        case "all":
+            return actionable_vulns, updates
+        case "vulns":
+            return actionable_vulns, []
+        case "updates":
+            return [], updates
+
     selected_vulns: list[VulnFinding] = []
     selected_updates: list[UpdateFinding] = []
     try:
         indices = [int(s.strip()) for s in selection.split(",")]
     except ValueError:
-        return actionable_vulns, updates  # fallback to all
+        return None
 
     for i in indices:
         if 1 <= i <= len(numbered):
@@ -288,6 +302,70 @@ def _parse_selection(
                 selected_updates.append(finding)
 
     return selected_vulns, selected_updates
+
+
+def _handle_continue(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+) -> NoReturn:
+    """Handle --continue: re-test a manually fixed failed finding."""
+    failed_vulns = [
+        v for v in scan_result.vulnerabilities
+        if v.update_status == UpdateStatus.FAILED
+    ]
+    failed_updates = [
+        u for u in scan_result.updates
+        if u.update_status == UpdateStatus.FAILED
+    ]
+    if not failed_vulns and not failed_updates:
+        _fatal("No failed findings to continue.")
+
+    branch = get_current_branch(proj_config.path)
+    finding = next(
+        (v for v in failed_vulns if branch == f"fix/{branch_slug(v.pkg_name)}"),
+        None,
+    ) or next(
+        (u for u in failed_updates
+         if branch == f"bump/{branch_slug(u.pkg_name)}"),
+        None,
+    )
+    if finding is None:
+        _fatal(
+            f"Current branch '{branch}' does not match any failed finding."
+        )
+
+    console.print(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
+    passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
+
+    if not passed:
+        console.print(
+            f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed"
+        )
+        sys.exit(ExitCode.UPDATE_FAILED)
+
+    finding.update_status = UpdateStatus.COMPLETED
+    save_scan_results(project, results_dir, scan_result)
+    console.print(f"  [bold green]PASS[/] {finding.pkg_name}")
+
+    remaining = [
+        f for f in [*scan_result.vulnerabilities, *scan_result.updates]
+        if f.update_status == UpdateStatus.FAILED
+    ]
+    if remaining:
+        pkg_names = [f.pkg_name for f in remaining]
+        console.print(f"\n  [dim]Still failed: {', '.join(pkg_names)}[/]")
+        sys.exit(ExitCode.UPDATE_FAILED)
+
+    ok, output = submit_stack(proj_config.path)
+    if ok:
+        console.print("  [bold green]Stack submitted.[/]")
+    else:
+        console.print("  [bold red]Submit failed.[/]")
+    if output:
+        console.print(f"  [dim]{output}[/]")
+    sys.exit(ExitCode.OK)
 
 
 @app.command
@@ -308,127 +386,53 @@ def update(
     config = load_config()
     proj_config = resolve_project(config, project)
 
-    # Pre-checks
     try:
         check_graphite_available()
     except GraphiteNotFoundError as e:
-        rprint(f"[bold red]Error:[/] {e}")
-        sys.exit(1)
+        _fatal(str(e))
 
     if not continue_:
         try:
             check_repo_clean(proj_config.path)
         except RepoDirtyError as e:
-            rprint(f"[bold yellow]Warning:[/] {e}")
+            console.print(f"[bold yellow]Warning:[/] {e}")
             if Confirm.ask(
                 "  Discard changes and reset to main?", default=False
             ):
                 reset_to_main(proj_config.path)
             else:
-                sys.exit(1)
+                sys.exit(ExitCode.ERROR)
 
-        # Sync trunk and clean up branches whose PRs have been merged/closed
         if not sync_graphite(proj_config.path):
-            rprint("[bold red]Error:[/] Failed to sync trunk. Check network and gt auth.")
-            sys.exit(1)
+            _fatal(
+                "Failed to sync trunk. Check network and gt auth."
+            )
 
     results_dir = MM_HOME / "scan-results"
     try:
         scan_result = load_scan_results(project, results_dir)
     except NoScanResultsError as e:
-        rprint(f"[bold red]Error:[/] {e}")
-        sys.exit(1)
+        _fatal(str(e))
 
     if proj_config.test is None:
-        rprint(
-            f"[bold red]Error:[/] No test configuration for [bold]{project}[/]. "
+        _fatal(
+            f"No test configuration for [bold]{project}[/]. "
             f"Add a [projects.{project}.test] section to ~/.mm/config.toml."
         )
-        sys.exit(1)
 
     if continue_:
-        # Find failed findings
-        failed_vulns = [
-            v for v in scan_result.vulnerabilities
-            if v.update_status == UpdateStatus.FAILED
-        ]
-        failed_updates = [
-            u for u in scan_result.updates
-            if u.update_status == UpdateStatus.FAILED
-        ]
-        if not failed_vulns and not failed_updates:
-            rprint("[bold red]Error:[/] No failed findings to continue.")
-            sys.exit(1)
-
-        # Match current branch to a failed finding
-        branch = get_current_branch(proj_config.path)
-        finding = None
-        for v in failed_vulns:
-            if branch == f"fix/{branch_slug(v.pkg_name)}":
-                finding = v
-                break
-        if finding is None:
-            for u in failed_updates:
-                if branch == f"bump/{branch_slug(u.pkg_name)}":
-                    finding = u
-                    break
-        if finding is None:
-            rprint(
-                f"[bold red]Error:[/] Current branch '{branch}' does not "
-                f"match any failed finding."
-            )
-            sys.exit(1)
-
-        # Re-test
-        rprint(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
-        passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
-
-        if passed:
-            finding.update_status = UpdateStatus.COMPLETED
-            save_scan_results(project, results_dir, scan_result)
-            rprint(f"  [bold green]PASS[/] {finding.pkg_name}")
-
-            # Check remaining failures
-            remaining = [
-                v for v in scan_result.vulnerabilities
-                if v.update_status == UpdateStatus.FAILED
-            ] + [
-                u for u in scan_result.updates
-                if u.update_status == UpdateStatus.FAILED
-            ]
-            if not remaining:
-                ok, output = submit_stack(proj_config.path)
-                if ok:
-                    rprint("  [bold green]Stack submitted.[/]")
-                    if output:
-                        rprint(f"  [dim]{output}[/]")
-                else:
-                    rprint("  [bold red]Submit failed.[/]")
-                    if output:
-                        rprint(f"  [dim]{output}[/]")
-                sys.exit(0)
-            else:
-                pkg_names = [f.pkg_name for f in remaining]
-                rprint(f"\n  [dim]Still failed: {', '.join(pkg_names)}[/]")
-                sys.exit(4)
-        else:
-            rprint(
-                f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed"
-            )
-            sys.exit(4)
+        _handle_continue(project, proj_config, scan_result, results_dir)
 
     # Collect actionable findings
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
 
     if not actionable_vulns and not updates:
-        rprint(f"[bold green]{project}[/] — nothing to update.")
-        sys.exit(0)
+        console.print(f"[bold green]{project}[/] — nothing to update.")
+        sys.exit(ExitCode.OK)
 
-    # Display findings
     _print_scan_result(scan_result)
 
-    # Numbered listing
     numbered = _print_numbered_findings(actionable_vulns, updates)
 
     # Interactive selection
@@ -440,22 +444,30 @@ def update(
     elif updates:
         choices = "all/updates/1,2,.../none"
 
-    selection = Prompt.ask(
-        f"\n  Select updates [{choices}]",
-        default="all",
-    )
-
-    selected_vulns, selected_updates = _parse_selection(
-        selection, numbered, actionable_vulns, updates,
-    )
+    while True:
+        selection = Prompt.ask(
+            f"\n  Select updates [{choices}]",
+            default="all",
+        )
+        result = _parse_selection(
+            selection, numbered, actionable_vulns, updates,
+        )
+        if result is not None:
+            selected_vulns, selected_updates = result
+            break
+        console.print(
+            f"[bold red]Invalid selection:[/] '{selection}'. Try again."
+        )
 
     if not selected_vulns and not selected_updates:
-        sys.exit(0)
+        sys.exit(ExitCode.OK)
 
     # Process vulns (independent branches)
     vuln_results = []
     if selected_vulns:
-        rprint(f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]")
+        console.print(
+            f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]"
+        )
         vuln_results = process_vulns(
             selected_vulns, proj_config,
             scan_result=scan_result, project_name=project,
@@ -465,7 +477,9 @@ def update(
     # Process updates (stacked, risk-ascending)
     update_results = []
     if selected_updates:
-        rprint(f"\n[bold]Processing {len(selected_updates)} update(s)...[/]")
+        console.print(
+            f"\n[bold]Processing {len(selected_updates)} update(s)...[/]"
+        )
         update_results = process_updates(
             selected_updates, proj_config,
             scan_result=scan_result, project_name=project,
@@ -477,22 +491,26 @@ def update(
     passed = [r for r in all_results if r.passed]
     failed = [r for r in all_results if not r.passed]
 
-    rprint("\n" + "─" * 40)
-    rprint("[bold]Summary:[/]")
+    console.print("\n" + "─" * 40)
+    console.print("[bold]Summary:[/]")
     if passed:
-        rprint(f"  [green]{len(passed)} passed[/]")
+        console.print(f"  [green]{len(passed)} passed[/]")
     if failed:
         phase_labels = {
             "apply": "install failed",
             "gt-create": "branch creation failed",
         }
         for r in failed:
-            label = phase_labels.get(r.failed_phase, r.failed_phase or "unknown")
-            rprint(f"  [red]FAIL[/] {r.pkg_name} — {label}")
-    rprint("─" * 40)
+            label = phase_labels.get(
+                r.failed_phase, r.failed_phase or "unknown"
+            )
+            console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
+    console.print("─" * 40)
 
-    has_failures = any(not r.passed for r in all_results)
-    sys.exit(4 if has_failures else 0)
+    sys.exit(
+        ExitCode.UPDATE_FAILED if any(not r.passed for r in all_results)
+        else ExitCode.OK
+    )
 
 
 @app.command
@@ -506,8 +524,8 @@ def deploy(
     project: str
         Project name to deploy.
     """
-    print("Not implemented.")
-    sys.exit(1)
+    console.print("Not implemented.")
+    sys.exit(ExitCode.ERROR)
 
 
 @app.command(name="list")
@@ -516,10 +534,11 @@ def list_projects() -> None:
     config = load_config()
 
     if not config.projects:
-        print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        console.print(
+            "No projects configured. Edit ~/.mm/config.toml to add projects."
+        )
         return
 
-    console = Console()
     table = Table(title="Configured Projects")
     table.add_column("Name", style="bold")
     table.add_column("Path")
