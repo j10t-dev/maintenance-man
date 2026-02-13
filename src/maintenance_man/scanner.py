@@ -5,7 +5,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from maintenance_man.config import MM_HOME
+from maintenance_man import config as _config
 from maintenance_man.dependency_age import filter_by_age
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
@@ -173,7 +173,7 @@ def scan_project(
     )
 
     # Write results to disk — sanitise name to prevent path traversal
-    results_dir = MM_HOME / "scan-results"
+    results_dir = _config.MM_HOME / "scan-results"
     results_dir.mkdir(parents=True, exist_ok=True)
     safe_name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
     results_file = results_dir / f"{safe_name}.json"

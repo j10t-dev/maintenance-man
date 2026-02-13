@@ -11,7 +11,8 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from maintenance_man import __version__
-from maintenance_man.config import MM_HOME, load_config, resolve_project
+from maintenance_man import config as _config
+from maintenance_man.config import load_config, resolve_project
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -408,7 +409,7 @@ def update(
                 "Failed to sync trunk. Check network and gt auth."
             )
 
-    results_dir = MM_HOME / "scan-results"
+    results_dir = _config.MM_HOME / "scan-results"
     try:
         scan_result = load_scan_results(project, results_dir)
     except NoScanResultsError as e:

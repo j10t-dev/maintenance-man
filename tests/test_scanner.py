@@ -159,5 +159,4 @@ class TestScanProjectWithUpdates:
             scan_project("clean", project, min_version_age_days=14)
 
         mock_age.assert_called_once()
-        call_kwargs = mock_age.call_args
-        assert call_kwargs[1].get("min_age_days") == 14 or call_kwargs[0][2] == 14
+        assert mock_age.call_args.kwargs["min_age_days"] == 14

@@ -24,7 +24,7 @@ class TestPhaseTestConfig:
         assert tc.component == "bun run test:component"
 
     def test_rejects_extra_fields(self):
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError, match="unknown"):
             PhaseTestConfig(unit="bun test", unknown="bad")
 
 

@@ -33,10 +33,10 @@ class TestProjectConfig:
         assert proj.path == tmp_path
         assert proj.package_manager == "bun"
 
-    def test_all_package_managers_accepted(self, tmp_path: Path):
-        for pm in ("bun", "uv", "mvn"):
-            proj = ProjectConfig(path=tmp_path, package_manager=pm)
-            assert proj.package_manager == pm
+    @pytest.mark.parametrize("pm", ["bun", "uv", "mvn"])
+    def test_all_package_managers_accepted(self, tmp_path: Path, pm: str):
+        proj = ProjectConfig(path=tmp_path, package_manager=pm)
+        assert proj.package_manager == pm
 
     def test_missing_path_raises(self):
         with pytest.raises(ValidationError, match="path"):

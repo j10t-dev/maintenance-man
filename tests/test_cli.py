@@ -10,7 +10,7 @@ class TestHelp:
         assert exc_info.value.code == 0
 
     def test_help_contains_description(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit, match="0"):
             app(["--help"])
         assert "maintenance" in capsys.readouterr().out.lower()
 
@@ -22,7 +22,7 @@ class TestVersion:
         assert exc_info.value.code == 0
 
     def test_version_prints_version(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit, match="0"):
             app(["--version"])
         assert "0.1.0" in capsys.readouterr().out
 

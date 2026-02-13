@@ -9,8 +9,11 @@ from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import SemverTier
 from maintenance_man.outdated import (
     OutdatedCheckError,
+    bun_outdated,
     classify_semver,
     get_outdated,
+    mvn_outdated,
+    uv_outdated,
 )
 
 
@@ -68,8 +71,6 @@ class TestUvOutdated:
         project = _make_project("uv")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import uv_outdated
-
             updates = uv_outdated(project)
 
         assert len(updates) == 2
@@ -86,8 +87,6 @@ class TestUvOutdated:
         project = _make_project("uv")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import uv_outdated
-
             updates = uv_outdated(project)
 
         assert updates == []
@@ -99,8 +98,6 @@ class TestUvOutdated:
         project = _make_project("uv")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import uv_outdated
-
             with pytest.raises(OutdatedCheckError):
                 uv_outdated(project)
 
@@ -119,8 +116,6 @@ class TestBunOutdated:
         project = _make_project("bun")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import bun_outdated
-
             updates = bun_outdated(project)
 
         assert len(updates) == 2
@@ -139,8 +134,6 @@ class TestBunOutdated:
         project = _make_project("bun")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import bun_outdated
-
             updates = bun_outdated(project)
 
         assert updates == []
@@ -152,8 +145,6 @@ class TestBunOutdated:
         project = _make_project("bun")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import bun_outdated
-
             with pytest.raises(OutdatedCheckError):
                 bun_outdated(project)
 
@@ -172,8 +163,6 @@ class TestMvnOutdated:
         project = _make_project("mvn")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import mvn_outdated
-
             updates = mvn_outdated(project)
 
         assert len(updates) == 2
@@ -191,8 +180,6 @@ class TestMvnOutdated:
         project = _make_project("mvn")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import mvn_outdated
-
             updates = mvn_outdated(project)
 
         assert updates == []
@@ -204,8 +191,6 @@ class TestMvnOutdated:
         project = _make_project("mvn")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            from maintenance_man.outdated import mvn_outdated
-
             with pytest.raises(OutdatedCheckError):
                 mvn_outdated(project)
 
