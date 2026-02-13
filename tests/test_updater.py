@@ -15,13 +15,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.updater import (
-    GraphiteNotFoundError,
     NoScanResultsError,
-    RepoDirtyError,
-    _branch_slug,
-    check_graphite_available,
-    check_repo_clean,
-    get_current_branch,
     get_update_command,
     load_scan_results,
     process_updates,
@@ -29,6 +23,14 @@ from maintenance_man.updater import (
     run_test_phases,
     save_scan_results,
     sort_updates_by_risk,
+)
+from maintenance_man.vcs import (
+    GraphiteNotFoundError,
+    RepoDirtyError,
+    branch_slug,
+    check_graphite_available,
+    check_repo_clean,
+    get_current_branch,
 )
 
 # -- Fixtures --
@@ -144,14 +146,14 @@ class TestCheckGraphiteAvailable:
 # -- check_repo_clean --
 
 class TestCheckRepoClean:
-    @patch("maintenance_man.updater.subprocess.run")
+    @patch("maintenance_man.vcs.subprocess.run")
     def test_clean_repo(self, mock_run: MagicMock, tmp_path: Path):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr=""
         )
         check_repo_clean(tmp_path)  # should not raise
 
-    @patch("maintenance_man.updater.subprocess.run")
+    @patch("maintenance_man.vcs.subprocess.run")
     def test_dirty_repo(self, mock_run: MagicMock, tmp_path: Path):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=" M src/file.py\n", stderr=""
@@ -278,28 +280,28 @@ class TestSortUpdatesByRisk:
         assert result[0].semver_tier == SemverTier.MINOR
 
 
-# -- _branch_slug --
+# -- branch_slug --
 
 class TestBranchSlug:
     def test_plain_name(self):
-        assert _branch_slug("express") == "express"
+        assert branch_slug("express") == "express"
 
     def test_scoped_npm(self):
-        assert _branch_slug("@types/bun") == "types-bun"
+        assert branch_slug("@types/bun") == "types-bun"
 
     def test_deeply_scoped(self):
-        assert _branch_slug("@babel/preset-env") == "babel-preset-env"
+        assert branch_slug("@babel/preset-env") == "babel-preset-env"
 
     def test_no_at_no_slash(self):
-        assert _branch_slug("lodash") == "lodash"
+        assert branch_slug("lodash") == "lodash"
 
 
 # -- process_vulns --
 
 class TestProcessVulns:
     @patch("maintenance_man.updater.submit_stack", return_value=(True, ""))
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases", return_value=(True, None))
     def test_single_vuln_passes(
@@ -314,9 +316,9 @@ class TestProcessVulns:
         assert results[0].kind == "vuln"
         mock_submit.assert_called_once()
 
-    @patch("maintenance_man.updater._gt_delete")
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_delete")
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch(
         "maintenance_man.updater.run_test_phases",
@@ -338,7 +340,7 @@ class TestProcessVulns:
         assert mock_apply.call_count == 2
         assert mock_delete.call_count == 2  # both failed branches deleted
 
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=False)
     def test_vuln_apply_fails(
         self, mock_apply, mock_checkout, project_config: ProjectConfig,
@@ -352,8 +354,8 @@ class TestProcessVulns:
 
     @patch("maintenance_man.updater.save_scan_results")
     @patch("maintenance_man.updater.submit_stack", return_value=(False, ""))
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases", return_value=(True, None))
     def test_submit_failure_marks_findings_failed(
@@ -381,8 +383,8 @@ class TestProcessVulns:
 
 class TestProcessUpdates:
     @patch("maintenance_man.updater.submit_stack", return_value=(True, ""))
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases", return_value=(True, None))
     def test_all_updates_pass(
@@ -407,9 +409,9 @@ class TestProcessUpdates:
         mock_submit.assert_called_once()
 
     @patch("maintenance_man.updater.submit_stack", return_value=(True, ""))
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_delete")
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_delete")
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases")
     def test_update_failure_skips_and_continues(
@@ -436,8 +438,8 @@ class TestProcessUpdates:
         mock_co.assert_any_call("bump/pkg-c", ANY)
         mock_submit.assert_called_once()
 
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases", return_value=(True, None))
     def test_empty_updates(
@@ -450,8 +452,8 @@ class TestProcessUpdates:
 
     @patch("maintenance_man.updater.save_scan_results")
     @patch("maintenance_man.updater.submit_stack", return_value=(False, ""))
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases", return_value=(True, None))
     def test_submit_failure_marks_findings_failed(
@@ -480,8 +482,8 @@ class TestProcessUpdates:
 class TestStatusTracking:
     @patch("maintenance_man.updater.save_scan_results")
     @patch("maintenance_man.updater.submit_stack", return_value=(True, ""))
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases", return_value=(True, None))
     def test_vuln_pass_sets_completed(
@@ -499,9 +501,9 @@ class TestStatusTracking:
         mock_save.assert_called()
 
     @patch("maintenance_man.updater.save_scan_results")
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_delete")
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_delete")
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases", return_value=(False, "unit"))
     def test_update_fail_sets_failed(
@@ -521,9 +523,9 @@ class TestStatusTracking:
 
     @patch("maintenance_man.updater.save_scan_results")
     @patch("maintenance_man.updater.submit_stack", return_value=(True, ""))
-    @patch("maintenance_man.updater._gt_checkout", return_value=True)
-    @patch("maintenance_man.updater._gt_delete")
-    @patch("maintenance_man.updater._gt_create", return_value=True)
+    @patch("maintenance_man.updater.gt_checkout", return_value=True)
+    @patch("maintenance_man.updater.gt_delete")
+    @patch("maintenance_man.updater.gt_create", return_value=True)
     @patch("maintenance_man.updater._apply_update", return_value=True)
     @patch("maintenance_man.updater.run_test_phases")
     def test_started_set_before_processing(
@@ -555,14 +557,14 @@ class TestStatusTracking:
 # -- get_current_branch --
 
 class TestGetCurrentBranch:
-    @patch("maintenance_man.updater.subprocess.run")
+    @patch("maintenance_man.vcs.subprocess.run")
     def test_returns_branch_name(self, mock_run: MagicMock, tmp_path: Path):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="bump/pkg-a\n", stderr=""
         )
         assert get_current_branch(tmp_path) == "bump/pkg-a"
 
-    @patch("maintenance_man.updater.subprocess.run")
+    @patch("maintenance_man.vcs.subprocess.run")
     def test_strips_whitespace(self, mock_run: MagicMock, tmp_path: Path):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="  fix/some-pkg  \n", stderr=""
@@ -571,9 +573,9 @@ class TestGetCurrentBranch:
 
 
 class TestSyncGraphite:
-    @patch("maintenance_man.updater.subprocess.run")
+    @patch("maintenance_man.vcs.subprocess.run")
     def test_deletes_merged_branches(self, mock_run: MagicMock, tmp_path: Path):
-        from maintenance_man.updater import sync_graphite
+        from maintenance_man.vcs import sync_graphite
 
         def side_effect(cmd, **kwargs):
             if cmd[0] == "gt" and cmd[1] == "sync":
@@ -615,11 +617,11 @@ class TestSyncGraphite:
         deleted = {c[0][0][3] for c in delete_calls}
         assert deleted == {"bump/click", "bump/tornado"}
 
-    @patch("maintenance_man.updater.subprocess.run")
+    @patch("maintenance_man.vcs.subprocess.run")
     def test_handles_gh_failure_gracefully(
         self, mock_run: MagicMock, tmp_path: Path,
     ):
-        from maintenance_man.updater import sync_graphite
+        from maintenance_man.vcs import sync_graphite
 
         def side_effect(cmd, **kwargs):
             if cmd[0] == "gt" and cmd[1] == "sync":

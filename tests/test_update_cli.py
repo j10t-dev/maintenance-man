@@ -77,7 +77,7 @@ class TestUpdatePreChecks:
     def test_dirty_repo_exits_1_when_declined(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        from maintenance_man.updater import RepoDirtyError
+        from maintenance_man.vcs import RepoDirtyError
         monkeypatch.setattr(
             "maintenance_man.cli.check_repo_clean",
             MagicMock(side_effect=RepoDirtyError("dirty")),
@@ -92,7 +92,7 @@ class TestUpdatePreChecks:
     def test_no_gt_exits_1(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        from maintenance_man.updater import GraphiteNotFoundError
+        from maintenance_man.vcs import GraphiteNotFoundError
         monkeypatch.setattr(
             "maintenance_man.cli.check_graphite_available",
             MagicMock(side_effect=GraphiteNotFoundError("no gt")),

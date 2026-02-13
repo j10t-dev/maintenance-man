@@ -1,7 +1,6 @@
 import json
 import os
 import shlex
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,14 +15,14 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     VulnFinding,
 )
-
-
-class GraphiteNotFoundError(Exception):
-    pass
-
-
-class RepoDirtyError(Exception):
-    pass
+from maintenance_man.vcs import (
+    branch_slug,
+    discard_changes,
+    gt_checkout,
+    gt_create,
+    gt_delete,
+    submit_stack,
+)
 
 
 class NoScanResultsError(Exception):
@@ -96,7 +95,7 @@ def process_vulns(
             v.fixed_version,
             project_path,
         ):
-            _discard_changes(project_path)
+            discard_changes(project_path)
             v.update_status = UpdateStatus.FAILED
             _persist_status(scan_result, project_name, results_dir)
             results.append(
@@ -109,8 +108,8 @@ def process_vulns(
             )
             continue
 
-        if not _gt_create(msg, f"fix/{_branch_slug(v.pkg_name)}", project_path):
-            _discard_changes(project_path)
+        if not gt_create(msg, f"fix/{branch_slug(v.pkg_name)}", project_path):
+            discard_changes(project_path)
             v.update_status = UpdateStatus.FAILED
             _persist_status(scan_result, project_name, results_dir)
             results.append(
@@ -129,7 +128,7 @@ def process_vulns(
             v.update_status = UpdateStatus.COMPLETED
         else:
             rprint(f"  [bold red]FAIL[/] {v.pkg_name} — {failed_phase} failed")
-            _gt_delete(f"fix/{_branch_slug(v.pkg_name)}", project_path)
+            gt_delete(f"fix/{branch_slug(v.pkg_name)}", project_path)
             v.update_status = UpdateStatus.FAILED
 
         _persist_status(scan_result, project_name, results_dir)
@@ -145,8 +144,8 @@ def process_vulns(
     # Submit fix stack from the tip (last passing branch)
     passing = [r for r in results if r.passed]
     if passing:
-        tip = f"fix/{_branch_slug(passing[-1].pkg_name)}"
-        _gt_checkout(tip, project_path)
+        tip = f"fix/{branch_slug(passing[-1].pkg_name)}"
+        gt_checkout(tip, project_path)
         ok, output = submit_stack(project_path)
         if ok:
             rprint("  [bold green]Fix stack submitted.[/]")
@@ -166,7 +165,7 @@ def process_vulns(
             _persist_status(scan_result, project_name, results_dir)
 
     # Return to main after all vulns
-    _gt_checkout("main", project_path)
+    gt_checkout("main", project_path)
     return results
 
 
@@ -207,7 +206,7 @@ def process_updates(
             u.latest_version,
             project_path,
         ):
-            _discard_changes(project_path)
+            discard_changes(project_path)
             u.update_status = UpdateStatus.FAILED
             _persist_status(scan_result, project_name, results_dir)
             results.append(
@@ -225,8 +224,8 @@ def process_updates(
             f"{u.installed_version} -> {u.latest_version} "
             f"({u.semver_tier.value})"
         )
-        if not _gt_create(msg, f"bump/{_branch_slug(u.pkg_name)}", project_path):
-            _discard_changes(project_path)
+        if not gt_create(msg, f"bump/{branch_slug(u.pkg_name)}", project_path):
+            discard_changes(project_path)
             u.update_status = UpdateStatus.FAILED
             _persist_status(scan_result, project_name, results_dir)
             results.append(
@@ -247,7 +246,7 @@ def process_updates(
             rprint(
                 f"  [bold red]FAIL[/] {u.pkg_name} — {failed_phase} failed"
             )
-            _gt_delete(f"bump/{_branch_slug(u.pkg_name)}", project_path)
+            gt_delete(f"bump/{branch_slug(u.pkg_name)}", project_path)
             u.update_status = UpdateStatus.FAILED
 
         _persist_status(scan_result, project_name, results_dir)
@@ -263,8 +262,8 @@ def process_updates(
     # Submit update stack from the tip (last passing branch)
     passing = [r for r in results if r.passed]
     if passing:
-        tip = f"bump/{_branch_slug(passing[-1].pkg_name)}"
-        _gt_checkout(tip, project_path)
+        tip = f"bump/{branch_slug(passing[-1].pkg_name)}"
+        gt_checkout(tip, project_path)
         ok, output = submit_stack(project_path)
         if ok:
             rprint("  [bold green]Update stack submitted.[/]")
@@ -284,38 +283,8 @@ def process_updates(
             _persist_status(scan_result, project_name, results_dir)
 
     # Return to main after all updates
-    _gt_checkout("main", project_path)
+    gt_checkout("main", project_path)
     return results
-
-
-def sync_graphite(project_path: Path) -> bool:
-    """Sync with remote and delete local branches whose PRs are merged/closed.
-
-    Runs ``gt sync`` to fetch and update trunk, then explicitly deletes any
-    tracked ``bump/`` or ``fix/`` branches whose GitHub PRs have been merged
-    or closed.  This avoids stale branches blocking future stack submissions.
-    """
-    _run(["gt", "sync", "--no-interactive"], project_path, timeout=120)
-
-    prefixes = ("bump/", "fix/")
-    stale_branches = _gh_list_pr_branches("merged", prefixes, project_path)
-    stale_branches |= _gh_list_pr_branches("closed", prefixes, project_path)
-
-    local = _run(
-        ["git", "branch", "--format=%(refname:short)"], project_path, timeout=10
-    )
-    if local.returncode != 0:
-        return True
-
-    local_branches = {b.strip() for b in local.stdout.splitlines()}
-
-    # Delete stale branches — gt delete handles metadata + restacks children;
-    # fall back to git branch -D for branches Graphite doesn't track.
-    for branch in sorted(local_branches & stale_branches):
-        if not _gt_delete(branch, project_path):
-            _run(["git", "branch", "-D", branch], project_path, timeout=10)
-
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -406,68 +375,9 @@ def run_test_phases(
     return True, None
 
 
-def check_graphite_available() -> None:
-    """Raise GraphiteNotFoundError if gt is not on PATH."""
-    if shutil.which("gt") is None:
-        raise GraphiteNotFoundError(
-            "Graphite CLI (gt) is not installed or not on PATH. "
-            "Install it from https://graphite.dev/docs/installing-the-cli"
-        )
-
-
-def check_repo_clean(project_path: Path) -> None:
-    """Raise RepoDirtyError if the git repo has uncommitted changes."""
-    completed = _run(["git", "status", "--porcelain"], project_path)
-    if completed.stdout.strip():
-        raise RepoDirtyError(
-            f"Repository has uncommitted changes:\n{completed.stdout.strip()}"
-        )
-
-
-def get_current_branch(project_path: Path) -> str:
-    """Return the current git branch name."""
-    return _run(["git", "branch", "--show-current"], project_path).stdout.strip()
-
-
-def reset_to_main(project_path: Path) -> None:
-    """Discard all changes and check out main."""
-    _run(["git", "checkout", "main", "--", "."], project_path)
-    _run(["git", "clean", "-fd"], project_path)
-    _gt_checkout("main", project_path)
-
-
-def submit_stack(project_path: Path) -> tuple[bool, str]:
-    """Run gt submit --stack. Returns (success, output)."""
-    completed = _run(["gt", "submit", "--stack"], project_path, timeout=120)
-    output = (
-        completed.stdout.strip()
-        if completed.returncode == 0
-        else completed.stderr.strip()
-    )
-    return completed.returncode == 0, output
-
-
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-
-def _run(
-    cmd: list[str],
-    cwd: Path,
-    *,
-    timeout: int = 30,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess with standard capture settings."""
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        timeout=timeout,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
 
 
 def _project_env() -> dict[str, str]:
@@ -489,24 +399,20 @@ def _persist_status(
         save_scan_results(project_name, results_dir, scan_result)
 
 
-def _branch_slug(pkg_name: str) -> str:
-    """Normalise a package name into a branch-safe slug."""
-    return pkg_name.lstrip("@").replace("/", "-")
-
-
-def _discard_changes(project_path: Path) -> None:
-    """Discard all uncommitted changes in the working tree."""
-    _run(["git", "checkout", "--", "."], project_path)
-    _run(["git", "clean", "-fd"], project_path)
-
-
 def _apply_update(
     package_manager: str, pkg_name: str, version: str, project_path: Path
 ) -> bool:
     """Apply a single package update. Returns True on success."""
     env = _project_env()
     cmd = get_update_command(package_manager, pkg_name, version)
-    completed = _run(cmd, project_path, timeout=300, env=env)
+    completed = subprocess.run(
+        cmd,
+        cwd=project_path,
+        timeout=300,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     if completed.returncode != 0:
         rprint(
             f"  [bold red]FAIL[/] Package manager command failed: "
@@ -516,7 +422,14 @@ def _apply_update(
 
     # Maven needs a second command to finalise
     if package_manager == "mvn":
-        commit = _run(["mvn", "versions:commit"], project_path, timeout=120, env=env)
+        commit = subprocess.run(
+            ["mvn", "versions:commit"],
+            cwd=project_path,
+            timeout=120,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
         if commit.returncode != 0:
             rprint(
                 f"  [bold red]FAIL[/] mvn versions:commit failed: "
@@ -524,75 +437,3 @@ def _apply_update(
             )
             return False
     return True
-
-
-def _gt_create(message: str, branch_name: str, project_path: Path) -> bool:
-    """Create a Graphite branch, deleting any stale branch with the same name first."""
-    cmd = ["gt", "create", branch_name, "-a", "-m", message]
-    created = _run(cmd, project_path, timeout=60)
-    if created.returncode == 0:
-        return True
-
-    if "already exists" not in created.stderr:
-        rprint(
-            f"  [bold red]FAIL[/] gt create failed: {created.stderr.strip()}"
-        )
-        return False
-
-    # Stale branch — delete and recreate
-    _gt_delete(branch_name, project_path)
-    retry = _run(cmd, project_path, timeout=60)
-    if retry.returncode != 0:
-        rprint(
-            f"  [bold red]FAIL[/] gt create (retry) failed: "
-            f"{retry.stderr.strip()}"
-        )
-        return False
-
-    return True
-
-
-def _gt_delete(branch_name: str, project_path: Path) -> bool:
-    """Delete a Graphite branch. Returns True on success."""
-    completed = _run(["gt", "delete", "-f", branch_name], project_path)
-    if completed.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] gt delete {branch_name} failed: "
-            f"{completed.stderr.strip()}"
-        )
-        return False
-    return True
-
-
-def _gt_checkout(branch: str, project_path: Path) -> bool:
-    """Check out a Graphite branch. Returns True on success."""
-    completed = _run(["gt", "checkout", branch], project_path)
-    if completed.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] gt checkout {branch} failed: "
-            f"{completed.stderr.strip()}"
-        )
-        return False
-    return True
-
-
-def _gh_list_pr_branches(
-    state: str, prefixes: tuple[str, ...], project_path: Path
-) -> set[str]:
-    """Return branch names for PRs in the given state matching any prefix."""
-    completed = _run(
-        [
-            "gh", "pr", "list",
-            "--state", state,
-            "--json", "headRefName",
-            "--jq", ".[].headRefName",
-        ],
-        project_path,
-    )
-    if completed.returncode != 0:
-        return set()
-    return {
-        b.strip()
-        for b in completed.stdout.splitlines()
-        if b.strip().startswith(prefixes)
-    }

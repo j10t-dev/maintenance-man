@@ -24,19 +24,21 @@ from maintenance_man.scanner import (
     scan_project,
 )
 from maintenance_man.updater import (
-    GraphiteNotFoundError,
     NoScanResultsError,
-    RepoDirtyError,
-    _branch_slug,
-    check_graphite_available,
-    check_repo_clean,
-    get_current_branch,
     load_scan_results,
     process_updates,
     process_vulns,
-    reset_to_main,
     run_test_phases,
     save_scan_results,
+)
+from maintenance_man.vcs import (
+    GraphiteNotFoundError,
+    RepoDirtyError,
+    branch_slug,
+    check_graphite_available,
+    check_repo_clean,
+    get_current_branch,
+    reset_to_main,
     submit_stack,
     sync_graphite,
 )
@@ -362,12 +364,12 @@ def update(
         branch = get_current_branch(proj_config.path)
         finding = None
         for v in failed_vulns:
-            if branch == f"fix/{_branch_slug(v.pkg_name)}":
+            if branch == f"fix/{branch_slug(v.pkg_name)}":
                 finding = v
                 break
         if finding is None:
             for u in failed_updates:
-                if branch == f"bump/{_branch_slug(u.pkg_name)}":
+                if branch == f"bump/{branch_slug(u.pkg_name)}":
                     finding = u
                     break
         if finding is None:
