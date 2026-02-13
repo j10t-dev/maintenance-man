@@ -42,6 +42,15 @@ class VulnFinding(BaseModel):
     def actionable(self) -> bool:
         return self.fixed_version is not None
 
+    @property
+    def target_version(self) -> str:
+        assert self.fixed_version is not None
+        return self.fixed_version
+
+    @property
+    def detail(self) -> str:
+        return self.vuln_id
+
 
 class SecretFinding(BaseModel):
     file: str
@@ -57,6 +66,14 @@ class UpdateFinding(BaseModel):
     semver_tier: SemverTier
     published_date: datetime | None = None
     update_status: UpdateStatus | None = None
+
+    @property
+    def target_version(self) -> str:
+        return self.latest_version
+
+    @property
+    def detail(self) -> str:
+        return self.semver_tier.value
 
 
 class ScanResult(BaseModel):
