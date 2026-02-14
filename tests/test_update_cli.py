@@ -70,8 +70,9 @@ class TestUpdatePreChecks:
             "maintenance_man.cli.load_scan_results",
             MagicMock(side_effect=NoScanResultsError("No results")),
         )
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 1
 
     def test_dirty_repo_exits_1_when_declined(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -84,8 +85,9 @@ class TestUpdatePreChecks:
         monkeypatch.setattr(
             "maintenance_man.cli.Confirm.ask", MagicMock(return_value=False),
         )
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 1
 
     def test_no_gt_exits_1(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -95,8 +97,9 @@ class TestUpdatePreChecks:
             "maintenance_man.cli.check_graphite_available",
             MagicMock(side_effect=GraphiteNotFoundError("no gt")),
         )
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 1
 
     def test_no_test_config_exits_1(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -109,8 +112,9 @@ class TestUpdatePreChecks:
                 path=Path("/tmp/x"), package_manager="bun", test=None
             )),
         )
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 1
 
 
 class TestUpdateSelection:
@@ -122,8 +126,9 @@ class TestUpdateSelection:
         monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
         monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="none"))
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 0
         mock_vulns.assert_not_called()
         mock_updates.assert_not_called()
 
@@ -138,8 +143,9 @@ class TestUpdateSelection:
         monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns"))
         monkeypatch.setattr("maintenance_man.cli.submit_stack", MagicMock(return_value=(True, "")))
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 0
         mock_vulns.assert_called_once()
         mock_updates.assert_not_called()
 
@@ -156,8 +162,9 @@ class TestUpdateExitCodes:
         ]))
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
         monkeypatch.setattr("maintenance_man.cli.submit_stack", MagicMock(return_value=(True, "")))
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 0
 
     def test_any_failure_exits_4(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -171,8 +178,9 @@ class TestUpdateExitCodes:
         monkeypatch.setattr("maintenance_man.cli.process_updates", MagicMock(return_value=[]))
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
         monkeypatch.setattr("maintenance_man.cli.submit_stack", MagicMock())
-        with pytest.raises(SystemExit, match="4"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 4
 
 
 class TestUpdateNumberedSelection:
@@ -187,8 +195,9 @@ class TestUpdateNumberedSelection:
         monkeypatch.setattr("maintenance_man.cli.process_updates", MagicMock(return_value=[]))
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="1"))
         monkeypatch.setattr("maintenance_man.cli.submit_stack", MagicMock(return_value=(True, "")))
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 0
         # Should have called process_vulns with the first vuln
         mock_vulns.assert_called_once()
 
@@ -198,8 +207,9 @@ class TestUpdateContinue:
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         """--continue with no failed findings should error."""
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "--continue"])
+        assert exc_info.value.code == 1
 
     def test_continue_passes_and_submits(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -218,8 +228,9 @@ class TestUpdateContinue:
         monkeypatch.setattr("maintenance_man.cli.run_test_phases", mock_test)
         monkeypatch.setattr("maintenance_man.cli.save_scan_results", MagicMock())
         monkeypatch.setattr("maintenance_man.cli.submit_stack", mock_submit)
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "--continue"])
+        assert exc_info.value.code == 0
         mock_test.assert_called_once()
         mock_submit.assert_called_once()
 
@@ -238,8 +249,9 @@ class TestUpdateContinue:
         monkeypatch.setattr("maintenance_man.cli.get_current_branch", MagicMock(return_value="bump/pkg-a"))
         monkeypatch.setattr("maintenance_man.cli.run_test_phases", mock_test)
         monkeypatch.setattr("maintenance_man.cli.save_scan_results", MagicMock())
-        with pytest.raises(SystemExit, match="4"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "--continue"])
+        assert exc_info.value.code == 4
 
     def test_continue_branch_mismatch_exits_1(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -253,8 +265,9 @@ class TestUpdateContinue:
             lambda name, d: scan_result,
         )
         monkeypatch.setattr("maintenance_man.cli.get_current_branch", MagicMock(return_value="main"))
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "--continue"])
+        assert exc_info.value.code == 1
 
     def test_continue_with_remaining_failures_no_submit(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -274,8 +287,9 @@ class TestUpdateContinue:
         monkeypatch.setattr("maintenance_man.cli.run_test_phases", MagicMock(return_value=(True, None)))
         monkeypatch.setattr("maintenance_man.cli.save_scan_results", MagicMock())
         monkeypatch.setattr("maintenance_man.cli.submit_stack", mock_submit)
-        with pytest.raises(SystemExit, match="4"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "--continue"])
+        assert exc_info.value.code == 4
         mock_submit.assert_not_called()
 
 
@@ -296,8 +310,9 @@ class TestUpdateAutoSubmit:
             UpdateResult(pkg_name="pkg-a", kind="update", passed=True)
         ]))
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 0
 
     def test_all_failures_exits_4(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -310,8 +325,9 @@ class TestUpdateAutoSubmit:
         ]))
         monkeypatch.setattr("maintenance_man.cli.process_updates", MagicMock(return_value=[]))
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
-        with pytest.raises(SystemExit, match="4"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 4
 
     def test_mixed_results_exits_4(
         self, mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch,
@@ -326,5 +342,6 @@ class TestUpdateAutoSubmit:
             UpdateResult(pkg_name="pkg-a", kind="update", passed=True)
         ]))
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
-        with pytest.raises(SystemExit, match="4"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 4

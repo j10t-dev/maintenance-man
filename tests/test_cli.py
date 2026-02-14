@@ -1,6 +1,7 @@
 import pytest
 
 from maintenance_man.cli import app
+from maintenance_man import __version__
 
 
 class TestHelp:
@@ -10,8 +11,9 @@ class TestHelp:
         assert exc_info.value.code == 0
 
     def test_help_contains_description(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["--help"])
+        assert exc_info.value.code == 0
         assert "maintenance" in capsys.readouterr().out.lower()
 
 
@@ -22,9 +24,10 @@ class TestVersion:
         assert exc_info.value.code == 0
 
     def test_version_prints_version(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit, match="0"):
+        with pytest.raises(SystemExit) as exc_info:
             app(["--version"])
-        assert "0.1.0" in capsys.readouterr().out
+        assert exc_info.value.code == 0
+        assert __version__ in capsys.readouterr().out
 
 
 
