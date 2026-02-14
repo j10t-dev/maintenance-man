@@ -41,7 +41,7 @@ def _make_clean_result() -> ScanResult:
     )
 
 
-def _make_bumps_only_result() -> ScanResult:
+def _make_updates_only_result() -> ScanResult:
     return ScanResult(
         project="outdated",
         scanned_at=datetime.now(tz=timezone.utc),
@@ -65,13 +65,15 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fake_scan(
         name: str, project_config: object, min_version_age_days: int = 7
     ) -> ScanResult:
-        if name == "vulnerable":
-            return _make_vulnerable_result()
-        if name == "clean":
-            return _make_clean_result()
-        if name == "outdated":
-            return _make_bumps_only_result()
-        raise FileNotFoundError(f"Unknown project: {name}")
+        match name:
+            case "vulnerable":
+                return _make_vulnerable_result()
+            case "clean":
+                return _make_clean_result()
+            case "outdated":
+                return _make_updates_only_result()
+            case _:
+                raise FileNotFoundError(f"Unknown project: {name}")
 
     monkeypatch.setattr("maintenance_man.cli.scan_project", _fake_scan)
 

@@ -11,7 +11,7 @@ _PATCH_NOW = "maintenance_man.dependency_age._utcnow"
 _PATCH_CACHE_DIR = "maintenance_man.dependency_age._pypi_cache_dir"
 
 
-def _bun_info_result(published_iso: str) -> subprocess.CompletedProcess:
+def _bun_info_result(published_iso: str) -> subprocess.CompletedProcess[str]:
     """Build a fake ``bun info`` CompletedProcess with a Published line."""
     return subprocess.CompletedProcess(
         args=["bun", "info", "pkg@version"],

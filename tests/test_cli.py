@@ -1,6 +1,7 @@
 import pytest
 
 from maintenance_man.cli import app
+from maintenance_man import __version__
 
 
 class TestHelp:
@@ -10,8 +11,9 @@ class TestHelp:
         assert exc_info.value.code == 0
 
     def test_help_contains_description(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc_info:
             app(["--help"])
+        assert exc_info.value.code == 0
         assert "maintenance" in capsys.readouterr().out.lower()
 
 
@@ -22,22 +24,11 @@ class TestVersion:
         assert exc_info.value.code == 0
 
     def test_version_prints_version(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc_info:
             app(["--version"])
-        assert "0.1.0" in capsys.readouterr().out
+        assert exc_info.value.code == 0
+        assert __version__ in capsys.readouterr().out
 
-
-class TestUpdateStub:
-    def test_update_requires_project(self):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["update"])
-        assert exc_info.value.code != 0
-
-    def test_update_stub_with_project(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["update", "feetfax"])
-        assert exc_info.value.code == 1
-        assert "not implemented" in capsys.readouterr().out.lower()
 
 
 class TestDeployStub:
@@ -48,6 +39,6 @@ class TestDeployStub:
 
     def test_deploy_stub_with_project(self, capsys: pytest.CaptureFixture[str]):
         with pytest.raises(SystemExit) as exc_info:
-            app(["deploy", "feetfax"])
+            app(["deploy", "project-alpha"])
         assert exc_info.value.code == 1
         assert "not implemented" in capsys.readouterr().out.lower()

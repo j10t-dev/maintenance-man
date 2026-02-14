@@ -1,2 +1,8 @@
 - Document `uv tool install -e .` for global `mm` command availability
 - Create a test project with known vulnerabilities and outdated dependencies for manual/integration testing of scan and update commands
+- `mm list` should show pending vuln/update counts from persisted scan results
+- Investigate whether integration tests need pre/post test hooks for fixture setup (e.g. Docker infra), or if testcontainers (available for Node, Python, Java) makes this unnecessary
+- Add `integration_strategy` option to `[projects.*.test]`: `"all"` (default, run integration after every update) vs `"final"` (run unit per-update, integration once at stack top after all updates processed). On final integration failure, don't fail the whole stack — leave it to the user to investigate/remove the offending branch
+- Add generic `test` run command
+- scan - check if main has remotes to pull? 
+- models / config - no need for tests to be a separate block
