@@ -5,6 +5,8 @@ import pytest
 from pydantic import ValidationError
 
 from maintenance_man.config import (
+    ConfigError,
+    ProjectNotFoundError,
     ensure_mm_home,
     load_config,
     resolve_project,
@@ -160,10 +162,10 @@ class TestLoadConfig:
         assert config.defaults.min_version_age_days == 7
         assert config.projects == {}
 
-    def test_invalid_config_raises_system_exit(self, mm_home: Path):
+    def test_invalid_config_raises_config_error(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "config.toml").write_text("[defaults]\nbogus_key = true\n")
-        with pytest.raises(SystemExit):
+        with pytest.raises(ConfigError):
             load_config()
 
 
@@ -181,16 +183,16 @@ class TestResolveProject:
         proj = resolve_project(config, "myapp")
         assert proj.package_manager == "bun"
 
-    def test_unknown_project_raises_system_exit(self, mm_home: Path):
+    def test_unknown_project_raises_project_not_found(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "worktrees").mkdir()
         (mm_home / "config.toml").write_text("[defaults]\n")
         config = load_config()
-        with pytest.raises(SystemExit):
+        with pytest.raises(ProjectNotFoundError):
             resolve_project(config, "nonexistent")
 
-    def test_missing_path_raises_system_exit(self, mm_home: Path):
+    def test_missing_path_raises_project_not_found(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "worktrees").mkdir()
@@ -198,5 +200,5 @@ class TestResolveProject:
             '[projects.myapp]\npath = "/nonexistent/path"\npackage_manager = "bun"\n'
         )
         config = load_config()
-        with pytest.raises(SystemExit):
+        with pytest.raises(ProjectNotFoundError):
             resolve_project(config, "myapp")

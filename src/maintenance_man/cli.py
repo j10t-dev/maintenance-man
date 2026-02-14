@@ -12,7 +12,12 @@ from rich.table import Table
 
 from maintenance_man import __version__
 from maintenance_man import config as _config
-from maintenance_man.config import load_config, resolve_project
+from maintenance_man.config import (
+    ConfigError,
+    ProjectNotFoundError,
+    load_config,
+    resolve_project,
+)
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -70,6 +75,16 @@ app = cyclopts.App(
 def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
     console.print(f"[bold red]Error:[/] {msg}")
     sys.exit(code)
+
+
+def _scan_exit_code(has_vulns: bool, has_updates: bool) -> ExitCode:
+    match (has_vulns, has_updates):
+        case (True, _):
+            return ExitCode.VULNS_FOUND
+        case (_, True):
+            return ExitCode.UPDATES_FOUND
+        case _:
+            return ExitCode.OK
 
 
 def _pluralise(n: int, singular: str, plural: str) -> str:
@@ -188,7 +203,10 @@ def scan(
     project: str | None
         Project name to scan. Scans all if omitted.
     """
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as e:
+        _fatal(str(e))
 
     try:
         check_trivy_available()
@@ -202,7 +220,10 @@ def scan(
         return
 
     if project:
-        proj_config = resolve_project(config, project)
+        try:
+            proj_config = resolve_project(config, project)
+        except ProjectNotFoundError as e:
+            _fatal(str(e))
         try:
             result = _scan_one(
                 project, proj_config, config.defaults.min_version_age_days
@@ -210,12 +231,7 @@ def scan(
         except TrivyScanError as e:
             _fatal(str(e))
 
-        if result.has_actionable_vulns:
-            sys.exit(ExitCode.VULNS_FOUND)
-        elif result.has_updates:
-            sys.exit(ExitCode.UPDATES_FOUND)
-        else:
-            sys.exit(ExitCode.OK)
+        sys.exit(_scan_exit_code(result.has_actionable_vulns, result.has_updates))
 
     # Scan all projects
     has_vulns = False
@@ -238,38 +254,33 @@ def scan(
         has_vulns |= result.has_actionable_vulns
         has_updates |= result.has_updates
 
-    if has_vulns:
-        sys.exit(ExitCode.VULNS_FOUND)
-    elif has_updates:
-        sys.exit(ExitCode.UPDATES_FOUND)
-    else:
-        sys.exit(ExitCode.OK)
+    sys.exit(_scan_exit_code(has_vulns, has_updates))
 
 
 def _print_numbered_findings(
     vulns: list[VulnFinding], updates: list[UpdateFinding]
-) -> list[tuple[str, VulnFinding | UpdateFinding]]:
-    """Print numbered list of findings. Returns ordered list of (kind, finding)."""
-    numbered: list[tuple[str, VulnFinding | UpdateFinding]] = []
+) -> list[VulnFinding | UpdateFinding]:
+    """Print numbered list of findings. Returns ordered list of findings."""
+    numbered: list[VulnFinding | UpdateFinding] = []
     for idx, v in enumerate(vulns, 1):
         console.print(
             f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {v.pkg_name} "
             f"{v.installed_version} -> {v.fixed_version} ({v.vuln_id})"
         )
-        numbered.append(("vuln", v))
+        numbered.append(v)
     for idx, u in enumerate(updates, len(vulns) + 1):
         console.print(
             f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {u.pkg_name} "
             f"{u.installed_version} -> {u.latest_version} "
             f"({u.semver_tier.value})"
         )
-        numbered.append(("update", u))
+        numbered.append(u)
     return numbered
 
 
 def _parse_selection(
     selection: str,
-    numbered: list[tuple[str, VulnFinding | UpdateFinding]],
+    numbered: list[VulnFinding | UpdateFinding],
     actionable_vulns: list[VulnFinding],
     updates: list[UpdateFinding],
 ) -> tuple[list[VulnFinding], list[UpdateFinding]] | None:
@@ -296,11 +307,12 @@ def _parse_selection(
 
     for i in indices:
         if 1 <= i <= len(numbered):
-            kind, finding = numbered[i - 1]
-            if kind == "vuln":
-                selected_vulns.append(finding)
-            else:
-                selected_updates.append(finding)
+            finding = numbered[i - 1]
+            match finding:
+                case VulnFinding():
+                    selected_vulns.append(finding)
+                case UpdateFinding():
+                    selected_updates.append(finding)
 
     return selected_vulns, selected_updates
 
@@ -384,8 +396,15 @@ def update(
     continue_: bool
         Re-test a manually fixed failed finding on the current branch.
     """
-    config = load_config()
-    proj_config = resolve_project(config, project)
+    try:
+        config = load_config()
+    except ConfigError as e:
+        _fatal(str(e))
+
+    try:
+        proj_config = resolve_project(config, project)
+    except ProjectNotFoundError as e:
+        _fatal(str(e))
 
     try:
         check_graphite_available()
@@ -437,13 +456,13 @@ def update(
     numbered = _print_numbered_findings(actionable_vulns, updates)
 
     # Interactive selection
-    choices = "all"
-    if actionable_vulns and updates:
-        choices = "all/vulns/updates/1,2,.../none"
-    elif actionable_vulns:
-        choices = "all/vulns/1,2,.../none"
-    elif updates:
-        choices = "all/updates/1,2,.../none"
+    parts = ["all"]
+    if actionable_vulns:
+        parts.append("vulns")
+    if updates:
+        parts.append("updates")
+    parts.extend(["1,2,...", "none"])
+    choices = "/".join(parts)
 
     while True:
         selection = Prompt.ask(
@@ -508,10 +527,7 @@ def update(
             console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
     console.print("─" * 40)
 
-    sys.exit(
-        ExitCode.UPDATE_FAILED if any(not r.passed for r in all_results)
-        else ExitCode.OK
-    )
+    sys.exit(ExitCode.UPDATE_FAILED if failed else ExitCode.OK)
 
 
 @app.command
@@ -532,7 +548,10 @@ def deploy(
 @app.command(name="list")
 def list_projects() -> None:
     """List all configured projects."""
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as e:
+        _fatal(str(e))
 
     if not config.projects:
         console.print(

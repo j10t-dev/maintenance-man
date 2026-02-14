@@ -1,11 +1,17 @@
-import sys
 import tomllib
 from pathlib import Path
 
 from pydantic import ValidationError
-from rich import print as rprint
 
 from maintenance_man.models.config import MmConfig, ProjectConfig
+
+
+class ConfigError(Exception):
+    """Raised when the configuration file is invalid or cannot be parsed."""
+
+
+class ProjectNotFoundError(Exception):
+    """Raised when a requested project is not found or its path does not exist."""
 
 MM_HOME: Path = Path.home() / ".mm"
 
@@ -35,37 +41,36 @@ def load_config() -> MmConfig:
     ensure_mm_home()
 
     config_path = MM_HOME / "config.toml"
-    text = config_path.read_text()
 
     try:
-        raw = tomllib.loads(text)
+        with config_path.open("rb") as f:
+            raw = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
-        rprint(f"[bold red]Config error:[/] Failed to parse {config_path}\n{e}")
-        sys.exit(1)
+        raise ConfigError(
+            f"Failed to parse {config_path}\n{e}"
+        ) from e
 
     try:
         return MmConfig(**raw)
     except ValidationError as e:
-        rprint(f"[bold red]Config error:[/] Invalid config in {config_path}\n{e}")
-        sys.exit(1)
+        raise ConfigError(
+            f"Invalid config in {config_path}\n{e}"
+        ) from e
 
 
 def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
     """Look up a project by name and validate its path exists on disk."""
     if name not in config.projects:
-        rprint(
-            f"[bold red]Error:[/] Unknown project [bold]{name}[/]. "
+        raise ProjectNotFoundError(
+            f"Unknown project '{name}'. "
             f"Known projects: {', '.join(config.projects) or '(none)'}"
         )
-        sys.exit(1)
 
     project = config.projects[name]
 
     if not project.path.exists():
-        rprint(
-            f"[bold red]Error:[/] Project [bold]{name}[/] path does not exist: "
-            f"{project.path}"
+        raise ProjectNotFoundError(
+            f"Project '{name}' path does not exist: {project.path}"
         )
-        sys.exit(1)
 
     return project

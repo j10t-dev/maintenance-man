@@ -50,11 +50,13 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
     if old == new:
         return SemverTier.UNKNOWN
 
-    if old.major != new.major:
-        return SemverTier.MAJOR
-    if old.minor != new.minor:
-        return SemverTier.MINOR
-    return SemverTier.PATCH
+    match (old.major != new.major, old.minor != new.minor):
+        case (True, _):
+            return SemverTier.MAJOR
+        case (_, True):
+            return SemverTier.MINOR
+        case _:
+            return SemverTier.PATCH
 
 
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
