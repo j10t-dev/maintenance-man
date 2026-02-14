@@ -326,6 +326,7 @@ def get_update_command(
             raise ValueError(f"Unsupported package manager: {package_manager}")
 
 
+# TODO: extract as part of test command feature
 def run_test_phases(
     test_config: PhaseTestConfig, project_path: Path
 ) -> tuple[bool, str | None]:

@@ -72,9 +72,9 @@ class TestSecretFinding:
 class TestScanResult:
     def test_scan_result_empty(self):
         result = ScanResult(
-            project="feetfax",
+            project="project-alpha",
             scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
-            trivy_target="/home/user/dev/feetfax",
+            trivy_target="/tmp/project-alpha",
             vulnerabilities=[],
             secrets=[],
         )
@@ -92,9 +92,9 @@ class TestScanResult:
             status="fixed",
         )
         result = ScanResult(
-            project="lifts",
+            project="project-beta",
             scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
-            trivy_target="/home/user/dev/lifts",
+            trivy_target="/tmp/project-beta",
             vulnerabilities=[vuln],
             secrets=[],
         )
@@ -108,9 +108,9 @@ class TestScanResult:
             semver_tier=SemverTier.MINOR,
         )
         result = ScanResult(
-            project="myproject",
+            project="project-gamma",
             scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
-            trivy_target="/home/user/dev/myproject",
+            trivy_target="/tmp/project-gamma",
             updates=[finding],
         )
         assert result.has_updates is True
@@ -118,9 +118,9 @@ class TestScanResult:
 
     def test_scan_result_empty_has_no_updates(self):
         result = ScanResult(
-            project="myproject",
+            project="project-gamma",
             scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
-            trivy_target="/home/user/dev/myproject",
+            trivy_target="/tmp/project-gamma",
         )
         assert result.has_updates is False
 
@@ -157,9 +157,9 @@ class TestUpdateFinding:
             published_date=datetime(2026, 1, 20, tzinfo=timezone.utc),
         )
         result = ScanResult(
-            project="myproject",
+            project="project-gamma",
             scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
-            trivy_target="/dev/null",
+            trivy_target="/tmp/project-gamma",
             updates=[finding],
         )
         json_str = result.model_dump_json()

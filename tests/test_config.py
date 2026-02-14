@@ -77,11 +77,11 @@ class TestMmConfig:
 [defaults]
 min_version_age_days = 14
 
-[projects.feetfax]
+[projects.project-alpha]
 path = "{tmp_path}"
 package_manager = "bun"
 
-[projects.lifts]
+[projects.project-beta]
 path = "{tmp_path}"
 package_manager = "uv"
 """
@@ -89,8 +89,8 @@ package_manager = "uv"
         config = MmConfig(**raw)
         assert config.defaults.min_version_age_days == 14
         assert len(config.projects) == 2
-        assert config.projects["feetfax"].package_manager == "bun"
-        assert config.projects["lifts"].package_manager == "uv"
+        assert config.projects["project-alpha"].package_manager == "bun"
+        assert config.projects["project-beta"].package_manager == "uv"
 
     def test_toml_missing_defaults_uses_fallback(self, tmp_path: Path):
         """If [defaults] is omitted from TOML, fallback values are used."""

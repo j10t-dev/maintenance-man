@@ -36,6 +36,6 @@ class TestDeployStub:
 
     def test_deploy_stub_with_project(self, capsys: pytest.CaptureFixture[str]):
         with pytest.raises(SystemExit) as exc_info:
-            app(["deploy", "feetfax"])
+            app(["deploy", "project-alpha"])
         assert exc_info.value.code == 1
         assert "not implemented" in capsys.readouterr().out.lower()
