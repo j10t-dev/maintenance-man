@@ -1,5 +1,13 @@
 from maintenance_man.models.config import DefaultsConfig, MmConfig, ProjectConfig
-from maintenance_man.models.scan import ScanResult, SecretFinding, Severity, VulnFinding
+from maintenance_man.models.scan import (
+    ScanResult,
+    SecretFinding,
+    SemverTier,
+    Severity,
+    UpdateFinding,
+    UpdateStatus,
+    VulnFinding,
+)
 
 __all__ = [
     "DefaultsConfig",
@@ -7,6 +15,9 @@ __all__ = [
     "ProjectConfig",
     "ScanResult",
     "SecretFinding",
+    "SemverTier",
     "Severity",
+    "UpdateFinding",
+    "UpdateStatus",
     "VulnFinding",
 ]

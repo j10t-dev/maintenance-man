@@ -13,11 +13,6 @@ class RepoDirtyError(Exception):
     pass
 
 
-# ---------------------------------------------------------------------------
-# Subprocess helper
-# ---------------------------------------------------------------------------
-
-
 def _run(
     cmd: list[str],
     cwd: Path,
@@ -36,19 +31,9 @@ def _run(
     )
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-
 def branch_slug(pkg_name: str) -> str:
     """Normalise a package name into a branch-safe slug."""
     return pkg_name.lstrip("@").replace("/", "-")
-
-
-# ---------------------------------------------------------------------------
-# Pre-checks
-# ---------------------------------------------------------------------------
 
 
 def check_graphite_available() -> None:
@@ -69,10 +54,6 @@ def check_repo_clean(project_path: Path) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Branch operations
-# ---------------------------------------------------------------------------
-
 
 def get_current_branch(project_path: Path) -> str:
     """Return the current git branch name."""
@@ -92,35 +73,30 @@ def reset_to_main(project_path: Path) -> None:
     gt_checkout("main", project_path)
 
 
-# ---------------------------------------------------------------------------
-# Graphite wrappers
-# ---------------------------------------------------------------------------
-
-
 def gt_create(message: str, branch_name: str, project_path: Path) -> bool:
     """Create a Graphite branch, deleting any stale branch with the same name first."""
     cmd = ["gt", "create", branch_name, "-a", "-m", message]
-    created = _run(cmd, project_path, timeout=60)
-    if created.returncode == 0:
-        return True
+    first = _run(cmd, project_path, timeout=60)
 
-    if "already exists" not in created.stderr:
-        rprint(
-            f"  [bold red]FAIL[/] gt create failed: {created.stderr.strip()}"
-        )
-        return False
-
-    # Stale branch — delete and recreate
-    gt_delete(branch_name, project_path)
-    retry = _run(cmd, project_path, timeout=60)
-    if retry.returncode != 0:
-        rprint(
-            f"  [bold red]FAIL[/] gt create (retry) failed: "
-            f"{retry.stderr.strip()}"
-        )
-        return False
-
-    return True
+    match (first.returncode, "already exists" in first.stderr):
+        case (0, _):
+            return True
+        case (_, True):
+            # Stale branch -- delete and recreate
+            gt_delete(branch_name, project_path)
+            retry = _run(cmd, project_path, timeout=60)
+            if retry.returncode != 0:
+                rprint(
+                    f"  [bold red]FAIL[/] gt create (retry) failed: "
+                    f"{retry.stderr.strip()}"
+                )
+                return False
+            return True
+        case _:
+            rprint(
+                f"  [bold red]FAIL[/] gt create failed: {first.stderr.strip()}"
+            )
+            return False
 
 
 def gt_delete(branch_name: str, project_path: Path) -> bool:
@@ -149,18 +125,9 @@ def gt_checkout(branch: str, project_path: Path) -> bool:
 
 def submit_stack(project_path: Path) -> tuple[bool, str]:
     """Run gt submit --stack. Returns (success, output)."""
-    completed = _run(["gt", "submit", "--stack"], project_path, timeout=120)
-    output = (
-        completed.stdout.strip()
-        if completed.returncode == 0
-        else completed.stderr.strip()
-    )
-    return completed.returncode == 0, output
-
-
-# ---------------------------------------------------------------------------
-# Sync & cleanup
-# ---------------------------------------------------------------------------
+    r = _run(["gt", "submit", "--stack"], project_path, timeout=120)
+    ok = r.returncode == 0
+    return ok, (r.stdout if ok else r.stderr).strip()
 
 
 def sync_graphite(project_path: Path) -> bool:

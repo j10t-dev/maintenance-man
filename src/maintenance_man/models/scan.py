@@ -1,5 +1,5 @@
 from datetime import datetime
-from enum import StrEnum
+from enum import StrEnum, auto
 
 from pydantic import BaseModel
 
@@ -13,16 +13,16 @@ class Severity(StrEnum):
 
 
 class SemverTier(StrEnum):
-    PATCH = "patch"
-    MINOR = "minor"
-    MAJOR = "major"
-    UNKNOWN = "unknown"
+    PATCH = auto()
+    MINOR = auto()
+    MAJOR = auto()
+    UNKNOWN = auto()
 
 
 class UpdateStatus(StrEnum):
-    STARTED = "started"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    STARTED = auto()
+    COMPLETED = auto()
+    FAILED = auto()
 
 
 class VulnFinding(BaseModel):
@@ -44,7 +44,8 @@ class VulnFinding(BaseModel):
 
     @property
     def target_version(self) -> str:
-        assert self.fixed_version is not None
+        if self.fixed_version is None:
+            raise ValueError("No fixed version available")
         return self.fixed_version
 
     @property
@@ -56,7 +57,7 @@ class SecretFinding(BaseModel):
     file: str
     rule_id: str
     title: str
-    severity: str
+    severity: Severity
 
 
 class UpdateFinding(BaseModel):

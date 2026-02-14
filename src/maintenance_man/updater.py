@@ -9,6 +9,7 @@ from typing import Literal, Protocol
 
 from rich import print as rprint
 
+from maintenance_man import sanitise_project_name
 from maintenance_man.models.config import PhaseTestConfig, ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -89,10 +90,12 @@ _UPDATE_STACK = _StackConfig(
     commit_fmt="update: {pkg} {old} -> {new} ({detail})",
 )
 
-
-# ---------------------------------------------------------------------------
-# Main processing
-# ---------------------------------------------------------------------------
+_RISK_ORDER = {
+    SemverTier.PATCH: 0,
+    SemverTier.MINOR: 1,
+    SemverTier.MAJOR: 2,
+    SemverTier.UNKNOWN: 3,
+}
 
 
 def process_vulns(
@@ -143,6 +146,27 @@ def process_updates(
     )
 
 
+def _record_failure(
+    finding: Finding,
+    kind: UpdateKind,
+    phase: str,
+    project_path: Path,
+    scan_result: ScanResult | None,
+    project_name: str,
+    results_dir: Path | None,
+) -> UpdateResult:
+    """Discard changes, mark the finding as failed, persist and return a result."""
+    discard_changes(project_path)
+    finding.update_status = UpdateStatus.FAILED
+    _persist_status(scan_result, project_name, results_dir)
+    return UpdateResult(
+        pkg_name=finding.pkg_name,
+        kind=kind,
+        passed=False,
+        failed_phase=phase,
+    )
+
+
 def _process_stack(
     findings: Sequence[Finding],
     project_config: ProjectConfig,
@@ -190,31 +214,17 @@ def _process_stack(
             f.target_version,
             project_path,
         ):
-            discard_changes(project_path)
-            f.update_status = UpdateStatus.FAILED
-            _persist_status(scan_result, project_name, results_dir)
-            results.append(
-                UpdateResult(
-                    pkg_name=f.pkg_name,
-                    kind=cfg.kind,
-                    passed=False,
-                    failed_phase="apply",
-                )
-            )
+            results.append(_record_failure(
+                f, cfg.kind, "apply", project_path,
+                scan_result, project_name, results_dir,
+            ))
             continue
 
         if not gt_create(msg, branch, project_path):
-            discard_changes(project_path)
-            f.update_status = UpdateStatus.FAILED
-            _persist_status(scan_result, project_name, results_dir)
-            results.append(
-                UpdateResult(
-                    pkg_name=f.pkg_name,
-                    kind=cfg.kind,
-                    passed=False,
-                    failed_phase="gt-create",
-                )
-            )
+            results.append(_record_failure(
+                f, cfg.kind, "gt-create", project_path,
+                scan_result, project_name, results_dir,
+            ))
             continue
 
         passed, failed_phase = run_test_phases(test_config, project_path)
@@ -262,26 +272,21 @@ def _process_stack(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Scan result persistence
-# ---------------------------------------------------------------------------
-
-
 def _results_path(project_name: str, results_dir: Path) -> Path:
     """Return the path to a project's scan results file."""
-    safe = project_name.replace("/", "_").replace("\\", "_").replace("..", "_")
-    return results_dir / f"{safe}.json"
+    return results_dir / f"{sanitise_project_name(project_name)}.json"
 
 
 def load_scan_results(project_name: str, results_dir: Path) -> ScanResult:
     """Load scan results JSON for a project. Raises NoScanResultsError if missing."""
     results_file = _results_path(project_name, results_dir)
-    if not results_file.exists():
+    try:
+        data = json.loads(results_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         raise NoScanResultsError(
             f"No scan results found for '{project_name}'. "
             f"Run 'mm scan {project_name}' first."
-        )
-    data = json.loads(results_file.read_text(encoding="utf-8"))
+        ) from None
     return ScanResult.model_validate(data)
 
 
@@ -297,13 +302,7 @@ def save_scan_results(
 
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
     """Sort updates risk-ascending: PATCH < MINOR < MAJOR < UNKNOWN."""
-    order = {
-        SemverTier.PATCH: 0,
-        SemverTier.MINOR: 1,
-        SemverTier.MAJOR: 2,
-        SemverTier.UNKNOWN: 3,
-    }
-    return sorted(updates, key=lambda u: order.get(u.semver_tier, 99))
+    return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
 
 
 def get_update_command(
@@ -354,11 +353,6 @@ def run_test_phases(
         if completed.returncode != 0:
             return False, phase_name
     return True, None
-
-
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
 
 
 def _project_env() -> dict[str, str]:
