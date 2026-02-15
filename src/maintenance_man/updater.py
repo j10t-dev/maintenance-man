@@ -146,25 +146,82 @@ def process_updates(
     )
 
 
-def _record_failure(
-    finding: Finding,
-    kind: UpdateKind,
-    phase: str,
-    project_path: Path,
-    scan_result: ScanResult | None,
-    project_name: str,
-    results_dir: Path | None,
-) -> UpdateResult:
-    """Discard changes, mark the finding as failed, persist and return a result."""
-    discard_changes(project_path)
-    finding.update_status = UpdateStatus.FAILED
-    _persist_status(scan_result, project_name, results_dir)
-    return UpdateResult(
-        pkg_name=finding.pkg_name,
-        kind=kind,
-        passed=False,
-        failed_phase=phase,
+def load_scan_results(project_name: str, results_dir: Path) -> ScanResult:
+    """Load scan results JSON for a project. Raises NoScanResultsError if missing."""
+    results_file = _results_path(project_name, results_dir)
+    try:
+        data = json.loads(results_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise NoScanResultsError(
+            f"No scan results found for '{project_name}'. "
+            f"Run 'mm scan {project_name}' first."
+        ) from None
+    return ScanResult.model_validate(data)
+
+
+def save_scan_results(
+    project_name: str, results_dir: Path, scan_result: ScanResult
+) -> None:
+    """Write scan results (with update statuses) back to disk."""
+    results_file = _results_path(project_name, results_dir)
+    results_file.write_text(
+        scan_result.model_dump_json(indent=2), encoding="utf-8"
     )
+
+
+def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
+    """Sort updates risk-ascending: PATCH < MINOR < MAJOR < UNKNOWN."""
+    return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
+
+
+def get_update_command(
+    package_manager: str, pkg_name: str, version: str
+) -> list[str]:
+    """Return the shell command to update a package to a specific version."""
+    match package_manager:
+        case "bun":
+            return ["bun", "add", f"{pkg_name}@{version}"]
+        case "uv":
+            return ["uv", "add", f"{pkg_name}=={version}"]
+        case "mvn":
+            return [
+                "mvn",
+                "versions:use-dep-version",
+                f"-Dincludes={pkg_name}",
+                f"-DdepVersion={version}",
+            ]
+        case _:
+            raise ValueError(f"Unsupported package manager: {package_manager}")
+
+
+# TODO: extract as part of test command feature
+def run_test_phases(
+    test_config: PhaseTestConfig, project_path: Path
+) -> tuple[bool, str | None]:
+    """Run configured test phases sequentially. Returns (passed, failed_phase).
+
+    Stops on first failure. Returns (True, None) if all phases pass.
+    """
+    env = _project_env()
+    phases = [
+        ("unit", test_config.unit),
+        ("integration", test_config.integration),
+        ("component", test_config.component),
+    ]
+    for phase_name, command in phases:
+        if command is None:
+            continue
+        rprint(f"  [dim]$ {command}[/]")
+        completed = subprocess.run(
+            shlex.split(command),
+            cwd=project_path,
+            timeout=600,
+            text=True,
+            env=env,
+        )
+        if completed.returncode != 0:
+            return False, phase_name
+    return True, None
 
 
 def _process_stack(
@@ -272,87 +329,30 @@ def _process_stack(
     return results
 
 
-def _results_path(project_name: str, results_dir: Path) -> Path:
-    """Return the path to a project's scan results file."""
-    return results_dir / f"{sanitise_project_name(project_name)}.json"
-
-
-def load_scan_results(project_name: str, results_dir: Path) -> ScanResult:
-    """Load scan results JSON for a project. Raises NoScanResultsError if missing."""
-    results_file = _results_path(project_name, results_dir)
-    try:
-        data = json.loads(results_file.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise NoScanResultsError(
-            f"No scan results found for '{project_name}'. "
-            f"Run 'mm scan {project_name}' first."
-        ) from None
-    return ScanResult.model_validate(data)
-
-
-def save_scan_results(
-    project_name: str, results_dir: Path, scan_result: ScanResult
-) -> None:
-    """Write scan results (with update statuses) back to disk."""
-    results_file = _results_path(project_name, results_dir)
-    results_file.write_text(
-        scan_result.model_dump_json(indent=2), encoding="utf-8"
+def _record_failure(
+    finding: Finding,
+    kind: UpdateKind,
+    phase: str,
+    project_path: Path,
+    scan_result: ScanResult | None,
+    project_name: str,
+    results_dir: Path | None,
+) -> UpdateResult:
+    """Discard changes, mark the finding as failed, persist and return a result."""
+    discard_changes(project_path)
+    finding.update_status = UpdateStatus.FAILED
+    _persist_status(scan_result, project_name, results_dir)
+    return UpdateResult(
+        pkg_name=finding.pkg_name,
+        kind=kind,
+        passed=False,
+        failed_phase=phase,
     )
 
 
-def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
-    """Sort updates risk-ascending: PATCH < MINOR < MAJOR < UNKNOWN."""
-    return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
-
-
-def get_update_command(
-    package_manager: str, pkg_name: str, version: str
-) -> list[str]:
-    """Return the shell command to update a package to a specific version."""
-    match package_manager:
-        case "bun":
-            return ["bun", "add", f"{pkg_name}@{version}"]
-        case "uv":
-            return ["uv", "add", f"{pkg_name}=={version}"]
-        case "mvn":
-            return [
-                "mvn",
-                "versions:use-dep-version",
-                f"-Dincludes={pkg_name}",
-                f"-DdepVersion={version}",
-            ]
-        case _:
-            raise ValueError(f"Unsupported package manager: {package_manager}")
-
-
-# TODO: extract as part of test command feature
-def run_test_phases(
-    test_config: PhaseTestConfig, project_path: Path
-) -> tuple[bool, str | None]:
-    """Run configured test phases sequentially. Returns (passed, failed_phase).
-
-    Stops on first failure. Returns (True, None) if all phases pass.
-    """
-    env = _project_env()
-    phases = [
-        ("unit", test_config.unit),
-        ("integration", test_config.integration),
-        ("component", test_config.component),
-    ]
-    for phase_name, command in phases:
-        if command is None:
-            continue
-        rprint(f"  [dim]$ {command}[/]")
-        completed = subprocess.run(
-            shlex.split(command),
-            cwd=project_path,
-            timeout=600,
-            text=True,
-            env=env,
-        )
-        if completed.returncode != 0:
-            return False, phase_name
-    return True, None
+def _results_path(project_name: str, results_dir: Path) -> Path:
+    """Return the path to a project's scan results file."""
+    return results_dir / f"{sanitise_project_name(project_name)}.json"
 
 
 def _project_env() -> dict[str, str]:

@@ -13,16 +13,48 @@ from pathlib import Path
 from maintenance_man.models.scan import UpdateFinding
 
 
-def _utcnow() -> datetime:
-    """Return current UTC time. Extracted for testability."""
-    return datetime.now(timezone.utc)
+def filter_by_age(
+    updates: list[UpdateFinding],
+    manager: str,
+    min_age_days: int,
+    project_path: str | Path | None = None,
+) -> list[UpdateFinding]:
+    """Filter out updates where the target version is younger than min_age_days.
 
+    Sets published_date on each update. Returns only updates that pass the age gate.
+    If min_age_days is 0, returns all updates unmodified (no registry lookups).
+    """
+    if min_age_days == 0 or not updates:
+        return list(updates)
 
-def _fetch_json(url: str) -> dict:
-    """Fetch JSON from a URL using stdlib urllib."""
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
+    lookup_fn = _REGISTRY_LOOKUPS.get(manager)
+    if lookup_fn is None:
+        return list(updates)
+
+    # bun info needs a cwd with a package.json
+    if manager == "bun" and project_path:
+        lookup_fn = functools.partial(lookup_fn, cwd=project_path)
+
+    cutoff = _utcnow() - timedelta(days=min_age_days)
+
+    def _lookup_one(update: UpdateFinding) -> tuple[UpdateFinding, datetime | None]:
+        try:
+            return update, lookup_fn(update.pkg_name, update.latest_version)
+        except Exception:
+            return update, None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        lookups = list(pool.map(_lookup_one, updates))
+
+    result: list[UpdateFinding] = []
+    for update, pub_date in lookups:
+        if pub_date is not None:
+            update = update.model_copy(update={"published_date": pub_date})
+            if pub_date >= cutoff:
+                continue
+        result.append(update)
+
+    return result
 
 
 def _get_npm_publish_date(
@@ -47,17 +79,6 @@ def _get_npm_publish_date(
         None,
     )
     return datetime.fromisoformat(ts) if ts else None
-
-
-def _pypi_cache_dir() -> Path:
-    """Return (and create) the maintenance-man cache directory."""
-    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
-    d = base / "maintenance-man"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-_pypi_cache_lock = threading.Lock()
 
 
 def _get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
@@ -123,45 +144,24 @@ _REGISTRY_LOOKUPS = {
 }
 
 
-def filter_by_age(
-    updates: list[UpdateFinding],
-    manager: str,
-    min_age_days: int,
-    project_path: str | Path | None = None,
-) -> list[UpdateFinding]:
-    """Filter out updates where the target version is younger than min_age_days.
+def _utcnow() -> datetime:
+    """Return current UTC time. Extracted for testability."""
+    return datetime.now(timezone.utc)
 
-    Sets published_date on each update. Returns only updates that pass the age gate.
-    If min_age_days is 0, returns all updates unmodified (no registry lookups).
-    """
-    if min_age_days == 0 or not updates:
-        return list(updates)
 
-    lookup_fn = _REGISTRY_LOOKUPS.get(manager)
-    if lookup_fn is None:
-        return list(updates)
+def _fetch_json(url: str) -> dict:
+    """Fetch JSON from a URL using stdlib urllib."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
 
-    # bun info needs a cwd with a package.json
-    if manager == "bun" and project_path:
-        lookup_fn = functools.partial(lookup_fn, cwd=project_path)
 
-    cutoff = _utcnow() - timedelta(days=min_age_days)
+def _pypi_cache_dir() -> Path:
+    """Return (and create) the maintenance-man cache directory."""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    d = base / "maintenance-man"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-    def _lookup_one(update: UpdateFinding) -> tuple[UpdateFinding, datetime | None]:
-        try:
-            return update, lookup_fn(update.pkg_name, update.latest_version)
-        except Exception:
-            return update, None
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        lookups = list(pool.map(_lookup_one, updates))
-
-    result: list[UpdateFinding] = []
-    for update, pub_date in lookups:
-        if pub_date is not None:
-            update = update.model_copy(update={"published_date": pub_date})
-            if pub_date >= cutoff:
-                continue
-        result.append(update)
-
-    return result
+_pypi_cache_lock = threading.Lock()
