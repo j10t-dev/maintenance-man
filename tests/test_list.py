@@ -176,3 +176,124 @@ class TestListFindings:
             app(["list", "--detail"])
         assert exc_info.value.code == 0
         assert expected_substring in capsys.readouterr().out
+
+    def test_detail_sorts_by_severity(
+        self,
+        list_project_home: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Findings are sorted CRITICAL > HIGH > LOW in detail output."""
+        vulns = [
+            VulnFinding(
+                vuln_id="CVE-LOW",
+                pkg_name="low-pkg",
+                installed_version="1.0.0",
+                fixed_version="1.0.1",
+                severity=Severity.LOW,
+                title="t",
+                description="d",
+                status="fixed",
+            ),
+            VulnFinding(
+                vuln_id="CVE-CRIT",
+                pkg_name="crit-pkg",
+                installed_version="1.0.0",
+                fixed_version="1.0.1",
+                severity=Severity.CRITICAL,
+                title="t",
+                description="d",
+                status="fixed",
+            ),
+            VulnFinding(
+                vuln_id="CVE-HIGH",
+                pkg_name="high-pkg",
+                installed_version="1.0.0",
+                fixed_version="1.0.1",
+                severity=Severity.HIGH,
+                title="t",
+                description="d",
+                status="fixed",
+            ),
+        ]
+        result = ScanResult(
+            project="myapp",
+            scanned_at=_NOW,
+            trivy_target=".",
+            vulnerabilities=vulns,
+        )
+        _write_scan_result(list_project_home, "myapp", result)
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list", "--detail"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        crit_pos = output.index("CVE-CRIT")
+        high_pos = output.index("CVE-HIGH")
+        low_pos = output.index("CVE-LOW")
+        assert crit_pos < high_pos < low_pos
+
+    def test_detail_fix_marker_on_highest_version(
+        self,
+        list_project_home: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """'← fix' marks the highest fix version for duplicate-package vulns."""
+        vulns = [
+            VulnFinding(
+                vuln_id="CVE-0001",
+                pkg_name="requests",
+                installed_version="2.25.0",
+                fixed_version="2.31.0",
+                severity=Severity.HIGH,
+                title="t",
+                description="d",
+                status="fixed",
+            ),
+            VulnFinding(
+                vuln_id="CVE-0002",
+                pkg_name="requests",
+                installed_version="2.25.0",
+                fixed_version="2.32.4",
+                severity=Severity.HIGH,
+                title="t",
+                description="d",
+                status="fixed",
+            ),
+        ]
+        result = ScanResult(
+            project="myapp",
+            scanned_at=_NOW,
+            trivy_target=".",
+            vulnerabilities=vulns,
+        )
+        _write_scan_result(list_project_home, "myapp", result)
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list", "--detail"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        # The marker should appear on the row with 2.32.4
+        assert "2.32.4" in output
+        # Find lines containing the marker
+        lines_with_marker = [
+            line for line in output.splitlines() if "\u2190 fix" in line
+        ]
+        assert len(lines_with_marker) == 1
+        assert "2.32.4" in lines_with_marker[0]
+
+    def test_detail_no_fix_marker_for_single_vuln_package(
+        self,
+        list_project_home: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Single-vuln packages should not get the '← fix' marker."""
+        result = ScanResult(
+            project="myapp",
+            scanned_at=_NOW,
+            trivy_target=".",
+            vulnerabilities=[_VULN],
+        )
+        _write_scan_result(list_project_home, "myapp", result)
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list", "--detail"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "\u2190 fix" not in output

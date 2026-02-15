@@ -92,3 +92,17 @@ class ScanResult(BaseModel):
     @property
     def has_updates(self) -> bool:
         return bool(self.updates)
+
+
+_SEVERITY_ORDER: dict[Severity, int] = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+    Severity.UNKNOWN: 4,
+}
+
+
+def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
+    """Sort vulnerabilities by severity, most critical first."""
+    return sorted(vulns, key=lambda v: _SEVERITY_ORDER[v.severity])
