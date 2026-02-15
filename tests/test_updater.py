@@ -16,6 +16,8 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.updater import (
     NoScanResultsError,
+    _consolidate_vulns,
+    _highest_fix_version,
     get_update_command,
     load_scan_results,
     process_updates,
@@ -284,6 +286,88 @@ class TestSortUpdatesByRisk:
         assert result[0].semver_tier == SemverTier.MINOR
 
 
+# -- _highest_fix_version --
+
+
+class TestHighestFixVersion:
+    def test_picks_highest_semver(self):
+        vulns = [
+            make_vuln(fixed_version="2.31.0"),
+            make_vuln(fixed_version="2.32.4"),
+            make_vuln(fixed_version="2.32.0"),
+        ]
+        assert _highest_fix_version(vulns) == "2.32.4"
+
+    def test_single_vuln(self):
+        assert _highest_fix_version([make_vuln(fixed_version="1.0.1")]) == "1.0.1"
+
+    def test_invalid_version_ignored(self):
+        vulns = [
+            make_vuln(fixed_version="not-a-version"),
+            make_vuln(fixed_version="2.0.0"),
+        ]
+        assert _highest_fix_version(vulns) == "2.0.0"
+
+    def test_invalid_version_order_independent(self):
+        vulns = [
+            make_vuln(fixed_version="2.0.0"),
+            make_vuln(fixed_version="not-a-version"),
+        ]
+        assert _highest_fix_version(vulns) == "2.0.0"
+
+
+# -- _consolidate_vulns --
+
+
+class TestConsolidateVulns:
+    def test_same_package_consolidated(self):
+        vulns = [
+            make_vuln(
+                vuln_id="CVE-2023-32681",
+                pkg_name="requests",
+                fixed_version="2.31.0",
+            ),
+            make_vuln(
+                vuln_id="CVE-2024-35195",
+                pkg_name="requests",
+                fixed_version="2.32.0",
+            ),
+            make_vuln(
+                vuln_id="CVE-2024-47081",
+                pkg_name="requests",
+                fixed_version="2.32.4",
+            ),
+        ]
+        result = _consolidate_vulns(vulns)
+        assert len(result) == 1
+        assert result[0].pkg_name == "requests"
+        assert result[0].target_version == "2.32.4"
+        assert "CVE-2023-32681" in result[0].detail
+        assert "CVE-2024-35195" in result[0].detail
+        assert "CVE-2024-47081" in result[0].detail
+
+    def test_different_packages_not_consolidated(self):
+        vulns = [
+            make_vuln(vuln_id="CVE-0001", pkg_name="pkg-a", fixed_version="1.0.1"),
+            make_vuln(vuln_id="CVE-0002", pkg_name="pkg-b", fixed_version="2.0.1"),
+        ]
+        result = _consolidate_vulns(vulns)
+        assert len(result) == 2
+        assert result[0].pkg_name == "pkg-a"
+        assert result[1].pkg_name == "pkg-b"
+
+    def test_status_fanout_to_originals(self):
+        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
+        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="pkg", fixed_version="1.0.2")
+        consolidated = _consolidate_vulns([v1, v2])
+        consolidated[0].update_status = UpdateStatus.COMPLETED
+        assert v1.update_status == UpdateStatus.COMPLETED
+        assert v2.update_status == UpdateStatus.COMPLETED
+
+    def test_empty_list(self):
+        assert _consolidate_vulns([]) == []
+
+
 # -- process_vulns --
 
 
@@ -347,6 +431,48 @@ class TestProcessVulns:
         assert results[0].failed_phase == "submit"
         assert vuln.update_status == UpdateStatus.FAILED
         mock_save.assert_called()
+
+    def test_duplicate_package_vulns_consolidated(
+        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        """Multiple CVEs for the same package → one _apply_update call."""
+        v1 = make_vuln(
+            vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0"
+        )
+        v2 = make_vuln(
+            vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4"
+        )
+        v3 = make_vuln(
+            vuln_id="CVE-0003", pkg_name="requests", fixed_version="2.32.0"
+        )
+        results = process_vulns([v1, v2, v3], project_config)
+        assert len(results) == 1
+        assert results[0].passed is True
+        mock_vcs["_apply_update"].assert_called_once()
+        # Highest version used
+        call_args = mock_vcs["_apply_update"].call_args
+        assert call_args[0][2] == "2.32.4"
+        # All originals get status
+        assert v1.update_status == UpdateStatus.COMPLETED
+        assert v2.update_status == UpdateStatus.COMPLETED
+        assert v3.update_status == UpdateStatus.COMPLETED
+
+    def test_duplicate_package_vulns_failure_fans_out(
+        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        """When consolidated vuln fails, all originals are marked FAILED."""
+        mock_vcs["_apply_update"].return_value = False
+        v1 = make_vuln(
+            vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0"
+        )
+        v2 = make_vuln(
+            vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4"
+        )
+        results = process_vulns([v1, v2], project_config)
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert v1.update_status == UpdateStatus.FAILED
+        assert v2.update_status == UpdateStatus.FAILED
 
 
 # -- process_updates --
