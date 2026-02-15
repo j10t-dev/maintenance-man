@@ -50,7 +50,10 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     if venv_python.exists():
         cmd += ["--python", str(venv_python)]
     completed = _run_checked(
-        cmd, cwd=project.path, timeout=120, label="uv pip list --outdated",
+        cmd,
+        cwd=project.path,
+        timeout=120,
+        label="uv pip list --outdated",
     )
 
     try:
@@ -76,7 +79,10 @@ def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `bun outdated` and parse the table output."""
     cmd = ["bun", "outdated"]
     completed = _run_checked(
-        cmd, cwd=project.path, timeout=120, label="bun outdated",
+        cmd,
+        cwd=project.path,
+        timeout=120,
+        label="bun outdated",
         allow_nonzero_with_stdout=True,
     )
 
@@ -104,7 +110,9 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         "-DprocessDependencyManagement=false",
     ]
     completed = _run_checked(
-        cmd, cwd=project.path, timeout=300,
+        cmd,
+        cwd=project.path,
+        timeout=300,
         label="mvn versions:display-dependency-updates",
     )
 
@@ -138,7 +146,11 @@ def _run_checked(
     """Run a subprocess with common error handling."""
     try:
         completed = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout,
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
         raise OutdatedCheckError(f"{label} timed out") from e
@@ -147,8 +159,7 @@ def _run_checked(
         if allow_nonzero_with_stdout and completed.stdout.strip():
             return completed
         raise OutdatedCheckError(
-            f"{label} failed (exit {completed.returncode}): "
-            f"{completed.stderr.strip()}"
+            f"{label} failed (exit {completed.returncode}): {completed.stderr.strip()}"
         )
     return completed
 
@@ -156,22 +167,21 @@ def _run_checked(
 def _parse_bun_table(output: str) -> list[dict[str, str]]:
     """Parse bun outdated table output into list of dicts."""
     lines = (line.strip() for line in output.strip().splitlines())
-    table_lines = (
-        line for line in lines
-        if line.startswith("|") and "---" not in line
-    )
+    table_lines = (line for line in lines if line.startswith("|") and "---" not in line)
 
     rows = []
     for line in table_lines:
         cells = [c.strip() for c in line.split("|") if c.strip()]
         if len(cells) < 4 or cells[0].lower() == "package":
             continue
-        rows.append({
-            "package": re.sub(r"\s*\(dev\)$", "", cells[0]),
-            "current": cells[1],
-            "update": cells[2],
-            "latest": cells[3],
-        })
+        rows.append(
+            {
+                "package": re.sub(r"\s*\(dev\)$", "", cells[0]),
+                "current": cells[1],
+                "update": cells[2],
+                "latest": cells[3],
+            }
+        )
     return rows
 
 

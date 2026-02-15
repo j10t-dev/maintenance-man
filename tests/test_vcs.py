@@ -22,9 +22,13 @@ from maintenance_man.vcs import (
 
 
 def _completed(
-    returncode: int = 0, stdout: str = "", stderr: str = "",
+    returncode: int = 0,
+    stdout: str = "",
+    stderr: str = "",
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +128,10 @@ class TestResetToMain:
     @patch("maintenance_man.vcs.gt_checkout", return_value=True)
     @patch("maintenance_man.vcs._run")
     def test_restores_main_and_cleans(
-        self, mock_run: MagicMock, mock_gt_co: MagicMock, tmp_path: Path,
+        self,
+        mock_run: MagicMock,
+        mock_gt_co: MagicMock,
+        tmp_path: Path,
     ):
         mock_run.return_value = _completed()
         reset_to_main(tmp_path)
@@ -156,7 +163,9 @@ class TestGtCreate:
 
     @patch("maintenance_man.vcs._run")
     def test_stale_branch_delete_and_retry_succeeds(
-        self, mock_run: MagicMock, tmp_path: Path,
+        self,
+        mock_run: MagicMock,
+        tmp_path: Path,
     ):
         create_cmd = ["gt", "create", "bump/pkg-a", "-a", "-m", "msg"]
         mock_run.side_effect = [
@@ -172,7 +181,9 @@ class TestGtCreate:
 
     @patch("maintenance_man.vcs._run")
     def test_stale_branch_retry_also_fails(
-        self, mock_run: MagicMock, tmp_path: Path,
+        self,
+        mock_run: MagicMock,
+        tmp_path: Path,
     ):
         mock_run.side_effect = [
             _completed(returncode=1, stderr="already exists"),
@@ -193,7 +204,8 @@ class TestGtDelete:
         mock_run.return_value = _completed()
         assert gt_delete("bump/pkg-a", tmp_path) is True
         mock_run.assert_called_once_with(
-            ["gt", "delete", "-f", "bump/pkg-a"], tmp_path,
+            ["gt", "delete", "-f", "bump/pkg-a"],
+            tmp_path,
         )
 
     @patch("maintenance_man.vcs._run")
@@ -213,7 +225,8 @@ class TestGtCheckout:
         mock_run.return_value = _completed()
         assert gt_checkout("bump/pkg-a", tmp_path) is True
         mock_run.assert_called_once_with(
-            ["gt", "checkout", "bump/pkg-a"], tmp_path,
+            ["gt", "checkout", "bump/pkg-a"],
+            tmp_path,
         )
 
     @patch("maintenance_man.vcs._run")
@@ -235,7 +248,9 @@ class TestSubmitStack:
         assert ok is True
         assert output == "PR #42 created"
         mock_run.assert_called_once_with(
-            ["gt", "submit", "--stack"], tmp_path, timeout=120,
+            ["gt", "submit", "--stack"],
+            tmp_path,
+            timeout=120,
         )
 
     @patch("maintenance_man.vcs._run")
@@ -274,15 +289,16 @@ class TestSyncGraphite:
         assert sync_graphite(tmp_path) is True
 
         delete_calls = [
-            c for c in mock_run.call_args_list
-            if c[0][0][:2] == ["gt", "delete"]
+            c for c in mock_run.call_args_list if c[0][0][:2] == ["gt", "delete"]
         ]
         deleted = {c[0][0][3] for c in delete_calls}
         assert deleted == {"bump/click", "bump/tornado"}
 
     @patch("maintenance_man.vcs._run")
     def test_handles_gh_failure_gracefully(
-        self, mock_run: MagicMock, tmp_path: Path,
+        self,
+        mock_run: MagicMock,
+        tmp_path: Path,
     ):
         def side_effect(cmd, *args, **kwargs):
             if cmd[:2] == ["gt", "sync"]:
@@ -296,9 +312,12 @@ class TestSyncGraphite:
 
     @patch("maintenance_man.vcs._run")
     def test_falls_back_to_git_branch_delete(
-        self, mock_run: MagicMock, tmp_path: Path,
+        self,
+        mock_run: MagicMock,
+        tmp_path: Path,
     ):
         """When gt delete fails, falls back to git branch -D."""
+
         def side_effect(cmd, *args, **kwargs):
             if cmd[:2] == ["gt", "sync"]:
                 return _completed()
@@ -319,7 +338,8 @@ class TestSyncGraphite:
         assert sync_graphite(tmp_path) is True
 
         git_delete = [
-            c for c in mock_run.call_args_list
+            c
+            for c in mock_run.call_args_list
             if c[0][0][:2] == ["git", "branch"] and "-D" in c[0][0]
         ]
         assert len(git_delete) == 1
@@ -327,9 +347,12 @@ class TestSyncGraphite:
 
     @patch("maintenance_man.vcs._run")
     def test_ignores_non_prefixed_branches(
-        self, mock_run: MagicMock, tmp_path: Path,
+        self,
+        mock_run: MagicMock,
+        tmp_path: Path,
     ):
         """Branches not matching bump/ or fix/ prefixes are left alone."""
+
         def side_effect(cmd, *args, **kwargs):
             if cmd[:2] == ["gt", "sync"]:
                 return _completed()
@@ -343,9 +366,9 @@ class TestSyncGraphite:
         assert sync_graphite(tmp_path) is True
 
         delete_calls = [
-            c for c in mock_run.call_args_list
-            if c[0][0][:2] == ["gt", "delete"] or (
-                c[0][0][:2] == ["git", "branch"] and "-D" in c[0][0]
-            )
+            c
+            for c in mock_run.call_args_list
+            if c[0][0][:2] == ["gt", "delete"]
+            or (c[0][0][:2] == ["git", "branch"] and "-D" in c[0][0])
         ]
         assert len(delete_calls) == 0

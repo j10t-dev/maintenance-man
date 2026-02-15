@@ -58,7 +58,10 @@ def filter_by_age(
 
 
 def _get_npm_publish_date(
-    pkg: str, version: str, *, cwd: str | Path | None = None,
+    pkg: str,
+    version: str,
+    *,
+    cwd: str | Path | None = None,
 ) -> datetime | None:
     """Fetch publish date via ``bun info``."""
     try:
@@ -73,9 +76,11 @@ def _get_npm_publish_date(
         return None
 
     ts = next(
-        (line.removeprefix("Published:").strip()
-         for line in completed.stdout.splitlines()
-         if line.startswith("Published:")),
+        (
+            line.removeprefix("Published:").strip()
+            for line in completed.stdout.splitlines()
+            if line.startswith("Published:")
+        ),
         None,
     )
     return datetime.fromisoformat(ts) if ts else None
@@ -98,7 +103,11 @@ def _get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
     data = _fetch_json(f"https://pypi.org/pypi/{quote(pkg)}/{quote(version)}/json")
 
     ts = next(
-        (u.get("upload_time_iso_8601") for u in data.get("urls", []) if u.get("upload_time_iso_8601")),
+        (
+            u.get("upload_time_iso_8601")
+            for u in data.get("urls", [])
+            if u.get("upload_time_iso_8601")
+        ),
         None,
     )
     if ts is None:
