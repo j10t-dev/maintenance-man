@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -356,6 +357,14 @@ def _scan_one(
     name: str, proj_config: ProjectConfig, min_age_days: int
 ) -> ScanResult:
     """Scan a single project with timing output."""
+    try:
+        sync_graphite(proj_config.path)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        console.print(
+            f"[bold yellow]Warning:[/] {name} — "
+            f"failed to graphite sync: {exc}"
+        )
+
     t0 = time.monotonic()
     result = scan_project(name, proj_config, min_age_days)
     elapsed = time.monotonic() - t0
