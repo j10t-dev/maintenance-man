@@ -113,7 +113,28 @@ def _fix_version_key(v: VulnFinding) -> Version:
 
 
 def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
-    """Sort by severity (critical first), then fix version descending."""
-    # Two-pass stable sort: first by version desc, then by severity asc.
+    """Sort by package (grouped), with groups ordered by worst severity.
+
+    Within each package group, vulns are sorted by severity (critical first),
+    then fix version descending.  This keeps all vulns for a package together
+    so the "fix" marker is easy to follow.
+    """
+    # Build a lookup of worst (lowest ordinal) severity per package.
+    worst: dict[str, int] = {}
+    for v in vulns:
+        order = _SEVERITY_ORDER[v.severity]
+        if v.pkg_name not in worst or order < worst[v.pkg_name]:
+            worst[v.pkg_name] = order
+
+    def _key(v: VulnFinding) -> tuple[int, str, int]:
+        return (
+            worst[v.pkg_name],
+            v.pkg_name,
+            _SEVERITY_ORDER[v.severity],
+        )
+
+    # Two-pass stable sort: version desc first, then the composite key.
+    # The stable sort preserves version-desc ordering within each
+    # (package, severity) group.
     by_version = sorted(vulns, key=_fix_version_key, reverse=True)
-    return sorted(by_version, key=lambda v: _SEVERITY_ORDER[v.severity])
+    return sorted(by_version, key=_key)

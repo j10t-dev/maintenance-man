@@ -226,6 +226,25 @@ class TestSortVulnsBySeverity:
     def test_empty_list(self):
         assert sort_vulns_by_severity([]) == []
 
+    def test_groups_by_package_then_severity(self):
+        """Vulns for the same package stay together, groups ordered by worst severity."""
+        vulns = [
+            self._make_vuln(Severity.HIGH, vuln_id="flask-high"),
+            self._make_vuln(Severity.CRITICAL, vuln_id="requests-crit"),
+            self._make_vuln(Severity.MEDIUM, vuln_id="requests-med"),
+        ]
+        # Patch pkg_name directly — _make_vuln always uses "pkg".
+        vulns[0] = vulns[0].model_copy(update={"pkg_name": "flask"})
+        vulns[1] = vulns[1].model_copy(update={"pkg_name": "requests"})
+        vulns[2] = vulns[2].model_copy(update={"pkg_name": "requests"})
+
+        result = sort_vulns_by_severity(vulns)
+        assert [v.vuln_id for v in result] == [
+            "requests-crit",
+            "requests-med",
+            "flask-high",
+        ]
+
 
 class TestSemverTier:
     def test_semver_tier_values(self):
