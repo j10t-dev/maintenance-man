@@ -13,30 +13,14 @@ class OutdatedCheckError(Exception):
     pass
 
 
-def _run_checked(
-    cmd: list[str],
-    cwd: str | Path,
-    timeout: int,
-    *,
-    label: str,
-    allow_nonzero_with_stdout: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess with common error handling."""
-    try:
-        completed = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise OutdatedCheckError(f"{label} timed out") from e
-
-    if completed.returncode != 0:
-        if allow_nonzero_with_stdout and completed.stdout.strip():
-            return completed
+def get_outdated(project: ProjectConfig) -> list[UpdateFinding]:
+    """Run the appropriate outdated check for the project's package manager."""
+    checker = _CHECKERS.get(project.package_manager)
+    if checker is None:
         raise OutdatedCheckError(
-            f"{label} failed (exit {completed.returncode}): "
-            f"{completed.stderr.strip()}"
+            f"No outdated checker for package manager: {project.package_manager}"
         )
-    return completed
+    return checker(project)
 
 
 def classify_semver(installed: str, latest: str) -> SemverTier:
@@ -88,28 +72,6 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     ]
 
 
-def _parse_bun_table(output: str) -> list[dict[str, str]]:
-    """Parse bun outdated table output into list of dicts."""
-    lines = (line.strip() for line in output.strip().splitlines())
-    table_lines = (
-        line for line in lines
-        if line.startswith("|") and "---" not in line
-    )
-
-    rows = []
-    for line in table_lines:
-        cells = [c.strip() for c in line.split("|") if c.strip()]
-        if len(cells) < 4 or cells[0].lower() == "package":
-            continue
-        rows.append({
-            "package": re.sub(r"\s*\(dev\)$", "", cells[0]),
-            "current": cells[1],
-            "update": cells[2],
-            "latest": cells[3],
-        })
-    return rows
-
-
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `bun outdated` and parse the table output."""
     cmd = ["bun", "outdated"]
@@ -132,16 +94,6 @@ def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         for row in rows
         if row["current"] != row["latest"]
     ]
-
-
-_MVN_UPDATE_RE = re.compile(
-    r"^\[INFO\]\s+"
-    r"(\S+:\S+)"  # groupId:artifactId
-    r"\s+\.+\s+"  # dot padding
-    r"(\S+)"  # current version
-    r"\s+->\s+"  # arrow
-    r"(\S+)"  # new version
-)
 
 
 def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
@@ -175,11 +127,59 @@ _CHECKERS = {
 }
 
 
-def get_outdated(project: ProjectConfig) -> list[UpdateFinding]:
-    """Run the appropriate outdated check for the project's package manager."""
-    checker = _CHECKERS.get(project.package_manager)
-    if checker is None:
-        raise OutdatedCheckError(
-            f"No outdated checker for package manager: {project.package_manager}"
+def _run_checked(
+    cmd: list[str],
+    cwd: str | Path,
+    timeout: int,
+    *,
+    label: str,
+    allow_nonzero_with_stdout: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess with common error handling."""
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout,
         )
-    return checker(project)
+    except subprocess.TimeoutExpired as e:
+        raise OutdatedCheckError(f"{label} timed out") from e
+
+    if completed.returncode != 0:
+        if allow_nonzero_with_stdout and completed.stdout.strip():
+            return completed
+        raise OutdatedCheckError(
+            f"{label} failed (exit {completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
+    return completed
+
+
+def _parse_bun_table(output: str) -> list[dict[str, str]]:
+    """Parse bun outdated table output into list of dicts."""
+    lines = (line.strip() for line in output.strip().splitlines())
+    table_lines = (
+        line for line in lines
+        if line.startswith("|") and "---" not in line
+    )
+
+    rows = []
+    for line in table_lines:
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if len(cells) < 4 or cells[0].lower() == "package":
+            continue
+        rows.append({
+            "package": re.sub(r"\s*\(dev\)$", "", cells[0]),
+            "current": cells[1],
+            "update": cells[2],
+            "latest": cells[3],
+        })
+    return rows
+
+
+_MVN_UPDATE_RE = re.compile(
+    r"^\[INFO\]\s+"
+    r"(\S+:\S+)"  # groupId:artifactId
+    r"\s+\.+\s+"  # dot padding
+    r"(\S+)"  # current version
+    r"\s+->\s+"  # arrow
+    r"(\S+)"  # new version
+)

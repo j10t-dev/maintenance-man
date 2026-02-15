@@ -72,124 +72,8 @@ app = cyclopts.App(
 )
 
 
-def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
-    console.print(f"[bold red]Error:[/] {msg}")
-    sys.exit(code)
-
-
-def _scan_exit_code(has_vulns: bool, has_updates: bool) -> ExitCode:
-    match (has_vulns, has_updates):
-        case (True, _):
-            return ExitCode.VULNS_FOUND
-        case (_, True):
-            return ExitCode.UPDATES_FOUND
-        case _:
-            return ExitCode.OK
-
-
-def _pluralise(n: int, singular: str, plural: str) -> str:
-    return f"{n} {singular if n == 1 else plural}"
-
-
-def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
-    """Print a Rich-formatted summary of scan results for one project."""
-    actionable = [v for v in result.vulnerabilities if v.actionable]
-    advisories = [v for v in result.vulnerabilities if not v.actionable]
-    secrets = result.secrets
-    updates = result.updates
-
-    total = len(actionable) + len(advisories) + len(secrets) + len(updates)
-    timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
-
-    if total == 0:
-        console.print(f"[bold green]{result.project}[/] — clean{timing}")
-        return
-
-    categories = [
-        (actionable, "vulnerability", "vulnerabilities"),
-        (advisories, "advisory", "advisories"),
-        (secrets, "secret", "secrets"),
-        (updates, "update", "updates"),
-    ]
-    parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
-
-    console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
-
-    if actionable:
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold red", width=4)
-        table.add_column("Package")
-        table.add_column("Installed")
-        table.add_column("Fix")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in actionable:
-            table.add_row(
-                "VULN",
-                v.pkg_name,
-                v.installed_version,
-                v.fixed_version or "",
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
-
-    if advisories:
-        table = Table(show_header=False, **_TABLE_STYLE)
-        table.add_column("", style="bold yellow", width=4)
-        table.add_column("Package")
-        table.add_column("Installed")
-        table.add_column("Status")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in advisories:
-            table.add_row(
-                "ADV",
-                v.pkg_name,
-                v.installed_version,
-                v.status,
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
-
-    if secrets:
-        for s in secrets:
-            console.print(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
-
-    if updates:
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold cyan", width=4)
-        table.add_column("Package")
-        table.add_column("Installed")
-        table.add_column("Latest")
-        table.add_column("Tier")
-        table.add_column("Age")
-        for u in updates:
-            age = ""
-            if u.published_date:
-                days = (datetime.now(timezone.utc) - u.published_date).days
-                age = f"({days} days old)"
-            table.add_row(
-                "UPDATE",
-                u.pkg_name,
-                u.installed_version,
-                u.latest_version,
-                u.semver_tier.value,
-                age,
-            )
-        console.print(table)
-
-
-def _scan_one(
-    name: str, proj_config: ProjectConfig, min_age_days: int
-) -> ScanResult:
-    """Scan a single project with timing output."""
-    t0 = time.monotonic()
-    result = scan_project(name, proj_config, min_age_days)
-    elapsed = time.monotonic() - t0
-    _print_scan_result(result, elapsed_s=elapsed)
-    return result
+def main() -> None:
+    app()
 
 
 @app.command
@@ -255,130 +139,6 @@ def scan(
         has_updates |= result.has_updates
 
     sys.exit(_scan_exit_code(has_vulns, has_updates))
-
-
-def _print_numbered_findings(
-    vulns: list[VulnFinding], updates: list[UpdateFinding]
-) -> list[VulnFinding | UpdateFinding]:
-    """Print numbered list of findings. Returns ordered list of findings."""
-    numbered: list[VulnFinding | UpdateFinding] = []
-    for idx, v in enumerate(vulns, 1):
-        console.print(
-            f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {v.pkg_name} "
-            f"{v.installed_version} -> {v.fixed_version} ({v.vuln_id})"
-        )
-        numbered.append(v)
-    for idx, u in enumerate(updates, len(vulns) + 1):
-        console.print(
-            f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {u.pkg_name} "
-            f"{u.installed_version} -> {u.latest_version} "
-            f"({u.semver_tier.value})"
-        )
-        numbered.append(u)
-    return numbered
-
-
-def _parse_selection(
-    selection: str,
-    numbered: list[VulnFinding | UpdateFinding],
-    actionable_vulns: list[VulnFinding],
-    updates: list[UpdateFinding],
-) -> tuple[list[VulnFinding], list[UpdateFinding]] | None:
-    """Parse user selection string into vuln and update lists.
-
-    Returns None if the selection string is invalid.
-    """
-    match selection:
-        case "none":
-            return [], []
-        case "all":
-            return actionable_vulns, updates
-        case "vulns":
-            return actionable_vulns, []
-        case "updates":
-            return [], updates
-
-    selected_vulns: list[VulnFinding] = []
-    selected_updates: list[UpdateFinding] = []
-    try:
-        indices = [int(s.strip()) for s in selection.split(",")]
-    except ValueError:
-        return None
-
-    for i in indices:
-        if 1 <= i <= len(numbered):
-            finding = numbered[i - 1]
-            match finding:
-                case VulnFinding():
-                    selected_vulns.append(finding)
-                case UpdateFinding():
-                    selected_updates.append(finding)
-
-    return selected_vulns, selected_updates
-
-
-def _handle_continue(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    results_dir: Path,
-) -> NoReturn:
-    """Handle --continue: re-test a manually fixed failed finding."""
-    failed_vulns = [
-        v for v in scan_result.vulnerabilities
-        if v.update_status == UpdateStatus.FAILED
-    ]
-    failed_updates = [
-        u for u in scan_result.updates
-        if u.update_status == UpdateStatus.FAILED
-    ]
-    if not failed_vulns and not failed_updates:
-        _fatal("No failed findings to continue.")
-
-    branch = get_current_branch(proj_config.path)
-    finding = next(
-        (v for v in failed_vulns if branch == f"fix/{branch_slug(v.pkg_name)}"),
-        None,
-    ) or next(
-        (u for u in failed_updates
-         if branch == f"bump/{branch_slug(u.pkg_name)}"),
-        None,
-    )
-    if finding is None:
-        _fatal(
-            f"Current branch '{branch}' does not match any failed finding."
-        )
-
-    console.print(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
-    passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
-
-    if not passed:
-        console.print(
-            f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed"
-        )
-        sys.exit(ExitCode.UPDATE_FAILED)
-
-    finding.update_status = UpdateStatus.COMPLETED
-    save_scan_results(project, results_dir, scan_result)
-    console.print(f"  [bold green]PASS[/] {finding.pkg_name}")
-
-    remaining = [
-        f for f in [*scan_result.vulnerabilities, *scan_result.updates]
-        if f.update_status == UpdateStatus.FAILED
-    ]
-    if remaining:
-        pkg_names = [f.pkg_name for f in remaining]
-        console.print(f"\n  [dim]Still failed: {', '.join(pkg_names)}[/]")
-        sys.exit(ExitCode.UPDATE_FAILED)
-
-    ok, output = submit_stack(proj_config.path)
-    if ok:
-        console.print("  [bold green]Stack submitted.[/]")
-    else:
-        console.print("  [bold red]Submit failed.[/]")
-    if output:
-        console.print(f"  [dim]{output}[/]")
-    sys.exit(ExitCode.OK)
 
 
 @app.command
@@ -570,5 +330,248 @@ def list_projects() -> None:
     console.print(table)
 
 
-def main() -> None:
-    app()
+# -- Helpers ------------------------------------------------------------------
+
+
+def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
+    console.print(f"[bold red]Error:[/] {msg}")
+    sys.exit(code)
+
+
+def _scan_exit_code(has_vulns: bool, has_updates: bool) -> ExitCode:
+    match (has_vulns, has_updates):
+        case (True, _):
+            return ExitCode.VULNS_FOUND
+        case (_, True):
+            return ExitCode.UPDATES_FOUND
+        case _:
+            return ExitCode.OK
+
+
+def _pluralise(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
+def _scan_one(
+    name: str, proj_config: ProjectConfig, min_age_days: int
+) -> ScanResult:
+    """Scan a single project with timing output."""
+    t0 = time.monotonic()
+    result = scan_project(name, proj_config, min_age_days)
+    elapsed = time.monotonic() - t0
+    _print_scan_result(result, elapsed_s=elapsed)
+    return result
+
+
+def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
+    """Print a Rich-formatted summary of scan results for one project."""
+    actionable = [v for v in result.vulnerabilities if v.actionable]
+    advisories = [v for v in result.vulnerabilities if not v.actionable]
+    secrets = result.secrets
+    updates = result.updates
+
+    total = len(actionable) + len(advisories) + len(secrets) + len(updates)
+    timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
+
+    if total == 0:
+        console.print(f"[bold green]{result.project}[/] — clean{timing}")
+        return
+
+    categories = [
+        (actionable, "vulnerability", "vulnerabilities"),
+        (advisories, "advisory", "advisories"),
+        (secrets, "secret", "secrets"),
+        (updates, "update", "updates"),
+    ]
+    parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
+
+    console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
+
+    if actionable:
+        table = Table(show_header=True, **_TABLE_STYLE)
+        table.add_column("", style="bold red", width=4)
+        table.add_column("Package")
+        table.add_column("Installed")
+        table.add_column("Fix")
+        table.add_column("Severity")
+        table.add_column("CVE")
+        for v in actionable:
+            table.add_row(
+                "VULN",
+                v.pkg_name,
+                v.installed_version,
+                v.fixed_version or "",
+                v.severity.value,
+                v.vuln_id,
+            )
+        console.print(table)
+
+    if advisories:
+        table = Table(show_header=False, **_TABLE_STYLE)
+        table.add_column("", style="bold yellow", width=4)
+        table.add_column("Package")
+        table.add_column("Installed")
+        table.add_column("Status")
+        table.add_column("Severity")
+        table.add_column("CVE")
+        for v in advisories:
+            table.add_row(
+                "ADV",
+                v.pkg_name,
+                v.installed_version,
+                v.status,
+                v.severity.value,
+                v.vuln_id,
+            )
+        console.print(table)
+
+    if secrets:
+        for s in secrets:
+            console.print(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
+
+    if updates:
+        table = Table(show_header=True, **_TABLE_STYLE)
+        table.add_column("", style="bold cyan", width=4)
+        table.add_column("Package")
+        table.add_column("Installed")
+        table.add_column("Latest")
+        table.add_column("Tier")
+        table.add_column("Age")
+        for u in updates:
+            age = ""
+            if u.published_date:
+                days = (datetime.now(timezone.utc) - u.published_date).days
+                age = f"({days} days old)"
+            table.add_row(
+                "UPDATE",
+                u.pkg_name,
+                u.installed_version,
+                u.latest_version,
+                u.semver_tier.value,
+                age,
+            )
+        console.print(table)
+
+
+def _print_numbered_findings(
+    vulns: list[VulnFinding], updates: list[UpdateFinding]
+) -> list[VulnFinding | UpdateFinding]:
+    """Print numbered list of findings. Returns ordered list of findings."""
+    numbered: list[VulnFinding | UpdateFinding] = []
+    for idx, v in enumerate(vulns, 1):
+        console.print(
+            f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {v.pkg_name} "
+            f"{v.installed_version} -> {v.fixed_version} ({v.vuln_id})"
+        )
+        numbered.append(v)
+    for idx, u in enumerate(updates, len(vulns) + 1):
+        console.print(
+            f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {u.pkg_name} "
+            f"{u.installed_version} -> {u.latest_version} "
+            f"({u.semver_tier.value})"
+        )
+        numbered.append(u)
+    return numbered
+
+
+def _parse_selection(
+    selection: str,
+    numbered: list[VulnFinding | UpdateFinding],
+    actionable_vulns: list[VulnFinding],
+    updates: list[UpdateFinding],
+) -> tuple[list[VulnFinding], list[UpdateFinding]] | None:
+    """Parse user selection string into vuln and update lists.
+
+    Returns None if the selection string is invalid.
+    """
+    match selection:
+        case "none":
+            return [], []
+        case "all":
+            return actionable_vulns, updates
+        case "vulns":
+            return actionable_vulns, []
+        case "updates":
+            return [], updates
+
+    selected_vulns: list[VulnFinding] = []
+    selected_updates: list[UpdateFinding] = []
+    try:
+        indices = [int(s.strip()) for s in selection.split(",")]
+    except ValueError:
+        return None
+
+    for i in indices:
+        if 1 <= i <= len(numbered):
+            finding = numbered[i - 1]
+            match finding:
+                case VulnFinding():
+                    selected_vulns.append(finding)
+                case UpdateFinding():
+                    selected_updates.append(finding)
+
+    return selected_vulns, selected_updates
+
+
+def _handle_continue(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+) -> NoReturn:
+    """Handle --continue: re-test a manually fixed failed finding."""
+    failed_vulns = [
+        v for v in scan_result.vulnerabilities
+        if v.update_status == UpdateStatus.FAILED
+    ]
+    failed_updates = [
+        u for u in scan_result.updates
+        if u.update_status == UpdateStatus.FAILED
+    ]
+    if not failed_vulns and not failed_updates:
+        _fatal("No failed findings to continue.")
+
+    branch = get_current_branch(proj_config.path)
+    finding = next(
+        (v for v in failed_vulns if branch == f"fix/{branch_slug(v.pkg_name)}"),
+        None,
+    ) or next(
+        (u for u in failed_updates
+         if branch == f"bump/{branch_slug(u.pkg_name)}"),
+        None,
+    )
+    if finding is None:
+        _fatal(
+            f"Current branch '{branch}' does not match any failed finding."
+        )
+
+    console.print(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
+    passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
+
+    if not passed:
+        console.print(
+            f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed"
+        )
+        sys.exit(ExitCode.UPDATE_FAILED)
+
+    finding.update_status = UpdateStatus.COMPLETED
+    save_scan_results(project, results_dir, scan_result)
+    console.print(f"  [bold green]PASS[/] {finding.pkg_name}")
+
+    remaining = [
+        f for f in [*scan_result.vulnerabilities, *scan_result.updates]
+        if f.update_status == UpdateStatus.FAILED
+    ]
+    if remaining:
+        pkg_names = [f.pkg_name for f in remaining]
+        console.print(f"\n  [dim]Still failed: {', '.join(pkg_names)}[/]")
+        sys.exit(ExitCode.UPDATE_FAILED)
+
+    ok, output = submit_stack(proj_config.path)
+    if ok:
+        console.print("  [bold green]Stack submitted.[/]")
+    else:
+        console.print("  [bold red]Submit failed.[/]")
+    if output:
+        console.print(f"  [dim]{output}[/]")
+    sys.exit(ExitCode.OK)

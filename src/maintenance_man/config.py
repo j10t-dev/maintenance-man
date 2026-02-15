@@ -15,26 +15,6 @@ class ProjectNotFoundError(Exception):
 
 MM_HOME: Path = Path.home() / ".mm"
 
-_SKELETON_CONFIG = """\
-[defaults]
-min_version_age_days = 7
-
-# [projects.my-project]
-# path = "/home/user/dev/my-project"
-# package_manager = "bun"        # bun | uv | mvn
-"""
-
-
-def ensure_mm_home() -> None:
-    """Create ~/.mm/ directory structure and skeleton config if missing."""
-    MM_HOME.mkdir(parents=True, exist_ok=True)
-    (MM_HOME / "scan-results").mkdir(exist_ok=True)
-    (MM_HOME / "worktrees").mkdir(exist_ok=True)
-
-    config_path = MM_HOME / "config.toml"
-    if not config_path.exists():
-        config_path.write_text(_SKELETON_CONFIG)
-
 
 def load_config() -> MmConfig:
     """Load and validate config from ~/.mm/config.toml."""
@@ -74,3 +54,24 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
         )
 
     return project
+
+
+def ensure_mm_home() -> None:
+    """Create ~/.mm/ directory structure and skeleton config if missing."""
+    MM_HOME.mkdir(parents=True, exist_ok=True)
+    (MM_HOME / "scan-results").mkdir(exist_ok=True)
+    (MM_HOME / "worktrees").mkdir(exist_ok=True)
+
+    config_path = MM_HOME / "config.toml"
+    if not config_path.exists():
+        config_path.write_text(_SKELETON_CONFIG)
+
+
+_SKELETON_CONFIG = """\
+[defaults]
+min_version_age_days = 7
+
+# [projects.my-project]
+# path = "/home/user/dev/my-project"
+# package_manager = "bun"        # bun | uv | mvn
+"""
