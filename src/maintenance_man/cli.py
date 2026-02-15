@@ -19,7 +19,7 @@ from maintenance_man.config import (
     load_config,
     resolve_project,
 )
-from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
     UpdateFinding,
@@ -61,6 +61,7 @@ class ExitCode(IntEnum):
     VULNS_FOUND = 2
     UPDATES_FOUND = 3
     UPDATE_FAILED = 4
+    TEST_FAILED = 5
 
 
 console = Console()
@@ -94,10 +95,7 @@ def scan(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    try:
-        cfg = load_config(config_path=config)
-    except ConfigError as e:
-        _fatal(str(e))
+    cfg = _load_cfg(config)
 
     try:
         check_trivy_available()
@@ -109,10 +107,7 @@ def scan(
         return
 
     if project:
-        try:
-            proj_config = resolve_project(cfg, project)
-        except ProjectNotFoundError as e:
-            _fatal(str(e))
+        proj_config = _resolve_proj(cfg, project)
         try:
             result = _scan_one(project, proj_config, cfg.defaults.min_version_age_days)
         except TrivyScanError as e:
@@ -160,15 +155,8 @@ def update(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    try:
-        cfg = load_config(config_path=config)
-    except ConfigError as e:
-        _fatal(str(e))
-
-    try:
-        proj_config = resolve_project(cfg, project)
-    except ProjectNotFoundError as e:
-        _fatal(str(e))
+    cfg = _load_cfg(config)
+    proj_config = _resolve_proj(cfg, project)
 
     try:
         check_graphite_available()
@@ -194,11 +182,7 @@ def update(
     except NoScanResultsError as e:
         _fatal(str(e))
 
-    if proj_config.test is None:
-        _fatal(
-            f"No test configuration for [bold]{project}[/]. "
-            f"Add a [projects.{project}.test] section to ~/.mm/config.toml."
-        )
+    _require_test_config(project, proj_config)
 
     if continue_:
         _handle_continue(project, proj_config, scan_result, results_dir)
@@ -304,6 +288,40 @@ def deploy(
     sys.exit(ExitCode.ERROR)
 
 
+@app.command
+def test(
+    project: str,
+    *,
+    config: Path | None = None,
+) -> None:
+    """Run a project's test suite.
+
+    Runs configured test phases (unit → integration → component) in order,
+    stopping on first failure.
+
+    Parameters
+    ----------
+    project: str
+        Project name to test.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
+    """
+    cfg = _load_cfg(config)
+    proj_config = _resolve_proj(cfg, project)
+    _require_test_config(project, proj_config)
+
+    console.print(f"[bold]Testing {project}[/]\n")
+
+    passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
+
+    if passed:
+        console.print("\n[bold green]All test phases passed.[/]")
+        sys.exit(ExitCode.OK)
+    else:
+        console.print(f"\n[bold red]Failed:[/] {failed_phase} tests")
+        sys.exit(ExitCode.TEST_FAILED)
+
+
 _NO_DATA = "[dim]—[/]"
 
 
@@ -322,10 +340,7 @@ def list_projects(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    try:
-        cfg = load_config(config_path=config)
-    except ConfigError as e:
-        _fatal(str(e))
+    cfg = _load_cfg(config)
 
     if not cfg.projects:
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
@@ -387,6 +402,28 @@ def list_projects(
 def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
     console.print(f"[bold red]Error:[/] {msg}")
     sys.exit(code)
+
+
+def _load_cfg(config: Path | None) -> MmConfig:
+    try:
+        return load_config(config_path=config)
+    except ConfigError as e:
+        _fatal(str(e))
+
+
+def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
+    try:
+        return resolve_project(cfg, project)
+    except ProjectNotFoundError as e:
+        _fatal(str(e))
+
+
+def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
+    if proj_config.test is None:
+        _fatal(
+            f"No test configuration for [bold]{project}[/]. "
+            f"Add a [projects.{project}.test] section to ~/.mm/config.toml."
+        )
 
 
 def _scan_exit_code(has_vulns: bool, has_updates: bool) -> ExitCode:

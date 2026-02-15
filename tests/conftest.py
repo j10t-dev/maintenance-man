@@ -47,6 +47,10 @@ package_manager = "bun"
 
 [projects.outdated.test]
 unit = "bun test"
+
+[projects.no-tests]
+path = "{clean_path}"
+package_manager = "uv"
 """
     (mm_home / "config.toml").write_text(config_text)
     return mm_home
