@@ -80,6 +80,8 @@ def main() -> None:
 @app.command
 def scan(
     project: str | None = None,
+    *,
+    config: Path | None = None,
 ) -> None:
     """Scan projects for vulnerabilities and available updates.
 
@@ -87,9 +89,11 @@ def scan(
     ----------
     project: str | None
         Project name to scan. Scans all if omitted.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     try:
-        config = load_config()
+        cfg = load_config(config_path=config)
     except ConfigError as e:
         _fatal(str(e))
 
@@ -98,21 +102,17 @@ def scan(
     except TrivyNotFoundError as e:
         _fatal(str(e))
 
-    if not config.projects:
-        console.print(
-            "No projects configured. Edit ~/.mm/config.toml to add projects."
-        )
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
     if project:
         try:
-            proj_config = resolve_project(config, project)
+            proj_config = resolve_project(cfg, project)
         except ProjectNotFoundError as e:
             _fatal(str(e))
         try:
-            result = _scan_one(
-                project, proj_config, config.defaults.min_version_age_days
-            )
+            result = _scan_one(project, proj_config, cfg.defaults.min_version_age_days)
         except TrivyScanError as e:
             _fatal(str(e))
 
@@ -121,7 +121,7 @@ def scan(
     # Scan all projects
     has_vulns = False
     has_updates = False
-    for name, proj_config in config.projects.items():
+    for name, proj_config in cfg.projects.items():
         if not proj_config.path.exists():
             console.print(
                 f"[bold yellow]Warning:[/] {name} — "
@@ -129,9 +129,7 @@ def scan(
             )
             continue
         try:
-            result = _scan_one(
-                name, proj_config, config.defaults.min_version_age_days
-            )
+            result = _scan_one(name, proj_config, cfg.defaults.min_version_age_days)
         except TrivyScanError as e:
             console.print(f"[bold red]Error:[/] {name} — {e}")
             continue
@@ -147,6 +145,7 @@ def update(
     project: str,
     *,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
+    config: Path | None = None,
 ) -> None:
     """Apply updates from scan results to a project.
 
@@ -156,14 +155,16 @@ def update(
         Project name to update.
     continue_: bool
         Re-test a manually fixed failed finding on the current branch.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     try:
-        config = load_config()
+        cfg = load_config(config_path=config)
     except ConfigError as e:
         _fatal(str(e))
 
     try:
-        proj_config = resolve_project(config, project)
+        proj_config = resolve_project(cfg, project)
     except ProjectNotFoundError as e:
         _fatal(str(e))
 
@@ -177,17 +178,13 @@ def update(
             check_repo_clean(proj_config.path)
         except RepoDirtyError as e:
             console.print(f"[bold yellow]Warning:[/] {e}")
-            if Confirm.ask(
-                "  Discard changes and reset to main?", default=False
-            ):
+            if Confirm.ask("  Discard changes and reset to main?", default=False):
                 reset_to_main(proj_config.path)
             else:
                 sys.exit(ExitCode.ERROR)
 
         if not sync_graphite(proj_config.path):
-            _fatal(
-                "Failed to sync trunk. Check network and gt auth."
-            )
+            _fatal("Failed to sync trunk. Check network and gt auth.")
 
     results_dir = _config.MM_HOME / "scan-results"
     try:
@@ -231,14 +228,15 @@ def update(
             default="all",
         )
         result = _parse_selection(
-            selection, numbered, actionable_vulns, updates,
+            selection,
+            numbered,
+            actionable_vulns,
+            updates,
         )
         if result is not None:
             selected_vulns, selected_updates = result
             break
-        console.print(
-            f"[bold red]Invalid selection:[/] '{selection}'. Try again."
-        )
+        console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
 
     if not selected_vulns and not selected_updates:
         sys.exit(ExitCode.OK)
@@ -246,24 +244,24 @@ def update(
     # Process vulns (independent branches)
     vuln_results = []
     if selected_vulns:
-        console.print(
-            f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]"
-        )
+        console.print(f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]")
         vuln_results = process_vulns(
-            selected_vulns, proj_config,
-            scan_result=scan_result, project_name=project,
+            selected_vulns,
+            proj_config,
+            scan_result=scan_result,
+            project_name=project,
             results_dir=results_dir,
         )
 
     # Process updates (stacked, risk-ascending)
     update_results = []
     if selected_updates:
-        console.print(
-            f"\n[bold]Processing {len(selected_updates)} update(s)...[/]"
-        )
+        console.print(f"\n[bold]Processing {len(selected_updates)} update(s)...[/]")
         update_results = process_updates(
-            selected_updates, proj_config,
-            scan_result=scan_result, project_name=project,
+            selected_updates,
+            proj_config,
+            scan_result=scan_result,
+            project_name=project,
             results_dir=results_dir,
         )
 
@@ -282,9 +280,7 @@ def update(
             "gt-create": "branch creation failed",
         }
         for r in failed:
-            label = phase_labels.get(
-                r.failed_phase, r.failed_phase or "unknown"
-            )
+            label = phase_labels.get(r.failed_phase, r.failed_phase or "unknown")
             console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
     console.print("─" * 40)
 
@@ -307,17 +303,24 @@ def deploy(
 
 
 @app.command(name="list")
-def list_projects() -> None:
-    """List all configured projects."""
+def list_projects(
+    *,
+    config: Path | None = None,
+) -> None:
+    """List all configured projects.
+
+    Parameters
+    ----------
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
+    """
     try:
-        config = load_config()
+        cfg = load_config(config_path=config)
     except ConfigError as e:
         _fatal(str(e))
 
-    if not config.projects:
-        console.print(
-            "No projects configured. Edit ~/.mm/config.toml to add projects."
-        )
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
     table = Table(title="Configured Projects")
@@ -325,7 +328,7 @@ def list_projects() -> None:
     table.add_column("Path")
     table.add_column("Package Manager")
 
-    for name, project in sorted(config.projects.items()):
+    for name, project in sorted(cfg.projects.items()):
         table.add_row(name, str(project.path), project.package_manager)
 
     console.print(table)
@@ -353,16 +356,13 @@ def _pluralise(n: int, singular: str, plural: str) -> str:
     return f"{n} {singular if n == 1 else plural}"
 
 
-def _scan_one(
-    name: str, proj_config: ProjectConfig, min_age_days: int
-) -> ScanResult:
+def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
     """Scan a single project with timing output."""
     try:
         sync_graphite(proj_config.path)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         console.print(
-            f"[bold yellow]Warning:[/] {name} — "
-            f"failed to graphite sync: {exc}"
+            f"[bold yellow]Warning:[/] {name} — failed to graphite sync: {exc}"
         )
 
     t0 = time.monotonic()
@@ -530,12 +530,10 @@ def _handle_continue(
 ) -> NoReturn:
     """Handle --continue: re-test a manually fixed failed finding."""
     failed_vulns = [
-        v for v in scan_result.vulnerabilities
-        if v.update_status == UpdateStatus.FAILED
+        v for v in scan_result.vulnerabilities if v.update_status == UpdateStatus.FAILED
     ]
     failed_updates = [
-        u for u in scan_result.updates
-        if u.update_status == UpdateStatus.FAILED
+        u for u in scan_result.updates if u.update_status == UpdateStatus.FAILED
     ]
     if not failed_vulns and not failed_updates:
         _fatal("No failed findings to continue.")
@@ -545,22 +543,17 @@ def _handle_continue(
         (v for v in failed_vulns if branch == f"fix/{branch_slug(v.pkg_name)}"),
         None,
     ) or next(
-        (u for u in failed_updates
-         if branch == f"bump/{branch_slug(u.pkg_name)}"),
+        (u for u in failed_updates if branch == f"bump/{branch_slug(u.pkg_name)}"),
         None,
     )
     if finding is None:
-        _fatal(
-            f"Current branch '{branch}' does not match any failed finding."
-        )
+        _fatal(f"Current branch '{branch}' does not match any failed finding.")
 
     console.print(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
     passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
 
     if not passed:
-        console.print(
-            f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed"
-        )
+        console.print(f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed")
         sys.exit(ExitCode.UPDATE_FAILED)
 
     finding.update_status = UpdateStatus.COMPLETED
@@ -568,7 +561,8 @@ def _handle_continue(
     console.print(f"  [bold green]PASS[/] {finding.pkg_name}")
 
     remaining = [
-        f for f in [*scan_result.vulnerabilities, *scan_result.updates]
+        f
+        for f in [*scan_result.vulnerabilities, *scan_result.updates]
         if f.update_status == UpdateStatus.FAILED
     ]
     if remaining:

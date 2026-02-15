@@ -1,0 +1,15 @@
+[defaults]
+min_version_age_days = 0
+
+[projects.dirty-bun]
+path = "projects/dirty-bun"
+package_manager = "bun"
+
+[projects.dirty-uv]
+path = "projects/dirty-uv"
+package_manager = "uv"
+
+[projects.dirty-mvn]
+path = "projects/dirty-mvn"
+package_manager = "mvn"
+scan_secrets = false

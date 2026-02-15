@@ -168,6 +168,47 @@ class TestLoadConfig:
         with pytest.raises(ConfigError):
             load_config()
 
+    def test_loads_from_custom_path(self, tmp_path: Path):
+        """load_config(config_path=...) reads from the given file."""
+        config_file = tmp_path / "custom-config.toml"
+        config_file.write_text("[defaults]\nmin_version_age_days = 42\n")
+        config = load_config(config_path=config_file)
+        assert config.defaults.min_version_age_days == 42
+
+    def test_custom_path_does_not_create_mm_home(self, mm_home: Path):
+        """Using a custom config path should not create ~/.mm/."""
+        config_file = mm_home.parent / "custom-config.toml"
+        config_file.write_text("[defaults]\n")
+        load_config(config_path=config_file)
+        assert not mm_home.exists()
+
+    def test_custom_path_file_not_found(self, tmp_path: Path):
+        """Missing custom config file raises ConfigError."""
+        with pytest.raises(ConfigError):
+            load_config(config_path=tmp_path / "nonexistent.toml")
+
+    def test_resolves_relative_project_paths(self, tmp_path: Path):
+        """Relative project paths resolve against config file's parent dir."""
+        project_dir = tmp_path / "projects" / "myapp"
+        project_dir.mkdir(parents=True)
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[projects.myapp]\npath = "projects/myapp"\npackage_manager = "bun"\n'
+        )
+        config = load_config(config_path=config_file)
+        assert config.projects["myapp"].path == project_dir
+
+    def test_absolute_paths_unchanged(self, tmp_path: Path):
+        """Absolute project paths are not modified during resolution."""
+        project_dir = tmp_path / "myapp"
+        project_dir.mkdir()
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "bun"\n'
+        )
+        config = load_config(config_path=config_file)
+        assert config.projects["myapp"].path == project_dir
+
 
 class TestResolveProject:
     def test_resolves_existing_project(self, mm_home: Path):
