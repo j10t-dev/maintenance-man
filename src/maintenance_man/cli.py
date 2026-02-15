@@ -25,6 +25,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
+    sort_vulns_by_severity,
 )
 from maintenance_man.scanner import (
     TrivyNotFoundError,
@@ -34,6 +35,7 @@ from maintenance_man.scanner import (
 )
 from maintenance_man.updater import (
     NoScanResultsError,
+    _highest_fix_version,
     load_scan_results,
     process_updates,
     process_vulns,
@@ -434,8 +436,12 @@ def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanR
 
 def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
     """Print a Rich-formatted summary of scan results for one project."""
-    actionable = [v for v in result.vulnerabilities if v.actionable]
-    advisories = [v for v in result.vulnerabilities if not v.actionable]
+    actionable = sort_vulns_by_severity(
+        [v for v in result.vulnerabilities if v.actionable]
+    )
+    advisories = sort_vulns_by_severity(
+        [v for v in result.vulnerabilities if not v.actionable]
+    )
     secrets = result.secrets
     updates = result.updates
 
@@ -457,6 +463,16 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
     console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
 
     if actionable:
+        # Determine the winning fix version per package for the marker.
+        win_versions: dict[str, str] = {}
+        pkg_counts: dict[str, int] = {}
+        for v in actionable:
+            pkg_counts[v.pkg_name] = pkg_counts.get(v.pkg_name, 0) + 1
+        for pkg in pkg_counts:
+            if pkg_counts[pkg] > 1:
+                group = [v for v in actionable if v.pkg_name == pkg]
+                win_versions[pkg] = _highest_fix_version(group)
+
         table = Table(show_header=True, **_TABLE_STYLE)
         table.add_column("", style="bold red", width=4)
         table.add_column("Package")
@@ -465,11 +481,17 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
         table.add_column("Severity")
         table.add_column("CVE")
         for v in actionable:
+            fix_col = v.fixed_version or ""
+            if (
+                v.pkg_name in win_versions
+                and v.fixed_version == win_versions[v.pkg_name]
+            ):
+                fix_col += " ← fix"
             table.add_row(
                 "VULN",
                 v.pkg_name,
                 v.installed_version,
-                v.fixed_version or "",
+                fix_col,
                 v.severity.value,
                 v.vuln_id,
             )
@@ -526,6 +548,7 @@ def _print_numbered_findings(
     vulns: list[VulnFinding], updates: list[UpdateFinding]
 ) -> list[VulnFinding | UpdateFinding]:
     """Print numbered list of findings. Returns ordered list of findings."""
+    vulns = sort_vulns_by_severity(vulns)
     numbered: list[VulnFinding | UpdateFinding] = []
     for idx, v in enumerate(vulns, 1):
         console.print(

@@ -4,12 +4,13 @@ import pytest
 from pydantic import ValidationError
 
 from maintenance_man.models.scan import (
-    UpdateFinding,
     ScanResult,
     SecretFinding,
     SemverTier,
     Severity,
+    UpdateFinding,
     VulnFinding,
+    sort_vulns_by_severity,
 )
 
 
@@ -167,6 +168,45 @@ class TestUpdateFinding:
         assert len(reloaded.updates) == 1
         assert reloaded.updates[0].pkg_name == "react"
         assert reloaded.updates[0].semver_tier == SemverTier.MAJOR
+
+
+class TestSortVulnsBySeverity:
+    def _make_vuln(self, severity: Severity) -> VulnFinding:
+        return VulnFinding(
+            vuln_id=f"CVE-{severity.value}",
+            pkg_name="pkg",
+            installed_version="1.0.0",
+            fixed_version="1.0.1",
+            severity=severity,
+            title="t",
+            description="d",
+            status="fixed",
+        )
+
+    def test_sorts_critical_first(self):
+        vulns = [
+            self._make_vuln(Severity.LOW),
+            self._make_vuln(Severity.CRITICAL),
+            self._make_vuln(Severity.MEDIUM),
+            self._make_vuln(Severity.HIGH),
+            self._make_vuln(Severity.UNKNOWN),
+        ]
+        result = sort_vulns_by_severity(vulns)
+        assert [v.severity for v in result] == [
+            Severity.CRITICAL,
+            Severity.HIGH,
+            Severity.MEDIUM,
+            Severity.LOW,
+            Severity.UNKNOWN,
+        ]
+
+    def test_single_item(self):
+        result = sort_vulns_by_severity([self._make_vuln(Severity.HIGH)])
+        assert len(result) == 1
+        assert result[0].severity == Severity.HIGH
+
+    def test_empty_list(self):
+        assert sort_vulns_by_severity([]) == []
 
 
 class TestSemverTier:

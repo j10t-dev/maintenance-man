@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 import json
 import os
 import shlex
 import subprocess
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
+from packaging.version import InvalidVersion, Version
 from rich import print as rprint
 
 from maintenance_man import sanitise_project_name
@@ -98,6 +101,84 @@ _RISK_ORDER = {
 }
 
 
+def _highest_fix_version(vulns: list[VulnFinding]) -> str:
+    """Return the highest ``fixed_version`` from *vulns*.
+
+    Uses :class:`packaging.version.Version` for comparison.  Unparsable
+    version strings are ignored; if *none* can be parsed the last item
+    in the list is returned as a fallback.
+    """
+
+    def _sort_key(v: VulnFinding) -> Version:
+        try:
+            return Version(v.fixed_version or "0")
+        except InvalidVersion:
+            return Version("0")
+
+    best = max(vulns, key=_sort_key)
+    return best.fixed_version or vulns[-1].fixed_version or ""
+
+
+@dataclass
+class _ConsolidatedVuln:
+    """Proxy that groups several vulns for the same package into one finding.
+
+    Satisfies the :class:`Finding` protocol so it can be passed straight into
+    :func:`_process_stack`.  Writes to :attr:`update_status` are fanned out to
+    every original :class:`VulnFinding` so that serialisation (which works on
+    the originals) stays consistent.
+    """
+
+    pkg_name: str
+    installed_version: str
+    _target_version: str
+    _detail: str
+    _originals: list[VulnFinding] = field(repr=False)
+    _update_status: UpdateStatus | None = None
+
+    @property
+    def target_version(self) -> str:
+        return self._target_version
+
+    @property
+    def detail(self) -> str:
+        return self._detail
+
+    @property
+    def update_status(self) -> UpdateStatus | None:
+        return self._update_status
+
+    @update_status.setter
+    def update_status(self, value: UpdateStatus | None) -> None:
+        self._update_status = value
+        for orig in self._originals:
+            orig.update_status = value
+
+
+def _consolidate_vulns(
+    vulns: list[VulnFinding],
+) -> list[_ConsolidatedVuln]:
+    """Group actionable vulns by package and pick the highest fix version."""
+    by_pkg: dict[str, list[VulnFinding]] = {}
+    for v in vulns:
+        by_pkg.setdefault(v.pkg_name, []).append(v)
+
+    consolidated: list[_ConsolidatedVuln] = []
+    for pkg, group in by_pkg.items():
+        best_version = _highest_fix_version(group)
+        detail = ", ".join(v.vuln_id for v in group)
+        consolidated.append(
+            _ConsolidatedVuln(
+                pkg_name=pkg,
+                installed_version=group[0].installed_version,
+                _target_version=best_version,
+                _detail=detail,
+                _originals=group,
+            )
+        )
+    return consolidated
+
+
 def process_vulns(
     vulns: list[VulnFinding],
     project_config: ProjectConfig,
@@ -108,13 +189,14 @@ def process_vulns(
 ) -> list[UpdateResult]:
     """Process vuln fixes as a Graphite stack off main.
 
-    Each vuln gets its own stacked branch. Failures are removed from the
-    stack and processing continues.  The fix stack is submitted before
-    returning to main.
+    Vulns for the same package are consolidated so only one branch is
+    created per package (using the highest fix version).  The fix stack is
+    submitted before returning to main.
     """
     actionable = [v for v in vulns if v.actionable]
+    consolidated = _consolidate_vulns(actionable)
     return _process_stack(
-        actionable,
+        consolidated,
         project_config,
         _VULN_STACK,
         scan_result=scan_result,
