@@ -6,10 +6,10 @@ import pytest
 
 from maintenance_man.cli import app
 from maintenance_man.models.scan import (
-    UpdateFinding,
     ScanResult,
     SemverTier,
     Severity,
+    UpdateFinding,
     VulnFinding,
 )
 from maintenance_man.updater import UpdateResult
@@ -117,7 +117,7 @@ class TestUpdatePreChecks:
             "maintenance_man.cli.resolve_project",
             MagicMock(
                 return_value=ProjectConfig(
-                    path=Path("/tmp/x"), package_manager="bun", test=None
+                    path=Path("/tmp/x"), package_manager="bun"
                 )
             ),
         )

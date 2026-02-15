@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from maintenance_man.dependency_age import filter_by_age
-from maintenance_man.models.scan import UpdateFinding, SemverTier
+from maintenance_man.models.scan import SemverTier, UpdateFinding
 
 _PATCH_FETCH = "maintenance_man.dependency_age._fetch_json"
 _PATCH_SUBRUN = "maintenance_man.dependency_age.subprocess.run"

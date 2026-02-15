@@ -1,7 +1,7 @@
 import pytest
 
-from maintenance_man.cli import app
 from maintenance_man import __version__
+from maintenance_man.cli import app
 
 
 class TestHelp:

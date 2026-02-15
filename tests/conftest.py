@@ -30,23 +30,17 @@ min_version_age_days = 7
 [projects.vulnerable]
 path = "{vuln_path}"
 package_manager = "uv"
-
-[projects.vulnerable.test]
-unit = "uv run pytest"
+test_unit = "uv run pytest"
 
 [projects.clean]
 path = "{clean_path}"
 package_manager = "uv"
-
-[projects.clean.test]
-unit = "uv run pytest"
+test_unit = "uv run pytest"
 
 [projects.outdated]
 path = "{clean_path}"
 package_manager = "bun"
-
-[projects.outdated.test]
-unit = "bun test"
+test_unit = "bun test"
 
 [projects.no-tests]
 path = "{clean_path}"
