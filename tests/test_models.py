@@ -1,7 +1,7 @@
 from maintenance_man.models.scan import (
-    UpdateFinding,
     SemverTier,
     Severity,
+    UpdateFinding,
     UpdateStatus,
     VulnFinding,
 )

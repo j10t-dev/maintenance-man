@@ -5,14 +5,15 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from maintenance_man import config as _config, sanitise_project_name
+from maintenance_man import config as _config
+from maintenance_man import sanitise_project_name
 from maintenance_man.dependency_age import filter_by_age
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
-    UpdateFinding,
     ScanResult,
     SecretFinding,
     Severity,
+    UpdateFinding,
     VulnFinding,
 )
 from maintenance_man.outdated import get_outdated

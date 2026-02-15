@@ -6,7 +6,7 @@ from pathlib import Path
 from packaging.version import InvalidVersion, Version
 
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import UpdateFinding, SemverTier
+from maintenance_man.models.scan import SemverTier, UpdateFinding
 
 
 class OutdatedCheckError(Exception):

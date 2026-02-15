@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import UpdateFinding, ScanResult, SemverTier, Severity
+from maintenance_man.models.scan import ScanResult, SemverTier, Severity, UpdateFinding
 from maintenance_man.scanner import (
     TrivyNotFoundError,
     check_trivy_available,

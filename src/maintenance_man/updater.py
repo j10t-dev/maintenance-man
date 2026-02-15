@@ -13,7 +13,7 @@ from packaging.version import InvalidVersion, Version
 from rich import print as rprint
 
 from maintenance_man import sanitise_project_name
-from maintenance_man.models.config import PhaseTestConfig, ProjectConfig
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,
@@ -35,8 +35,17 @@ class NoScanResultsError(Exception):
     pass
 
 
-class NoPhaseTestConfigError(Exception):
+class NoTestConfigError(Exception):
     pass
+
+
+def _has_test_config(project_config: ProjectConfig) -> bool:
+    """Return True if any test phase is configured."""
+    return any([
+        project_config.test_unit,
+        project_config.test_integration,
+        project_config.test_component,
+    ])
 
 
 type UpdateKind = Literal["vuln", "update"]
@@ -274,7 +283,7 @@ def get_update_command(package_manager: str, pkg_name: str, version: str) -> lis
 
 # TODO: extract as part of test command feature
 def run_test_phases(
-    test_config: PhaseTestConfig, project_path: Path
+    project_config: ProjectConfig, project_path: Path
 ) -> tuple[bool, str | None]:
     """Run configured test phases sequentially. Returns (passed, failed_phase).
 
@@ -282,9 +291,9 @@ def run_test_phases(
     """
     env = _project_env()
     phases = [
-        ("unit", test_config.unit),
-        ("integration", test_config.integration),
-        ("component", test_config.component),
+        ("unit", project_config.test_unit),
+        ("integration", project_config.test_integration),
+        ("component", project_config.test_component),
     ]
     for phase_name, command in phases:
         if command is None:
@@ -317,14 +326,13 @@ def _process_stack(
     the stack and processing continues. The stack is submitted before
     returning to main.
     """
-    if project_config.test is None:
-        raise NoPhaseTestConfigError(
+    if not _has_test_config(project_config):
+        raise NoTestConfigError(
             f"No test configuration for project at {project_config.path}"
         )
 
     results: list[UpdateResult] = []
     project_path = Path(project_config.path)
-    test_config = project_config.test
 
     for f in findings:
         rprint(
@@ -376,7 +384,7 @@ def _process_stack(
             )
             continue
 
-        passed, failed_phase = run_test_phases(test_config, project_path)
+        passed, failed_phase = run_test_phases(project_config, project_path)
         if passed:
             rprint(f"  [bold green]PASS[/] {f.pkg_name}")
             f.update_status = UpdateStatus.COMPLETED

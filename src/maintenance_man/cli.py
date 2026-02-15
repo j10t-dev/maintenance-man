@@ -35,6 +35,7 @@ from maintenance_man.scanner import (
 )
 from maintenance_man.updater import (
     NoScanResultsError,
+    _has_test_config,
     _highest_fix_version,
     load_scan_results,
     process_updates,
@@ -312,7 +313,7 @@ def test(
 
     console.print(f"[bold]Testing {project}[/]\n")
 
-    passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
+    passed, failed_phase = run_test_phases(proj_config, proj_config.path)
 
     if passed:
         console.print("\n[bold green]All test phases passed.[/]")
@@ -419,10 +420,10 @@ def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
 
 
 def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
-    if proj_config.test is None:
+    if not _has_test_config(proj_config):
         _fatal(
             f"No test configuration for [bold]{project}[/]. "
-            f"Add a [projects.{project}.test] section to ~/.mm/config.toml."
+            f"Add test_unit to [projects.{project}] in ~/.mm/config.toml."
         )
 
 
@@ -670,7 +671,7 @@ def _handle_continue(
         _fatal(f"Current branch '{branch}' does not match any failed finding.")
 
     console.print(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
-    passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
+    passed, failed_phase = run_test_phases(proj_config, proj_config.path)
 
     if not passed:
         console.print(f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed")

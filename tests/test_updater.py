@@ -5,7 +5,7 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
-from maintenance_man.models.config import PhaseTestConfig, ProjectConfig
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,
@@ -68,7 +68,7 @@ def project_config(tmp_path: Path) -> ProjectConfig:
     return ProjectConfig(
         path=tmp_path,
         package_manager="bun",
-        test=PhaseTestConfig(unit="bun test"),
+        test_unit="bun test",
     )
 
 
@@ -205,9 +205,11 @@ class TestRunTestPhases:
             )
         )
         monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
-        tc = PhaseTestConfig(
-            unit="bun test",
-            integration="bun run test:integration",
+        tc = ProjectConfig(
+            path=tmp_path,
+            package_manager="bun",
+            test_unit="bun test",
+            test_integration="bun run test:integration",
         )
         passed, failed_phase = run_test_phases(tc, tmp_path)
         assert passed is True
@@ -221,7 +223,7 @@ class TestRunTestPhases:
             )
         )
         monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
-        tc = PhaseTestConfig(unit="bun test")
+        tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
         passed, failed_phase = run_test_phases(tc, tmp_path)
         assert passed is False
         assert failed_phase == "unit"
@@ -240,7 +242,12 @@ class TestRunTestPhases:
 
         mock_run = MagicMock(side_effect=side_effect)
         monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
-        tc = PhaseTestConfig(unit="bun test", integration="bun run test:integration")
+        tc = ProjectConfig(
+            path=tmp_path,
+            package_manager="bun",
+            test_unit="bun test",
+            test_integration="bun run test:integration",
+        )
         passed, failed_phase = run_test_phases(tc, tmp_path)
         assert passed is False
         assert failed_phase == "integration"
@@ -254,7 +261,9 @@ class TestRunTestPhases:
             )
         )
         monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
-        tc = PhaseTestConfig(unit="bun test")  # no integration or component
+        tc = ProjectConfig(
+            path=tmp_path, package_manager="bun", test_unit="bun test"
+        )  # no integration or component
         passed, _ = run_test_phases(tc, tmp_path)
         assert passed is True
         assert mock_run.call_count == 1  # only unit
