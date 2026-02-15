@@ -171,12 +171,17 @@ class TestUpdateFinding:
 
 
 class TestSortVulnsBySeverity:
-    def _make_vuln(self, severity: Severity) -> VulnFinding:
+    def _make_vuln(
+        self,
+        severity: Severity,
+        fixed_version: str = "1.0.1",
+        vuln_id: str | None = None,
+    ) -> VulnFinding:
         return VulnFinding(
-            vuln_id=f"CVE-{severity.value}",
+            vuln_id=vuln_id or f"CVE-{severity.value}",
             pkg_name="pkg",
             installed_version="1.0.0",
-            fixed_version="1.0.1",
+            fixed_version=fixed_version,
             severity=severity,
             title="t",
             description="d",
@@ -200,6 +205,19 @@ class TestSortVulnsBySeverity:
             Severity.UNKNOWN,
         ]
 
+    def test_subsorts_by_fix_version_descending(self):
+        vulns = [
+            self._make_vuln(Severity.HIGH, "2.31.0", vuln_id="CVE-LOW"),
+            self._make_vuln(Severity.HIGH, "2.32.4", vuln_id="CVE-HIGH"),
+            self._make_vuln(Severity.HIGH, "2.32.0", vuln_id="CVE-MID"),
+        ]
+        result = sort_vulns_by_severity(vulns)
+        assert [v.vuln_id for v in result] == [
+            "CVE-HIGH",
+            "CVE-MID",
+            "CVE-LOW",
+        ]
+
     def test_single_item(self):
         result = sort_vulns_by_severity([self._make_vuln(Severity.HIGH)])
         assert len(result) == 1
@@ -207,6 +225,25 @@ class TestSortVulnsBySeverity:
 
     def test_empty_list(self):
         assert sort_vulns_by_severity([]) == []
+
+    def test_groups_by_package_then_severity(self):
+        """Vulns for the same package stay together, groups ordered by worst severity."""
+        vulns = [
+            self._make_vuln(Severity.HIGH, vuln_id="flask-high"),
+            self._make_vuln(Severity.CRITICAL, vuln_id="requests-crit"),
+            self._make_vuln(Severity.MEDIUM, vuln_id="requests-med"),
+        ]
+        # Patch pkg_name directly — _make_vuln always uses "pkg".
+        vulns[0] = vulns[0].model_copy(update={"pkg_name": "flask"})
+        vulns[1] = vulns[1].model_copy(update={"pkg_name": "requests"})
+        vulns[2] = vulns[2].model_copy(update={"pkg_name": "requests"})
+
+        result = sort_vulns_by_severity(vulns)
+        assert [v.vuln_id for v in result] == [
+            "requests-crit",
+            "requests-med",
+            "flask-high",
+        ]
 
 
 class TestSemverTier:
