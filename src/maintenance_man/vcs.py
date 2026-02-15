@@ -70,9 +70,7 @@ def gt_create(message: str, branch_name: str, project_path: Path) -> bool:
                 return False
             return True
         case _:
-            rprint(
-                f"  [bold red]FAIL[/] gt create failed: {first.stderr.strip()}"
-            )
+            rprint(f"  [bold red]FAIL[/] gt create failed: {first.stderr.strip()}")
             return False
 
 
@@ -165,10 +163,15 @@ def _gh_list_pr_branches(
     """Return branch names for PRs in the given state matching any prefix."""
     completed = _run(
         [
-            "gh", "pr", "list",
-            "--state", state,
-            "--json", "headRefName",
-            "--jq", ".[].headRefName",
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            state,
+            "--json",
+            "headRefName",
+            "--jq",
+            ".[].headRefName",
         ],
         project_path,
     )

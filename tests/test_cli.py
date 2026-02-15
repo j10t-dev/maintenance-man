@@ -30,7 +30,6 @@ class TestVersion:
         assert __version__ in capsys.readouterr().out
 
 
-
 class TestDeployStub:
     def test_deploy_requires_project(self):
         with pytest.raises(SystemExit) as exc_info:

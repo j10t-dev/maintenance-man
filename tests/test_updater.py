@@ -107,15 +107,11 @@ def mock_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
 
 
 class TestSaveScanResults:
-    def test_writes_json_to_disk(
-        self, scan_results_dir: Path, scan_result: ScanResult
-    ):
+    def test_writes_json_to_disk(self, scan_results_dir: Path, scan_result: ScanResult):
         save_scan_results("myapp", scan_results_dir, scan_result)
         import json
 
-        data = json.loads(
-            (scan_results_dir / "myapp.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
         assert data["project"] == "myapp"
 
     def test_preserves_update_status(self, scan_results_dir: Path):
@@ -136,9 +132,7 @@ class TestSaveScanResults:
         save_scan_results("myapp", scan_results_dir, result)
         import json
 
-        data = json.loads(
-            (scan_results_dir / "myapp.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
         assert data["updates"][0]["update_status"] == "completed"
 
 
@@ -463,9 +457,7 @@ class TestStatusTracking:
             project_name="myapp",
             results_dir=Path("/tmp/fake"),
         )
-        assert (
-            scan_result.vulnerabilities[0].update_status == UpdateStatus.COMPLETED
-        )
+        assert scan_result.vulnerabilities[0].update_status == UpdateStatus.COMPLETED
         mock_save.assert_called()
 
     def test_update_fail_sets_failed(
@@ -504,9 +496,7 @@ class TestStatusTracking:
 
         def capture_status(*args, **kwargs):
             # Capture update statuses at the time tests run
-            statuses_during_test.extend(
-                [u.update_status for u in scan_result.updates]
-            )
+            statuses_during_test.extend([u.update_status for u in scan_result.updates])
             return (True, None)
 
         mock_vcs["run_test_phases"].side_effect = capture_status

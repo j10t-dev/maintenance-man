@@ -20,6 +20,7 @@ def _bun_info_result(published_iso: str) -> subprocess.CompletedProcess[str]:
         stderr="",
     )
 
+
 _FROZEN_NOW = datetime(2026, 1, 30, tzinfo=timezone.utc)
 
 

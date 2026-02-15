@@ -164,9 +164,7 @@ def save_scan_results(
 ) -> None:
     """Write scan results (with update statuses) back to disk."""
     results_file = _results_path(project_name, results_dir)
-    results_file.write_text(
-        scan_result.model_dump_json(indent=2), encoding="utf-8"
-    )
+    results_file.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
 
 
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
@@ -174,9 +172,7 @@ def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
     return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
 
 
-def get_update_command(
-    package_manager: str, pkg_name: str, version: str
-) -> list[str]:
+def get_update_command(package_manager: str, pkg_name: str, version: str) -> list[str]:
     """Return the shell command to update a package to a specific version."""
     match package_manager:
         case "bun":
@@ -271,17 +267,31 @@ def _process_stack(
             f.target_version,
             project_path,
         ):
-            results.append(_record_failure(
-                f, cfg.kind, "apply", project_path,
-                scan_result, project_name, results_dir,
-            ))
+            results.append(
+                _record_failure(
+                    f,
+                    cfg.kind,
+                    "apply",
+                    project_path,
+                    scan_result,
+                    project_name,
+                    results_dir,
+                )
+            )
             continue
 
         if not gt_create(msg, branch, project_path):
-            results.append(_record_failure(
-                f, cfg.kind, "gt-create", project_path,
-                scan_result, project_name, results_dir,
-            ))
+            results.append(
+                _record_failure(
+                    f,
+                    cfg.kind,
+                    "gt-create",
+                    project_path,
+                    scan_result,
+                    project_name,
+                    results_dir,
+                )
+            )
             continue
 
         passed, failed_phase = run_test_phases(test_config, project_path)

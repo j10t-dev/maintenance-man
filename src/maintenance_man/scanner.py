@@ -93,14 +93,16 @@ def _check_outdated(
         return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
     except Exception:
         logging.getLogger(__name__).warning(
-            "Outdated check failed for %s — skipping update results", name,
+            "Outdated check failed for %s — skipping update results",
+            name,
             exc_info=True,
         )
         return []
 
 
 def _run_trivy_scan(
-    project_path: Path, scan_secrets: bool,
+    project_path: Path,
+    scan_secrets: bool,
 ) -> tuple[list[VulnFinding], list[SecretFinding]]:
     """Run Trivy against *project_path* and return parsed vulnerability and secret findings."""
     scanners = "vuln,secret" if scan_secrets else "vuln"
