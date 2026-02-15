@@ -302,15 +302,21 @@ def deploy(
     sys.exit(ExitCode.ERROR)
 
 
+_NO_DATA = "[dim]—[/]"
+
+
 @app.command(name="list")
 def list_projects(
     *,
+    detail: Annotated[bool, cyclopts.Parameter(name=("--detail", "-d"))] = False,
     config: Path | None = None,
 ) -> None:
-    """List all configured projects.
+    """List all configured projects with scan findings summary.
 
     Parameters
     ----------
+    detail: bool
+        Show full findings detail for each project.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
@@ -323,15 +329,54 @@ def list_projects(
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
+    results_dir = _config.MM_HOME / "scan-results"
+    scan_results: dict[str, ScanResult] = {}
+    for name in cfg.projects:
+        try:
+            scan_results[name] = load_scan_results(name, results_dir)
+        except NoScanResultsError:
+            pass
+        except Exception:
+            console.print(
+                f"[yellow]Warning:[/] corrupt scan results for '{name}' — skipping"
+            )
+
     table = Table(title="Configured Projects")
-    table.add_column("Name", style="bold")
-    table.add_column("Path")
-    table.add_column("Package Manager")
+    for col, kw in [
+        ("Name", {"style": "bold"}),
+        ("Path", {}),
+        ("Pkg Mgr", {}),
+        ("Vulns", {"justify": "right"}),
+        ("Updates", {"justify": "right"}),
+        ("Secrets", {"justify": "right"}),
+        ("Scanned", {}),
+    ]:
+        table.add_column(col, **kw)
 
     for name, project in sorted(cfg.projects.items()):
-        table.add_row(name, str(project.path), project.package_manager)
+        sr = scan_results.get(name)
+        if sr:
+            counts = (
+                str(sum(v.actionable for v in sr.vulnerabilities)),
+                str(len(sr.updates)),
+                str(len(sr.secrets)),
+                _relative_time(sr.scanned_at),
+            )
+        else:
+            counts = (_NO_DATA, _NO_DATA, _NO_DATA, "[dim]never[/]")
+
+        table.add_row(
+            name,
+            str(project.path),
+            project.package_manager,
+            *counts,
+        )
 
     console.print(table)
+
+    if detail:
+        for name in sorted(scan_results):
+            _print_scan_result(scan_results[name])
 
 
 # -- Helpers ------------------------------------------------------------------
@@ -354,6 +399,21 @@ def _scan_exit_code(has_vulns: bool, has_updates: bool) -> ExitCode:
 
 def _pluralise(n: int, singular: str, plural: str) -> str:
     return f"{n} {singular if n == 1 else plural}"
+
+
+def _relative_time(dt: datetime, now: datetime | None = None) -> str:
+    """Format a datetime as a human-readable relative time string."""
+    now = now or datetime.now(timezone.utc)
+    total_seconds = int((now - dt).total_seconds())
+    match total_seconds:
+        case s if s < 60:
+            return "just now"
+        case s if s < 3600:
+            return f"{s // 60}m ago"
+        case s if s < 86400:
+            return f"{s // 3600}h ago"
+        case s:
+            return f"{s // 86400}d ago"
 
 
 def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
