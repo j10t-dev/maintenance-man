@@ -61,6 +61,7 @@ class ExitCode(IntEnum):
     VULNS_FOUND = 2
     UPDATES_FOUND = 3
     UPDATE_FAILED = 4
+    TEST_FAILED = 5
 
 
 console = Console()
@@ -302,6 +303,52 @@ def deploy(
     """
     console.print("Not implemented.")
     sys.exit(ExitCode.ERROR)
+
+
+@app.command
+def test(
+    project: str,
+    *,
+    config: Path | None = None,
+) -> None:
+    """Run a project's test suite.
+
+    Runs configured test phases (unit → integration → component) in order,
+    stopping on first failure.
+
+    Parameters
+    ----------
+    project: str
+        Project name to test.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
+    """
+    try:
+        cfg = load_config(config_path=config)
+    except ConfigError as e:
+        _fatal(str(e))
+
+    try:
+        proj_config = resolve_project(cfg, project)
+    except ProjectNotFoundError as e:
+        _fatal(str(e))
+
+    if proj_config.test is None:
+        _fatal(
+            f"No test configuration for [bold]{project}[/]. "
+            f"Add a [projects.{project}.test] section to ~/.mm/config.toml."
+        )
+
+    console.print(f"[bold]Testing {project}[/]\n")
+
+    passed, failed_phase = run_test_phases(proj_config.test, proj_config.path)
+
+    if passed:
+        console.print("\n[bold green]All test phases passed.[/]")
+        sys.exit(ExitCode.OK)
+    else:
+        console.print(f"\n[bold red]Failed:[/] {failed_phase} tests")
+        sys.exit(ExitCode.TEST_FAILED)
 
 
 _NO_DATA = "[dim]—[/]"
