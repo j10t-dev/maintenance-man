@@ -13,29 +13,41 @@ class ConfigError(Exception):
 class ProjectNotFoundError(Exception):
     """Raised when a requested project is not found or its path does not exist."""
 
+
 MM_HOME: Path = Path.home() / ".mm"
 
 
-def load_config() -> MmConfig:
-    """Load and validate config from ~/.mm/config.toml."""
-    ensure_mm_home()
+def load_config(config_path: Path | None = None) -> MmConfig:
+    """Load and validate config from a TOML file.
 
-    config_path = MM_HOME / "config.toml"
+    If config_path is None, reads from ~/.mm/config.toml (creating it if needed).
+    Relative project paths are resolved against the config file's parent directory.
+    """
+    if config_path is None:
+        ensure_mm_home()
+        config_path = MM_HOME / "config.toml"
+
+    if not config_path.exists():
+        raise ConfigError(f"Config file not found: {config_path}")
 
     try:
         with config_path.open("rb") as f:
             raw = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
-        raise ConfigError(
-            f"Failed to parse {config_path}\n{e}"
-        ) from e
+        raise ConfigError(f"Failed to parse {config_path}\n{e}") from e
 
     try:
-        return MmConfig(**raw)
+        config = MmConfig(**raw)
     except ValidationError as e:
-        raise ConfigError(
-            f"Invalid config in {config_path}\n{e}"
-        ) from e
+        raise ConfigError(f"Invalid config in {config_path}\n{e}") from e
+
+    # Resolve relative project paths against config file's parent directory
+    config_dir = config_path.parent.resolve()
+    for project in config.projects.values():
+        if not project.path.is_absolute():
+            project.path = (config_dir / project.path).resolve()
+
+    return config
 
 
 def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
