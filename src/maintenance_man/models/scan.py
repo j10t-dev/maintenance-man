@@ -1,6 +1,7 @@
 from datetime import datetime
 from enum import StrEnum, auto
 
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
 
@@ -103,6 +104,16 @@ _SEVERITY_ORDER: dict[Severity, int] = {
 }
 
 
+def _fix_version_key(v: VulnFinding) -> Version:
+    """Parse *fixed_version* for sorting; unparsable values sort last."""
+    try:
+        return Version(v.fixed_version or "0")
+    except InvalidVersion:
+        return Version("0")
+
+
 def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
-    """Sort vulnerabilities by severity, most critical first."""
-    return sorted(vulns, key=lambda v: _SEVERITY_ORDER[v.severity])
+    """Sort by severity (critical first), then fix version descending."""
+    # Two-pass stable sort: first by version desc, then by severity asc.
+    by_version = sorted(vulns, key=_fix_version_key, reverse=True)
+    return sorted(by_version, key=lambda v: _SEVERITY_ORDER[v.severity])

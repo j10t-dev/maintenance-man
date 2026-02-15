@@ -279,6 +279,54 @@ class TestListFindings:
         assert len(lines_with_marker) == 1
         assert "2.32.4" in lines_with_marker[0]
 
+    def test_detail_fix_marker_mixed_severity_same_package(
+        self,
+        list_project_home: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Mixed severities for same package still show marker on highest fix."""
+        vulns = [
+            VulnFinding(
+                vuln_id="CVE-CRIT",
+                pkg_name="requests",
+                installed_version="2.25.0",
+                fixed_version="2.31.0",
+                severity=Severity.CRITICAL,
+                title="t",
+                description="d",
+                status="fixed",
+            ),
+            VulnFinding(
+                vuln_id="CVE-HIGH",
+                pkg_name="requests",
+                installed_version="2.25.0",
+                fixed_version="2.32.4",
+                severity=Severity.HIGH,
+                title="t",
+                description="d",
+                status="fixed",
+            ),
+        ]
+        result = ScanResult(
+            project="myapp",
+            scanned_at=_NOW,
+            trivy_target=".",
+            vulnerabilities=vulns,
+        )
+        _write_scan_result(list_project_home, "myapp", result)
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list", "--detail"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        # CRITICAL should appear before HIGH
+        assert output.index("CVE-CRIT") < output.index("CVE-HIGH")
+        # Marker on the row with 2.32.4 (the HIGH one)
+        lines_with_marker = [
+            line for line in output.splitlines() if "\u2190 fix" in line
+        ]
+        assert len(lines_with_marker) == 1
+        assert "2.32.4" in lines_with_marker[0]
+
     def test_detail_no_fix_marker_for_single_vuln_package(
         self,
         list_project_home: Path,

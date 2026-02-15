@@ -171,12 +171,17 @@ class TestUpdateFinding:
 
 
 class TestSortVulnsBySeverity:
-    def _make_vuln(self, severity: Severity) -> VulnFinding:
+    def _make_vuln(
+        self,
+        severity: Severity,
+        fixed_version: str = "1.0.1",
+        vuln_id: str | None = None,
+    ) -> VulnFinding:
         return VulnFinding(
-            vuln_id=f"CVE-{severity.value}",
+            vuln_id=vuln_id or f"CVE-{severity.value}",
             pkg_name="pkg",
             installed_version="1.0.0",
-            fixed_version="1.0.1",
+            fixed_version=fixed_version,
             severity=severity,
             title="t",
             description="d",
@@ -198,6 +203,19 @@ class TestSortVulnsBySeverity:
             Severity.MEDIUM,
             Severity.LOW,
             Severity.UNKNOWN,
+        ]
+
+    def test_subsorts_by_fix_version_descending(self):
+        vulns = [
+            self._make_vuln(Severity.HIGH, "2.31.0", vuln_id="CVE-LOW"),
+            self._make_vuln(Severity.HIGH, "2.32.4", vuln_id="CVE-HIGH"),
+            self._make_vuln(Severity.HIGH, "2.32.0", vuln_id="CVE-MID"),
+        ]
+        result = sort_vulns_by_severity(vulns)
+        assert [v.vuln_id for v in result] == [
+            "CVE-HIGH",
+            "CVE-MID",
+            "CVE-LOW",
         ]
 
     def test_single_item(self):
