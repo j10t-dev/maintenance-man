@@ -37,3 +37,17 @@ class TestProjectConfigTestFields:
             ProjectConfig(
                 path=Path("/tmp/x"), package_manager="bun", unknown="bad"
             )
+
+
+class TestProjectConfigScanSkipDirs:
+    def test_defaults_to_empty_list(self):
+        pc = ProjectConfig(path=Path("/tmp/x"), package_manager="uv")
+        assert pc.scan_skip_dirs == []
+
+    def test_accepts_skip_dirs(self):
+        pc = ProjectConfig(
+            path=Path("/tmp/x"),
+            package_manager="uv",
+            scan_skip_dirs=["tests/fixtures", "vendor"],
+        )
+        assert pc.scan_skip_dirs == ["tests/fixtures", "vendor"]

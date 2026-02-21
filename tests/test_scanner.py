@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -160,3 +161,52 @@ class TestScanProjectWithUpdates:
 
         mock_age.assert_called_once()
         assert mock_age.call_args.kwargs["min_age_days"] == 14
+
+
+class TestRunTrivyScanSkipDirs:
+    def test_skip_dirs_appended_to_command(
+        self, scan_results_dir: Path, tmp_path: Path
+    ):
+        """scan_skip_dirs entries are forwarded as --skip-dirs flags to trivy."""
+        project = ProjectConfig(
+            path=tmp_path,
+            package_manager="uv",
+            scan_skip_dirs=["tests/fixtures", "vendor"],
+        )
+        fake_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='{"Results": []}', stderr=""
+        )
+        with (
+            patch(
+                "maintenance_man.scanner.subprocess.run",
+                return_value=fake_result,
+            ) as mock_run,
+            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+        ):
+            scan_project("test-proj", project)
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd.count("--skip-dirs") == 2
+        dirs_indices = [i for i, v in enumerate(cmd) if v == "--skip-dirs"]
+        assert cmd[dirs_indices[0] + 1] == "tests/fixtures"
+        assert cmd[dirs_indices[1] + 1] == "vendor"
+
+    def test_no_skip_dirs_by_default(
+        self, scan_results_dir: Path, tmp_path: Path
+    ):
+        """Without scan_skip_dirs, no --skip-dirs flags are added."""
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
+        fake_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='{"Results": []}', stderr=""
+        )
+        with (
+            patch(
+                "maintenance_man.scanner.subprocess.run",
+                return_value=fake_result,
+            ) as mock_run,
+            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+        ):
+            scan_project("test-proj", project)
+
+        cmd = mock_run.call_args.args[0]
+        assert "--skip-dirs" not in cmd

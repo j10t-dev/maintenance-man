@@ -16,6 +16,7 @@ class ProjectConfig(BaseModel):
     path: Path
     package_manager: Literal["bun", "uv", "mvn"]
     scan_secrets: bool = True
+    scan_skip_dirs: list[str] = []
     test_unit: str | None = None
     test_integration: str | None = None
     test_component: str | None = None
