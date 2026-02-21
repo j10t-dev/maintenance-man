@@ -35,6 +35,7 @@ from maintenance_man.scanner import (
 )
 from maintenance_man.updater import (
     NoScanResultsError,
+    UpdateResult,
     _has_test_config,
     _highest_fix_version,
     load_scan_results,
@@ -140,7 +141,7 @@ def scan(
 
 @app.command
 def update(
-    project: str,
+    project: str | None = None,
     *,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
     config: Path | None = None,
@@ -149,20 +150,37 @@ def update(
 
     Parameters
     ----------
-    project: str
-        Project name to update.
+    project: str | None
+        Project name to update. Updates all projects if omitted.
     continue_: bool
         Re-test a manually fixed failed finding on the current branch.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
-    proj_config = _resolve_proj(cfg, project)
+
+    if continue_ and not project:
+        _fatal("--continue requires a project name.")
 
     try:
         check_graphite_available()
     except GraphiteNotFoundError as e:
         _fatal(str(e))
+
+    if project:
+        _update_single(cfg, project, continue_=continue_)
+    else:
+        _update_all(cfg)
+
+
+def _update_single(
+    cfg: MmConfig,
+    project: str,
+    *,
+    continue_: bool = False,
+) -> NoReturn:
+    """Update a single project with interactive selection."""
+    proj_config = _resolve_proj(cfg, project)
 
     if not continue_:
         try:
@@ -272,6 +290,137 @@ def update(
     console.print("─" * 40)
 
     sys.exit(ExitCode.UPDATE_FAILED if failed else ExitCode.OK)
+
+
+def _update_one(
+    project: str,
+    proj_config: ProjectConfig,
+    results_dir: Path,
+) -> list[UpdateResult] | None:
+    """Process all actionable findings for a single project (batch mode).
+
+    Returns a list of results, an empty list if there was nothing to do,
+    or ``None`` if the project was skipped due to an error.
+    """
+    # Check scan results and bail early before any git/network operations
+    try:
+        scan_result = load_scan_results(project, results_dir)
+    except NoScanResultsError:
+        return []
+
+    if not _has_test_config(proj_config):
+        console.print(f"  [dim]Skipping {project} — no test configuration[/]")
+        return []
+
+    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
+    updates = scan_result.updates
+
+    if not actionable_vulns and not updates:
+        console.print(f"  [dim]{project} — nothing to update[/]")
+        return []
+
+    # Only do expensive repo/network checks when there's actual work
+    try:
+        check_repo_clean(proj_config.path)
+    except RepoDirtyError as e:
+        console.print(f"[bold yellow]Warning:[/] {project} — {e}")
+        if Confirm.ask("  Discard changes and reset to main?", default=False):
+            reset_to_main(proj_config.path)
+        else:
+            console.print(f"  [dim]Skipping {project}[/]")
+            return None
+
+    if not sync_graphite(proj_config.path):
+        console.print(f"  [bold red]Error:[/] {project} — failed to sync trunk")
+        return None
+
+    _print_scan_result(scan_result)
+
+    vuln_results: list[UpdateResult] = []
+    if actionable_vulns:
+        console.print(f"\n[bold]Processing {len(actionable_vulns)} vuln fix(es)...[/]")
+        vuln_results = process_vulns(
+            actionable_vulns,
+            proj_config,
+            scan_result=scan_result,
+            project_name=project,
+            results_dir=results_dir,
+        )
+
+    update_results: list[UpdateResult] = []
+    if updates:
+        console.print(f"\n[bold]Processing {len(updates)} update(s)...[/]")
+        update_results = process_updates(
+            updates,
+            proj_config,
+            scan_result=scan_result,
+            project_name=project,
+            results_dir=results_dir,
+        )
+
+    return vuln_results + update_results
+
+
+def _update_all(cfg: MmConfig) -> NoReturn:
+    """Update all configured projects, auto-selecting all findings."""
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        sys.exit(ExitCode.OK)
+
+    results_dir = _config.MM_HOME / "scan-results"
+    all_project_results: list[tuple[str, list[UpdateResult]]] = []
+    had_errors = False
+
+    for name, proj_config in sorted(cfg.projects.items()):
+        if not proj_config.path.exists():
+            console.print(
+                f"[bold yellow]Warning:[/] {name} — "
+                f"path does not exist: {proj_config.path}"
+            )
+            had_errors = True
+            continue
+
+        console.print(f"\n{'═' * 40}")
+        console.print(f"[bold]{name}[/]")
+        console.print("═" * 40)
+
+        results = _update_one(name, proj_config, results_dir)
+        if results is None:
+            had_errors = True
+        elif results:
+            all_project_results.append((name, results))
+
+    _print_mass_update_summary(all_project_results)
+
+    any_failed = had_errors or any(
+        not r.passed for _, results in all_project_results for r in results
+    )
+    sys.exit(ExitCode.UPDATE_FAILED if any_failed else ExitCode.OK)
+
+
+def _print_mass_update_summary(
+    project_results: list[tuple[str, list[UpdateResult]]],
+) -> None:
+    """Print a cross-project summary table."""
+    if not project_results:
+        console.print("\n[dim]No projects had actionable findings.[/]")
+        return
+
+    table = Table(title="Update Summary")
+    table.add_column("Project", style="bold")
+    table.add_column("Package")
+    table.add_column("Kind")
+    table.add_column("Result")
+
+    for proj_name, results in project_results:
+        for r in results:
+            status = (
+                "[green]PASS[/]" if r.passed else f"[red]FAIL ({r.failed_phase})[/]"
+            )
+            table.add_row(proj_name, r.pkg_name, r.kind, status)
+
+    console.print()
+    console.print(table)
 
 
 @app.command

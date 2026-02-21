@@ -12,7 +12,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
-from maintenance_man.updater import UpdateResult
+from maintenance_man.updater import NoScanResultsError, UpdateResult
 
 
 def _make_scan_result() -> ScanResult:
@@ -375,6 +375,15 @@ class TestUpdateContinue:
         assert exc_info.value.code == 4
         mock_submit.assert_not_called()
 
+    def test_continue_without_project_exits_1(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "--continue"])
+        assert exc_info.value.code == 1
+
 
 class TestUpdateAutoSubmit:
     """Stack submission is now internal to process_vulns/process_updates.
@@ -470,4 +479,81 @@ class TestUpdateAutoSubmit:
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
+        assert exc_info.value.code == 4
+
+
+class TestUpdateAll:
+    """Tests for `mm update` with no project argument (batch mode)."""
+
+    def test_skips_projects_without_scan_results(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Projects with no scan data are skipped silently."""
+        monkeypatch.setattr(
+            "maintenance_man.cli.load_scan_results",
+            MagicMock(side_effect=NoScanResultsError("No results")),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update"])
+        assert exc_info.value.code == 0
+
+    def test_processes_all_projects(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """All projects with scan results get processed; exits 0 when all pass."""
+        mock_vulns = MagicMock(
+            return_value=[UpdateResult(pkg_name="some-pkg", kind="vuln", passed=True)]
+        )
+        mock_updates = MagicMock(
+            return_value=[UpdateResult(pkg_name="pkg-a", kind="update", passed=True)]
+        )
+        monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
+        monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update"])
+        assert exc_info.value.code == 0
+        # 3 of 4 projects have test config (no-tests is skipped)
+        assert mock_vulns.call_count == 3
+        assert mock_updates.call_count == 3
+
+    def test_any_failure_exits_4(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_vulns = MagicMock(
+            return_value=[
+                UpdateResult(
+                    pkg_name="some-pkg",
+                    kind="vuln",
+                    passed=False,
+                    failed_phase="test_unit",
+                )
+            ]
+        )
+        mock_updates = MagicMock(
+            return_value=[UpdateResult(pkg_name="pkg-a", kind="update", passed=True)]
+        )
+        monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
+        monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update"])
+        assert exc_info.value.code == 4
+
+    def test_sync_failure_exits_4(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A project-level error (e.g. sync failure) causes non-zero exit."""
+        monkeypatch.setattr("maintenance_man.cli.sync_graphite", lambda p: False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update"])
         assert exc_info.value.code == 4
