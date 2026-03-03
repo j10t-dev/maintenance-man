@@ -48,6 +48,7 @@ def _mock_updater(monkeypatch: pytest.MonkeyPatch):
     """Mock all updater pre-checks to pass by default."""
     monkeypatch.setattr("maintenance_man.cli.check_graphite_available", lambda: None)
     monkeypatch.setattr("maintenance_man.cli.check_repo_clean", lambda p: None)
+    monkeypatch.setattr("maintenance_man.cli.ensure_on_main", lambda p: True)
     monkeypatch.setattr("maintenance_man.cli.sync_graphite", lambda p: True)
     monkeypatch.setattr(
         "maintenance_man.cli.load_scan_results",
@@ -557,3 +558,109 @@ class TestUpdateAll:
         with pytest.raises(SystemExit) as exc_info:
             app(["update"])
         assert exc_info.value.code == 4
+
+
+class TestWorktreeMode:
+    """Tests for mm update --worktree."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_worktree(self, monkeypatch: pytest.MonkeyPatch):
+        """Patch worktree operations by default; individual tests override as needed."""
+        monkeypatch.setattr("maintenance_man.cli.create_worktree", lambda p, w: True)
+        monkeypatch.setattr("maintenance_man.cli.remove_worktree", lambda p, w: None)
+
+    def test_worktree_flag_skips_repo_clean_check(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With --worktree, check_repo_clean is NOT called."""
+        mock_clean = MagicMock()
+        monkeypatch.setattr("maintenance_man.cli.check_repo_clean", mock_clean)
+
+        mock_vulns = MagicMock(return_value=[
+            UpdateResult(pkg_name="pkg", kind="vuln", passed=True)
+        ])
+        mock_updates = MagicMock(return_value=[
+            UpdateResult(pkg_name="pkg-a", kind="update", passed=True)
+        ])
+        monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
+        monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "--worktree"])
+        assert exc_info.value.code == 0
+        mock_clean.assert_not_called()
+
+    def test_single_project_worktree_mode(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Single project with --worktree succeeds."""
+        mock_vulns = MagicMock(return_value=[
+            UpdateResult(pkg_name="some-pkg", kind="vuln", passed=True)
+        ])
+        mock_updates = MagicMock(return_value=[
+            UpdateResult(pkg_name="pkg-a", kind="update", passed=True)
+        ])
+        monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
+        monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
+        monkeypatch.setattr(
+            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "--worktree"])
+        assert exc_info.value.code == 0
+
+    def test_single_project_worktree_create_failure(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Single project with --worktree exits 1 when worktree creation fails."""
+        monkeypatch.setattr("maintenance_man.cli.create_worktree", lambda p, w: False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "--worktree"])
+        assert exc_info.value.code == 1
+
+    def test_worktree_create_failure_skips_project(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If worktree creation fails, the project is skipped."""
+        monkeypatch.setattr("maintenance_man.cli.create_worktree", lambda p, w: False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "--worktree"])
+        assert exc_info.value.code == 4  # UPDATE_FAILED (had_errors)
+
+    def test_worktree_not_created_on_sync_failure(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sync runs on original repo before worktree; no worktree to clean up."""
+        mock_create = MagicMock()
+        mock_remove = MagicMock()
+        monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_create)
+        monkeypatch.setattr("maintenance_man.cli.remove_worktree", mock_remove)
+        monkeypatch.setattr("maintenance_man.cli.sync_graphite", lambda p: False)
+
+        with pytest.raises(SystemExit):
+            app(["update", "--worktree"])
+        # Sync fails before worktree creation, so neither create nor remove is called
+        mock_create.assert_not_called()
+        mock_remove.assert_not_called()
+
+    def test_continue_and_worktree_errors(
+        self,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """--continue and --worktree together is an error."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "--continue", "--worktree"])
+        assert exc_info.value.code == 1
