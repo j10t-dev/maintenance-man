@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
@@ -43,6 +44,40 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
             return SemverTier.PATCH
 
 
+_PEP503_NORMALISE_RE = re.compile(r"[-_.]+")
+
+
+def _normalise_pkg_name(name: str) -> str:
+    """Normalise a package name per PEP 503 (lowercase, collapse separators)."""
+    return _PEP503_NORMALISE_RE.sub("-", name).lower()
+
+
+_PEP508_NAME_RE = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)")
+
+
+def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
+    """Read pyproject.toml and return normalised names of all direct dependencies."""
+    pyproject_path = project_path / "pyproject.toml"
+    try:
+        with open(pyproject_path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
+        raise OutdatedCheckError(f"Failed to read {pyproject_path}: {e}") from e
+
+    names: set[str] = set()
+
+    for spec in data.get("project", {}).get("dependencies", []):
+        if m := _PEP508_NAME_RE.match(spec):
+            names.add(_normalise_pkg_name(m.group(1)))
+
+    for group_entries in data.get("dependency-groups", {}).values():
+        for entry in group_entries:
+            if isinstance(entry, str) and (m := _PEP508_NAME_RE.match(entry)):
+                names.add(_normalise_pkg_name(m.group(1)))
+
+    return names
+
+
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `uv pip list --outdated --format json` and parse results."""
     venv_python = Path(project.path) / ".venv" / "bin" / "python"
@@ -61,6 +96,8 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     except json.JSONDecodeError as e:
         raise OutdatedCheckError(f"Failed to parse uv output: {e}") from e
 
+    direct_deps = _get_uv_direct_dep_names(Path(project.path))
+
     return [
         UpdateFinding(
             pkg_name=entry["name"],
@@ -72,6 +109,7 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         if (cur := entry.get("version"))
         and (lat := entry.get("latest_version"))
         and cur != lat
+        and _normalise_pkg_name(entry["name"]) in direct_deps
     ]
 
 
