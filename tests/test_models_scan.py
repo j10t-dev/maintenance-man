@@ -227,7 +227,7 @@ class TestSortVulnsBySeverity:
         assert sort_vulns_by_severity([]) == []
 
     def test_groups_by_package_then_severity(self):
-        """Vulns for the same package stay together, groups ordered by worst severity."""
+        """Vulns for same package stay together, ordered by worst severity."""
         vulns = [
             self._make_vuln(Severity.HIGH, vuln_id="flask-high"),
             self._make_vuln(Severity.CRITICAL, vuln_id="requests-crit"),

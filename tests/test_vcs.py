@@ -12,6 +12,7 @@ from maintenance_man.vcs import (
     check_repo_clean,
     create_worktree,
     discard_changes,
+    ensure_on_main,
     get_current_branch,
     gt_checkout,
     gt_create,
@@ -104,6 +105,29 @@ class TestGetCurrentBranch:
     def test_strips_whitespace(self, mock_run: MagicMock, tmp_path: Path):
         mock_run.return_value = _completed(stdout="  fix/some-pkg  \n")
         assert get_current_branch(tmp_path) == "fix/some-pkg"
+
+
+# ---------------------------------------------------------------------------
+# ensure_on_main
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureOnMain:
+    @patch("maintenance_man.vcs.gt_checkout")
+    @patch("maintenance_man.vcs.get_current_branch", return_value="main")
+    def test_already_on_main(
+        self, mock_branch: MagicMock, mock_checkout: MagicMock, tmp_path: Path
+    ):
+        assert ensure_on_main(tmp_path) is True
+        mock_checkout.assert_not_called()
+
+    @patch("maintenance_man.vcs.gt_checkout", return_value=True)
+    @patch("maintenance_man.vcs.get_current_branch", return_value="feat/x")
+    def test_checks_out_main(
+        self, mock_branch: MagicMock, mock_checkout: MagicMock, tmp_path: Path
+    ):
+        assert ensure_on_main(tmp_path) is True
+        mock_checkout.assert_called_once_with("main", tmp_path)
 
 
 # ---------------------------------------------------------------------------

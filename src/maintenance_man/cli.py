@@ -179,7 +179,7 @@ def update(
         _fatal(str(e))
 
     if project:
-        _update_single(cfg, project, continue_=continue_, use_worktree=worktree)
+        _update_interactive(cfg, project, continue_=continue_, use_worktree=worktree)
     else:
         _update_all(cfg, use_worktree=worktree)
 
@@ -199,7 +199,7 @@ def _worktree_context(proj_config: ProjectConfig, project: str):
         remove_worktree(proj_config.path, wt_path)
 
 
-def _update_single(
+def _update_interactive(
     cfg: MmConfig,
     project: str,
     *,
@@ -335,7 +335,7 @@ def _update_single(
         sys.exit(ExitCode.UPDATE_FAILED if failed else ExitCode.OK)
 
 
-def _update_one(
+def _update_batch(
     project: str,
     proj_config: ProjectConfig,
     results_dir: Path,
@@ -456,7 +456,7 @@ def _update_all(cfg: MmConfig, *, use_worktree: bool = False) -> NoReturn:
         console.print(f"[bold]{name}[/]")
         console.print("═" * 40)
 
-        results = _update_one(name, proj_config, results_dir, use_worktree=use_worktree)
+        results = _update_batch(name, proj_config, results_dir, use_worktree=use_worktree)
         if results is None:
             had_errors = True
         elif results:

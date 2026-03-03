@@ -27,6 +27,7 @@ from maintenance_man.vcs import (
     gt_checkout,
     gt_create,
     gt_delete,
+    reset_to_main,
     submit_stack,
 )
 
@@ -407,26 +408,54 @@ def _process_stack(
     passing = [r for r in results if r.passed]
     if passing:
         tip = f"{cfg.branch_prefix}{branch_slug(passing[-1].pkg_name)}"
-        gt_checkout(tip, project_path)
-        ok, output = submit_stack(project_path)
-        if ok:
-            rprint(f"  [bold green]{cfg.submit_label} submitted.[/]")
+        if not gt_checkout(tip, project_path):
+            rprint(
+                f"  [bold red]{cfg.submit_label} checkout failed"
+                " — skipping submit.[/]"
+            )
+            _mark_stack_failed(
+                results, findings, "submit", scan_result, project_name, results_dir
+            )
         else:
-            rprint(f"  [bold red]{cfg.submit_label} submit failed.[/]")
-            for r in results:
-                if r.passed:
-                    r.passed = False
-                    r.failed_phase = "submit"
-            for f in findings:
-                if f.update_status == UpdateStatus.COMPLETED:
-                    f.update_status = UpdateStatus.FAILED
-            _persist_status(scan_result, project_name, results_dir)
-        if output:
-            rprint(f"  [dim]{output}[/]")
+            ok, output = submit_stack(project_path)
+            if ok:
+                rprint(f"  [bold green]{cfg.submit_label} submitted.[/]")
+            else:
+                rprint(f"  [bold red]{cfg.submit_label} submit failed.[/]")
+                _mark_stack_failed(
+                    results,
+                    findings,
+                    "submit",
+                    scan_result,
+                    project_name,
+                    results_dir,
+                )
+            if output:
+                rprint(f"  [dim]{output}[/]")
 
     # Return to main after processing
-    gt_checkout("main", project_path)
+    if not gt_checkout("main", project_path):
+        reset_to_main(project_path)
     return results
+
+
+def _mark_stack_failed(
+    results: list[UpdateResult],
+    findings: Sequence[Finding],
+    phase: str,
+    scan_result: ScanResult | None,
+    project_name: str,
+    results_dir: Path | None,
+) -> None:
+    """Mark all passing results and completed findings as failed."""
+    for r in results:
+        if r.passed:
+            r.passed = False
+            r.failed_phase = phase
+    for f in findings:
+        if f.update_status == UpdateStatus.COMPLETED:
+            f.update_status = UpdateStatus.FAILED
+    _persist_status(scan_result, project_name, results_dir)
 
 
 def _record_failure(
