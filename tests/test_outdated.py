@@ -9,6 +9,8 @@ from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import SemverTier
 from maintenance_man.outdated import (
     OutdatedCheckError,
+    _get_uv_direct_dep_names,
+    _normalise_pkg_name,
     bun_outdated,
     classify_semver,
     get_outdated,
@@ -47,8 +49,83 @@ class TestClassifySemver:
         assert classify_semver("1.2.3.4", "1.2.4.0") == SemverTier.PATCH
 
 
+class TestNormalisePkgName:
+    def test_lowercase(self):
+        assert _normalise_pkg_name("Requests") == "requests"
+
+    def test_underscores_to_hyphens(self):
+        assert _normalise_pkg_name("pydantic_core") == "pydantic-core"
+
+    def test_dots_to_hyphens(self):
+        assert _normalise_pkg_name("zope.interface") == "zope-interface"
+
+    def test_consecutive_separators(self):
+        assert _normalise_pkg_name("Foo-_.Bar") == "foo-bar"
+
+    def test_already_normalised(self):
+        assert _normalise_pkg_name("rich") == "rich"
+
+
+class TestGetUvDirectDepNames:
+    def test_extracts_from_dependencies_and_groups(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            '[project]\n'
+            'dependencies = ["requests>=2.28", "Flask==3.0.0"]\n'
+            "\n"
+            "[dependency-groups]\n"
+            'dev = ["pytest>=8.0", "ruff>=0.9.0"]\n'
+        )
+        names = _get_uv_direct_dep_names(tmp_path)
+        assert names == {"requests", "flask", "pytest", "ruff"}
+
+    def test_normalises_names(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            '[project]\n'
+            'dependencies = ["pydantic_core>=2.0", "Zope.Interface"]\n'
+        )
+        names = _get_uv_direct_dep_names(tmp_path)
+        assert names == {"pydantic-core", "zope-interface"}
+
+    def test_skips_non_string_group_entries(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[project]\n"
+            'dependencies = ["requests>=2.28"]\n'
+            "\n"
+            "[dependency-groups]\n"
+            'all = [{include-group = "dev"}, "extra-pkg>=1.0"]\n'
+        )
+        names = _get_uv_direct_dep_names(tmp_path)
+        assert names == {"requests", "extra-pkg"}
+
+    def test_empty_dependencies(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text("[project]\ndependencies = []\n")
+        names = _get_uv_direct_dep_names(tmp_path)
+        assert names == set()
+
+    def test_no_dependency_groups(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            '[project]\ndependencies = ["rich>=14.0"]\n'
+        )
+        names = _get_uv_direct_dep_names(tmp_path)
+        assert names == {"rich"}
+
+    def test_missing_pyproject_raises(self, tmp_path):
+        with pytest.raises(OutdatedCheckError, match="Failed to read"):
+            _get_uv_direct_dep_names(tmp_path)
+
+
 class TestUvOutdated:
-    def test_parses_json_output(self):
+    def test_parses_json_output(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            '[project]\ndependencies = ["requests>=2.28", "flask>=2.0"]\n'
+        )
+
         fake_json = json.dumps(
             [
                 {
@@ -68,7 +145,7 @@ class TestUvOutdated:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=fake_json, stderr=""
         )
-        project = _make_project("uv")
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
             updates = uv_outdated(project)
@@ -80,26 +157,72 @@ class TestUvOutdated:
         assert updates[0].semver_tier == SemverTier.MINOR
         assert updates[1].semver_tier == SemverTier.MAJOR
 
-    def test_empty_output(self):
+    def test_empty_output(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text("[project]\ndependencies = []\n")
+
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="[]", stderr=""
         )
-        project = _make_project("uv")
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
             updates = uv_outdated(project)
 
         assert updates == []
 
-    def test_command_failure_raises(self):
+    def test_command_failure_raises(self, tmp_path):
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="error"
         )
-        project = _make_project("uv")
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
             with pytest.raises(OutdatedCheckError):
                 uv_outdated(project)
+
+    def test_excludes_transitive_deps(self, tmp_path):
+        """uv_outdated should only return direct dependencies from pyproject.toml."""
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            '[project]\ndependencies = ["pydantic>=2.0", "rich>=14.0"]\n'
+        )
+
+        fake_json = json.dumps(
+            [
+                {
+                    "name": "pydantic",
+                    "version": "2.12.5",
+                    "latest_version": "2.13.0",
+                },
+                {
+                    "name": "pydantic-core",
+                    "version": "2.41.5",
+                    "latest_version": "2.42.0",
+                },
+                {
+                    "name": "rich",
+                    "version": "14.3.1",
+                    "latest_version": "14.3.3",
+                },
+            ]
+        )
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=fake_json, stderr=""
+        )
+        project = ProjectConfig(
+            path=tmp_path, package_manager="uv"
+        )
+
+        with patch(
+            "maintenance_man.outdated.subprocess.run", return_value=completed
+        ):
+            updates = uv_outdated(project)
+
+        pkg_names = [u.pkg_name for u in updates]
+        assert "pydantic" in pkg_names
+        assert "rich" in pkg_names
+        assert "pydantic-core" not in pkg_names
 
 
 class TestBunOutdated:
@@ -205,8 +328,11 @@ class TestGetOutdated:
             updates = get_outdated(project)
         assert updates == []
 
-    def test_dispatches_to_uv(self):
-        project = _make_project("uv")
+    def test_dispatches_to_uv(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text("[project]\ndependencies = []\n")
+
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="[]", stderr=""
         )
