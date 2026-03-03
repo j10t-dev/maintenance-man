@@ -44,7 +44,9 @@ def scan_project(
     if not project_path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
 
-    vulns, secrets = _run_trivy_scan(project_path, project.scan_secrets)
+    vulns, secrets = _run_trivy_scan(
+        project_path, project.scan_secrets, project.scan_skip_dirs
+    )
     updates = _check_outdated(name, project, vulns, min_version_age_days)
 
     scan_result = ScanResult(
@@ -104,8 +106,9 @@ def _check_outdated(
 def _run_trivy_scan(
     project_path: Path,
     scan_secrets: bool,
+    skip_dirs: list[str] | None = None,
 ) -> tuple[list[VulnFinding], list[SecretFinding]]:
-    """Run Trivy against *project_path* and return parsed vulnerability and secret findings."""
+    """Run Trivy against *project_path* and return parsed findings."""
     scanners = "vuln,secret" if scan_secrets else "vuln"
     cmd = [
         "trivy",
@@ -114,8 +117,10 @@ def _run_trivy_scan(
         "json",
         "--scanners",
         scanners,
-        ".",
     ]
+    for d in skip_dirs or []:
+        cmd.extend(["--skip-dirs", d])
+    cmd.append(".")
     try:
         completed = subprocess.run(
             cmd,

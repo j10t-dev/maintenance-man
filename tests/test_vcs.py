@@ -10,11 +10,14 @@ from maintenance_man.vcs import (
     branch_slug,
     check_graphite_available,
     check_repo_clean,
+    create_worktree,
     discard_changes,
+    ensure_on_main,
     get_current_branch,
     gt_checkout,
     gt_create,
     gt_delete,
+    remove_worktree,
     reset_to_main,
     submit_stack,
     sync_graphite,
@@ -105,6 +108,29 @@ class TestGetCurrentBranch:
 
 
 # ---------------------------------------------------------------------------
+# ensure_on_main
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureOnMain:
+    @patch("maintenance_man.vcs.gt_checkout")
+    @patch("maintenance_man.vcs.get_current_branch", return_value="main")
+    def test_already_on_main(
+        self, mock_branch: MagicMock, mock_checkout: MagicMock, tmp_path: Path
+    ):
+        assert ensure_on_main(tmp_path) is True
+        mock_checkout.assert_not_called()
+
+    @patch("maintenance_man.vcs.gt_checkout", return_value=True)
+    @patch("maintenance_man.vcs.get_current_branch", return_value="feat/x")
+    def test_checks_out_main(
+        self, mock_branch: MagicMock, mock_checkout: MagicMock, tmp_path: Path
+    ):
+        assert ensure_on_main(tmp_path) is True
+        mock_checkout.assert_called_once_with("main", tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # discard_changes
 # ---------------------------------------------------------------------------
 
@@ -167,7 +193,6 @@ class TestGtCreate:
         mock_run: MagicMock,
         tmp_path: Path,
     ):
-        create_cmd = ["gt", "create", "bump/pkg-a", "-a", "-m", "msg"]
         mock_run.side_effect = [
             # First create — fails with "already exists"
             _completed(returncode=1, stderr="branch already exists"),
@@ -372,3 +397,46 @@ class TestSyncGraphite:
             or (c[0][0][:2] == ["git", "branch"] and "-D" in c[0][0])
         ]
         assert len(delete_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# create_worktree
+# ---------------------------------------------------------------------------
+
+
+class TestCreateWorktree:
+    def test_success_returns_true(self):
+        mock_run = MagicMock(return_value=_completed(0))
+        with patch("maintenance_man.vcs._run", mock_run):
+            result = create_worktree(Path("/repo"), Path("/tmp/wt"))
+        assert result is True
+        mock_run.assert_called_once_with(
+            ["git", "worktree", "add", "--detach", "/tmp/wt", "main"],
+            Path("/repo"),
+            timeout=30,
+        )
+
+    def test_failure_returns_false(self):
+        mock_run = MagicMock(
+            return_value=_completed(1, stderr="fatal: branch already checked out")
+        )
+        with patch("maintenance_man.vcs._run", mock_run):
+            result = create_worktree(Path("/repo"), Path("/tmp/wt"))
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# remove_worktree
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveWorktree:
+    def test_calls_git_worktree_remove(self):
+        mock_run = MagicMock(return_value=_completed(0))
+        with patch("maintenance_man.vcs._run", mock_run):
+            remove_worktree(Path("/repo"), Path("/tmp/wt"))
+        mock_run.assert_called_once_with(
+            ["git", "worktree", "remove", "--force", "/tmp/wt"],
+            Path("/repo"),
+            timeout=30,
+        )
