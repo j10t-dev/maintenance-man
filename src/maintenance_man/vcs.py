@@ -20,7 +20,13 @@ def sync_graphite(project_path: Path) -> bool:
     tracked ``bump/`` or ``fix/`` branches whose GitHub PRs have been merged
     or closed.  This avoids stale branches blocking future stack submissions.
     """
-    _run(["gt", "sync", "--no-interactive"], project_path, timeout=120)
+    sync_result = _run(["gt", "sync", "--no-interactive"], project_path, timeout=120)
+    if sync_result.returncode != 0:
+        rprint(
+            f"  [bold yellow]Warning:[/] gt sync failed: "
+            f"{sync_result.stderr.strip()}"
+        )
+        return False
 
     prefixes = ("bump/", "fix/")
     stale_branches = _gh_list_pr_branches("merged", prefixes, project_path)
@@ -44,8 +50,11 @@ def sync_graphite(project_path: Path) -> bool:
 
 
 def submit_stack(project_path: Path) -> tuple[bool, str]:
-    """Run gt submit --stack. Returns (success, output)."""
+    """Run gt submit --stack. Retries with --force on stale-ref failures."""
     r = _run(["gt", "submit", "--stack"], project_path, timeout=120)
+    if r.returncode != 0 and "force-with-lease" in r.stderr.lower():
+        rprint("  [bold yellow]Warning:[/] stale remote refs — retrying with --force")
+        r = _run(["gt", "submit", "--stack", "--force"], project_path, timeout=120)
     ok = r.returncode == 0
     return ok, (r.stdout if ok else r.stderr).strip()
 
@@ -119,6 +128,43 @@ def check_repo_clean(project_path: Path) -> None:
 def get_current_branch(project_path: Path) -> str:
     """Return the current git branch name."""
     return _run(["git", "branch", "--show-current"], project_path).stdout.strip()
+
+
+def ensure_on_main(project_path: Path) -> bool:
+    """Ensure the repo is on the main branch. Returns True if successful."""
+    if get_current_branch(project_path) == "main":
+        return True
+    return gt_checkout("main", project_path)
+
+
+def create_worktree(project_path: Path, worktree_path: Path) -> bool:
+    """Create a git worktree at worktree_path, checked out to main."""
+    r = _run(
+        ["git", "worktree", "add", "--detach", str(worktree_path), "main"],
+        project_path,
+        timeout=30,
+    )
+    if r.returncode != 0:
+        rprint(
+            f"  [bold red]Error:[/] worktree creation failed: "
+            f"{r.stderr.strip()}"
+        )
+        return False
+    return True
+
+
+def remove_worktree(project_path: Path, worktree_path: Path) -> None:
+    """Remove a temporary worktree."""
+    r = _run(
+        ["git", "worktree", "remove", "--force", str(worktree_path)],
+        project_path,
+        timeout=30,
+    )
+    if r.returncode != 0:
+        rprint(
+            f"  [bold yellow]Warning:[/] worktree removal failed: "
+            f"{r.stderr.strip()}"
+        )
 
 
 def discard_changes(project_path: Path) -> None:
