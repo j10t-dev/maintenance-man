@@ -20,6 +20,13 @@ from maintenance_man.config import (
     load_config,
     resolve_project,
 )
+from maintenance_man.deployer import (
+    BuildError,
+    DeployError,
+    check_health,
+    run_build,
+    run_deploy,
+)
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -68,6 +75,8 @@ class ExitCode(IntEnum):
     UPDATES_FOUND = 3
     UPDATE_FAILED = 4
     TEST_FAILED = 5
+    BUILD_FAILED = 6
+    DEPLOY_FAILED = 7
 
 
 console = Console()
@@ -498,6 +507,10 @@ def _print_mass_update_summary(
 @app.command
 def deploy(
     project: str,
+    *,
+    build: bool = False,
+    check: bool = False,
+    config: Path | None = None,
 ) -> None:
     """Deploy a project.
 
@@ -505,9 +518,56 @@ def deploy(
     ----------
     project: str
         Project name to deploy.
+    build: bool
+        Run build_command before deploying. Silently skips if no build_command
+        is configured.
+    check: bool
+        Verify deployment health via healthchecker after deploy.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    console.print("Not implemented.")
-    sys.exit(ExitCode.ERROR)
+    cfg = _load_cfg(config)
+    proj_config = _resolve_proj(cfg, project)
+
+    if not proj_config.deploy_command:
+        _fatal(
+            f"No deploy_command configured for [bold]{project}[/]. "
+            f"Add deploy_command to [projects.{project}] in ~/.mm/config.toml."
+        )
+
+    if build and proj_config.build_command:
+        console.print(f"[bold]Building {project}[/]\n")
+        try:
+            run_build(project, proj_config.build_command, proj_config.path)
+        except BuildError as e:
+            _fatal(str(e), code=ExitCode.BUILD_FAILED)
+        console.print("\n[bold green]Build succeeded.[/]\n")
+
+    console.print(f"[bold]Deploying {project}[/]\n")
+
+    try:
+        run_deploy(project, proj_config.deploy_command, proj_config.path)
+    except DeployError as e:
+        _fatal(str(e), code=ExitCode.DEPLOY_FAILED)
+
+    console.print("\n[bold green]Deploy succeeded.[/]")
+
+    if check:
+        if not cfg.defaults.healthcheck_url:
+            console.print(
+                "[dim]--check: no healthcheck_url configured in [defaults][/]"
+            )
+        else:
+            console.print(f"\n[bold]Checking health of {project}...[/]")
+            result = check_health(cfg.defaults.healthcheck_url, project)
+            if result.is_up:
+                console.print(f"[bold green]Healthy:[/] {project} is up")
+            elif result.error:
+                console.print(f"[bold yellow]Warning:[/] {result.error}")
+            else:
+                console.print(f"[bold yellow]Warning:[/] {project} is not healthy")
+
+    sys.exit(ExitCode.OK)
 
 
 @app.command
@@ -542,6 +602,41 @@ def test(
     else:
         console.print(f"\n[bold red]Failed:[/] {failed_phase} tests")
         sys.exit(ExitCode.TEST_FAILED)
+
+
+@app.command
+def build(
+    project: str,
+    *,
+    config: Path | None = None,
+) -> None:
+    """Build a project's artefacts.
+
+    Parameters
+    ----------
+    project: str
+        Project name to build.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
+    """
+    cfg = _load_cfg(config)
+    proj_config = _resolve_proj(cfg, project)
+
+    if not proj_config.build_command:
+        _fatal(
+            f"No build_command configured for [bold]{project}[/]. "
+            f"Add build_command to [projects.{project}] in ~/.mm/config.toml."
+        )
+
+    console.print(f"[bold]Building {project}[/]\n")
+
+    try:
+        run_build(project, proj_config.build_command, proj_config.path)
+    except BuildError as e:
+        _fatal(str(e), code=ExitCode.BUILD_FAILED)
+
+    console.print("\n[bold green]Build succeeded.[/]")
+    sys.exit(ExitCode.OK)
 
 
 _NO_DATA = "[dim]—[/]"

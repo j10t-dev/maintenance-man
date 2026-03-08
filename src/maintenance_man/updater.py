@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shlex
 import subprocess
 from collections.abc import Sequence
@@ -13,6 +12,7 @@ from packaging.version import InvalidVersion, Version
 from rich import print as rprint
 
 from maintenance_man import sanitise_project_name
+from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -485,14 +485,11 @@ def _results_path(project_name: str, results_dir: Path) -> Path:
 
 
 def _project_env() -> dict[str, str]:
-    """Return a copy of os.environ without VIRTUAL_ENV.
+    """Return a copy of os.environ with venv isolation.
 
-    Prevents the host venv leaking into subprocess calls that run inside
-    a target project directory (e.g. ``uv run``, ``uv add``).
+    Delegates to :func:`maintenance_man.env.project_env`.
     """
-    env = os.environ.copy()
-    env.pop("VIRTUAL_ENV", None)
-    return env
+    return project_env()
 
 
 def _persist_status(

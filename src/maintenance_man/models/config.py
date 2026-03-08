@@ -8,6 +8,7 @@ class DefaultsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     min_version_age_days: int = 7
+    healthcheck_url: str | None = None
 
 
 class ProjectConfig(BaseModel):
@@ -20,6 +21,8 @@ class ProjectConfig(BaseModel):
     test_unit: str | None = None
     test_integration: str | None = None
     test_component: str | None = None
+    build_command: str | None = None
+    deploy_command: str | None = None
 
 
 class MmConfig(BaseModel):
