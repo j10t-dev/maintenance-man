@@ -2,10 +2,11 @@ import subprocess
 import sys
 import time
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, Literal, NoReturn
 
 import cyclopts
 from rich.console import Console
@@ -82,6 +83,13 @@ class ExitCode(IntEnum):
     TEST_FAILED = 5
     BUILD_FAILED = 6
     DEPLOY_FAILED = 7
+
+
+@dataclass
+class DeployResult:
+    project: str
+    build_status: Literal["pass", "fail", "skip"]
+    deploy_status: Literal["pass", "fail", "skip"]
 
 
 console = Console()
@@ -470,7 +478,12 @@ def _update_all(cfg: MmConfig, *, use_worktree: bool = False) -> NoReturn:
         console.print(f"[bold]{name}[/]")
         console.print("═" * 40)
 
-        results = _update_batch(name, proj_config, results_dir, use_worktree=use_worktree)
+        results = _update_batch(
+            name,
+            proj_config,
+            results_dir,
+            use_worktree=use_worktree,
+        )
         if results is None:
             had_errors = True
         elif results:
@@ -509,9 +522,197 @@ def _print_mass_update_summary(
     console.print(table)
 
 
+def _deploy_one(
+    name: str,
+    proj_config: ProjectConfig,
+    cfg: MmConfig,
+    *,
+    check: bool = False,
+) -> DeployResult:
+    """Build and deploy a single project. Returns result, never raises."""
+    build_status = "skip"
+    deploy_status = "skip"
+
+    if proj_config.build_command:
+        console.print("  [bold]Building...[/]")
+        try:
+            _run_build_step(name, proj_config)
+        except BuildError as e:
+            console.print(f"  [bold red]Build failed:[/] {e}")
+            build_status = "fail"
+            return DeployResult(
+                project=name,
+                build_status=build_status,
+                deploy_status=deploy_status,
+            )
+        build_status = "pass"
+
+    console.print("  [bold]Deploying...[/]")
+    try:
+        _run_deploy_step(name, proj_config)
+    except DeployError as e:
+        console.print(f"  [bold red]Deploy failed:[/] {e}")
+        deploy_status = "fail"
+        return DeployResult(
+            project=name,
+            build_status=build_status,
+            deploy_status=deploy_status,
+        )
+    deploy_status = "pass"
+
+    if check and cfg.defaults.healthcheck_url:
+        _run_health_check_step(cfg.defaults.healthcheck_url, name, indent="  ")
+
+    return DeployResult(
+        project=name,
+        build_status=build_status,
+        deploy_status=deploy_status,
+    )
+
+
+def _deploy_all(cfg: MmConfig, *, check: bool = False) -> NoReturn:
+    """Deploy all configured projects that have a deploy_command."""
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        sys.exit(ExitCode.OK)
+
+    results: list[DeployResult] = []
+
+    for name, proj_config in sorted(cfg.projects.items()):
+        if not proj_config.deploy_command:
+            continue
+
+        if not proj_config.path.exists():
+            console.print(
+                f"[bold yellow]Warning:[/] {name} — "
+                f"path does not exist: {proj_config.path}"
+            )
+            results.append(
+                DeployResult(project=name, build_status="skip", deploy_status="fail")
+            )
+            continue
+
+        console.print(f"\n{'═' * 40}")
+        console.print(f"[bold]{name}[/]")
+        console.print("═" * 40)
+
+        results.append(_deploy_one(name, proj_config, cfg, check=check))
+
+    _print_deploy_summary(results)
+
+    any_failed = any(
+        r.deploy_status == "fail" or r.build_status == "fail" for r in results
+    )
+    sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
+
+
+def _print_deploy_summary(results: list[DeployResult]) -> None:
+    """Print a cross-project deploy summary table."""
+    if not results:
+        console.print("\n[dim]No projects have deploy_command configured.[/]")
+        return
+
+    _STATUS_DISPLAY = {
+        "pass": "[green]PASS[/]",
+        "fail": "[red]FAIL[/]",
+        "skip": "[dim]SKIP[/]",
+    }
+
+    table = Table(title="Deploy Summary")
+    table.add_column("Project", style="bold")
+    table.add_column("Build")
+    table.add_column("Deploy")
+
+    for r in results:
+        table.add_row(
+            r.project,
+            _STATUS_DISPLAY[r.build_status],
+            _STATUS_DISPLAY[r.deploy_status],
+        )
+
+    console.print()
+    console.print(table)
+
+
+def _warn_missing_healthcheck_url() -> None:
+    """Warn when --check was requested but no healthcheck_url is configured."""
+    console.print("[dim]--check: no healthcheck_url configured in [defaults][/]")
+
+
+def _record_deploy_activity(
+    project: str,
+    event_type: Literal["build", "deploy"],
+    *,
+    success: bool,
+    project_path: Path,
+) -> None:
+    """Record build/deploy activity for a project."""
+    activity_path = _config.MM_HOME / "activity.json"
+    branch = _safe_branch(project_path)
+    record_activity(activity_path, project, event_type, success=success, branch=branch)
+
+
+def _run_build_step(project: str, proj_config: ProjectConfig) -> None:
+    """Run build and record activity, raising BuildError on failure."""
+    assert proj_config.build_command is not None
+    try:
+        run_build(project, proj_config.build_command, proj_config.path)
+    except BuildError:
+        _record_deploy_activity(
+            project,
+            "build",
+            success=False,
+            project_path=proj_config.path,
+        )
+        raise
+    _record_deploy_activity(
+        project,
+        "build",
+        success=True,
+        project_path=proj_config.path,
+    )
+
+
+def _run_deploy_step(project: str, proj_config: ProjectConfig) -> None:
+    """Run deploy and record activity, raising DeployError on failure."""
+    assert proj_config.deploy_command is not None
+    try:
+        run_deploy(project, proj_config.deploy_command, proj_config.path)
+    except DeployError:
+        _record_deploy_activity(
+            project,
+            "deploy",
+            success=False,
+            project_path=proj_config.path,
+        )
+        raise
+    _record_deploy_activity(
+        project,
+        "deploy",
+        success=True,
+        project_path=proj_config.path,
+    )
+
+
+def _run_health_check_step(
+    healthcheck_url: str,
+    project: str,
+    *,
+    indent: str = "",
+) -> None:
+    """Run a health check and print a consistent status message."""
+    result = check_health(healthcheck_url, project)
+    if result.is_up:
+        console.print(f"{indent}[bold green]Healthy:[/] {project} is up")
+    elif result.error:
+        console.print(f"{indent}[bold yellow]Warning:[/] {result.error}")
+    else:
+        console.print(f"{indent}[bold yellow]Warning:[/] {project} is not healthy")
+
+
 @app.command
 def deploy(
-    project: str,
+    project: str | None = None,
     *,
     build: bool = False,
     check: bool = False,
@@ -521,17 +722,24 @@ def deploy(
 
     Parameters
     ----------
-    project: str
-        Project name to deploy.
+    project: str | None
+        Project name to deploy. Deploys all if omitted.
     build: bool
         Run build_command before deploying. Silently skips if no build_command
-        is configured.
+        is configured. Always enabled when deploying all projects.
     check: bool
         Verify deployment health via healthchecker after deploy.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
+
+    if not project:
+        if check and not cfg.defaults.healthcheck_url:
+            _warn_missing_healthcheck_url()
+        _deploy_all(cfg, check=check)
+        return  # _deploy_all calls sys.exit(); guard against refactors
+
     proj_config = _resolve_proj(cfg, project)
 
     if not proj_config.deploy_command:
@@ -542,45 +750,27 @@ def deploy(
 
     if build and proj_config.build_command:
         console.print(f"[bold]Building {project}[/]\n")
-        activity_path = _config.MM_HOME / "activity.json"
-        branch = _safe_branch(proj_config.path)
         try:
-            run_build(project, proj_config.build_command, proj_config.path)
+            _run_build_step(project, proj_config)
         except BuildError as e:
-            record_activity(
-                activity_path, project, "build", success=False, branch=branch
-            )
             _fatal(str(e), code=ExitCode.BUILD_FAILED)
-        record_activity(activity_path, project, "build", success=True, branch=branch)
         console.print("\n[bold green]Build succeeded.[/]\n")
 
     console.print(f"[bold]Deploying {project}[/]\n")
 
-    activity_path = _config.MM_HOME / "activity.json"
-    branch = _safe_branch(proj_config.path)
     try:
-        run_deploy(project, proj_config.deploy_command, proj_config.path)
+        _run_deploy_step(project, proj_config)
     except DeployError as e:
-        record_activity(activity_path, project, "deploy", success=False, branch=branch)
         _fatal(str(e), code=ExitCode.DEPLOY_FAILED)
 
-    record_activity(activity_path, project, "deploy", success=True, branch=branch)
     console.print("\n[bold green]Deploy succeeded.[/]")
 
     if check:
         if not cfg.defaults.healthcheck_url:
-            console.print(
-                "[dim]--check: no healthcheck_url configured in [defaults][/]"
-            )
+            _warn_missing_healthcheck_url()
         else:
             console.print(f"\n[bold]Checking health of {project}...[/]")
-            result = check_health(cfg.defaults.healthcheck_url, project)
-            if result.is_up:
-                console.print(f"[bold green]Healthy:[/] {project} is up")
-            elif result.error:
-                console.print(f"[bold yellow]Warning:[/] {result.error}")
-            else:
-                console.print(f"[bold yellow]Warning:[/] {project} is not healthy")
+            _run_health_check_step(cfg.defaults.healthcheck_url, project)
 
     sys.exit(ExitCode.OK)
 

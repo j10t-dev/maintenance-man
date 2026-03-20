@@ -56,6 +56,7 @@ def record_activity(
             proj.last_deploy = event
         activity[project] = proj
         serialised = {k: v.model_dump(mode="json") for k, v in activity.items()}
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(serialised, indent=2), encoding="utf-8")
     except Exception:
         pass
