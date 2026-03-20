@@ -7,7 +7,6 @@ import pytest
 from maintenance_man.deployer import (
     BuildError,
     DeployError,
-    HealthCheckResult,
     check_health,
     run_build,
     run_deploy,
@@ -118,7 +117,10 @@ class TestCheckHealth:
     @patch("maintenance_man.deployer.urllib.request.urlopen")
     def test_unhealthy_service(self, mock_urlopen: MagicMock) -> None:
         mock_response = MagicMock()
-        mock_response.read.return_value = b'{"name": "lifts", "is_up": false, "last_error": "connection refused"}'
+        mock_response.read.return_value = (
+            b'{"name": "lifts", "is_up": false, '
+            b'"last_error": "connection refused"}'
+        )
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_response
@@ -151,7 +153,12 @@ class TestCheckHealth:
 
         mock_urlopen.side_effect = URLError("Connection refused")
 
-        result = check_health("http://pihost:8080", "lifts", max_retries=3, initial_delay=0)
+        result = check_health(
+            "http://pihost:8080",
+            "lifts",
+            max_retries=3,
+            initial_delay=0,
+        )
 
         assert result.is_up is False
         assert result.error is not None
@@ -171,7 +178,12 @@ class TestCheckHealth:
             mock_response,
         ]
 
-        result = check_health("http://pihost:8080", "lifts", max_retries=3, initial_delay=0)
+        result = check_health(
+            "http://pihost:8080",
+            "lifts",
+            max_retries=3,
+            initial_delay=0,
+        )
 
         assert result.is_up is True
         assert mock_urlopen.call_count == 2
@@ -190,7 +202,12 @@ class TestCheckHealth:
             mock_response,
         ]
 
-        result = check_health("http://pihost:8080", "lifts", max_retries=3, initial_delay=0)
+        result = check_health(
+            "http://pihost:8080",
+            "lifts",
+            max_retries=3,
+            initial_delay=0,
+        )
 
         assert result.is_up is True
         assert mock_urlopen.call_count == 2
@@ -203,7 +220,12 @@ class TestCheckHealth:
             url="", code=502, msg="Bad Gateway", hdrs=None, fp=None,
         )
 
-        result = check_health("http://pihost:8080", "lifts", max_retries=3, initial_delay=0)
+        result = check_health(
+            "http://pihost:8080",
+            "lifts",
+            max_retries=3,
+            initial_delay=0,
+        )
 
         assert result.is_up is False
         assert "502" in result.error
@@ -217,7 +239,12 @@ class TestCheckHealth:
             url="", code=403, msg="Forbidden", hdrs=None, fp=None,
         )
 
-        result = check_health("http://pihost:8080", "lifts", max_retries=3, initial_delay=0)
+        result = check_health(
+            "http://pihost:8080",
+            "lifts",
+            max_retries=3,
+            initial_delay=0,
+        )
 
         assert result.is_up is False
         assert "403" in result.error
