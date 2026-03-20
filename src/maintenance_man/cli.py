@@ -27,6 +27,11 @@ from maintenance_man.deployer import (
     run_build,
     run_deploy,
 )
+from maintenance_man.models.activity import (
+    ActivityEvent,
+    load_activity,
+    record_activity,
+)
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -537,19 +542,29 @@ def deploy(
 
     if build and proj_config.build_command:
         console.print(f"[bold]Building {project}[/]\n")
+        activity_path = _config.MM_HOME / "activity.json"
+        branch = _safe_branch(proj_config.path)
         try:
             run_build(project, proj_config.build_command, proj_config.path)
         except BuildError as e:
+            record_activity(
+                activity_path, project, "build", success=False, branch=branch
+            )
             _fatal(str(e), code=ExitCode.BUILD_FAILED)
+        record_activity(activity_path, project, "build", success=True, branch=branch)
         console.print("\n[bold green]Build succeeded.[/]\n")
 
     console.print(f"[bold]Deploying {project}[/]\n")
 
+    activity_path = _config.MM_HOME / "activity.json"
+    branch = _safe_branch(proj_config.path)
     try:
         run_deploy(project, proj_config.deploy_command, proj_config.path)
     except DeployError as e:
+        record_activity(activity_path, project, "deploy", success=False, branch=branch)
         _fatal(str(e), code=ExitCode.DEPLOY_FAILED)
 
+    record_activity(activity_path, project, "deploy", success=True, branch=branch)
     console.print("\n[bold green]Deploy succeeded.[/]")
 
     if check:
@@ -630,11 +645,15 @@ def build(
 
     console.print(f"[bold]Building {project}[/]\n")
 
+    activity_path = _config.MM_HOME / "activity.json"
+    branch = _safe_branch(proj_config.path)
     try:
         run_build(project, proj_config.build_command, proj_config.path)
     except BuildError as e:
+        record_activity(activity_path, project, "build", success=False, branch=branch)
         _fatal(str(e), code=ExitCode.BUILD_FAILED)
 
+    record_activity(activity_path, project, "build", success=True, branch=branch)
     console.print("\n[bold green]Build succeeded.[/]")
     sys.exit(ExitCode.OK)
 
@@ -675,15 +694,18 @@ def list_projects(
                 f"[yellow]Warning:[/] corrupt scan results for '{name}' — skipping"
             )
 
+    activity = load_activity(_config.MM_HOME / "activity.json")
+
     table = Table(title="Configured Projects")
     for col, kw in [
         ("Name", {"style": "bold"}),
-        ("Path", {}),
-        ("Pkg Mgr", {}),
+        ("Type", {}),
         ("Vulns", {"justify": "right"}),
         ("Updates", {"justify": "right"}),
         ("Secrets", {"justify": "right"}),
         ("Scanned", {}),
+        ("Built", {}),
+        ("Deployed", {}),
     ]:
         table.add_column(col, **kw)
 
@@ -699,11 +721,13 @@ def list_projects(
         else:
             counts = (_NO_DATA, _NO_DATA, _NO_DATA, "[dim]never[/]")
 
+        proj_activity = activity.get(name)
         table.add_row(
             name,
-            str(project.path),
             project.package_manager,
             *counts,
+            _format_activity(proj_activity.last_build if proj_activity else None),
+            _format_activity(proj_activity.last_deploy if proj_activity else None),
         )
 
     console.print(table)
@@ -714,6 +738,14 @@ def list_projects(
 
 
 # -- Helpers ------------------------------------------------------------------
+
+
+def _safe_branch(project_path: Path) -> str:
+    """Get current branch, returning 'unknown' on any failure."""
+    try:
+        return get_current_branch(project_path)
+    except Exception:
+        return "unknown"
 
 
 def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
@@ -770,6 +802,16 @@ def _relative_time(dt: datetime, now: datetime | None = None) -> str:
             return f"{s // 3600}h ago"
         case s:
             return f"{s // 86400}d ago"
+
+
+def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -> str:
+    """Format an activity event as relative time with optional failure marker."""
+    if event is None:
+        return _NO_DATA
+    time_str = _relative_time(event.timestamp, now)
+    if not event.success:
+        return f"{time_str} [red]\\[F][/]"
+    return time_str
 
 
 def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:

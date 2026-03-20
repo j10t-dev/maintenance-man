@@ -1,3 +1,9 @@
+from maintenance_man.models.activity import (
+    ActivityEvent,
+    ProjectActivity,
+    load_activity,
+    record_activity,
+)
 from maintenance_man.models.config import DefaultsConfig, MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -10,8 +16,10 @@ from maintenance_man.models.scan import (
 )
 
 __all__ = [
+    "ActivityEvent",
     "DefaultsConfig",
     "MmConfig",
+    "ProjectActivity",
     "ProjectConfig",
     "ScanResult",
     "SecretFinding",
@@ -20,4 +28,6 @@ __all__ = [
     "UpdateFinding",
     "UpdateStatus",
     "VulnFinding",
+    "load_activity",
+    "record_activity",
 ]

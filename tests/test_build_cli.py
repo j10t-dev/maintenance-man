@@ -46,3 +46,33 @@ class TestBuildCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["build", "nonexistent"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
+
+    @patch("maintenance_man.cli.record_activity")
+    @patch("maintenance_man.cli.run_build")
+    def test_successful_build_records_activity(
+        self,
+        mock_build: MagicMock,
+        mock_record: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """Successful build records activity event."""
+        with pytest.raises(SystemExit):
+            app(["build", "deployable"], exit_on_error=False)
+        mock_record.assert_called_once()
+        _, kwargs = mock_record.call_args
+        assert kwargs["success"] is True
+
+    @patch("maintenance_man.cli.record_activity")
+    @patch("maintenance_man.cli.run_build", side_effect=BuildError("build failed"))
+    def test_failed_build_records_activity(
+        self,
+        mock_build: MagicMock,
+        mock_record: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """Failed build still records activity event with success=False."""
+        with pytest.raises(SystemExit):
+            app(["build", "deployable"], exit_on_error=False)
+        mock_record.assert_called_once()
+        _, kwargs = mock_record.call_args
+        assert kwargs["success"] is False

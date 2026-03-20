@@ -84,6 +84,55 @@ class TestDeployCommand:
             app(["deploy", "nonexistent"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
 
+    @patch("maintenance_man.cli.record_activity")
+    @patch("maintenance_man.cli.run_deploy")
+    def test_successful_deploy_records_activity(
+        self,
+        mock_deploy: MagicMock,
+        mock_record: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """Successful deploy records activity event."""
+        with pytest.raises(SystemExit):
+            app(["deploy", "deployable"], exit_on_error=False)
+        mock_record.assert_called_once()
+        _, kwargs = mock_record.call_args
+        assert kwargs["success"] is True
+
+    @patch("maintenance_man.cli.record_activity")
+    @patch("maintenance_man.cli.run_deploy", side_effect=DeployError("deploy failed"))
+    def test_failed_deploy_records_activity(
+        self,
+        mock_deploy: MagicMock,
+        mock_record: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """Failed deploy still records activity event with success=False."""
+        with pytest.raises(SystemExit):
+            app(["deploy", "deployable"], exit_on_error=False)
+        mock_record.assert_called_once()
+        _, kwargs = mock_record.call_args
+        assert kwargs["success"] is False
+
+    @patch("maintenance_man.cli.record_activity")
+    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.cli.run_build")
+    def test_deploy_with_build_records_both(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mock_record: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """--build records both build and deploy events."""
+        with pytest.raises(SystemExit):
+            app(["deploy", "deployable", "--build"], exit_on_error=False)
+        assert mock_record.call_count == 2
+        calls = mock_record.call_args_list
+        # First call is build, second is deploy
+        assert calls[0].args[2] == "build"
+        assert calls[1].args[2] == "deploy"
+
 
 class TestDeployCheck:
     @patch(
