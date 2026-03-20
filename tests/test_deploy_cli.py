@@ -194,6 +194,7 @@ class TestDeployCheck:
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "deployable", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
+        assert "--check: no healthcheck_url configured" in capsys.readouterr().out
 
 
 class TestMassDeployCommand:
@@ -296,6 +297,7 @@ class TestMassDeployCommand:
         mock_deploy: MagicMock,
         mock_check: MagicMock,
         mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """--check runs health check for each deployed project."""
         config_path = mm_home_with_projects / "config.toml"
@@ -309,6 +311,24 @@ class TestMassDeployCommand:
             app(["deploy", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
         assert mock_check.call_count == 2
+        output = capsys.readouterr().out
+        assert "Healthy: deploy-only is up" in output
+        assert "Healthy: deployable is up" in output
+
+    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.cli.run_build")
+    def test_check_without_healthcheck_url_warns_in_mass_mode(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Mass deploy warns when --check is requested without healthcheck_url."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy", "--check"], exit_on_error=False)
+        assert exc_info.value.code == ExitCode.OK
+        assert "--check: no healthcheck_url configured" in capsys.readouterr().out
 
     def test_no_projects_configured(
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]

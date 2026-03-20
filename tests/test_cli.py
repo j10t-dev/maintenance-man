@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from maintenance_man import __version__
@@ -31,10 +33,15 @@ class TestVersion:
 
 
 class TestDeployCommand:
-    def test_deploy_requires_project(self):
+    def test_deploy_no_project_is_mass_mode(self, mm_home: Path):
+        """Deploy with no project triggers mass mode (exits OK with no projects)."""
+        mm_home.mkdir(parents=True, exist_ok=True)
+        (mm_home / "scan-results").mkdir()
+        (mm_home / "worktrees").mkdir()
+        (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy"])
-        assert exc_info.value.code != 0
+        assert exc_info.value.code == 0
 
     def test_deploy_unknown_project_exits_error(self, mm_home):
         """Deploy with unknown project exits with ERROR."""
