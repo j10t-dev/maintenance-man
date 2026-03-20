@@ -194,3 +194,131 @@ class TestDeployCheck:
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "deployable", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
+
+
+class TestMassDeployCommand:
+    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.cli.run_build")
+    def test_deploys_all_projects_with_deploy_command(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """Mass deploy runs build+deploy for all projects with deploy_command."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy"], exit_on_error=False)
+        assert exc_info.value.code == ExitCode.OK
+        # "deployable" has both build+deploy, "deploy-only" has deploy only
+        assert mock_deploy.call_count == 2
+        # Only "deployable" has build_command
+        assert mock_build.call_count == 1
+
+    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.cli.run_build")
+    def test_skips_projects_without_deploy_command(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Projects without deploy_command are silently skipped."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy"], exit_on_error=False)
+        assert exc_info.value.code == ExitCode.OK
+        capsys.readouterr()
+        deployed_projects = [
+            call.args[0] for call in mock_deploy.call_args_list
+        ]
+        assert "no-deploy" not in deployed_projects
+        assert "vulnerable" not in deployed_projects
+
+    @patch(
+        "maintenance_man.cli.run_deploy",
+        side_effect=DeployError("deploy failed"),
+    )
+    @patch("maintenance_man.cli.run_build")
+    def test_continues_after_deploy_failure(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """Deploy failure on one project doesn't stop others."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy"], exit_on_error=False)
+        assert exc_info.value.code == ExitCode.DEPLOY_FAILED
+        assert mock_deploy.call_count == 2
+
+    @patch("maintenance_man.cli.run_deploy")
+    @patch(
+        "maintenance_man.cli.run_build",
+        side_effect=BuildError("build failed"),
+    )
+    def test_build_failure_skips_deploy_for_that_project(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """Build failure skips deploy for that project but continues to next."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy"], exit_on_error=False)
+        assert exc_info.value.code == ExitCode.DEPLOY_FAILED
+        # "deployable" build fails => deploy skipped; "deploy-only" has no build => runs
+        assert mock_deploy.call_count == 1
+
+    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.cli.run_build")
+    def test_prints_summary_table(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Mass deploy prints a summary table."""
+        with pytest.raises(SystemExit):
+            app(["deploy"], exit_on_error=False)
+        output = capsys.readouterr().out
+        assert "Deploy Summary" in output
+
+    @patch(
+        "maintenance_man.cli.check_health",
+        return_value=HealthCheckResult(is_up=True),
+    )
+    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.cli.run_build")
+    def test_check_flag_works_in_mass_mode(
+        self,
+        mock_build: MagicMock,
+        mock_deploy: MagicMock,
+        mock_check: MagicMock,
+        mm_home_with_projects: Path,
+    ) -> None:
+        """--check runs health check for each deployed project."""
+        config_path = mm_home_with_projects / "config.toml"
+        text = config_path.read_text().replace(
+            "min_version_age_days = 7",
+            'min_version_age_days = 7\nhealthcheck_url = "http://pihost:8080"',
+        )
+        config_path.write_text(text)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy", "--check"], exit_on_error=False)
+        assert exc_info.value.code == ExitCode.OK
+        assert mock_check.call_count == 2
+
+    def test_no_projects_configured(
+        self, mm_home: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Mass deploy with no projects prints message and exits OK."""
+        mm_home.mkdir(parents=True, exist_ok=True)
+        (mm_home / "scan-results").mkdir()
+        (mm_home / "worktrees").mkdir()
+        (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
+        with pytest.raises(SystemExit) as exc_info:
+            app(["deploy"], exit_on_error=False)
+        assert exc_info.value.code == ExitCode.OK
+        assert "no projects" in capsys.readouterr().out.lower()

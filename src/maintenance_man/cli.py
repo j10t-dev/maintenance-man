@@ -2,10 +2,11 @@ import subprocess
 import sys
 import time
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, Literal, NoReturn
 
 import cyclopts
 from rich.console import Console
@@ -82,6 +83,13 @@ class ExitCode(IntEnum):
     TEST_FAILED = 5
     BUILD_FAILED = 6
     DEPLOY_FAILED = 7
+
+
+@dataclass
+class DeployResult:
+    project: str
+    build_status: Literal["pass", "fail", "skip"]
+    deploy_status: Literal["pass", "fail", "skip"]
 
 
 console = Console()
@@ -509,9 +517,136 @@ def _print_mass_update_summary(
     console.print(table)
 
 
+def _deploy_one(
+    name: str,
+    proj_config: ProjectConfig,
+    cfg: MmConfig,
+    *,
+    check: bool = False,
+) -> DeployResult:
+    """Build and deploy a single project. Returns result, never raises."""
+    activity_path = _config.MM_HOME / "activity.json"
+    branch = _safe_branch(proj_config.path)
+    build_status = "skip"
+    deploy_status = "skip"
+
+    # Build (always attempted in mass mode if configured)
+    if proj_config.build_command:
+        console.print("  [bold]Building...[/]")
+        try:
+            run_build(name, proj_config.build_command, proj_config.path)
+        except BuildError as e:
+            record_activity(activity_path, name, "build", success=False, branch=branch)
+            console.print(f"  [bold red]Build failed:[/] {e}")
+            build_status = "fail"
+            return DeployResult(
+                project=name,
+                build_status=build_status,
+                deploy_status=deploy_status,
+            )
+        record_activity(activity_path, name, "build", success=True, branch=branch)
+        build_status = "pass"
+
+    # Deploy
+    console.print("  [bold]Deploying...[/]")
+    try:
+        run_deploy(name, proj_config.deploy_command, proj_config.path)
+    except DeployError as e:
+        record_activity(activity_path, name, "deploy", success=False, branch=branch)
+        console.print(f"  [bold red]Deploy failed:[/] {e}")
+        deploy_status = "fail"
+        return DeployResult(
+            project=name,
+            build_status=build_status,
+            deploy_status=deploy_status,
+        )
+    record_activity(activity_path, name, "deploy", success=True, branch=branch)
+    deploy_status = "pass"
+
+    # Health check
+    if check and cfg.defaults.healthcheck_url:
+        result = check_health(cfg.defaults.healthcheck_url, name)
+        if result.is_up:
+            console.print("  [bold green]Healthy[/]")
+        elif result.error:
+            console.print(f"  [bold yellow]Warning:[/] {result.error}")
+        else:
+            console.print(f"  [bold yellow]Warning:[/] {name} is not healthy")
+
+    return DeployResult(
+        project=name,
+        build_status=build_status,
+        deploy_status=deploy_status,
+    )
+
+
+def _deploy_all(cfg: MmConfig, *, check: bool = False) -> NoReturn:
+    """Deploy all configured projects that have a deploy_command."""
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        sys.exit(ExitCode.OK)
+
+    results: list[DeployResult] = []
+
+    for name, proj_config in sorted(cfg.projects.items()):
+        if not proj_config.deploy_command:
+            continue
+
+        if not proj_config.path.exists():
+            console.print(
+                f"[bold yellow]Warning:[/] {name} — "
+                f"path does not exist: {proj_config.path}"
+            )
+            results.append(
+                DeployResult(project=name, build_status="skip", deploy_status="fail")
+            )
+            continue
+
+        console.print(f"\n{'═' * 40}")
+        console.print(f"[bold]{name}[/]")
+        console.print("═" * 40)
+
+        results.append(_deploy_one(name, proj_config, cfg, check=check))
+
+    _print_deploy_summary(results)
+
+    any_failed = any(
+        r.deploy_status == "fail" or r.build_status == "fail" for r in results
+    )
+    sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
+
+
+def _print_deploy_summary(results: list[DeployResult]) -> None:
+    """Print a cross-project deploy summary table."""
+    if not results:
+        console.print("\n[dim]No projects have deploy_command configured.[/]")
+        return
+
+    _STATUS_DISPLAY = {
+        "pass": "[green]PASS[/]",
+        "fail": "[red]FAIL[/]",
+        "skip": "[dim]SKIP[/]",
+    }
+
+    table = Table(title="Deploy Summary")
+    table.add_column("Project", style="bold")
+    table.add_column("Build")
+    table.add_column("Deploy")
+
+    for r in results:
+        table.add_row(
+            r.project,
+            _STATUS_DISPLAY[r.build_status],
+            _STATUS_DISPLAY[r.deploy_status],
+        )
+
+    console.print()
+    console.print(table)
+
+
 @app.command
 def deploy(
-    project: str,
+    project: str | None = None,
     *,
     build: bool = False,
     check: bool = False,
@@ -521,17 +656,22 @@ def deploy(
 
     Parameters
     ----------
-    project: str
-        Project name to deploy.
+    project: str | None
+        Project name to deploy. Deploys all if omitted.
     build: bool
         Run build_command before deploying. Silently skips if no build_command
-        is configured.
+        is configured. Always enabled when deploying all projects.
     check: bool
         Verify deployment health via healthchecker after deploy.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
+
+    if not project:
+        _deploy_all(cfg, check=check)
+        return  # _deploy_all calls sys.exit(); guard against refactors
+
     proj_config = _resolve_proj(cfg, project)
 
     if not proj_config.deploy_command:
