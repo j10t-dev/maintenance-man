@@ -73,7 +73,7 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
                 return _make_clean_result()
             case "outdated":
                 return _make_updates_only_result()
-            case "no-tests":
+            case "no-tests" | "deployable" | "deploy-only" | "no-deploy":
                 return _make_clean_result()
             case _:
                 raise FileNotFoundError(f"Unknown project: {name}")

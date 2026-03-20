@@ -45,6 +45,24 @@ test_unit = "bun test"
 [projects.no-tests]
 path = "{clean_path}"
 package_manager = "uv"
+
+[projects.deployable]
+path = "{clean_path}"
+package_manager = "bun"
+build_command = "scripts/build.sh"
+deploy_command = "scripts/deploy.sh"
+test_unit = "bun test"
+
+[projects.deploy-only]
+path = "{clean_path}"
+package_manager = "uv"
+deploy_command = "scripts/deploy.sh"
+test_unit = "uv run pytest"
+
+[projects.no-deploy]
+path = "{clean_path}"
+package_manager = "uv"
+test_unit = "uv run pytest"
 """
     (mm_home / "config.toml").write_text(config_text)
     return mm_home

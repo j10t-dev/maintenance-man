@@ -518,9 +518,9 @@ class TestUpdateAll:
         with pytest.raises(SystemExit) as exc_info:
             app(["update"])
         assert exc_info.value.code == 0
-        # 3 of 4 projects have test config (no-tests is skipped)
-        assert mock_vulns.call_count == 3
-        assert mock_updates.call_count == 3
+        # 6 of 7 projects have test config (no-tests is skipped)
+        assert mock_vulns.call_count == 6
+        assert mock_updates.call_count == 6
 
     def test_any_failure_exits_4(
         self,

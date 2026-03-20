@@ -30,14 +30,14 @@ class TestVersion:
         assert __version__ in capsys.readouterr().out
 
 
-class TestDeployStub:
+class TestDeployCommand:
     def test_deploy_requires_project(self):
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy"])
         assert exc_info.value.code != 0
 
-    def test_deploy_stub_with_project(self, capsys: pytest.CaptureFixture[str]):
+    def test_deploy_unknown_project_exits_error(self, mm_home):
+        """Deploy with unknown project exits with ERROR."""
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "project-alpha"])
         assert exc_info.value.code == 1
-        assert "not implemented" in capsys.readouterr().out.lower()
