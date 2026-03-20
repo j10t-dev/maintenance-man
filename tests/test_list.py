@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from maintenance_man.cli import _relative_time, app
+from maintenance_man.models.activity import record_activity
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -345,3 +346,46 @@ class TestListFindings:
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
         assert "\u2190 fix" not in output
+
+
+class TestListActivity:
+    def test_shows_dash_when_never_built(
+        self,
+        list_project_home: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Projects with no activity show dash in Built/Deployed columns."""
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "Built" in output
+        assert "Deployed" in output
+
+    def test_shows_relative_time_for_build(
+        self,
+        list_project_home: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Build activity shows relative time."""
+        activity_path = list_project_home / "activity.json"
+        record_activity(activity_path, "myapp", "build", success=True, branch="main")
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "just now" in output.lower() or "0m ago" in output or "1m ago" in output
+
+    def test_shows_failure_marker(
+        self,
+        list_project_home: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Failed build/deploy shows [F] marker."""
+        activity_path = list_project_home / "activity.json"
+        record_activity(activity_path, "myapp", "build", success=False, branch="main")
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "[F]" in output
