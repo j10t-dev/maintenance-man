@@ -9,6 +9,7 @@ build/
 .ruff_cache/
 .pytest_cache/
 .serena/
+TODO
 
 # Test fixture installed deps
 tests/fixtures/projects/dirty-bun/node_modules/

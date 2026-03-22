@@ -1,0 +1,6 @@
+- Document `uv tool install -e .` for global `mm` command availability
+- Document; expectation is apps manage their own test instance lifecycles, and should do so from the test command invocation. How they do it is up to them
+- Add `integration_strategy` option to `[projects.*.test]`: `"all"` (default, run integration after every update) vs `"final"` (run unit per-update, integration once at stack top after all updates processed). On final integration failure, don't fail the whole stack — leave it to the user to investigate/remove the offending branch
+- HUMAN: write README.md. Make it good.
+- isDeployable option - some projects version managed but not conventionally deployed (e.g. mm itself - although maybe its version of deploy would be publish?)
+- alias status to list
