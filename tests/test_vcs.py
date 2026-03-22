@@ -273,7 +273,7 @@ class TestSubmitStack:
         assert ok is True
         assert output == "PR #42 created"
         mock_run.assert_called_once_with(
-            ["gt", "submit", "--stack"],
+            ["gt", "submit", "--stack", "--publish"],
             tmp_path,
             timeout=120,
         )

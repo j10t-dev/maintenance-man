@@ -51,10 +51,14 @@ def sync_graphite(project_path: Path) -> bool:
 
 def submit_stack(project_path: Path) -> tuple[bool, str]:
     """Run gt submit --stack. Retries with --force on stale-ref failures."""
-    r = _run(["gt", "submit", "--stack"], project_path, timeout=120)
+    r = _run(["gt", "submit", "--stack", "--publish"], project_path, timeout=120)
     if r.returncode != 0 and "force-with-lease" in r.stderr.lower():
         rprint("  [bold yellow]Warning:[/] stale remote refs — retrying with --force")
-        r = _run(["gt", "submit", "--stack", "--force"], project_path, timeout=120)
+        r = _run(
+            ["gt", "submit", "--stack", "--publish", "--force"],
+            project_path,
+            timeout=120,
+        )
     ok = r.returncode == 0
     return ok, (r.stdout if ok else r.stderr).strip()
 
