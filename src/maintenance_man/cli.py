@@ -16,8 +16,10 @@ from rich.table import Table
 from maintenance_man import __version__
 from maintenance_man import config as _config
 from maintenance_man.config import (
+    MM_HOME,
     ConfigError,
     ProjectNotFoundError,
+    ensure_mm_home,
     load_config,
     resolve_project,
 )
@@ -106,6 +108,14 @@ app = cyclopts.App(
 
 def main() -> None:
     app()
+
+
+@app.command
+def init() -> None:
+    """Initialise the ~/.mm directory and skeleton config."""
+    ensure_mm_home()
+    console.print(f"Initialised {MM_HOME}")
+    console.print(f"Edit {MM_HOME / 'config.toml'} to add projects.")
 
 
 @app.command
