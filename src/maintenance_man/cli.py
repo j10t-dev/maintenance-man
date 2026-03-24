@@ -861,7 +861,7 @@ def build(
 _NO_DATA = "[dim]—[/]"
 
 
-@app.command(name="list")
+@app.command(name=("list", "status"))
 def list_projects(
     *,
     detail: Annotated[bool, cyclopts.Parameter(name=("--detail", "-d"))] = False,
