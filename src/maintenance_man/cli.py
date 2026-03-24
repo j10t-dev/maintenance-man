@@ -589,6 +589,10 @@ def _deploy_all(cfg: MmConfig, *, check: bool = False) -> NoReturn:
     results: list[DeployResult] = []
 
     for name, proj_config in sorted(cfg.projects.items()):
+        if not proj_config.deployable:
+            console.print(f"[dim]{name} — skipped (not deployable)[/]")
+            continue
+
         if not proj_config.deploy_command:
             continue
 
@@ -751,6 +755,10 @@ def deploy(
         return  # _deploy_all calls sys.exit(); guard against refactors
 
     proj_config = _resolve_proj(cfg, project)
+
+    if not proj_config.deployable:
+        console.print(f"[dim]{project} — skipped (not deployable)[/]")
+        sys.exit(ExitCode.OK)
 
     if not proj_config.deploy_command:
         _fatal(
@@ -927,7 +935,9 @@ def list_projects(
             project.package_manager,
             *counts,
             _format_activity(proj_activity.last_build if proj_activity else None),
-            _format_activity(proj_activity.last_deploy if proj_activity else None),
+            "[dim]n/a[/]"
+            if not project.deployable
+            else _format_activity(proj_activity.last_deploy if proj_activity else None),
         )
 
     console.print(table)

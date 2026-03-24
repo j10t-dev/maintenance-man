@@ -21,6 +21,7 @@ class ProjectConfig(BaseModel):
     test_unit: str | None = None
     test_integration: str | None = None
     test_component: str | None = None
+    deployable: bool = True
     build_command: str | None = None
     deploy_command: str | None = None
 
