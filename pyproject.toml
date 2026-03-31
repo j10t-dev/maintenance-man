@@ -9,7 +9,7 @@ description = "Config-driven CLI for routine software project maintenance"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "cyclopts==4.10.0",
+    "cyclopts==4.10.1",
     "packaging>=24.0",
     "pydantic>=2.0",
     "rich==14.3.3",
