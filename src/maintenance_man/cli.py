@@ -12,6 +12,7 @@ import cyclopts
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
+from rich.text import Text
 
 from maintenance_man import __version__
 from maintenance_man import config as _config
@@ -947,7 +948,51 @@ def list_projects(
             _print_scan_result(scan_results[name])
 
 
+@app.command
+def todo(
+    project: str | None = None,
+    *,
+    config: Path | None = None,
+) -> None:
+    """Show TODO.md items for projects.
+
+    Parameters
+    ----------
+    project: str | None
+        Project name. Shows all projects if omitted.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
+    """
+    cfg = _load_cfg(config)
+
+    if project:
+        proj_config = _resolve_proj(cfg, project)
+        _print_project_todo(project, proj_config.path)
+        return
+
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        return
+
+    for name in sorted(cfg.projects):
+        _print_project_todo(name, cfg.projects[name].path)
+
+
 # -- Helpers ------------------------------------------------------------------
+
+
+def _print_project_todo(name: str, project_path: Path) -> None:
+    """Print a single project's TODO.md content with header."""
+    todo_path = project_path / "TODO.md"
+    console.print(f"\n[bold]{name}[/]")
+    if not todo_path.exists():
+        console.print("  [dim]no TODO.md[/]")
+        return
+    content = todo_path.read_text().strip()
+    if not content:
+        console.print("  [dim]empty[/]")
+        return
+    console.print(Text(content))
 
 
 def _safe_branch(project_path: Path) -> str:
