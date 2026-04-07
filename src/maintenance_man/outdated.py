@@ -214,7 +214,7 @@ def _parse_bun_table(output: str) -> list[dict[str, str]]:
             continue
         rows.append(
             {
-                "package": re.sub(r"\s*\(dev\)$", "", cells[0]),
+                "package": re.sub(r"\s*\(\w+\)$", "", cells[0]),
                 "current": cells[1],
                 "update": cells[2],
                 "latest": cells[3],
