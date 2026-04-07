@@ -95,7 +95,7 @@ def mock_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         ("submit_stack", (True, "")),
         ("gt_checkout", True),
         ("gt_create", True),
-        ("gt_delete", True),
+
         ("_apply_update", True),
         ("run_test_phases", (True, None)),
     ]:
@@ -390,17 +390,18 @@ class TestProcessVulns:
         assert results[0].kind == "vuln"
         mock_vcs["submit_stack"].assert_called_once()
 
-    def test_vuln_test_fails_continues(
+    def test_vuln_test_fails_stops_and_keeps_branch(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
         mock_vcs["run_test_phases"].return_value = (False, "unit")
         vuln2 = make_vuln(vuln_id="CVE-2024-0002", pkg_name="other-pkg")
         results = process_vulns([make_vuln(), vuln2], project_config)
-        assert len(results) == 2
+        # Stops after first failure — second vuln not attempted
+        assert len(results) == 1
         assert results[0].passed is False
-        assert results[1].passed is False
-        assert mock_vcs["_apply_update"].call_count == 2
-        assert mock_vcs["gt_delete"].call_count == 2  # both failed branches deleted
+        assert mock_vcs["_apply_update"].call_count == 1
+        # Failed branch kept: gt_checkout called with failing branch, not main
+        mock_vcs["gt_checkout"].assert_any_call("fix/some-pkg", ANY)
 
     def test_vuln_apply_fails(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
@@ -508,14 +509,13 @@ class TestProcessUpdates:
         mock_vcs["gt_checkout"].assert_any_call("main", ANY)
         mock_vcs["submit_stack"].assert_called_once()
 
-    def test_update_failure_skips_and_continues(
+    def test_update_failure_stops_submits_passing_and_keeps_branch(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        # Patch passes, minor fails, major passes
+        # Patch passes, minor fails — major is never attempted
         mock_vcs["run_test_phases"].side_effect = [
             (True, None),
             (False, "unit"),
-            (True, None),
         ]
         updates = [
             make_update(SemverTier.PATCH),
@@ -524,15 +524,16 @@ class TestProcessUpdates:
         ]
         results = process_updates(updates, project_config)
 
-        assert len(results) == 3
-        assert results[0].passed is True  # patch passed
+        # Only patch and minor are processed; major never starts
+        assert len(results) == 2
+        assert results[0].passed is True   # patch passed
         assert results[1].passed is False  # minor failed
         assert results[1].failed_phase == "unit"
-        assert results[2].passed is True  # major still attempted and passed
-        mock_vcs["gt_delete"].assert_called_once()  # failed branch deleted
-        # Stack submitted from tip (last passing = pkg-c / major)
-        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-c", ANY)
+        # Passing stack (patch) submitted before stopping
+        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-a", ANY)
         mock_vcs["submit_stack"].assert_called_once()
+        # Failed branch (minor) kept — checked out so user can --continue
+        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-b", ANY)
 
     def test_empty_updates(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
