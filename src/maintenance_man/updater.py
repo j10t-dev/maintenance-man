@@ -26,7 +26,6 @@ from maintenance_man.vcs import (
     discard_changes,
     gt_checkout,
     gt_create,
-    gt_delete,
     reset_to_main,
     submit_stack,
 )
@@ -225,7 +224,8 @@ def process_updates(
 ) -> list[UpdateResult]:
     """Process updates as a Graphite stack, risk-ascending.
 
-    Failures are deleted from the stack and processing continues.
+    On the first test failure the loop stops, passing branches are submitted,
+    and the failing branch is kept so the user can inspect and --continue.
     """
     sorted_updates = sort_updates_by_risk(updates)
     return _process_stack(
@@ -323,9 +323,9 @@ def _process_stack(
 ) -> list[UpdateResult]:
     """Process a list of findings as a Graphite stack.
 
-    Each finding gets its own stacked branch. Failures are removed from
-    the stack and processing continues. The stack is submitted before
-    returning to main.
+    Each finding gets its own stacked branch. On the first test failure the
+    loop stops, passing branches are submitted, and the failing branch is kept
+    so the user can inspect and --continue.
     """
     if not _has_test_config(project_config):
         raise NoTestConfigError(
@@ -391,7 +391,6 @@ def _process_stack(
             f.update_status = UpdateStatus.COMPLETED
         else:
             rprint(f"  [bold red]FAIL[/] {f.pkg_name} — {failed_phase} failed")
-            gt_delete(branch, project_path)
             f.update_status = UpdateStatus.FAILED
 
         _persist_status(scan_result, project_name, results_dir)
@@ -404,7 +403,10 @@ def _process_stack(
             )
         )
 
-    # Submit stack from the tip (last passing branch)
+        if not passed:
+            break
+
+    # Submit any passing branches as a stack before stopping
     passing = [r for r in results if r.passed]
     if passing:
         tip = f"{cfg.branch_prefix}{branch_slug(passing[-1].pkg_name)}"
@@ -433,9 +435,29 @@ def _process_stack(
             if output:
                 rprint(f"  [dim]{output}[/]")
 
-    # Return to main after processing
-    if not gt_checkout("main", project_path):
-        reset_to_main(project_path)
+    if results and not results[-1].passed:
+        # Check out the failing branch so the user can inspect and --continue.
+        # results[-1] is always the test failure that triggered the break:
+        # apply/gt-create failures use `continue` so they are never last.
+        # It is guaranteed to have a branch on disk (gt_create succeeded
+        # before run_test_phases was called).
+        failed_branch = f"{cfg.branch_prefix}{branch_slug(results[-1].pkg_name)}"
+        if gt_checkout(failed_branch, project_path):
+            pending = len(findings) - len(results)
+            suffix = f" ({pending} more pending)" if pending else ""
+            rprint(
+                f"\n  Branch [bold cyan]{failed_branch}[/] kept —"
+                f" fix the issue, then run [bold]mm update --continue[/].{suffix}"
+            )
+        else:
+            rprint(
+                f"  [bold red]Could not check out {failed_branch}[/] — returning to main."
+            )
+            if not gt_checkout("main", project_path):
+                reset_to_main(project_path)
+    else:
+        if not gt_checkout("main", project_path):
+            reset_to_main(project_path)
     return results
 
 
