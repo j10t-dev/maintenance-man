@@ -250,6 +250,25 @@ class TestBunOutdated:
         assert updates[1].latest_version == "5.0.0"
         assert updates[1].semver_tier == SemverTier.MAJOR
 
+    def test_strips_peer_and_dev_qualifiers(self):
+        fake_output = (
+            "| Package           | Current | Update | Latest |\n"
+            "|-------------------|---------|--------|--------|\n"
+            "| typescript (peer) | 5.9.3   | 6.0.2  | 6.0.2  |\n"
+            "| eslint (dev)      | 8.0.0   | 9.0.0  | 9.0.0  |\n"
+        )
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=fake_output, stderr=""
+        )
+        project = _make_project("bun")
+
+        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+            updates = bun_outdated(project)
+
+        assert len(updates) == 2
+        assert updates[0].pkg_name == "typescript"
+        assert updates[1].pkg_name == "eslint"
+
     def test_empty_output(self):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr=""
