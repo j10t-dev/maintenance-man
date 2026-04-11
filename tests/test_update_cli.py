@@ -57,6 +57,26 @@ def _mock_updater(monkeypatch: pytest.MonkeyPatch):
 
 
 class TestUpdatePreChecks:
+    def test_no_projects_configured_exits_0_without_gt(
+        self,
+        mm_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (mm_home).mkdir(parents=True, exist_ok=True)
+        (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
+
+        from maintenance_man.vcs import GraphiteNotFoundError
+
+        monkeypatch.setattr(
+            "maintenance_man.cli.check_graphite_available",
+            MagicMock(side_effect=GraphiteNotFoundError("no gt")),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update"])
+
+        assert exc_info.value.code == 0
+
     def test_no_scan_results_exits_1(
         self,
         mm_home_with_projects: Path,
@@ -558,6 +578,327 @@ class TestUpdateAll:
         with pytest.raises(SystemExit) as exc_info:
             app(["update"])
         assert exc_info.value.code == 4
+
+
+class TestUpdateTargetSelection:
+    def test_excluding_all_projects_exits_0_without_gt(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from maintenance_man.vcs import GraphiteNotFoundError
+
+        monkeypatch.setattr(
+            "maintenance_man.cli.check_graphite_available",
+            MagicMock(side_effect=GraphiteNotFoundError("no gt")),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(
+                [
+                    "update",
+                    "-n",
+                    "vulnerable",
+                    "clean",
+                    "outdated",
+                    "no-tests",
+                    "deployable",
+                    "deploy-only",
+                    "no-deploy",
+                ]
+            )
+
+        assert exc_info.value.code == 0
+
+    def test_no_args_uses_batch_all(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_batch = MagicMock(side_effect=SystemExit(0))
+        monkeypatch.setattr(
+            "maintenance_man.cli._update_batch_targets",
+            mock_batch,
+            raising=False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update"])
+
+        assert exc_info.value.code == 0
+        mock_batch.assert_called_once()
+        _, kwargs = mock_batch.call_args
+        assert kwargs["target_names"] == [
+            "clean",
+            "deploy-only",
+            "deployable",
+            "no-deploy",
+            "no-tests",
+            "outdated",
+            "vulnerable",
+        ]
+
+    def test_single_name_keeps_interactive_mode(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_interactive = MagicMock(side_effect=SystemExit(0))
+        mock_batch = MagicMock(side_effect=SystemExit(0))
+        monkeypatch.setattr("maintenance_man.cli._update_interactive", mock_interactive)
+        monkeypatch.setattr(
+            "maintenance_man.cli._update_batch_targets",
+            mock_batch,
+            raising=False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable"])
+
+        assert exc_info.value.code == 0
+        mock_interactive.assert_called_once()
+        mock_batch.assert_not_called()
+
+    def test_multiple_names_use_batch_in_cli_order(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_batch = MagicMock(side_effect=SystemExit(0))
+        monkeypatch.setattr(
+            "maintenance_man.cli._update_batch_targets",
+            mock_batch,
+            raising=False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "outdated", "vulnerable", "outdated"])
+
+        assert exc_info.value.code == 0
+        _, kwargs = mock_batch.call_args
+        assert kwargs["target_names"] == ["outdated", "vulnerable"]
+
+    def test_negate_mode_excludes_named_projects(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_batch = MagicMock(side_effect=SystemExit(0))
+        monkeypatch.setattr(
+            "maintenance_man.cli._update_batch_targets",
+            mock_batch,
+            raising=False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "-n", "vulnerable", "clean"])
+
+        assert exc_info.value.code == 0
+        _, kwargs = mock_batch.call_args
+        assert kwargs["target_names"] == [
+            "deploy-only",
+            "deployable",
+            "no-deploy",
+            "no-tests",
+            "outdated",
+        ]
+
+    def test_negate_mode_treats_all_positionals_as_exclusions(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_batch = MagicMock(side_effect=SystemExit(0))
+        monkeypatch.setattr(
+            "maintenance_man.cli._update_batch_targets",
+            mock_batch,
+            raising=False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "-n", "clean"])
+
+        assert exc_info.value.code == 0
+        _, kwargs = mock_batch.call_args
+        assert kwargs["target_names"] == [
+            "deploy-only",
+            "deployable",
+            "no-deploy",
+            "no-tests",
+            "outdated",
+        ]
+
+    def test_negate_with_no_names_matches_batch_all(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_batch = MagicMock(side_effect=SystemExit(0))
+        monkeypatch.setattr(
+            "maintenance_man.cli._update_batch_targets",
+            mock_batch,
+            raising=False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "-n"])
+
+        assert exc_info.value.code == 0
+        _, kwargs = mock_batch.call_args
+        assert kwargs["target_names"] == [
+            "clean",
+            "deploy-only",
+            "deployable",
+            "no-deploy",
+            "no-tests",
+            "outdated",
+            "vulnerable",
+        ]
+
+    def test_negate_mode_excluding_all_projects_exits_0(
+        self,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(
+                [
+                    "update",
+                    "-n",
+                    "vulnerable",
+                    "clean",
+                    "outdated",
+                    "no-tests",
+                    "deployable",
+                    "deploy-only",
+                    "no-deploy",
+                ]
+            )
+
+        assert exc_info.value.code == 0
+        assert "No target projects." in capsys.readouterr().out
+
+    def test_unknown_project_in_include_mode_exits_1(
+        self,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "missing"])
+
+        assert exc_info.value.code == 1
+        assert "Unknown project 'missing'" in capsys.readouterr().out
+
+    def test_unknown_project_in_negate_mode_exits_1(
+        self,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "-n", "missing"])
+
+        assert exc_info.value.code == 1
+        assert "Unknown project 'missing'" in capsys.readouterr().out
+
+    def test_continue_rejects_batch_include_mode(
+        self,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "clean", "--continue"])
+
+        assert exc_info.value.code == 1
+        assert "--continue requires exactly one project." in capsys.readouterr().out
+
+    def test_continue_and_negate_errors(
+        self,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "-n", "clean", "--continue"])
+
+        assert exc_info.value.code == 1
+        assert (
+            "--continue requires exactly one project and cannot be used with -n."
+            in capsys.readouterr().out
+        )
+
+    def test_batch_continues_after_project_failure(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_batch = MagicMock(
+            side_effect=[
+                None,
+                [UpdateResult(pkg_name="pkg-a", kind="update", passed=True)],
+            ]
+        )
+        monkeypatch.setattr("maintenance_man.cli._update_batch", mock_batch)
+        monkeypatch.setattr(
+            "maintenance_man.cli._print_mass_update_summary",
+            MagicMock(),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "clean"])
+
+        assert exc_info.value.code == 4
+        assert [call.args[0] for call in mock_batch.call_args_list] == [
+            "vulnerable",
+            "clean",
+        ]
+
+
+class TestUpdateCliSurface:
+    def test_help_does_not_expose_projects_option(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "--help"])
+
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "--projects" not in output
+        assert "--empty-projects" not in output
+
+    def test_help_uses_concise_projects_description(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "--help"])
+
+        assert exc_info.value.code == 0
+        output = " ".join(capsys.readouterr().out.split())
+        assert (
+            "Project names to update. No names batch-updates all configured"
+            in output
+        )
+        assert (
+            "projects. With -n/--negate, names are exclusions. One name keeps"
+            in output
+        )
+        assert "the interactive single-project flow." in output
+        assert (
+            "Multiple names batch only the named subset in CLI order."
+            not in output
+        )
+
+    def test_projects_option_is_not_accepted(
+        self,
+        mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "--projects", "vulnerable"])
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Unknown option" in (captured.out + captured.err)
 
 
 class TestWorktreeMode:

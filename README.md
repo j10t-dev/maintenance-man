@@ -28,6 +28,16 @@ Maintenance Manager was written to solve the following chain of problems:
 * Run `uv tool install -e .` to make the `mm` command globally available
 * See `mm --help` for the full command reference
 
+Common update flows:
+
+```bash
+mm update                 # batch update all configured projects
+mm update api             # interactive update flow for one project
+mm update api worker      # batch update only the named projects
+mm update -n api worker   # batch update all except api and worker
+mm update api -n worker   # same exclusion mode; flag position does not matter
+```
+
 ```bash
 ➜  maintenance-man git:(main) ✗ mm --help
 Usage: mm COMMAND

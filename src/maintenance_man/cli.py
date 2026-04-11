@@ -177,20 +177,91 @@ def scan(
     sys.exit(_scan_exit_code(has_vulns, has_updates))
 
 
+def _dedupe_preserve_order(names: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def _validate_project_names(cfg: MmConfig, names: list[str]) -> None:
+    known = set(cfg.projects)
+    for name in names:
+        if name not in known:
+            _fatal(
+                f"Unknown project '{name}'. "
+                f"Known projects: {', '.join(cfg.projects) or '(none)'}"
+            )
+
+
+def _sorted_project_names(cfg: MmConfig) -> list[str]:
+    return sorted(cfg.projects)
+
+
+def _exit_if_no_update_targets(cfg: MmConfig, target_names: list[str]) -> None:
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        sys.exit(ExitCode.OK)
+
+    if not target_names:
+        console.print("No target projects.")
+        sys.exit(ExitCode.OK)
+
+
+def _resolve_update_targets(
+    cfg: MmConfig,
+    projects: list[str],
+    *,
+    negate: bool,
+    continue_: bool,
+) -> tuple[Literal["single", "batch"], list[str]]:
+    ordered = _dedupe_preserve_order(projects)
+    _validate_project_names(cfg, ordered)
+
+    if negate:
+        if continue_:
+            _fatal(
+                "--continue requires exactly one project and cannot be used with -n."
+            )
+        excluded = set(ordered)
+        targets = [name for name in _sorted_project_names(cfg) if name not in excluded]
+        return "batch", targets
+
+    if not ordered:
+        if continue_:
+            _fatal("--continue requires a project name.")
+        return "batch", _sorted_project_names(cfg)
+
+    if continue_ and len(ordered) != 1:
+        _fatal("--continue requires exactly one project.")
+
+    if len(ordered) == 1:
+        return "single", ordered
+
+    return "batch", ordered
+
+
 @app.command
 def update(
-    project: str | None = None,
-    *,
+    *projects: str,
+    negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
     worktree: bool = False,
     config: Path | None = None,
 ) -> None:
-    """Apply updates from scan results to a project.
+    """Apply updates from scan results to one, many, or all projects.
 
     Parameters
     ----------
-    project: str | None
-        Project name to update. Updates all projects if omitted.
+    projects: str
+        Project names to update. No names batch-updates all configured projects.
+        With -n/--negate, names are exclusions. One name keeps the interactive
+        single-project flow.
+    negate: bool
+        Treat all positional project names as exclusions.
     continue_: bool
         Re-test a manually fixed failed finding on the current branch.
     worktree: bool
@@ -200,22 +271,32 @@ def update(
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
-
-    if continue_ and not project:
-        _fatal("--continue requires a project name.")
+    mode, targets = _resolve_update_targets(
+        cfg,
+        list(projects),
+        negate=negate,
+        continue_=continue_,
+    )
 
     if continue_ and worktree:
         _fatal("--continue and --worktree cannot be used together.")
+
+    _exit_if_no_update_targets(cfg, targets)
 
     try:
         check_graphite_available()
     except GraphiteNotFoundError as e:
         _fatal(str(e))
 
-    if project:
-        _update_interactive(cfg, project, continue_=continue_, use_worktree=worktree)
-    else:
-        _update_all(cfg, use_worktree=worktree)
+    if mode == "single":
+        _update_interactive(
+            cfg,
+            targets[0],
+            continue_=continue_,
+            use_worktree=worktree,
+        )
+
+    _update_batch_targets(cfg, target_names=targets, use_worktree=worktree)
 
 
 @contextmanager
@@ -467,17 +548,21 @@ def _update_batch(
         return vuln_results + update_results
 
 
-def _update_all(cfg: MmConfig, *, use_worktree: bool = False) -> NoReturn:
-    """Update all configured projects, auto-selecting all findings."""
-    if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
-        sys.exit(ExitCode.OK)
+def _update_batch_targets(
+    cfg: MmConfig,
+    *,
+    target_names: list[str],
+    use_worktree: bool = False,
+) -> NoReturn:
+    """Update an explicit ordered set of projects, auto-selecting all findings."""
+    _exit_if_no_update_targets(cfg, target_names)
 
     results_dir = _config.MM_HOME / "scan-results"
     all_project_results: list[tuple[str, list[UpdateResult]]] = []
     had_errors = False
 
-    for name, proj_config in sorted(cfg.projects.items()):
+    for name in target_names:
+        proj_config = cfg.projects[name]
         if not proj_config.path.exists():
             console.print(
                 f"[bold yellow]Warning:[/] {name} — "

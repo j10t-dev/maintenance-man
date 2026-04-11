@@ -445,13 +445,19 @@ def _process_stack(
         if gt_checkout(failed_branch, project_path):
             pending = len(findings) - len(results)
             suffix = f" ({pending} more pending)" if pending else ""
+            continue_cmd = (
+                f"mm update {project_name} --continue"
+                if project_name
+                else "mm update --continue"
+            )
             rprint(
                 f"\n  Branch [bold cyan]{failed_branch}[/] kept —"
-                f" fix the issue, then run [bold]mm update --continue[/].{suffix}"
+                f" fix the issue, then run [bold]{continue_cmd}[/].{suffix}"
             )
         else:
             rprint(
-                f"  [bold red]Could not check out {failed_branch}[/] — returning to main."
+                f"  [bold red]Could not check out {failed_branch}[/]"
+                " — returning to main."
             )
             if not gt_checkout("main", project_path):
                 reset_to_main(project_path)

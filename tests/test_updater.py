@@ -535,6 +535,26 @@ class TestProcessUpdates:
         # Failed branch (minor) kept — checked out so user can --continue
         mock_vcs["gt_checkout"].assert_any_call("bump/pkg-b", ANY)
 
+    def test_update_failure_message_includes_project_for_continue(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        mock_vcs: dict[str, MagicMock],
+        project_config: ProjectConfig,
+    ):
+        mock_vcs["run_test_phases"].side_effect = [
+            (True, None),
+            (False, "unit"),
+        ]
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+        ]
+
+        process_updates(updates, project_config, project_name="myapp")
+
+        output = capsys.readouterr().out
+        assert "mm update myapp --continue" in output
+
     def test_empty_updates(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
