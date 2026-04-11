@@ -10,9 +10,10 @@ from typing import Annotated, Literal, NoReturn
 
 import cyclopts
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
-from rich.text import Text
 
 from maintenance_man import __version__
 from maintenance_man import config as _config
@@ -974,7 +975,19 @@ def todo(
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
+    empty = []
+    has_content = []
     for name in sorted(cfg.projects):
+        todo_path = cfg.projects[name].path / "TODO.md"
+        content = todo_path.read_text().strip() if todo_path.exists() else ""
+        if content:
+            has_content.append(name)
+        else:
+            empty.append(name)
+
+    for name in empty:
+        _print_project_todo(name, cfg.projects[name].path)
+    for name in has_content:
         _print_project_todo(name, cfg.projects[name].path)
 
 
@@ -984,15 +997,14 @@ def todo(
 def _print_project_todo(name: str, project_path: Path) -> None:
     """Print a single project's TODO.md content with header."""
     todo_path = project_path / "TODO.md"
-    console.print(f"\n[bold]{name}[/]")
     if not todo_path.exists():
-        console.print("  [dim]no TODO.md[/]")
+        console.print(Panel("[dim]no TODO.md[/]", title=name, border_style="dim"))
         return
     content = todo_path.read_text().strip()
     if not content:
-        console.print("  [dim]empty[/]")
+        console.print(Panel("[dim]empty[/]", title=name, border_style="dim"))
         return
-    console.print(Text(content))
+    console.print(Panel(Markdown(content), title=name))
 
 
 def _safe_branch(project_path: Path) -> str:
