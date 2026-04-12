@@ -70,7 +70,7 @@ class TestGetUvDirectDepNames:
     def test_extracts_from_dependencies_and_groups(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text(
-            '[project]\n'
+            "[project]\n"
             'dependencies = ["requests>=2.28", "Flask==3.0.0"]\n'
             "\n"
             "[dependency-groups]\n"
@@ -82,8 +82,7 @@ class TestGetUvDirectDepNames:
     def test_normalises_names(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text(
-            '[project]\n'
-            'dependencies = ["pydantic_core>=2.0", "Zope.Interface"]\n'
+            '[project]\ndependencies = ["pydantic_core>=2.0", "Zope.Interface"]\n'
         )
         names = _get_uv_direct_dep_names(tmp_path)
         assert names == {"pydantic-core", "zope-interface"}
@@ -108,9 +107,7 @@ class TestGetUvDirectDepNames:
 
     def test_no_dependency_groups(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            '[project]\ndependencies = ["rich>=14.0"]\n'
-        )
+        pyproject.write_text('[project]\ndependencies = ["rich>=14.0"]\n')
         names = _get_uv_direct_dep_names(tmp_path)
         assert names == {"rich"}
 
@@ -210,13 +207,9 @@ class TestUvOutdated:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=fake_json, stderr=""
         )
-        project = ProjectConfig(
-            path=tmp_path, package_manager="uv"
-        )
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch(
-            "maintenance_man.outdated.subprocess.run", return_value=completed
-        ):
+        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
             updates = uv_outdated(project)
 
         pkg_names = [u.pkg_name for u in updates]

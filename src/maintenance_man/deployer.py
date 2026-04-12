@@ -86,9 +86,7 @@ def check_health(
                 time.sleep(delay)
                 delay *= 2
                 continue
-            return HealthCheckResult(
-                is_up=False, error=f"HTTP {e.code}: {e.reason}"
-            )
+            return HealthCheckResult(is_up=False, error=f"HTTP {e.code}: {e.reason}")
         except json.JSONDecodeError:
             return HealthCheckResult(
                 is_up=False,

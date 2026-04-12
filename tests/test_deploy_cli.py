@@ -229,9 +229,7 @@ class TestMassDeployCommand:
             app(["deploy"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
         capsys.readouterr()
-        deployed_projects = [
-            call.args[0] for call in mock_deploy.call_args_list
-        ]
+        deployed_projects = [call.args[0] for call in mock_deploy.call_args_list]
         assert "no-deploy" not in deployed_projects
         assert "vulnerable" not in deployed_projects
 
