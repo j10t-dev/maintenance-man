@@ -9,6 +9,7 @@ from maintenance_man.models.scan import (
     SemverTier,
     Severity,
     UpdateFinding,
+    UpdateStatus,
     VulnFinding,
     sort_vulns_by_severity,
 )
@@ -71,6 +72,119 @@ class TestSecretFinding:
 
 
 class TestScanResult:
+    def test_scan_result_round_trips_ready_and_update_flow(self):
+        result = ScanResult(
+            project="project-ready-update",
+            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            trivy_target="/tmp/project-ready-update",
+            vulnerabilities=[
+                VulnFinding(
+                    vuln_id="CVE-2026-00001",
+                    pkg_name="requests",
+                    installed_version="2.31.0",
+                    fixed_version="2.32.4",
+                    severity=Severity.HIGH,
+                    title="t",
+                    description="d",
+                    status="fixed",
+                    update_status=UpdateStatus.READY,
+                    flow="update",
+                )
+            ],
+            updates=[
+                UpdateFinding(
+                    pkg_name="react",
+                    installed_version="18.2.0",
+                    latest_version="19.0.0",
+                    semver_tier=SemverTier.MAJOR,
+                    update_status=UpdateStatus.READY,
+                    flow="update",
+                )
+            ],
+        )
+
+        reloaded = ScanResult.model_validate_json(result.model_dump_json())
+
+        assert reloaded.vulnerabilities[0].update_status == UpdateStatus.READY
+        assert reloaded.vulnerabilities[0].flow == "update"
+        assert reloaded.updates[0].update_status == UpdateStatus.READY
+        assert reloaded.updates[0].flow == "update"
+
+    def test_scan_result_round_trips_ready_and_resolve_flow(self):
+        result = ScanResult(
+            project="project-ready-resolve",
+            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            trivy_target="/tmp/project-ready-resolve",
+            vulnerabilities=[
+                VulnFinding(
+                    vuln_id="CVE-2026-00002",
+                    pkg_name="urllib3",
+                    installed_version="2.0.0",
+                    fixed_version="2.0.7",
+                    severity=Severity.MEDIUM,
+                    title="t",
+                    description="d",
+                    status="fixed",
+                    update_status=UpdateStatus.READY,
+                    flow="resolve",
+                )
+            ],
+            updates=[
+                UpdateFinding(
+                    pkg_name="vite",
+                    installed_version="5.0.0",
+                    latest_version="5.1.0",
+                    semver_tier=SemverTier.MINOR,
+                    update_status=UpdateStatus.READY,
+                    flow="resolve",
+                )
+            ],
+        )
+
+        reloaded = ScanResult.model_validate_json(result.model_dump_json())
+
+        assert reloaded.vulnerabilities[0].update_status == UpdateStatus.READY
+        assert reloaded.vulnerabilities[0].flow == "resolve"
+        assert reloaded.updates[0].update_status == UpdateStatus.READY
+        assert reloaded.updates[0].flow == "resolve"
+
+    def test_legacy_started_status_loads_as_ready(self):
+        payload = {
+            "project": "project-started-legacy",
+            "scanned_at": "2026-01-30T00:00:00Z",
+            "trivy_target": "/tmp/project-started-legacy",
+            "vulnerabilities": [
+                {
+                    "vuln_id": "CVE-2026-00003",
+                    "pkg_name": "requests",
+                    "installed_version": "2.31.0",
+                    "fixed_version": "2.32.4",
+                    "severity": "HIGH",
+                    "title": "t",
+                    "description": "d",
+                    "status": "fixed",
+                    "update_status": "started",
+                }
+            ],
+            "updates": [
+                {
+                    "pkg_name": "react",
+                    "installed_version": "18.2.0",
+                    "latest_version": "19.0.0",
+                    "semver_tier": "major",
+                    "update_status": "started",
+                }
+            ],
+        }
+
+        reloaded = ScanResult.model_validate(payload)
+
+        assert reloaded.vulnerabilities[0].update_status == UpdateStatus.READY
+        assert reloaded.updates[0].update_status == UpdateStatus.READY
+
+    def test_update_status_started_no_longer_exists(self):
+        assert not hasattr(UpdateStatus, "STARTED")
+
     def test_scan_result_empty(self):
         result = ScanResult(
             project="project-alpha",

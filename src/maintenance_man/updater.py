@@ -15,6 +15,7 @@ from maintenance_man import sanitise_project_name
 from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    MaintenanceFlow,
     ScanResult,
     SemverTier,
     UpdateFinding,
@@ -22,12 +23,9 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.vcs import (
-    branch_slug,
     discard_changes,
-    gt_checkout,
-    gt_create,
-    reset_to_main,
-    submit_stack,
+    git_commit_all,
+    git_has_changes,
 )
 
 
@@ -35,11 +33,7 @@ class NoScanResultsError(Exception):
     pass
 
 
-class NoTestConfigError(Exception):
-    pass
-
-
-def _has_test_config(project_config: ProjectConfig) -> bool:
+def has_test_config(project_config: ProjectConfig) -> bool:
     """Return True if any test phase is configured."""
     return any(
         [
@@ -52,13 +46,17 @@ def _has_test_config(project_config: ProjectConfig) -> bool:
 
 type UpdateKind = Literal["vuln", "update"]
 
+FailureStrategy = Literal["continue", "stop"]
+
 
 class Finding(Protocol):
-    """Common interface for VulnFinding and UpdateFinding during stack processing."""
+    """Common interface for VulnFinding and UpdateFinding during update processing."""
 
     pkg_name: str
     installed_version: str
     update_status: UpdateStatus | None
+    failed_phase: str | None
+    flow: MaintenanceFlow | None
 
     @property
     def target_version(self) -> str: ...
@@ -78,29 +76,23 @@ class UpdateResult:
 
 
 @dataclass(frozen=True, slots=True)
-class _StackConfig:
-    """Varying parameters for a stack processing run."""
+class _FindingFlowConfig:
+    """Varying parameters for a finding processing run."""
 
-    branch_prefix: str
     kind: UpdateKind
     label: str
-    submit_label: str
     commit_fmt: str
 
 
-_VULN_STACK = _StackConfig(
-    branch_prefix="fix/",
+_VULN_STACK = _FindingFlowConfig(
     kind="vuln",
     label="[bold red]VULN[/]",
-    submit_label="Fix stack",
     commit_fmt="fix: upgrade {pkg} {old} -> {new} for {detail}",
 )
 
-_UPDATE_STACK = _StackConfig(
-    branch_prefix="bump/",
+_UPDATE_STACK = _FindingFlowConfig(
     kind="update",
     label="[bold cyan]UPDATE[/]",
-    submit_label="Update stack",
     commit_fmt="update: {pkg} {old} -> {new} ({detail})",
 )
 
@@ -112,10 +104,10 @@ _RISK_ORDER = {
 }
 
 
-def _highest_fix_version(vulns: list[VulnFinding]) -> str:
+def highest_fix_version(vulns: list[VulnFinding]) -> str:
     """Return the highest ``fixed_version`` from *vulns*.
 
-    Uses :class:`packaging.version.Version` for comparison.  Unparsable
+    Uses :class:`packaging.version.Version` for comparison. Unparsable
     version strings are ignored; if *none* can be parsed the last item
     in the list is returned as a fallback.
     """
@@ -130,12 +122,41 @@ def _highest_fix_version(vulns: list[VulnFinding]) -> str:
     return best.fixed_version or vulns[-1].fixed_version or ""
 
 
+def _first_non_none(values: Sequence[str | MaintenanceFlow | None]):
+    return next((value for value in values if value is not None), None)
+
+
+def _consolidated_lifecycle_state(
+    group: list[VulnFinding],
+) -> tuple[UpdateStatus | None, str | None, MaintenanceFlow | None]:
+    failed = [v for v in group if v.update_status == UpdateStatus.FAILED]
+    if failed:
+        return (
+            UpdateStatus.FAILED,
+            _first_non_none([v.failed_phase for v in failed]),
+            _first_non_none([v.flow for v in failed]),
+        )
+
+    ready = [v for v in group if v.update_status == UpdateStatus.READY]
+    if ready:
+        return (
+            UpdateStatus.READY,
+            _first_non_none([v.failed_phase for v in ready]),
+            _first_non_none([v.flow for v in ready]),
+        )
+
+    if group and all(v.update_status == UpdateStatus.COMPLETED for v in group):
+        return (UpdateStatus.COMPLETED, None, None)
+
+    return (None, None, None)
+
+
 @dataclass
 class _ConsolidatedVuln:
     """Proxy that groups several vulns for the same package into one finding.
 
-    Satisfies the :class:`Finding` protocol so it can be passed straight into
-    :func:`_process_stack`.  Writes to :attr:`update_status` are fanned out to
+    Satisfies the :class:`Finding` protocol so it can be used in the update
+    processing flows.  Writes to :attr:`update_status` are fanned out to
     every original :class:`VulnFinding` so that serialisation (which works on
     the originals) stays consistent.
     """
@@ -146,6 +167,13 @@ class _ConsolidatedVuln:
     _detail: str
     _originals: list[VulnFinding] = field(repr=False)
     _update_status: UpdateStatus | None = None
+    _failed_phase: str | None = None
+    _flow: MaintenanceFlow | None = None
+
+    def __post_init__(self) -> None:
+        self.update_status = self._update_status
+        self.failed_phase = self._failed_phase
+        self.flow = self._flow
 
     @property
     def target_version(self) -> str:
@@ -165,8 +193,28 @@ class _ConsolidatedVuln:
         for orig in self._originals:
             orig.update_status = value
 
+    @property
+    def failed_phase(self) -> str | None:
+        return self._failed_phase
 
-def _consolidate_vulns(
+    @failed_phase.setter
+    def failed_phase(self, value: str | None) -> None:
+        self._failed_phase = value
+        for orig in self._originals:
+            orig.failed_phase = value
+
+    @property
+    def flow(self) -> MaintenanceFlow | None:
+        return self._flow
+
+    @flow.setter
+    def flow(self, value: MaintenanceFlow | None) -> None:
+        self._flow = value
+        for orig in self._originals:
+            orig.flow = value
+
+
+def consolidate_vulns(
     vulns: list[VulnFinding],
 ) -> list[_ConsolidatedVuln]:
     """Group actionable vulns by package and pick the highest fix version."""
@@ -176,8 +224,9 @@ def _consolidate_vulns(
 
     consolidated: list[_ConsolidatedVuln] = []
     for pkg, group in by_pkg.items():
-        best_version = _highest_fix_version(group)
+        best_version = highest_fix_version(group)
         detail = ", ".join(v.vuln_id for v in group)
+        update_status, failed_phase, flow = _consolidated_lifecycle_state(group)
         consolidated.append(
             _ConsolidatedVuln(
                 pkg_name=pkg,
@@ -185,55 +234,53 @@ def _consolidate_vulns(
                 _target_version=best_version,
                 _detail=detail,
                 _originals=group,
+                _update_status=update_status,
+                _failed_phase=failed_phase,
+                _flow=flow,
             )
         )
     return consolidated
 
 
-def process_vulns(
+def process_vulns_local(
     vulns: list[VulnFinding],
     project_config: ProjectConfig,
     *,
+    flow: MaintenanceFlow,
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process vuln fixes as a Graphite stack off main.
-
-    Vulns for the same package are consolidated so only one branch is
-    created per package (using the highest fix version).  The fix stack is
-    submitted before returning to main.
-    """
+    """Process vuln fixes in the single-branch update flow."""
     actionable = [v for v in vulns if v.actionable]
-    consolidated = _consolidate_vulns(actionable)
-    return _process_stack(
+    consolidated = consolidate_vulns(actionable)
+    return process_findings(
         consolidated,
         project_config,
         _VULN_STACK,
+        flow=flow,
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
     )
 
 
-def process_updates(
+def process_updates_local(
     updates: list[UpdateFinding],
     project_config: ProjectConfig,
     *,
+    flow: MaintenanceFlow,
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process updates as a Graphite stack, risk-ascending.
-
-    On the first test failure the loop stops, passing branches are submitted,
-    and the failing branch is kept so the user can inspect and --continue.
-    """
+    """Process updates in the single-branch update flow, risk-ascending."""
     sorted_updates = sort_updates_by_risk(updates)
-    return _process_stack(
+    return process_findings(
         sorted_updates,
         project_config,
         _UPDATE_STACK,
+        flow=flow,
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
@@ -264,6 +311,18 @@ def save_scan_results(
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
     """Sort updates risk-ascending: PATCH < MINOR < MAJOR < UNKNOWN."""
     return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
+
+
+def remove_completed_findings(scan_result: ScanResult) -> None:
+    """Remove findings with COMPLETED status from the scan result in place."""
+    scan_result.vulnerabilities = [
+        v
+        for v in scan_result.vulnerabilities
+        if v.update_status != UpdateStatus.COMPLETED
+    ]
+    scan_result.updates = [
+        u for u in scan_result.updates if u.update_status != UpdateStatus.COMPLETED
+    ]
 
 
 def get_update_command(package_manager: str, pkg_name: str, version: str) -> list[str]:
@@ -314,47 +373,38 @@ def run_test_phases(
     return True, None
 
 
-def _process_stack(
+def process_findings(
     findings: Sequence[Finding],
     project_config: ProjectConfig,
-    cfg: _StackConfig,
+    cfg: _FindingFlowConfig | None = None,
     *,
+    flow: MaintenanceFlow,
+    on_failure: FailureStrategy = "continue",
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process a list of findings as a Graphite stack.
+    """Process findings on the current branch using plain git.
 
-    Each finding gets its own stacked branch. On the first test failure the
-    loop stops, passing branches are submitted, and the failing branch is kept
-    so the user can inspect and --continue.
+    *on_failure* controls behaviour when an update or test fails:
+
+    * ``"continue"`` — discard changes and move on to the next finding
+      (used by ``mm update``).
+    * ``"stop"`` — preserve changes for debugging and stop processing
+      (used by ``mm resolve``).
     """
-    if not _has_test_config(project_config):
-        raise NoTestConfigError(
-            f"No test configuration for project at {project_config.path}"
-        )
-
     results: list[UpdateResult] = []
     project_path = Path(project_config.path)
+    has_tests = has_test_config(project_config)
 
     for f in findings:
+        flow_cfg = _finding_flow_config(f, cfg)
         rprint(
-            f"\n  {cfg.label} {f.pkg_name} {f.installed_version} "
+            f"\n  {flow_cfg.label} {f.pkg_name} {f.installed_version} "
             f"-> {f.target_version} ({f.detail})"
         )
 
-        f.update_status = UpdateStatus.STARTED
-        _persist_status(scan_result, project_name, results_dir)
-
-        msg = cfg.commit_fmt.format(
-            pkg=f.pkg_name,
-            old=f.installed_version,
-            new=f.target_version,
-            detail=f.detail,
-        )
-        branch = f"{cfg.branch_prefix}{branch_slug(f.pkg_name)}"
-
-        if not _apply_update(
+        if not apply_update(
             project_config.package_manager,
             f.pkg_name,
             f.target_version,
@@ -363,128 +413,91 @@ def _process_stack(
             results.append(
                 _record_failure(
                     f,
-                    cfg.kind,
+                    flow_cfg.kind,
                     "apply",
                     project_path,
                     scan_result,
+                    flow,
                     project_name,
                     results_dir,
+                    discard=on_failure == "continue",
                 )
             )
+            if on_failure == "stop":
+                break
             continue
 
-        if not gt_create(msg, branch, project_path):
-            results.append(
-                _record_failure(
-                    f,
-                    cfg.kind,
-                    "gt-create",
-                    project_path,
-                    scan_result,
-                    project_name,
-                    results_dir,
-                )
-            )
-            continue
+        passed, failed_phase = True, None
+        if has_tests:
+            passed, failed_phase = run_test_phases(project_config, project_path)
 
-        passed, failed_phase = run_test_phases(project_config, project_path)
         if passed:
-            rprint(f"  [bold green]PASS[/] {f.pkg_name}")
-            f.update_status = UpdateStatus.COMPLETED
+            if not git_has_changes(project_path):
+                rprint(f"  [bold green]PASS[/] {f.pkg_name} [dim](already applied)[/]")
+                f.update_status = UpdateStatus.READY
+                f.failed_phase = None
+                f.flow = flow
+            else:
+                msg = flow_cfg.commit_fmt.format(
+                    pkg=f.pkg_name,
+                    old=f.installed_version,
+                    new=f.target_version,
+                    detail=f.detail,
+                )
+                if not git_commit_all(msg, project_path):
+                    results.append(
+                        _record_failure(
+                            f,
+                            flow_cfg.kind,
+                            "commit",
+                            project_path,
+                            scan_result,
+                            flow,
+                            project_name,
+                            results_dir,
+                            discard=on_failure == "continue",
+                        )
+                    )
+                    if on_failure == "stop":
+                        break
+                    continue
+                rprint(f"  [bold green]PASS[/] {f.pkg_name}")
+                f.update_status = UpdateStatus.READY
+                f.failed_phase = None
+                f.flow = flow
         else:
             rprint(f"  [bold red]FAIL[/] {f.pkg_name} — {failed_phase} failed")
+            if on_failure == "continue":
+                discard_changes(project_path)
             f.update_status = UpdateStatus.FAILED
+            f.failed_phase = failed_phase
+            f.flow = flow
 
         _persist_status(scan_result, project_name, results_dir)
         results.append(
             UpdateResult(
                 pkg_name=f.pkg_name,
-                kind=cfg.kind,
+                kind=flow_cfg.kind,
                 passed=passed,
                 failed_phase=failed_phase,
             )
         )
 
-        if not passed:
+        if not passed and on_failure == "stop":
             break
 
-    # Submit any passing branches as a stack before stopping
-    passing = [r for r in results if r.passed]
-    if passing:
-        tip = f"{cfg.branch_prefix}{branch_slug(passing[-1].pkg_name)}"
-        if not gt_checkout(tip, project_path):
-            rprint(
-                f"  [bold red]{cfg.submit_label} checkout failed — skipping submit.[/]"
-            )
-            _mark_stack_failed(
-                results, findings, "submit", scan_result, project_name, results_dir
-            )
-        else:
-            ok, output = submit_stack(project_path)
-            if ok:
-                rprint(f"  [bold green]{cfg.submit_label} submitted.[/]")
-            else:
-                rprint(f"  [bold red]{cfg.submit_label} submit failed.[/]")
-                _mark_stack_failed(
-                    results,
-                    findings,
-                    "submit",
-                    scan_result,
-                    project_name,
-                    results_dir,
-                )
-            if output:
-                rprint(f"  [dim]{output}[/]")
-
-    if results and not results[-1].passed:
-        # Check out the failing branch so the user can inspect and --continue.
-        # results[-1] is always the test failure that triggered the break:
-        # apply/gt-create failures use `continue` so they are never last.
-        # It is guaranteed to have a branch on disk (gt_create succeeded
-        # before run_test_phases was called).
-        failed_branch = f"{cfg.branch_prefix}{branch_slug(results[-1].pkg_name)}"
-        if gt_checkout(failed_branch, project_path):
-            pending = len(findings) - len(results)
-            suffix = f" ({pending} more pending)" if pending else ""
-            continue_cmd = (
-                f"mm update {project_name} --continue"
-                if project_name
-                else "mm update --continue"
-            )
-            rprint(
-                f"\n  Branch [bold cyan]{failed_branch}[/] kept —"
-                f" fix the issue, then run [bold]{continue_cmd}[/].{suffix}"
-            )
-        else:
-            rprint(
-                f"  [bold red]Could not check out {failed_branch}[/]"
-                " — returning to main."
-            )
-            if not gt_checkout("main", project_path):
-                reset_to_main(project_path)
-    else:
-        if not gt_checkout("main", project_path):
-            reset_to_main(project_path)
     return results
 
 
-def _mark_stack_failed(
-    results: list[UpdateResult],
-    findings: Sequence[Finding],
-    phase: str,
-    scan_result: ScanResult | None,
-    project_name: str,
-    results_dir: Path | None,
-) -> None:
-    """Mark all passing results and completed findings as failed."""
-    for r in results:
-        if r.passed:
-            r.passed = False
-            r.failed_phase = phase
-    for f in findings:
-        if f.update_status == UpdateStatus.COMPLETED:
-            f.update_status = UpdateStatus.FAILED
-    _persist_status(scan_result, project_name, results_dir)
+def _finding_flow_config(
+    finding: Finding,
+    cfg: _FindingFlowConfig | None,
+) -> _FindingFlowConfig:
+    """Return flow config for a finding, inferring it when omitted."""
+    if cfg is not None:
+        return cfg
+    vuln_types = (VulnFinding, _ConsolidatedVuln)
+    return _VULN_STACK if isinstance(finding, vuln_types) else _UPDATE_STACK
 
 
 def _record_failure(
@@ -493,12 +506,18 @@ def _record_failure(
     phase: str,
     project_path: Path,
     scan_result: ScanResult | None,
+    flow: MaintenanceFlow,
     project_name: str,
     results_dir: Path | None,
+    *,
+    discard: bool = True,
 ) -> UpdateResult:
-    """Discard changes, mark the finding as failed, persist and return a result."""
-    discard_changes(project_path)
+    """Mark finding as failed, optionally discard changes, persist and return."""
+    if discard:
+        discard_changes(project_path)
     finding.update_status = UpdateStatus.FAILED
+    finding.failed_phase = phase
+    finding.flow = flow
     _persist_status(scan_result, project_name, results_dir)
     return UpdateResult(
         pkg_name=finding.pkg_name,
@@ -531,7 +550,7 @@ def _persist_status(
         save_scan_results(project_name, results_dir, scan_result)
 
 
-def _apply_update(
+def apply_update(
     package_manager: str, pkg_name: str, version: str, project_path: Path
 ) -> bool:
     """Apply a single package update. Returns True on success."""

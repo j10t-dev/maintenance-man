@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum, auto
 
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class Severity(StrEnum):
@@ -21,9 +21,20 @@ class SemverTier(StrEnum):
 
 
 class UpdateStatus(StrEnum):
-    STARTED = auto()
-    COMPLETED = auto()
-    FAILED = auto()
+    FAILED = "failed"
+    READY = "ready"
+    COMPLETED = "completed"
+
+
+class MaintenanceFlow(StrEnum):
+    UPDATE = "update"
+    RESOLVE = "resolve"
+
+
+def _coerce_legacy_update_status(value: UpdateStatus | str | None) -> UpdateStatus | str | None:
+    if value == "started":
+        return UpdateStatus.READY
+    return value
 
 
 class VulnFinding(BaseModel):
@@ -38,6 +49,13 @@ class VulnFinding(BaseModel):
     primary_url: str | None = None
     published_date: datetime | None = None
     update_status: UpdateStatus | None = None
+    failed_phase: str | None = None
+    flow: MaintenanceFlow | None = None
+
+    @field_validator("update_status", mode="before")
+    @classmethod
+    def _migrate_update_status(cls, value: UpdateStatus | str | None):
+        return _coerce_legacy_update_status(value)
 
     @property
     def actionable(self) -> bool:
@@ -68,6 +86,13 @@ class UpdateFinding(BaseModel):
     semver_tier: SemverTier
     published_date: datetime | None = None
     update_status: UpdateStatus | None = None
+    failed_phase: str | None = None
+    flow: MaintenanceFlow | None = None
+
+    @field_validator("update_status", mode="before")
+    @classmethod
+    def _migrate_update_status(cls, value: UpdateStatus | str | None):
+        return _coerce_legacy_update_status(value)
 
     @property
     def target_version(self) -> str:

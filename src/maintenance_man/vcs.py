@@ -13,12 +13,20 @@ class RepoDirtyError(Exception):
     pass
 
 
+_MANAGED_BRANCH_PREFIXES = (
+    "bump/",
+    "fix/",
+    "mm/update-dependencies",
+    "mm/resolve-dependencies",
+)
+
+
 def sync_graphite(project_path: Path) -> bool:
     """Sync with remote and delete local branches whose PRs are merged/closed.
 
     Runs ``gt sync`` to fetch and update trunk, then explicitly deletes any
-    tracked ``bump/`` or ``fix/`` branches whose GitHub PRs have been merged
-    or closed.  This avoids stale branches blocking future stack submissions.
+    managed local branches whose GitHub PRs have been merged or closed. This
+    avoids stale branches blocking future stack submissions.
     """
     sync_result = _run(["gt", "sync", "--no-interactive"], project_path, timeout=120)
     if sync_result.returncode != 0:
@@ -27,9 +35,12 @@ def sync_graphite(project_path: Path) -> bool:
         )
         return False
 
-    prefixes = ("bump/", "fix/")
-    stale_branches = _gh_list_pr_branches("merged", prefixes, project_path)
-    stale_branches |= _gh_list_pr_branches("closed", prefixes, project_path)
+    stale_branches = _gh_list_pr_branches(
+        "merged", _MANAGED_BRANCH_PREFIXES, project_path
+    )
+    stale_branches |= _gh_list_pr_branches(
+        "closed", _MANAGED_BRANCH_PREFIXES, project_path
+    )
 
     local = _run(
         ["git", "branch", "--format=%(refname:short)"], project_path, timeout=10
@@ -133,17 +144,99 @@ def get_current_branch(project_path: Path) -> str:
     return _run(["git", "branch", "--show-current"], project_path).stdout.strip()
 
 
+def git_branch_exists(branch: str, project_path: Path) -> bool:
+    """Check if a local branch exists."""
+    r = _run(["git", "rev-parse", "--verify", branch], project_path)
+    return r.returncode == 0
+
+
+def git_create_branch(branch: str, project_path: Path) -> bool:
+    """Create and check out a new branch from current HEAD."""
+    r = _run(["git", "checkout", "-b", branch], project_path)
+    if r.returncode != 0:
+        rprint(f"  [bold red]Error:[/] branch creation failed: {r.stderr.strip()}")
+        return False
+    return True
+
+
+def git_commit_all(message: str, project_path: Path) -> bool:
+    """Stage all changes, including untracked files, and commit."""
+    add = _run(["git", "add", "-A"], project_path)
+    if add.returncode != 0:
+        rprint(f"  [bold red]Error:[/] git add failed: {add.stderr.strip()}")
+        return False
+    commit = _run(["git", "commit", "-m", message], project_path)
+    if commit.returncode != 0:
+        rprint(f"  [bold red]Error:[/] git commit failed: {commit.stderr.strip()}")
+        return False
+    return True
+
+
+def git_has_changes(project_path: Path) -> bool:
+    """Return True when the repo has tracked or untracked changes."""
+    r = _run(["git", "status", "--porcelain"], project_path)
+    if r.returncode != 0:
+        return True
+    return bool(r.stdout.strip())
+
+
+def git_merge_fast_forward(branch: str, project_path: Path) -> bool:
+    """Fast-forward merge a branch into the current branch."""
+    r = _run(["git", "merge", "--ff-only", branch], project_path)
+    if r.returncode != 0:
+        rprint(f"  [bold red]Error:[/] fast-forward merge failed: {r.stderr.strip()}")
+        return False
+    return True
+
+
+def git_delete_branch(branch: str, project_path: Path) -> bool:
+    """Delete a local branch."""
+    r = _run(["git", "branch", "-D", branch], project_path)
+    if r.returncode != 0:
+        rprint(f"  [bold yellow]Warning:[/] branch deletion failed: {r.stderr.strip()}")
+        return False
+    return True
+
+
+def git_checkout(branch: str, project_path: Path) -> bool:
+    """Check out a branch using plain git."""
+    r = _run(["git", "checkout", branch], project_path)
+    if r.returncode != 0:
+        rprint(f"  [bold red]Error:[/] checkout failed: {r.stderr.strip()}")
+        return False
+    return True
+
+
+def git_replace_branch(branch: str, base_branch: str, project_path: Path) -> bool:
+    """Replace an existing branch by checking out base, deleting, and recreating."""
+    if get_current_branch(project_path) and not git_checkout(base_branch, project_path):
+        return False
+    if not git_delete_branch(branch, project_path):
+        return False
+    return git_create_branch(branch, project_path)
+
+
 def ensure_on_main(project_path: Path) -> bool:
     """Ensure the repo is on the main branch. Returns True if successful."""
     if get_current_branch(project_path) == "main":
         return True
-    return gt_checkout("main", project_path)
+    return git_checkout("main", project_path)
 
 
-def create_worktree(project_path: Path, worktree_path: Path) -> bool:
-    """Create a git worktree at worktree_path, checked out to main."""
+def create_worktree(
+    project_path: Path,
+    worktree_path: Path,
+    *,
+    branch: str = "main",
+    detach: bool = True,
+) -> bool:
+    """Create a git worktree at worktree_path on the requested branch."""
+    cmd = ["git", "worktree", "add"]
+    if detach:
+        cmd.append("--detach")
+    cmd.extend([str(worktree_path), branch])
     r = _run(
-        ["git", "worktree", "add", "--detach", str(worktree_path), "main"],
+        cmd,
         project_path,
         timeout=30,
     )
@@ -167,8 +260,8 @@ def remove_worktree(project_path: Path, worktree_path: Path) -> None:
 
 
 def discard_changes(project_path: Path) -> None:
-    """Discard all uncommitted changes in the working tree."""
-    _run(["git", "checkout", "--", "."], project_path)
+    """Discard all uncommitted tracked and untracked changes."""
+    _run(["git", "reset", "--hard", "HEAD"], project_path)
     _run(["git", "clean", "-fd"], project_path)
 
 
@@ -176,7 +269,7 @@ def reset_to_main(project_path: Path) -> None:
     """Discard all changes and check out main."""
     _run(["git", "checkout", "main", "--", "."], project_path)
     _run(["git", "clean", "-fd"], project_path)
-    gt_checkout("main", project_path)
+    git_checkout("main", project_path)
 
 
 def branch_slug(pkg_name: str) -> str:

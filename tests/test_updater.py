@@ -1,7 +1,7 @@
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import ANY, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -16,12 +16,14 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.updater import (
     NoScanResultsError,
-    _consolidate_vulns,
-    _highest_fix_version,
+    consolidate_vulns,
     get_update_command,
+    highest_fix_version,
     load_scan_results,
-    process_updates,
-    process_vulns,
+    process_findings,
+    process_updates_local,
+    process_vulns_local,
+    remove_completed_findings,
     run_test_phases,
     save_scan_results,
     sort_updates_by_risk,
@@ -88,15 +90,32 @@ def scan_result() -> ScanResult:
 
 
 @pytest.fixture()
-def mock_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    """Mock all VCS and updater subprocess calls."""
+def mock_local_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
+    """Mock VCS and updater calls for single-branch update processing."""
     mocks = {}
     for name, default in [
-        ("submit_stack", (True, "")),
-        ("gt_checkout", True),
-        ("gt_create", True),
-        ("_apply_update", True),
+        ("git_commit_all", True),
+        ("apply_update", True),
         ("run_test_phases", (True, None)),
+    ]:
+        mock = MagicMock(return_value=default)
+        monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
+        mocks[name] = mock
+    mock_discard = MagicMock()
+    monkeypatch.setattr("maintenance_man.updater.discard_changes", mock_discard)
+    mocks["discard_changes"] = mock_discard
+    return mocks
+
+
+@pytest.fixture()
+def mock_resolve_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
+    """Mock VCS and updater calls for single-branch resolve processing."""
+    mocks = {}
+    for name, default in [
+        ("git_commit_all", True),
+        ("apply_update", True),
+        ("run_test_phases", (True, None)),
+        ("discard_changes", None),
     ]:
         mock = MagicMock(return_value=default)
         monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
@@ -294,7 +313,7 @@ class TestSortUpdatesByRisk:
         assert result[0].semver_tier == SemverTier.MINOR
 
 
-# -- _highest_fix_version --
+# -- highest_fix_version --
 
 
 class TestHighestFixVersion:
@@ -304,27 +323,27 @@ class TestHighestFixVersion:
             make_vuln(fixed_version="2.32.4"),
             make_vuln(fixed_version="2.32.0"),
         ]
-        assert _highest_fix_version(vulns) == "2.32.4"
+        assert highest_fix_version(vulns) == "2.32.4"
 
     def test_single_vuln(self):
-        assert _highest_fix_version([make_vuln(fixed_version="1.0.1")]) == "1.0.1"
+        assert highest_fix_version([make_vuln(fixed_version="1.0.1")]) == "1.0.1"
 
     def test_invalid_version_ignored(self):
         vulns = [
             make_vuln(fixed_version="not-a-version"),
             make_vuln(fixed_version="2.0.0"),
         ]
-        assert _highest_fix_version(vulns) == "2.0.0"
+        assert highest_fix_version(vulns) == "2.0.0"
 
     def test_invalid_version_order_independent(self):
         vulns = [
             make_vuln(fixed_version="2.0.0"),
             make_vuln(fixed_version="not-a-version"),
         ]
-        assert _highest_fix_version(vulns) == "2.0.0"
+        assert highest_fix_version(vulns) == "2.0.0"
 
 
-# -- _consolidate_vulns --
+# -- consolidate_vulns --
 
 
 class TestConsolidateVulns:
@@ -346,7 +365,7 @@ class TestConsolidateVulns:
                 fixed_version="2.32.4",
             ),
         ]
-        result = _consolidate_vulns(vulns)
+        result = consolidate_vulns(vulns)
         assert len(result) == 1
         assert result[0].pkg_name == "requests"
         assert result[0].target_version == "2.32.4"
@@ -359,7 +378,7 @@ class TestConsolidateVulns:
             make_vuln(vuln_id="CVE-0001", pkg_name="pkg-a", fixed_version="1.0.1"),
             make_vuln(vuln_id="CVE-0002", pkg_name="pkg-b", fixed_version="2.0.1"),
         ]
-        result = _consolidate_vulns(vulns)
+        result = consolidate_vulns(vulns)
         assert len(result) == 2
         assert result[0].pkg_name == "pkg-a"
         assert result[1].pkg_name == "pkg-b"
@@ -367,289 +386,501 @@ class TestConsolidateVulns:
     def test_status_fanout_to_originals(self):
         v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
         v2 = make_vuln(vuln_id="CVE-0002", pkg_name="pkg", fixed_version="1.0.2")
-        consolidated = _consolidate_vulns([v1, v2])
+        consolidated = consolidate_vulns([v1, v2])
         consolidated[0].update_status = UpdateStatus.COMPLETED
         assert v1.update_status == UpdateStatus.COMPLETED
         assert v2.update_status == UpdateStatus.COMPLETED
 
+    def test_lifecycle_fanout_to_originals(self):
+        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
+        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="pkg", fixed_version="1.0.2")
+        consolidated = consolidate_vulns([v1, v2])
+
+        consolidated[0].update_status = UpdateStatus.READY
+        consolidated[0].failed_phase = "unit"
+        consolidated[0].flow = "resolve"
+
+        assert v1.update_status == UpdateStatus.READY
+        assert v2.update_status == UpdateStatus.READY
+        assert v1.failed_phase == "unit"
+        assert v2.failed_phase == "unit"
+        assert v1.flow == "resolve"
+        assert v2.flow == "resolve"
+
+    def test_initial_lifecycle_state_normalises_across_group(self):
+        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
+        v2 = make_vuln(
+            vuln_id="CVE-0002",
+            pkg_name="pkg",
+            fixed_version="1.0.2",
+            update_status=UpdateStatus.FAILED,
+            failed_phase="unit",
+            flow="resolve",
+        )
+
+        consolidated = consolidate_vulns([v1, v2])
+
+        assert consolidated[0].update_status == UpdateStatus.FAILED
+        assert consolidated[0].failed_phase == "unit"
+        assert consolidated[0].flow == "resolve"
+        assert v1.update_status == UpdateStatus.FAILED
+        assert v1.failed_phase == "unit"
+        assert v1.flow == "resolve"
+        assert v2.update_status == UpdateStatus.FAILED
+        assert v2.failed_phase == "unit"
+        assert v2.flow == "resolve"
+
     def test_empty_list(self):
-        assert _consolidate_vulns([]) == []
+        assert consolidate_vulns([]) == []
 
 
-# -- process_vulns --
+# -- remove_completed_findings --
 
 
-class TestProcessVulns:
-    def test_single_vuln_passes(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+class TestRemoveCompletedFindings:
+    def test_removes_completed_vulns_and_updates(self):
+        vulns = [
+            make_vuln(vuln_id="CVE-1", update_status=UpdateStatus.COMPLETED),
+            make_vuln(vuln_id="CVE-2", update_status=UpdateStatus.FAILED),
+            make_vuln(vuln_id="CVE-3", update_status=None),
+        ]
+        updates = [
+            make_update(SemverTier.PATCH, update_status=UpdateStatus.COMPLETED),
+            make_update(SemverTier.MINOR, update_status=UpdateStatus.FAILED),
+        ]
+        scan = ScanResult(
+            project="myapp",
+            scanned_at=datetime.now(tz=timezone.utc),
+            trivy_target="/tmp/myapp",
+            vulnerabilities=vulns,
+            updates=updates,
+        )
+
+        remove_completed_findings(scan)
+
+        assert len(scan.vulnerabilities) == 2
+        assert all(
+            v.update_status != UpdateStatus.COMPLETED for v in scan.vulnerabilities
+        )
+        assert len(scan.updates) == 1
+        assert scan.updates[0].update_status == UpdateStatus.FAILED
+
+    def test_no_completed_is_noop(self):
+        scan = ScanResult(
+            project="myapp",
+            scanned_at=datetime.now(tz=timezone.utc),
+            trivy_target="/tmp/myapp",
+            updates=[make_update(SemverTier.PATCH, update_status=UpdateStatus.FAILED)],
+        )
+
+        remove_completed_findings(scan)
+
+        assert len(scan.updates) == 1
+
+
+# -- process_findings (on_failure="continue") --
+
+
+class TestProcessFindingsLocal:
+    def test_success_sets_ready_and_update_flow(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        results = process_vulns([make_vuln()], project_config)
+        update = make_update(SemverTier.PATCH)
+
+        results = process_findings([update], project_config, flow="update")
+
         assert len(results) == 1
         assert results[0].passed is True
-        assert results[0].kind == "vuln"
-        mock_vcs["submit_stack"].assert_called_once()
+        assert update.update_status == UpdateStatus.READY
+        assert update.failed_phase is None
+        assert update.flow == "update"
 
-    def test_vuln_test_fails_stops_and_keeps_branch(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    def test_already_applied_sets_ready_and_update_flow(
+        self,
+        mock_local_vcs: dict[str, MagicMock],
+        monkeypatch: pytest.MonkeyPatch,
+        project_config: ProjectConfig,
     ):
-        mock_vcs["run_test_phases"].return_value = (False, "unit")
-        vuln2 = make_vuln(vuln_id="CVE-2024-0002", pkg_name="other-pkg")
-        results = process_vulns([make_vuln(), vuln2], project_config)
-        # Stops after first failure — second vuln not attempted
+        mock_has_changes = MagicMock(return_value=False)
+        monkeypatch.setattr(
+            "maintenance_man.updater.git_has_changes",
+            mock_has_changes,
+            raising=False,
+        )
+        update = make_update(SemverTier.PATCH)
+
+        results = process_findings([update], project_config, flow="update")
+
+        assert len(results) == 1
+        assert results[0].passed is True
+        assert update.update_status == UpdateStatus.READY
+        assert update.failed_phase is None
+        assert update.flow == "update"
+        mock_local_vcs["git_commit_all"].assert_not_called()
+
+    def test_failure_sets_failed_and_active_flow(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_local_vcs["run_test_phases"].return_value = (False, "unit")
+        update = make_update(SemverTier.PATCH)
+
+        results = process_findings([update], project_config, flow="update")
+
         assert len(results) == 1
         assert results[0].passed is False
-        assert mock_vcs["_apply_update"].call_count == 1
-        # Failed branch kept: gt_checkout called with failing branch, not main
-        mock_vcs["gt_checkout"].assert_any_call("fix/some-pkg", ANY)
+        assert results[0].failed_phase == "unit"
+        assert update.update_status == UpdateStatus.FAILED
+        assert update.failed_phase == "unit"
+        assert update.flow == "update"
 
-    def test_vuln_apply_fails(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    def test_all_pass(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        mock_vcs["_apply_update"].return_value = False
-        results = process_vulns([make_vuln()], project_config)
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+        ]
+
+        results = process_findings(updates, project_config, flow="update")
+
+        assert len(results) == 2
+        assert all(r.passed for r in results)
+        assert mock_local_vcs["apply_update"].call_count == 2
+        assert mock_local_vcs["run_test_phases"].call_count == 2
+        assert mock_local_vcs["git_commit_all"].call_count == 2
+        mock_local_vcs["discard_changes"].assert_not_called()
+
+    def test_failure_discards_and_continues(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_local_vcs["run_test_phases"].side_effect = [
+            (True, None),
+            (False, "unit"),
+            (True, None),
+        ]
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+            make_update(SemverTier.MAJOR),
+        ]
+
+        results = process_findings(updates, project_config, flow="update")
+
+        assert len(results) == 3
+        assert results[0].passed is True
+        assert results[1].passed is False
+        assert results[2].passed is True
+        mock_local_vcs["discard_changes"].assert_called_once()
+        assert mock_local_vcs["git_commit_all"].call_count == 2
+
+    def test_apply_failure_continues(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_local_vcs["apply_update"].side_effect = [False, True]
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+        ]
+
+        results = process_findings(updates, project_config, flow="update")
+
+        assert len(results) == 2
+        assert results[0].passed is False
+        assert results[0].failed_phase == "apply"
+        assert results[1].passed is True
+
+    def test_no_test_config_treats_update_as_pass(
+        self, mock_local_vcs: dict[str, MagicMock], tmp_path: Path
+    ):
+        project_config = ProjectConfig(path=tmp_path, package_manager="bun")
+
+        results = process_findings(
+            [make_update(SemverTier.PATCH)],
+            project_config,
+            flow="update",
+        )
+
+        assert len(results) == 1
+        assert results[0].passed is True
+        mock_local_vcs["run_test_phases"].assert_not_called()
+        mock_local_vcs["git_commit_all"].assert_called_once()
+
+    def test_commit_failure_marks_finding_failed_and_continues(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_local_vcs["git_commit_all"].side_effect = [False, True]
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+        ]
+
+        results = process_findings(updates, project_config, flow="update")
+
+        assert len(results) == 2
+        assert results[0].passed is False
+        assert results[0].failed_phase == "commit"
+        assert results[1].passed is True
+
+    def test_noop_update_without_changes_counts_as_pass(
+        self,
+        mock_local_vcs: dict[str, MagicMock],
+        monkeypatch: pytest.MonkeyPatch,
+        project_config: ProjectConfig,
+    ):
+        mock_local_vcs["git_commit_all"].return_value = False
+        mock_has_changes = MagicMock(return_value=False)
+        monkeypatch.setattr(
+            "maintenance_man.updater.git_has_changes",
+            mock_has_changes,
+            raising=False,
+        )
+        update = make_update(SemverTier.PATCH)
+
+        results = process_findings([update], project_config, flow="update")
+
+        assert len(results) == 1
+        assert results[0].passed is True
+        assert results[0].failed_phase is None
+        assert update.update_status == UpdateStatus.READY
+        mock_local_vcs["git_commit_all"].assert_not_called()
+
+    def test_status_tracking(
+        self,
+        mock_local_vcs: dict[str, MagicMock],
+        monkeypatch: pytest.MonkeyPatch,
+        project_config: ProjectConfig,
+    ):
+        mock_local_vcs["run_test_phases"].side_effect = [
+            (True, None),
+            (False, "unit"),
+        ]
+        mock_save = MagicMock()
+        monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
+        upd_pass = make_update(SemverTier.PATCH)
+        upd_fail = make_update(SemverTier.MINOR)
+        scan = ScanResult(
+            project="myapp",
+            scanned_at=datetime.now(tz=timezone.utc),
+            trivy_target="/tmp/myapp",
+            updates=[upd_pass, upd_fail],
+        )
+
+        process_findings(
+            [upd_pass, upd_fail],
+            project_config,
+            flow="update",
+            scan_result=scan,
+            project_name="myapp",
+            results_dir=Path("/tmp/fake"),
+        )
+
+        assert upd_pass.update_status == UpdateStatus.READY
+        assert upd_fail.update_status == UpdateStatus.FAILED
+        mock_save.assert_called()
+
+    def test_empty_findings(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        results = process_findings([], project_config, flow="update")
+        assert results == []
+
+
+# -- process_findings (on_failure="stop") --
+
+
+class TestProcessFindingsResolve:
+    def test_success_sets_ready_and_resolve_flow(
+        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        update = make_update(SemverTier.PATCH)
+
+        results = process_findings(
+            [update],
+            project_config,
+            flow="resolve",
+            on_failure="stop",
+        )
+
+        assert len(results) == 1
+        assert results[0].passed is True
+        assert update.update_status == UpdateStatus.READY
+        assert update.failed_phase is None
+        assert update.flow == "resolve"
+
+    def test_failure_sets_failed_and_resolve_flow(
+        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_resolve_vcs["apply_update"].return_value = False
+        update = make_update(SemverTier.PATCH)
+
+        results = process_findings(
+            [update],
+            project_config,
+            flow="resolve",
+            on_failure="stop",
+        )
+
         assert len(results) == 1
         assert results[0].passed is False
         assert results[0].failed_phase == "apply"
+        assert update.update_status == UpdateStatus.FAILED
+        assert update.failed_phase == "apply"
+        assert update.flow == "resolve"
 
-    def test_submit_failure_marks_findings_failed(
-        self,
-        mock_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
+    def test_all_pass(
+        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        mock_vcs["submit_stack"].return_value = (False, "")
-        mock_save = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
-        vuln = make_vuln()
-        scan = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=timezone.utc),
-            trivy_target="/tmp/myapp",
-            vulnerabilities=[vuln],
-            secrets=[],
-            updates=[],
-        )
-        results = process_vulns(
-            [vuln],
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+        ]
+
+        results = process_findings(
+            updates,
             project_config,
-            scan_result=scan,
-            project_name="myapp",
-            results_dir=Path("/tmp/fake"),
+            flow="resolve",
+            on_failure="stop",
         )
-        assert results[0].passed is False
-        assert results[0].failed_phase == "submit"
-        assert vuln.update_status == UpdateStatus.FAILED
-        mock_save.assert_called()
 
-    def test_duplicate_package_vulns_consolidated(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+        assert len(results) == 2
+        assert all(r.passed for r in results)
+        assert mock_resolve_vcs["apply_update"].call_count == 2
+        assert mock_resolve_vcs["git_commit_all"].call_count == 2
+        assert mock_resolve_vcs["run_test_phases"].call_count == 2
+
+    def test_failure_stops_and_preserves_branch_state(
+        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        """Multiple CVEs for the same package → one _apply_update call."""
-        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0")
-        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4")
-        v3 = make_vuln(vuln_id="CVE-0003", pkg_name="requests", fixed_version="2.32.0")
-        results = process_vulns([v1, v2, v3], project_config)
+        mock_resolve_vcs["run_test_phases"].side_effect = [
+            (True, None),
+            (False, "unit"),
+        ]
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+            make_update(SemverTier.MAJOR),
+        ]
+
+        results = process_findings(
+            updates,
+            project_config,
+            flow="resolve",
+            on_failure="stop",
+        )
+
+        assert len(results) == 2
+        assert results[0].passed is True
+        assert results[1].passed is False
+        assert results[1].failed_phase == "unit"
+        assert mock_resolve_vcs["apply_update"].call_count == 2
+        assert mock_resolve_vcs["git_commit_all"].call_count == 1
+        mock_resolve_vcs["discard_changes"].assert_not_called()
+
+    def test_no_test_config_treats_update_as_pass(
+        self, mock_resolve_vcs: dict[str, MagicMock], tmp_path: Path
+    ):
+        project_config = ProjectConfig(path=tmp_path, package_manager="bun")
+
+        results = process_findings(
+            [make_update(SemverTier.PATCH)],
+            project_config,
+            flow="resolve",
+            on_failure="stop",
+        )
+
         assert len(results) == 1
         assert results[0].passed is True
-        mock_vcs["_apply_update"].assert_called_once()
-        # Highest version used
-        call_args = mock_vcs["_apply_update"].call_args
-        assert call_args[0][2] == "2.32.4"
-        # All originals get status
-        assert v1.update_status == UpdateStatus.COMPLETED
-        assert v2.update_status == UpdateStatus.COMPLETED
-        assert v3.update_status == UpdateStatus.COMPLETED
+        mock_resolve_vcs["run_test_phases"].assert_not_called()
 
-    def test_duplicate_package_vulns_failure_fans_out(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        """When consolidated vuln fails, all originals are marked FAILED."""
-        mock_vcs["_apply_update"].return_value = False
-        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0")
-        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4")
-        results = process_vulns([v1, v2], project_config)
-        assert len(results) == 1
-        assert results[0].passed is False
-        assert v1.update_status == UpdateStatus.FAILED
-        assert v2.update_status == UpdateStatus.FAILED
-
-
-# -- process_updates --
-
-
-class TestProcessUpdates:
-    def test_all_updates_pass(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        updates = [
-            make_update(SemverTier.MAJOR),
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
-        results = process_updates(updates, project_config)
-        # All 3 pass, sorted as patch -> minor -> major
-        assert len(results) == 3
-        assert all(r.passed for r in results)
-        # Verify sort order via call order
-        names = [r.pkg_name for r in results]
-        assert names == ["pkg-a", "pkg-b", "pkg-c"]  # patch, minor, major
-        # Stack submitted from tip (last passing = pkg-c), then return to main
-        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-c", ANY)
-        mock_vcs["gt_checkout"].assert_any_call("main", ANY)
-        mock_vcs["submit_stack"].assert_called_once()
-
-    def test_update_failure_stops_submits_passing_and_keeps_branch(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        # Patch passes, minor fails — major is never attempted
-        mock_vcs["run_test_phases"].side_effect = [
-            (True, None),
-            (False, "unit"),
-        ]
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-            make_update(SemverTier.MAJOR),
-        ]
-        results = process_updates(updates, project_config)
-
-        # Only patch and minor are processed; major never starts
-        assert len(results) == 2
-        assert results[0].passed is True  # patch passed
-        assert results[1].passed is False  # minor failed
-        assert results[1].failed_phase == "unit"
-        # Passing stack (patch) submitted before stopping
-        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-a", ANY)
-        mock_vcs["submit_stack"].assert_called_once()
-        # Failed branch (minor) kept — checked out so user can --continue
-        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-b", ANY)
-
-    def test_update_failure_message_includes_project_for_continue(
+    def test_status_tracking(
         self,
-        capsys: pytest.CaptureFixture[str],
-        mock_vcs: dict[str, MagicMock],
-        project_config: ProjectConfig,
-    ):
-        mock_vcs["run_test_phases"].side_effect = [
-            (True, None),
-            (False, "unit"),
-        ]
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
-
-        process_updates(updates, project_config, project_name="myapp")
-
-        output = capsys.readouterr().out
-        assert "mm update myapp --continue" in output
-
-    def test_empty_updates(
-        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        results = process_updates([], project_config)
-        assert results == []
-        mock_vcs["gt_checkout"].assert_called_once_with("main", ANY)
-
-    def test_submit_failure_marks_findings_failed(
-        self,
-        mock_vcs: dict[str, MagicMock],
+        mock_resolve_vcs: dict[str, MagicMock],
         monkeypatch: pytest.MonkeyPatch,
         project_config: ProjectConfig,
     ):
-        mock_vcs["submit_stack"].return_value = (False, "")
+        mock_resolve_vcs["run_test_phases"].side_effect = [
+            (False, "unit"),
+        ]
         mock_save = MagicMock()
         monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
-        upd = make_update(SemverTier.PATCH)
+        upd_fail = make_update(SemverTier.PATCH, update_status=UpdateStatus.FAILED)
         scan = ScanResult(
             project="myapp",
             scanned_at=datetime.now(tz=timezone.utc),
             trivy_target="/tmp/myapp",
-            vulnerabilities=[],
-            secrets=[],
-            updates=[upd],
+            updates=[upd_fail],
         )
-        results = process_updates(
-            [upd],
+
+        process_findings(
+            [upd_fail],
             project_config,
+            flow="resolve",
             scan_result=scan,
             project_name="myapp",
             results_dir=Path("/tmp/fake"),
+            on_failure="stop",
         )
-        assert results[0].passed is False
-        assert results[0].failed_phase == "submit"
-        assert upd.update_status == UpdateStatus.FAILED
+
+        assert upd_fail.update_status == UpdateStatus.FAILED
         mock_save.assert_called()
 
-
-# -- status tracking --
-
-
-class TestStatusTracking:
-    def test_vuln_pass_sets_completed(
+    def test_noop_update_without_changes_counts_as_pass(
         self,
-        mock_vcs: dict[str, MagicMock],
+        mock_resolve_vcs: dict[str, MagicMock],
         monkeypatch: pytest.MonkeyPatch,
         project_config: ProjectConfig,
-        scan_result: ScanResult,
     ):
-        mock_save = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
-        process_vulns(
-            scan_result.vulnerabilities,
-            project_config,
-            scan_result=scan_result,
-            project_name="myapp",
-            results_dir=Path("/tmp/fake"),
+        mock_resolve_vcs["git_commit_all"].return_value = False
+        mock_has_changes = MagicMock(return_value=False)
+        monkeypatch.setattr(
+            "maintenance_man.updater.git_has_changes",
+            mock_has_changes,
+            raising=False,
         )
-        assert scan_result.vulnerabilities[0].update_status == UpdateStatus.COMPLETED
-        mock_save.assert_called()
+        update = make_update(SemverTier.PATCH)
 
-    def test_update_fail_sets_failed(
-        self,
-        mock_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
-        scan_result: ScanResult,
+        results = process_findings(
+            [update],
+            project_config,
+            flow="resolve",
+            on_failure="stop",
+        )
+
+        assert len(results) == 1
+        assert results[0].passed is True
+        assert results[0].failed_phase is None
+        assert update.update_status == UpdateStatus.READY
+        mock_resolve_vcs["git_commit_all"].assert_not_called()
+
+
+# -- process_vulns_local / process_updates_local --
+
+
+class TestProcessVulnsLocal:
+    def test_consolidates_and_processes(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        mock_vcs["run_test_phases"].return_value = (False, "unit")
-        mock_save = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
-        process_updates(
-            scan_result.updates,
-            project_config,
-            scan_result=scan_result,
-            project_name="myapp",
-            results_dir=Path("/tmp/fake"),
-        )
-        statuses = [u.update_status for u in scan_result.updates]
-        assert UpdateStatus.FAILED in statuses
-        mock_save.assert_called()
+        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0")
+        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4")
 
-    def test_started_set_before_processing(
-        self,
-        mock_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
-        scan_result: ScanResult,
+        results = process_vulns_local([v1, v2], project_config, flow="update")
+
+        assert len(results) == 1
+        assert results[0].passed is True
+        assert results[0].kind == "vuln"
+
+
+class TestProcessUpdatesLocal:
+    def test_sorts_by_risk(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        """Verify 'started' is set before test execution."""
-        mock_save = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
+        updates = [
+            make_update(SemverTier.MAJOR),
+            make_update(SemverTier.PATCH),
+        ]
 
-        statuses_during_test = []
+        results = process_updates_local(updates, project_config, flow="update")
 
-        def capture_status(*args, **kwargs):
-            # Capture update statuses at the time tests run
-            statuses_during_test.extend([u.update_status for u in scan_result.updates])
-            return (True, None)
-
-        mock_vcs["run_test_phases"].side_effect = capture_status
-        process_updates(
-            scan_result.updates[:1],
-            project_config,
-            scan_result=scan_result,
-            project_name="myapp",
-            results_dir=Path("/tmp/fake"),
-        )
-        assert UpdateStatus.STARTED in statuses_during_test
+        assert len(results) == 2
+        assert results[0].pkg_name == "pkg-a"
+        assert results[1].pkg_name == "pkg-c"

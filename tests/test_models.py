@@ -1,10 +1,17 @@
 from maintenance_man.models.scan import (
+    MaintenanceFlow,
     SemverTier,
     Severity,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
 )
+
+
+class TestMaintenanceFlow:
+    def test_flow_members_are_string_values(self):
+        assert MaintenanceFlow.UPDATE == "update"
+        assert MaintenanceFlow.RESOLVE == "resolve"
 
 
 class TestUpdateStatus:

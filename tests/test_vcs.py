@@ -14,6 +14,14 @@ from maintenance_man.vcs import (
     discard_changes,
     ensure_on_main,
     get_current_branch,
+    git_branch_exists,
+    git_checkout,
+    git_commit_all,
+    git_create_branch,
+    git_delete_branch,
+    git_has_changes,
+    git_merge_fast_forward,
+    git_replace_branch,
     gt_checkout,
     gt_create,
     gt_delete,
@@ -108,12 +116,253 @@ class TestGetCurrentBranch:
 
 
 # ---------------------------------------------------------------------------
+# git_branch_exists
+# ---------------------------------------------------------------------------
+
+
+class TestGitBranchExists:
+    @patch("maintenance_man.vcs._run")
+    def test_branch_exists(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(stdout="mm/update-dependencies\n")
+        assert git_branch_exists("mm/update-dependencies", tmp_path) is True
+        mock_run.assert_called_once_with(
+            ["git", "rev-parse", "--verify", "mm/update-dependencies"],
+            tmp_path,
+        )
+
+    @patch("maintenance_man.vcs._run")
+    def test_branch_does_not_exist(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(
+            returncode=1, stderr="fatal: not a valid ref"
+        )
+        assert git_branch_exists("mm/update-dependencies", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# git_create_branch
+# ---------------------------------------------------------------------------
+
+
+class TestGitCreateBranch:
+    @patch("maintenance_man.vcs._run")
+    def test_success(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed()
+        assert git_create_branch("mm/update-dependencies", tmp_path) is True
+        mock_run.assert_called_once_with(
+            ["git", "checkout", "-b", "mm/update-dependencies"],
+            tmp_path,
+        )
+
+    @patch("maintenance_man.vcs._run")
+    def test_failure(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(returncode=1, stderr="already exists")
+        assert git_create_branch("mm/update-dependencies", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# git_commit_all
+# ---------------------------------------------------------------------------
+
+
+class TestGitCommitAll:
+    @patch("maintenance_man.vcs._run")
+    def test_success(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed()
+        assert git_commit_all("update: pkg-a 1.0.0 -> 1.0.1", tmp_path) is True
+        assert mock_run.call_count == 2
+        mock_run.assert_any_call(["git", "add", "-A"], tmp_path)
+        mock_run.assert_any_call(
+            ["git", "commit", "-m", "update: pkg-a 1.0.0 -> 1.0.1"],
+            tmp_path,
+        )
+
+    @patch("maintenance_man.vcs._run")
+    def test_commit_failure(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.side_effect = [
+            _completed(),
+            _completed(returncode=1, stderr="nothing to commit"),
+        ]
+        assert git_commit_all("msg", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# git_has_changes
+# ---------------------------------------------------------------------------
+
+
+class TestGitHasChanges:
+    @patch("maintenance_man.vcs._run")
+    def test_true_when_repo_has_changes(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(stdout=" M src/file.py\n")
+        assert git_has_changes(tmp_path) is True
+        mock_run.assert_called_once_with(["git", "status", "--porcelain"], tmp_path)
+
+    @patch("maintenance_man.vcs._run")
+    def test_false_when_repo_is_clean(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(stdout="")
+        assert git_has_changes(tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# git_merge_fast_forward
+# ---------------------------------------------------------------------------
+
+
+class TestGitMergeFastForward:
+    @patch("maintenance_man.vcs._run")
+    def test_success(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed()
+        assert git_merge_fast_forward("mm/update-dependencies", tmp_path) is True
+        mock_run.assert_called_once_with(
+            ["git", "merge", "--ff-only", "mm/update-dependencies"],
+            tmp_path,
+        )
+
+    @patch("maintenance_man.vcs._run")
+    def test_not_fast_forwardable(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(
+            returncode=1, stderr="fatal: Not possible to fast-forward"
+        )
+        assert git_merge_fast_forward("mm/update-dependencies", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# git_delete_branch
+# ---------------------------------------------------------------------------
+
+
+class TestGitDeleteBranch:
+    @patch("maintenance_man.vcs._run")
+    def test_success(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed()
+        assert git_delete_branch("mm/update-dependencies", tmp_path) is True
+        mock_run.assert_called_once_with(
+            ["git", "branch", "-D", "mm/update-dependencies"],
+            tmp_path,
+        )
+
+    @patch("maintenance_man.vcs._run")
+    def test_failure(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(returncode=1, stderr="not found")
+        assert git_delete_branch("mm/update-dependencies", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# git_checkout
+# ---------------------------------------------------------------------------
+
+
+class TestGitCheckout:
+    @patch("maintenance_man.vcs._run")
+    def test_success(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed()
+        assert git_checkout("main", tmp_path) is True
+        mock_run.assert_called_once_with(
+            ["git", "checkout", "main"],
+            tmp_path,
+        )
+
+    @patch("maintenance_man.vcs._run")
+    def test_failure(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(returncode=1, stderr="error")
+        assert git_checkout("main", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# git_replace_branch
+# ---------------------------------------------------------------------------
+
+
+class TestGitReplaceBranch:
+    @patch("maintenance_man.vcs.get_current_branch", return_value="feature/current")
+    @patch("maintenance_man.vcs.git_create_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_delete_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_checkout", return_value=True)
+    def test_success(
+        self,
+        mock_checkout: MagicMock,
+        mock_delete: MagicMock,
+        mock_create: MagicMock,
+        _mock_branch: MagicMock,
+        tmp_path: Path,
+    ):
+        assert git_replace_branch("mm/update-dependencies", "main", tmp_path) is True
+        mock_checkout.assert_called_once_with("main", tmp_path)
+        mock_delete.assert_called_once_with("mm/update-dependencies", tmp_path)
+        mock_create.assert_called_once_with("mm/update-dependencies", tmp_path)
+
+    @patch("maintenance_man.vcs.get_current_branch", return_value="")
+    @patch("maintenance_man.vcs.git_create_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_delete_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_checkout", return_value=True)
+    def test_detached_head_skips_checkout_and_recreates_branch(
+        self,
+        mock_checkout: MagicMock,
+        mock_delete: MagicMock,
+        mock_create: MagicMock,
+        _mock_branch: MagicMock,
+        tmp_path: Path,
+    ):
+        assert git_replace_branch("mm/update-dependencies", "main", tmp_path) is True
+        mock_checkout.assert_not_called()
+        mock_delete.assert_called_once_with("mm/update-dependencies", tmp_path)
+        mock_create.assert_called_once_with("mm/update-dependencies", tmp_path)
+
+    @patch("maintenance_man.vcs.get_current_branch", return_value="feature/current")
+    @patch("maintenance_man.vcs.git_create_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_delete_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_checkout", return_value=False)
+    def test_checkout_failure_aborts(
+        self,
+        mock_checkout: MagicMock,
+        mock_delete: MagicMock,
+        mock_create: MagicMock,
+        _mock_branch: MagicMock,
+        tmp_path: Path,
+    ):
+        assert git_replace_branch("mm/update-dependencies", "main", tmp_path) is False
+        mock_delete.assert_not_called()
+        mock_create.assert_not_called()
+
+    @patch("maintenance_man.vcs.get_current_branch", return_value="feature/current")
+    @patch("maintenance_man.vcs.git_create_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_delete_branch", return_value=False)
+    @patch("maintenance_man.vcs.git_checkout", return_value=True)
+    def test_delete_failure_aborts(
+        self,
+        mock_checkout: MagicMock,
+        mock_delete: MagicMock,
+        mock_create: MagicMock,
+        _mock_branch: MagicMock,
+        tmp_path: Path,
+    ):
+        assert git_replace_branch("mm/update-dependencies", "main", tmp_path) is False
+        mock_delete.assert_called_once_with("mm/update-dependencies", tmp_path)
+        mock_create.assert_not_called()
+
+    @patch("maintenance_man.vcs.get_current_branch", return_value="feature/current")
+    @patch("maintenance_man.vcs.git_create_branch", return_value=False)
+    @patch("maintenance_man.vcs.git_delete_branch", return_value=True)
+    @patch("maintenance_man.vcs.git_checkout", return_value=True)
+    def test_create_failure_aborts(
+        self,
+        mock_checkout: MagicMock,
+        mock_delete: MagicMock,
+        mock_create: MagicMock,
+        _mock_branch: MagicMock,
+        tmp_path: Path,
+    ):
+        assert git_replace_branch("mm/update-dependencies", "main", tmp_path) is False
+        mock_create.assert_called_once_with("mm/update-dependencies", tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # ensure_on_main
 # ---------------------------------------------------------------------------
 
 
 class TestEnsureOnMain:
-    @patch("maintenance_man.vcs.gt_checkout")
+    @patch("maintenance_man.vcs.git_checkout")
     @patch("maintenance_man.vcs.get_current_branch", return_value="main")
     def test_already_on_main(
         self, mock_branch: MagicMock, mock_checkout: MagicMock, tmp_path: Path
@@ -121,7 +370,7 @@ class TestEnsureOnMain:
         assert ensure_on_main(tmp_path) is True
         mock_checkout.assert_not_called()
 
-    @patch("maintenance_man.vcs.gt_checkout", return_value=True)
+    @patch("maintenance_man.vcs.git_checkout", return_value=True)
     @patch("maintenance_man.vcs.get_current_branch", return_value="feat/x")
     def test_checks_out_main(
         self, mock_branch: MagicMock, mock_checkout: MagicMock, tmp_path: Path
@@ -137,11 +386,11 @@ class TestEnsureOnMain:
 
 class TestDiscardChanges:
     @patch("maintenance_man.vcs._run")
-    def test_runs_checkout_and_clean(self, mock_run: MagicMock, tmp_path: Path):
+    def test_runs_hard_reset_and_clean(self, mock_run: MagicMock, tmp_path: Path):
         mock_run.return_value = _completed()
         discard_changes(tmp_path)
         assert mock_run.call_count == 2
-        mock_run.assert_any_call(["git", "checkout", "--", "."], tmp_path)
+        mock_run.assert_any_call(["git", "reset", "--hard", "HEAD"], tmp_path)
         mock_run.assert_any_call(["git", "clean", "-fd"], tmp_path)
 
 
@@ -151,19 +400,19 @@ class TestDiscardChanges:
 
 
 class TestResetToMain:
-    @patch("maintenance_man.vcs.gt_checkout", return_value=True)
+    @patch("maintenance_man.vcs.git_checkout", return_value=True)
     @patch("maintenance_man.vcs._run")
     def test_restores_main_and_cleans(
         self,
         mock_run: MagicMock,
-        mock_gt_co: MagicMock,
+        mock_git_co: MagicMock,
         tmp_path: Path,
     ):
         mock_run.return_value = _completed()
         reset_to_main(tmp_path)
         mock_run.assert_any_call(["git", "checkout", "main", "--", "."], tmp_path)
         mock_run.assert_any_call(["git", "clean", "-fd"], tmp_path)
-        mock_gt_co.assert_called_once_with("main", tmp_path)
+        mock_git_co.assert_called_once_with("main", tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -371,12 +620,66 @@ class TestSyncGraphite:
         assert "fix/vuln-1" in git_delete[0][0][0]
 
     @patch("maintenance_man.vcs._run")
+    def test_deletes_stale_fixed_update_branch(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        def side_effect(cmd, *args, **kwargs):
+            if cmd[:2] == ["gt", "sync"]:
+                return _completed()
+            if cmd[0] == "gh" and "--state" in cmd:
+                state = cmd[cmd.index("--state") + 1]
+                if state == "closed":
+                    return _completed(stdout="mm/update-dependencies\n")
+                return _completed()
+            if cmd[0] == "git" and "branch" in cmd:
+                return _completed(stdout="main\nmm/update-dependencies\n")
+            if cmd[:2] == ["gt", "delete"]:
+                return _completed()
+            return _completed()
+
+        mock_run.side_effect = side_effect
+        assert sync_graphite(tmp_path) is True
+
+        delete_calls = [
+            c for c in mock_run.call_args_list if c[0][0][:2] == ["gt", "delete"]
+        ]
+        assert len(delete_calls) == 1
+        assert delete_calls[0][0][0][3] == "mm/update-dependencies"
+
+    @patch("maintenance_man.vcs._run")
+    def test_deletes_stale_fixed_resolve_branch(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        def side_effect(cmd, *args, **kwargs):
+            if cmd[:2] == ["gt", "sync"]:
+                return _completed()
+            if cmd[0] == "gh" and "--state" in cmd:
+                state = cmd[cmd.index("--state") + 1]
+                if state == "merged":
+                    return _completed(stdout="mm/resolve-dependencies\n")
+                return _completed()
+            if cmd[0] == "git" and "branch" in cmd:
+                return _completed(stdout="main\nmm/resolve-dependencies\n")
+            if cmd[:2] == ["gt", "delete"]:
+                return _completed()
+            return _completed()
+
+        mock_run.side_effect = side_effect
+        assert sync_graphite(tmp_path) is True
+
+        delete_calls = [
+            c for c in mock_run.call_args_list if c[0][0][:2] == ["gt", "delete"]
+        ]
+        assert len(delete_calls) == 1
+        assert delete_calls[0][0][0][3] == "mm/resolve-dependencies"
+
+    @patch("maintenance_man.vcs._run")
     def test_ignores_non_prefixed_branches(
         self,
         mock_run: MagicMock,
         tmp_path: Path,
     ):
-        """Branches not matching bump/ or fix/ prefixes are left alone."""
+        """Branches not matching managed prefixes are left alone."""
 
         def side_effect(cmd, *args, **kwargs):
             if cmd[:2] == ["gt", "sync"]:
@@ -423,6 +726,28 @@ class TestCreateWorktree:
         with patch("maintenance_man.vcs._run", mock_run):
             result = create_worktree(Path("/repo"), Path("/tmp/wt"))
         assert result is False
+
+    def test_can_attach_worktree_to_specific_branch(self):
+        mock_run = MagicMock(return_value=_completed(0))
+        with patch("maintenance_man.vcs._run", mock_run):
+            result = create_worktree(
+                Path("/repo"),
+                Path("/tmp/wt"),
+                branch="mm/update-dependencies",
+                detach=False,
+            )
+        assert result is True
+        mock_run.assert_called_once_with(
+            [
+                "git",
+                "worktree",
+                "add",
+                "/tmp/wt",
+                "mm/update-dependencies",
+            ],
+            Path("/repo"),
+            timeout=30,
+        )
 
 
 # ---------------------------------------------------------------------------
