@@ -60,12 +60,9 @@ class TestRunBuild:
         assert f"{venv_dir}/bin" not in env["PATH"].split(":")
         assert "/usr/bin" in env["PATH"].split(":")
 
-
     @patch(
         "maintenance_man.deployer.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(
-            cmd="scripts/build.sh", timeout=600
-        ),
+        side_effect=subprocess.TimeoutExpired(cmd="scripts/build.sh", timeout=600),
     )
     def test_build_timeout_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
         with pytest.raises(BuildError, match="timed out"):
@@ -90,9 +87,7 @@ class TestRunDeploy:
 
     @patch(
         "maintenance_man.deployer.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(
-            cmd="scripts/deploy.sh", timeout=600
-        ),
+        side_effect=subprocess.TimeoutExpired(cmd="scripts/deploy.sh", timeout=600),
     )
     def test_deploy_timeout_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
         with pytest.raises(DeployError, match="timed out"):
@@ -118,8 +113,7 @@ class TestCheckHealth:
     def test_unhealthy_service(self, mock_urlopen: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.read.return_value = (
-            b'{"name": "lifts", "is_up": false, '
-            b'"last_error": "connection refused"}'
+            b'{"name": "lifts", "is_up": false, "last_error": "connection refused"}'
         )
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
@@ -217,7 +211,11 @@ class TestCheckHealth:
         from urllib.error import HTTPError
 
         mock_urlopen.side_effect = HTTPError(
-            url="", code=502, msg="Bad Gateway", hdrs=None, fp=None,
+            url="",
+            code=502,
+            msg="Bad Gateway",
+            hdrs=None,
+            fp=None,
         )
 
         result = check_health(
@@ -236,7 +234,11 @@ class TestCheckHealth:
         from urllib.error import HTTPError
 
         mock_urlopen.side_effect = HTTPError(
-            url="", code=403, msg="Forbidden", hdrs=None, fp=None,
+            url="",
+            code=403,
+            msg="Forbidden",
+            hdrs=None,
+            fp=None,
         )
 
         result = check_health(

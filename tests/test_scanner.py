@@ -191,9 +191,7 @@ class TestRunTrivyScanSkipDirs:
         assert cmd[dirs_indices[0] + 1] == "tests/fixtures"
         assert cmd[dirs_indices[1] + 1] == "vendor"
 
-    def test_no_skip_dirs_by_default(
-        self, scan_results_dir: Path, tmp_path: Path
-    ):
+    def test_no_skip_dirs_by_default(self, scan_results_dir: Path, tmp_path: Path):
         """Without scan_skip_dirs, no --skip-dirs flags are added."""
         project = ProjectConfig(path=tmp_path, package_manager="uv")
         fake_result = subprocess.CompletedProcess(

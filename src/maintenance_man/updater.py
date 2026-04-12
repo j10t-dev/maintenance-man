@@ -41,11 +41,13 @@ class NoTestConfigError(Exception):
 
 def _has_test_config(project_config: ProjectConfig) -> bool:
     """Return True if any test phase is configured."""
-    return any([
-        project_config.test_unit,
-        project_config.test_integration,
-        project_config.test_component,
-    ])
+    return any(
+        [
+            project_config.test_unit,
+            project_config.test_integration,
+            project_config.test_component,
+        ]
+    )
 
 
 type UpdateKind = Literal["vuln", "update"]
@@ -412,8 +414,7 @@ def _process_stack(
         tip = f"{cfg.branch_prefix}{branch_slug(passing[-1].pkg_name)}"
         if not gt_checkout(tip, project_path):
             rprint(
-                f"  [bold red]{cfg.submit_label} checkout failed"
-                " — skipping submit.[/]"
+                f"  [bold red]{cfg.submit_label} checkout failed — skipping submit.[/]"
             )
             _mark_stack_failed(
                 results, findings, "submit", scan_result, project_name, results_dir

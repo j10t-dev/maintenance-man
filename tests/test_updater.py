@@ -95,7 +95,6 @@ def mock_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         ("submit_stack", (True, "")),
         ("gt_checkout", True),
         ("gt_create", True),
-
         ("_apply_update", True),
         ("run_test_phases", (True, None)),
     ]:
@@ -446,15 +445,9 @@ class TestProcessVulns:
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
         """Multiple CVEs for the same package → one _apply_update call."""
-        v1 = make_vuln(
-            vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0"
-        )
-        v2 = make_vuln(
-            vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4"
-        )
-        v3 = make_vuln(
-            vuln_id="CVE-0003", pkg_name="requests", fixed_version="2.32.0"
-        )
+        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0")
+        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4")
+        v3 = make_vuln(vuln_id="CVE-0003", pkg_name="requests", fixed_version="2.32.0")
         results = process_vulns([v1, v2, v3], project_config)
         assert len(results) == 1
         assert results[0].passed is True
@@ -472,12 +465,8 @@ class TestProcessVulns:
     ):
         """When consolidated vuln fails, all originals are marked FAILED."""
         mock_vcs["_apply_update"].return_value = False
-        v1 = make_vuln(
-            vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0"
-        )
-        v2 = make_vuln(
-            vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4"
-        )
+        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0")
+        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4")
         results = process_vulns([v1, v2], project_config)
         assert len(results) == 1
         assert results[0].passed is False
@@ -526,7 +515,7 @@ class TestProcessUpdates:
 
         # Only patch and minor are processed; major never starts
         assert len(results) == 2
-        assert results[0].passed is True   # patch passed
+        assert results[0].passed is True  # patch passed
         assert results[1].passed is False  # minor failed
         assert results[1].failed_phase == "unit"
         # Passing stack (patch) submitted before stopping

@@ -23,8 +23,7 @@ def sync_graphite(project_path: Path) -> bool:
     sync_result = _run(["gt", "sync", "--no-interactive"], project_path, timeout=120)
     if sync_result.returncode != 0:
         rprint(
-            f"  [bold yellow]Warning:[/] gt sync failed: "
-            f"{sync_result.stderr.strip()}"
+            f"  [bold yellow]Warning:[/] gt sync failed: {sync_result.stderr.strip()}"
         )
         return False
 
@@ -149,10 +148,7 @@ def create_worktree(project_path: Path, worktree_path: Path) -> bool:
         timeout=30,
     )
     if r.returncode != 0:
-        rprint(
-            f"  [bold red]Error:[/] worktree creation failed: "
-            f"{r.stderr.strip()}"
-        )
+        rprint(f"  [bold red]Error:[/] worktree creation failed: {r.stderr.strip()}")
         return False
     return True
 
@@ -166,8 +162,7 @@ def remove_worktree(project_path: Path, worktree_path: Path) -> None:
     )
     if r.returncode != 0:
         rprint(
-            f"  [bold yellow]Warning:[/] worktree removal failed: "
-            f"{r.stderr.strip()}"
+            f"  [bold yellow]Warning:[/] worktree removal failed: {r.stderr.strip()}"
         )
 
 
