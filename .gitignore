@@ -10,6 +10,7 @@ build/
 .pytest_cache/
 .serena/
 TODO
+TODO.md
 
 # Test fixture installed deps
 tests/fixtures/projects/dirty-bun/node_modules/
