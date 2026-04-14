@@ -24,10 +24,11 @@ from maintenance_man.models.scan import (
 from maintenance_man.vcs import (
     branch_slug,
     discard_changes,
-    gt_checkout,
-    gt_create,
+    git_checkout,
+    git_commit_all,
+    git_create_branch,
+    push_and_create_pr,
     reset_to_main,
-    submit_stack,
 )
 
 
@@ -92,7 +93,7 @@ _VULN_STACK = _StackConfig(
     branch_prefix="fix/",
     kind="vuln",
     label="[bold red]VULN[/]",
-    submit_label="Fix stack",
+    submit_label="Fix PRs",
     commit_fmt="fix: upgrade {pkg} {old} -> {new} for {detail}",
 )
 
@@ -100,7 +101,7 @@ _UPDATE_STACK = _StackConfig(
     branch_prefix="bump/",
     kind="update",
     label="[bold cyan]UPDATE[/]",
-    submit_label="Update stack",
+    submit_label="Update PRs",
     commit_fmt="update: {pkg} {old} -> {new} ({detail})",
 )
 
@@ -198,11 +199,13 @@ def process_vulns(
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process vuln fixes as a Graphite stack off main.
+    """Process vuln fixes as branches off main.
 
     Vulns for the same package are consolidated so only one branch is
-    created per package (using the highest fix version).  The fix stack is
-    submitted before returning to main.
+    created per package (using the highest fix version). If all processed
+    findings pass, the tip branch is pushed and a PR is created before
+    returning to main. A test failure keeps the failing branch for
+    ``--continue`` and defers submission.
     """
     actionable = [v for v in vulns if v.actionable]
     consolidated = _consolidate_vulns(actionable)
@@ -224,10 +227,11 @@ def process_updates(
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process updates as a Graphite stack, risk-ascending.
+    """Process updates as branches, risk-ascending.
 
-    On the first test failure the loop stops, passing branches are submitted,
-    and the failing branch is kept so the user can inspect and --continue.
+    On the first test failure the loop stops, the failing branch is kept
+    so the user can inspect and ``--continue``, and PR submission is
+    deferred until the branch is green.
     """
     sorted_updates = sort_updates_by_risk(updates)
     return _process_stack(
@@ -323,11 +327,13 @@ def _process_stack(
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process a list of findings as a Graphite stack.
+    """Process a list of findings as individual branches.
 
-    Each finding gets its own stacked branch. On the first test failure the
-    loop stops, passing branches are submitted, and the failing branch is kept
-    so the user can inspect and --continue.
+    Each finding gets its own branch. On the first retryable test failure
+    the loop stops, the failing branch is kept so the user can inspect and
+    ``--continue``, and submission is deferred. If processing completes
+    without a retryable test failure, the tip branch is pushed and a PR is
+    created.
     """
     if not _has_test_config(project_config):
         raise NoTestConfigError(
@@ -373,12 +379,26 @@ def _process_stack(
             )
             continue
 
-        if not gt_create(msg, branch, project_path):
+        if not git_create_branch(branch, project_path):
             results.append(
                 _record_failure(
                     f,
                     cfg.kind,
-                    "gt-create",
+                    "branch",
+                    project_path,
+                    scan_result,
+                    project_name,
+                    results_dir,
+                )
+            )
+            continue
+
+        if not git_commit_all(msg, project_path):
+            results.append(
+                _record_failure(
+                    f,
+                    cfg.kind,
+                    "commit",
                     project_path,
                     scan_result,
                     project_name,
@@ -408,11 +428,12 @@ def _process_stack(
         if not passed:
             break
 
-    # Submit any passing branches as a stack before stopping
+    last_failed_phase = results[-1].failed_phase if results else None
+
     passing = [r for r in results if r.passed]
-    if passing:
+    if passing and not _should_defer_submit_for_continue(last_failed_phase):
         tip = f"{cfg.branch_prefix}{branch_slug(passing[-1].pkg_name)}"
-        if not gt_checkout(tip, project_path):
+        if not git_checkout(tip, project_path):
             rprint(
                 f"  [bold red]{cfg.submit_label} checkout failed — skipping submit.[/]"
             )
@@ -420,7 +441,7 @@ def _process_stack(
                 results, findings, "submit", scan_result, project_name, results_dir
             )
         else:
-            ok, output = submit_stack(project_path)
+            ok, output = push_and_create_pr(project_path)
             if ok:
                 rprint(f"  [bold green]{cfg.submit_label} submitted.[/]")
             else:
@@ -436,14 +457,12 @@ def _process_stack(
             if output:
                 rprint(f"  [dim]{output}[/]")
 
-    if results and not results[-1].passed:
+    if results and not results[-1].passed and _should_keep_failed_branch(
+        results[-1].failed_phase
+    ):
         # Check out the failing branch so the user can inspect and --continue.
-        # results[-1] is always the test failure that triggered the break:
-        # apply/gt-create failures use `continue` so they are never last.
-        # It is guaranteed to have a branch on disk (gt_create succeeded
-        # before run_test_phases was called).
         failed_branch = f"{cfg.branch_prefix}{branch_slug(results[-1].pkg_name)}"
-        if gt_checkout(failed_branch, project_path):
+        if git_checkout(failed_branch, project_path):
             pending = len(findings) - len(results)
             suffix = f" ({pending} more pending)" if pending else ""
             continue_cmd = (
@@ -460,12 +479,29 @@ def _process_stack(
                 f"  [bold red]Could not check out {failed_branch}[/]"
                 " — returning to main."
             )
-            if not gt_checkout("main", project_path):
+            if not git_checkout("main", project_path):
                 reset_to_main(project_path)
     else:
-        if not gt_checkout("main", project_path):
+        if not git_checkout("main", project_path):
             reset_to_main(project_path)
     return results
+
+
+def _should_defer_submit_for_continue(failed_phase: str | None) -> bool:
+    """Return True when a failed phase supports manual fix + --continue.
+
+    Only test-phase failures are retryable in-place. Apply/branch/commit/
+    submit failures are automation failures, so they should not defer
+    submission or keep a branch checked out for continuation.
+    """
+    return failed_phase in {"unit", "integration", "component"}
+
+
+
+def _should_keep_failed_branch(failed_phase: str | None) -> bool:
+    """Return True when the failed branch should be left checked out."""
+    return _should_defer_submit_for_continue(failed_phase)
+
 
 
 def _mark_stack_failed(

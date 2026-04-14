@@ -92,9 +92,10 @@ def mock_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     """Mock all VCS and updater subprocess calls."""
     mocks = {}
     for name, default in [
-        ("submit_stack", (True, "")),
-        ("gt_checkout", True),
-        ("gt_create", True),
+        ("push_and_create_pr", (True, "")),
+        ("git_checkout", True),
+        ("git_create_branch", True),
+        ("git_commit_all", True),
         ("_apply_update", True),
         ("run_test_phases", (True, None)),
     ]:
@@ -387,9 +388,9 @@ class TestProcessVulns:
         assert len(results) == 1
         assert results[0].passed is True
         assert results[0].kind == "vuln"
-        mock_vcs["submit_stack"].assert_called_once()
+        mock_vcs["push_and_create_pr"].assert_called_once()
 
-    def test_vuln_test_fails_stops_and_keeps_branch(
+    def test_vuln_test_fails_stops_keeps_branch_and_defers_submit(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
         mock_vcs["run_test_phases"].return_value = (False, "unit")
@@ -399,8 +400,9 @@ class TestProcessVulns:
         assert len(results) == 1
         assert results[0].passed is False
         assert mock_vcs["_apply_update"].call_count == 1
-        # Failed branch kept: gt_checkout called with failing branch, not main
-        mock_vcs["gt_checkout"].assert_any_call("fix/some-pkg", ANY)
+        mock_vcs["push_and_create_pr"].assert_not_called()
+        # Failed branch kept for --continue, not main
+        mock_vcs["git_checkout"].assert_any_call("fix/some-pkg", ANY)
 
     def test_vuln_apply_fails(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
@@ -411,13 +413,33 @@ class TestProcessVulns:
         assert results[0].passed is False
         assert results[0].failed_phase == "apply"
 
+    def test_vuln_branch_creation_failure_uses_branch_phase(
+        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_vcs["git_create_branch"].return_value = False
+        results = process_vulns([make_vuln()], project_config)
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert results[0].failed_phase == "branch"
+        mock_vcs["git_commit_all"].assert_not_called()
+        mock_vcs["git_checkout"].assert_called_once_with("main", ANY)
+
+    def test_vuln_commit_failure_uses_commit_phase(
+        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_vcs["git_commit_all"].return_value = False
+        results = process_vulns([make_vuln()], project_config)
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert results[0].failed_phase == "commit"
+
     def test_submit_failure_marks_findings_failed(
         self,
         mock_vcs: dict[str, MagicMock],
         monkeypatch: pytest.MonkeyPatch,
         project_config: ProjectConfig,
     ):
-        mock_vcs["submit_stack"].return_value = (False, "")
+        mock_vcs["push_and_create_pr"].return_value = (False, "")
         mock_save = MagicMock()
         monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
         vuln = make_vuln()
@@ -494,11 +516,11 @@ class TestProcessUpdates:
         names = [r.pkg_name for r in results]
         assert names == ["pkg-a", "pkg-b", "pkg-c"]  # patch, minor, major
         # Stack submitted from tip (last passing = pkg-c), then return to main
-        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-c", ANY)
-        mock_vcs["gt_checkout"].assert_any_call("main", ANY)
-        mock_vcs["submit_stack"].assert_called_once()
+        mock_vcs["git_checkout"].assert_any_call("bump/pkg-c", ANY)
+        mock_vcs["git_checkout"].assert_any_call("main", ANY)
+        mock_vcs["push_and_create_pr"].assert_called_once()
 
-    def test_update_failure_stops_submits_passing_and_keeps_branch(
+    def test_update_failure_stops_keeps_branch_and_defers_submit(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
         # Patch passes, minor fails — major is never attempted
@@ -518,11 +540,9 @@ class TestProcessUpdates:
         assert results[0].passed is True  # patch passed
         assert results[1].passed is False  # minor failed
         assert results[1].failed_phase == "unit"
-        # Passing stack (patch) submitted before stopping
-        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-a", ANY)
-        mock_vcs["submit_stack"].assert_called_once()
+        mock_vcs["push_and_create_pr"].assert_not_called()
         # Failed branch (minor) kept — checked out so user can --continue
-        mock_vcs["gt_checkout"].assert_any_call("bump/pkg-b", ANY)
+        mock_vcs["git_checkout"].assert_any_call("bump/pkg-b", ANY)
 
     def test_update_failure_message_includes_project_for_continue(
         self,
@@ -544,12 +564,29 @@ class TestProcessUpdates:
         output = capsys.readouterr().out
         assert "mm update myapp --continue" in output
 
+    def test_non_retryable_failure_still_submits_passing_updates(
+        self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_vcs["run_test_phases"].return_value = (True, None)
+        mock_vcs["git_commit_all"].side_effect = [True, False]
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+        ]
+
+        results = process_updates(updates, project_config)
+
+        assert len(results) == 2
+        assert results[0].passed is True
+        assert results[1].failed_phase == "commit"
+        mock_vcs["push_and_create_pr"].assert_called_once()
+
     def test_empty_updates(
         self, mock_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
         results = process_updates([], project_config)
         assert results == []
-        mock_vcs["gt_checkout"].assert_called_once_with("main", ANY)
+        mock_vcs["git_checkout"].assert_called_once_with("main", ANY)
 
     def test_submit_failure_marks_findings_failed(
         self,
@@ -557,7 +594,7 @@ class TestProcessUpdates:
         monkeypatch: pytest.MonkeyPatch,
         project_config: ProjectConfig,
     ):
-        mock_vcs["submit_stack"].return_value = (False, "")
+        mock_vcs["push_and_create_pr"].return_value = (False, "")
         mock_save = MagicMock()
         monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
         upd = make_update(SemverTier.PATCH)
