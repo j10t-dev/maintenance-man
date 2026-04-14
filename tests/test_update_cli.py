@@ -46,10 +46,10 @@ def _make_scan_result() -> ScanResult:
 @pytest.fixture(autouse=True)
 def _mock_updater(monkeypatch: pytest.MonkeyPatch):
     """Mock all updater pre-checks to pass by default."""
-    monkeypatch.setattr("maintenance_man.cli.check_graphite_available", lambda: None)
+    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
     monkeypatch.setattr("maintenance_man.cli.check_repo_clean", lambda p: None)
     monkeypatch.setattr("maintenance_man.cli.ensure_on_main", lambda p: True)
-    monkeypatch.setattr("maintenance_man.cli.sync_graphite", lambda p: True)
+    monkeypatch.setattr("maintenance_man.cli.sync_remote", lambda p: True)
     monkeypatch.setattr(
         "maintenance_man.cli.load_scan_results",
         lambda name, d: _make_scan_result(),
@@ -57,7 +57,7 @@ def _mock_updater(monkeypatch: pytest.MonkeyPatch):
 
 
 class TestUpdatePreChecks:
-    def test_no_projects_configured_exits_0_without_gt(
+    def test_no_projects_configured_exits_0_without_gh(
         self,
         mm_home: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -65,11 +65,11 @@ class TestUpdatePreChecks:
         (mm_home).mkdir(parents=True, exist_ok=True)
         (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
 
-        from maintenance_man.vcs import GraphiteNotFoundError
+        from maintenance_man.vcs import GitHubCLINotFoundError
 
         monkeypatch.setattr(
-            "maintenance_man.cli.check_graphite_available",
-            MagicMock(side_effect=GraphiteNotFoundError("no gt")),
+            "maintenance_man.cli.check_gh_available",
+            MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -77,7 +77,7 @@ class TestUpdatePreChecks:
 
         assert exc_info.value.code == 0
 
-    def test_no_scan_results_exits_1(
+    def test_no_scan_results_errors(
         self,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -92,7 +92,7 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 1
 
-    def test_dirty_repo_exits_1_when_declined(
+    def test_dirty_repo_decline_errors(
         self,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -111,22 +111,22 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 1
 
-    def test_no_gt_exits_1(
+    def test_missing_gh_errors(
         self,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        from maintenance_man.vcs import GraphiteNotFoundError
+        from maintenance_man.vcs import GitHubCLINotFoundError
 
         monkeypatch.setattr(
-            "maintenance_man.cli.check_graphite_available",
-            MagicMock(side_effect=GraphiteNotFoundError("no gt")),
+            "maintenance_man.cli.check_gh_available",
+            MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 1
 
-    def test_no_test_config_exits_1(
+    def test_missing_test_config_errors(
         self,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -181,7 +181,7 @@ class TestUpdateSelection:
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.submit_stack", MagicMock(return_value=(True, ""))
+            "maintenance_man.cli.push_and_create_pr", MagicMock(return_value=(True, ""))
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -216,7 +216,7 @@ class TestUpdateExitCodes:
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.submit_stack", MagicMock(return_value=(True, ""))
+            "maintenance_man.cli.push_and_create_pr", MagicMock(return_value=(True, ""))
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -246,10 +246,74 @@ class TestUpdateExitCodes:
         monkeypatch.setattr(
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
-        monkeypatch.setattr("maintenance_man.cli.submit_stack", MagicMock())
+        monkeypatch.setattr("maintenance_man.cli.push_and_create_pr", MagicMock())
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 4
+
+    def test_branch_failure_summary_uses_friendly_label(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_vulns",
+            MagicMock(
+                return_value=[
+                    UpdateResult(
+                        pkg_name="some-pkg",
+                        kind="vuln",
+                        passed=False,
+                        failed_phase="branch",
+                    )
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_updates", MagicMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable"])
+
+        assert exc_info.value.code == 4
+        assert "branch creation failed" in capsys.readouterr().out
+
+    def test_commit_failure_summary_uses_friendly_label(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_vulns",
+            MagicMock(
+                return_value=[
+                    UpdateResult(
+                        pkg_name="some-pkg",
+                        kind="vuln",
+                        passed=False,
+                        failed_phase="commit",
+                    )
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_updates", MagicMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable"])
+
+        assert exc_info.value.code == 4
+        assert "commit failed" in capsys.readouterr().out
 
 
 class TestUpdateNumberedSelection:
@@ -270,7 +334,7 @@ class TestUpdateNumberedSelection:
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="1")
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.submit_stack", MagicMock(return_value=(True, ""))
+            "maintenance_man.cli.push_and_create_pr", MagicMock(return_value=(True, ""))
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -312,7 +376,7 @@ class TestUpdateContinue:
         )
         monkeypatch.setattr("maintenance_man.cli.run_test_phases", mock_test)
         monkeypatch.setattr("maintenance_man.cli.save_scan_results", MagicMock())
-        monkeypatch.setattr("maintenance_man.cli.submit_stack", mock_submit)
+        monkeypatch.setattr("maintenance_man.cli.push_and_create_pr", mock_submit)
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "--continue"])
         assert exc_info.value.code == 0
@@ -390,7 +454,7 @@ class TestUpdateContinue:
             "maintenance_man.cli.run_test_phases", MagicMock(return_value=(True, None))
         )
         monkeypatch.setattr("maintenance_man.cli.save_scan_results", MagicMock())
-        monkeypatch.setattr("maintenance_man.cli.submit_stack", mock_submit)
+        monkeypatch.setattr("maintenance_man.cli.push_and_create_pr", mock_submit)
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "--continue"])
         assert exc_info.value.code == 4
@@ -573,7 +637,7 @@ class TestUpdateAll:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A project-level error (e.g. sync failure) causes non-zero exit."""
-        monkeypatch.setattr("maintenance_man.cli.sync_graphite", lambda p: False)
+        monkeypatch.setattr("maintenance_man.cli.sync_remote", lambda p: False)
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update"])
@@ -581,16 +645,16 @@ class TestUpdateAll:
 
 
 class TestUpdateTargetSelection:
-    def test_excluding_all_projects_exits_0_without_gt(
+    def test_excluding_all_projects_exits_0_without_gh(
         self,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from maintenance_man.vcs import GraphiteNotFoundError
+        from maintenance_man.vcs import GitHubCLINotFoundError
 
         monkeypatch.setattr(
-            "maintenance_man.cli.check_graphite_available",
-            MagicMock(side_effect=GraphiteNotFoundError("no gt")),
+            "maintenance_man.cli.check_gh_available",
+            MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -989,7 +1053,7 @@ class TestWorktreeMode:
         mock_remove = MagicMock()
         monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_create)
         monkeypatch.setattr("maintenance_man.cli.remove_worktree", mock_remove)
-        monkeypatch.setattr("maintenance_man.cli.sync_graphite", lambda p: False)
+        monkeypatch.setattr("maintenance_man.cli.sync_remote", lambda p: False)
 
         with pytest.raises(SystemExit):
             app(["update", "--worktree"])

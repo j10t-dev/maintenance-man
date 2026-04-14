@@ -61,7 +61,7 @@ def _make_updates_only_result() -> ScanResult:
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
     monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.sync_graphite", lambda _path: True)
+    monkeypatch.setattr("maintenance_man.cli.sync_remote", lambda _path: True)
 
     def _fake_scan(
         name: str, project_config: object, min_version_age_days: int = 7

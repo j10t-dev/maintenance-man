@@ -63,18 +63,18 @@ from maintenance_man.updater import (
     save_scan_results,
 )
 from maintenance_man.vcs import (
-    GraphiteNotFoundError,
+    GitHubCLINotFoundError,
     RepoDirtyError,
     branch_slug,
-    check_graphite_available,
+    check_gh_available,
     check_repo_clean,
     create_worktree,
     ensure_on_main,
     get_current_branch,
+    push_and_create_pr,
     remove_worktree,
     reset_to_main,
-    submit_stack,
-    sync_graphite,
+    sync_remote,
 )
 
 
@@ -284,8 +284,8 @@ def update(
     _exit_if_no_update_targets(cfg, targets)
 
     try:
-        check_graphite_available()
-    except GraphiteNotFoundError as e:
+        check_gh_available()
+    except GitHubCLINotFoundError as e:
         _fatal(str(e))
 
     if mode == "single":
@@ -342,8 +342,8 @@ def _update_interactive(
                     sys.exit(ExitCode.ERROR)
 
         if not continue_:
-            if not sync_graphite(work_config.path):
-                _fatal("Failed to sync trunk. Check network and gt auth.")
+            if not sync_remote(work_config.path):
+                _fatal("Failed to sync trunk. Check network and gh auth.")
 
         results_dir = _config.MM_HOME / "scan-results"
         try:
@@ -438,7 +438,8 @@ def _update_interactive(
         if failed:
             phase_labels = {
                 "apply": "install failed",
-                "gt-create": "branch creation failed",
+                "branch": "branch creation failed",
+                "commit": "commit failed",
             }
             for r in failed:
                 label = phase_labels.get(
@@ -482,11 +483,10 @@ def _update_batch(
     # Only do expensive repo/network checks when there's actual work
     work_config = proj_config
 
-    # Sync trunk and clean up stale branches on the *original* repo before
-    # creating a worktree (Graphite needs a real branch, not detached HEAD).
+    # Sync trunk on the *original* repo before creating a worktree.
     # In non-worktree mode the sync happens after we've confirmed we're on main.
     if use_worktree:
-        if not sync_graphite(proj_config.path):
+        if not sync_remote(proj_config.path):
             console.print(f"  [bold red]Error:[/] {project} — failed to sync trunk")
             return None
 
@@ -513,7 +513,7 @@ def _update_batch(
                 )
                 return None
 
-            if not sync_graphite(work_config.path):
+            if not sync_remote(work_config.path):
                 console.print(
                     f"  [bold red]Error:[/] {project} — failed to sync trunk"
                 )
@@ -1169,10 +1169,10 @@ def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -
 def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
     """Scan a single project with timing output."""
     try:
-        sync_graphite(proj_config.path)
+        sync_remote(proj_config.path)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         console.print(
-            f"[bold yellow]Warning:[/] {name} — failed to graphite sync: {exc}"
+            f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}"
         )
 
     t0 = time.monotonic()
@@ -1401,11 +1401,11 @@ def _handle_continue(
         console.print(f"\n  [dim]Still failed: {', '.join(pkg_names)}[/]")
         sys.exit(ExitCode.UPDATE_FAILED)
 
-    ok, output = submit_stack(proj_config.path)
+    ok, output = push_and_create_pr(proj_config.path)
     if ok:
-        console.print("  [bold green]Stack submitted.[/]")
+        console.print("  [bold green]PR submitted.[/]")
     else:
-        console.print("  [bold red]Submit failed.[/]")
+        console.print("  [bold red]PR submit failed.[/]")
     if output:
         console.print(f"  [dim]{output}[/]")
     sys.exit(ExitCode.OK)

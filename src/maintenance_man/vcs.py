@@ -5,7 +5,7 @@ from pathlib import Path
 from rich import print as rprint
 
 
-class GraphiteNotFoundError(Exception):
+class GitHubCLINotFoundError(Exception):
     pass
 
 
@@ -13,23 +13,26 @@ class RepoDirtyError(Exception):
     pass
 
 
-def sync_graphite(project_path: Path) -> bool:
-    """Sync with remote and delete local branches whose PRs are merged/closed.
+def sync_remote(project_path: Path) -> bool:
+    """Fetch from remote, prune stale refs, delete merged/closed branches.
 
-    Runs ``gt sync`` to fetch and update trunk, then explicitly deletes any
-    tracked ``bump/`` or ``fix/`` branches whose GitHub PRs have been merged
-    or closed.  This avoids stale branches blocking future stack submissions.
+    Runs ``git fetch --prune`` to update remote state, then deletes any
+    managed local branches whose GitHub PRs have been merged or closed.
     """
-    sync_result = _run(["gt", "sync", "--no-interactive"], project_path, timeout=120)
-    if sync_result.returncode != 0:
+    fetch_result = _run(["git", "fetch", "--prune"], project_path, timeout=120)
+    if fetch_result.returncode != 0:
         rprint(
-            f"  [bold yellow]Warning:[/] gt sync failed: {sync_result.stderr.strip()}"
+            f"  [bold yellow]Warning:[/] git fetch failed: "
+            f"{fetch_result.stderr.strip()}"
         )
         return False
 
-    prefixes = ("bump/", "fix/")
-    stale_branches = _gh_list_pr_branches("merged", prefixes, project_path)
-    stale_branches |= _gh_list_pr_branches("closed", prefixes, project_path)
+    stale_branches = _gh_list_pr_branches(
+        "merged", ("bump/", "fix/"), project_path
+    )
+    stale_branches |= _gh_list_pr_branches(
+        "closed", ("bump/", "fix/"), project_path
+    )
 
     local = _run(
         ["git", "branch", "--format=%(refname:short)"], project_path, timeout=10
@@ -39,83 +42,124 @@ def sync_graphite(project_path: Path) -> bool:
 
     local_branches = {b.strip() for b in local.stdout.splitlines()}
 
-    # Delete stale branches — gt delete handles metadata + restacks children;
-    # fall back to git branch -D for branches Graphite doesn't track.
     for branch in sorted(local_branches & stale_branches):
-        if not gt_delete(branch, project_path):
-            _run(["git", "branch", "-D", branch], project_path, timeout=10)
+        git_delete_branch(branch, project_path)
 
     return True
 
 
-def submit_stack(project_path: Path) -> tuple[bool, str]:
-    """Run gt submit --stack. Retries with --force on stale-ref failures."""
-    r = _run(["gt", "submit", "--stack", "--publish"], project_path, timeout=120)
-    if r.returncode != 0 and "force-with-lease" in r.stderr.lower():
-        rprint("  [bold yellow]Warning:[/] stale remote refs — retrying with --force")
-        r = _run(
-            ["gt", "submit", "--stack", "--publish", "--force"],
+def push_and_create_pr(project_path: Path) -> tuple[bool, str]:
+    """Push current branch and create a GitHub PR.
+
+    Pushes the current branch to origin. Automatic ``--force-with-lease``
+    retry is restricted to managed update branches (``bump/`` and ``fix/``),
+    where this tool owns the branch lifecycle.
+    """
+    branch = get_current_branch(project_path)
+    if not branch:
+        return False, "Not on a branch (detached HEAD)."
+
+    push = _run(
+        ["git", "push", "-u", "origin", branch],
+        project_path,
+        timeout=120,
+    )
+    if push.returncode != 0 and _is_non_fast_forward_push(push.stderr):
+        if not _is_managed_update_branch(branch):
+            return False, push.stderr.strip()
+        rprint(
+            "  [bold yellow]Warning:[/] remote branch diverged — retrying "
+            "with --force-with-lease"
+        )
+        push = _run(
+            ["git", "push", "--force-with-lease", "-u", "origin", branch],
             project_path,
             timeout=120,
         )
-    ok = r.returncode == 0
-    return ok, (r.stdout if ok else r.stderr).strip()
+    if push.returncode != 0:
+        return False, push.stderr.strip()
+
+    pr = _run(
+        ["gh", "pr", "create", "--fill", "--head", branch],
+        project_path,
+        timeout=60,
+    )
+    if pr.returncode != 0:
+        if "already exists" in pr.stderr.lower():
+            return True, f"PR already exists for {branch}"
+        return False, pr.stderr.strip()
+
+    return True, pr.stdout.strip()
 
 
-def gt_create(message: str, branch_name: str, project_path: Path) -> bool:
-    """Create a Graphite branch, deleting any stale branch with the same name first."""
-    cmd = ["gt", "create", branch_name, "-a", "-m", message]
-    first = _run(cmd, project_path, timeout=60)
+def git_checkout(branch: str, project_path: Path) -> bool:
+    """Check out a git branch. Returns True on success."""
+    completed = _run(["git", "checkout", branch], project_path)
+    if completed.returncode != 0:
+        rprint(
+            f"  [bold yellow]Warning:[/] git checkout {branch} failed: "
+            f"{completed.stderr.strip()}"
+        )
+        return False
+    return True
 
-    match (first.returncode, "already exists" in first.stderr):
-        case (0, _):
-            return True
-        case (_, True):
-            # Stale branch -- delete and recreate
-            gt_delete(branch_name, project_path)
-            retry = _run(cmd, project_path, timeout=60)
+
+def git_create_branch(branch_name: str, project_path: Path) -> bool:
+    """Create and check out a new git branch. Returns True on success.
+
+    If the branch already exists, deletes it first and recreates.
+    """
+    result = _run(["git", "checkout", "-b", branch_name], project_path)
+    if result.returncode != 0:
+        if "already exists" in result.stderr:
+            git_delete_branch(branch_name, project_path)
+            retry = _run(["git", "checkout", "-b", branch_name], project_path)
             if retry.returncode != 0:
                 rprint(
-                    f"  [bold red]FAIL[/] gt create (retry) failed: "
+                    f"  [bold red]FAIL[/] branch creation (retry) failed: "
                     f"{retry.stderr.strip()}"
                 )
                 return False
             return True
-        case _:
-            rprint(f"  [bold red]FAIL[/] gt create failed: {first.stderr.strip()}")
-            return False
+        rprint(f"  [bold red]FAIL[/] branch creation failed: {result.stderr.strip()}")
+        return False
+    return True
 
 
-def gt_delete(branch_name: str, project_path: Path) -> bool:
-    """Delete a Graphite branch. Returns True on success."""
-    completed = _run(["gt", "delete", "-f", branch_name], project_path)
+def git_commit_all(message: str, project_path: Path) -> bool:
+    """Stage all changes and commit. Returns True on success."""
+    add = _run(["git", "add", "-A"], project_path)
+    if add.returncode != 0:
+        rprint(f"  [bold red]FAIL[/] git add failed: {add.stderr.strip()}")
+        return False
+
+    result = _run(["git", "commit", "-m", message], project_path)
+    if result.returncode != 0:
+        rprint(
+            f"  [bold red]FAIL[/] git commit failed: {result.stderr.strip()}"
+        )
+        return False
+    return True
+
+
+def git_delete_branch(branch_name: str, project_path: Path) -> bool:
+    """Force-delete a local git branch. Returns True on success."""
+    completed = _run(["git", "branch", "-D", branch_name], project_path)
     if completed.returncode != 0:
         rprint(
-            f"  [bold yellow]Warning:[/] gt delete {branch_name} failed: "
+            f"  [bold yellow]Warning:[/] git branch -D {branch_name} failed: "
             f"{completed.stderr.strip()}"
         )
         return False
     return True
 
 
-def gt_checkout(branch: str, project_path: Path) -> bool:
-    """Check out a Graphite branch. Returns True on success."""
-    completed = _run(["gt", "checkout", branch], project_path)
-    if completed.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] gt checkout {branch} failed: "
-            f"{completed.stderr.strip()}"
-        )
-        return False
-    return True
-
-
-def check_graphite_available() -> None:
-    """Raise GraphiteNotFoundError if gt is not on PATH."""
-    if shutil.which("gt") is None:
-        raise GraphiteNotFoundError(
-            "Graphite CLI (gt) is not installed or not on PATH. "
-            "Install it from https://graphite.dev/docs/installing-the-cli"
+def check_gh_available() -> None:
+    """Raise GitHubCLINotFoundError if gh is not on PATH."""
+    if shutil.which("gh") is None:
+        raise GitHubCLINotFoundError(
+            "GitHub CLI (gh) is not installed or not on PATH. "
+            "Install it from https://cli.github.com/"
         )
 
 
@@ -137,7 +181,7 @@ def ensure_on_main(project_path: Path) -> bool:
     """Ensure the repo is on the main branch. Returns True if successful."""
     if get_current_branch(project_path) == "main":
         return True
-    return gt_checkout("main", project_path)
+    return git_checkout("main", project_path)
 
 
 def create_worktree(project_path: Path, worktree_path: Path) -> bool:
@@ -176,7 +220,7 @@ def reset_to_main(project_path: Path) -> None:
     """Discard all changes and check out main."""
     _run(["git", "checkout", "main", "--", "."], project_path)
     _run(["git", "clean", "-fd"], project_path)
-    gt_checkout("main", project_path)
+    git_checkout("main", project_path)
 
 
 def branch_slug(pkg_name: str) -> str:
@@ -227,3 +271,15 @@ def _gh_list_pr_branches(
         for b in completed.stdout.splitlines()
         if b.strip().startswith(prefixes)
     }
+
+
+def _is_managed_update_branch(branch: str) -> bool:
+    """Return True for branches managed by the automated update flow."""
+    return branch.startswith(("bump/", "fix/"))
+
+
+
+def _is_non_fast_forward_push(stderr: str) -> bool:
+    """Return True when a push failed due to remote divergence."""
+    error = stderr.lower()
+    return "non-fast-forward" in error or "fetch first" in error

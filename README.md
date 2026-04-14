@@ -9,7 +9,7 @@ Maintenance Man(ager) is a CLI helper that makes the routine maintenance of your
 1. Scan project(s) for vulnerabilities, dependency updates and exposed secrets (via)
 2. Update dependencies, validate via the target project's unit/integration/component tests.
   a. Each passing dependency update gets its own commit and branch. 
-  b. All passing updates are batched into a single graphite-stack.
+  b. All passing updates are submitted as a GitHub pull request.
 3. Build the deploy artifacts for the updated project(s) (if relevant)
 4. Deploy updated application(s) and validate via healthchecking.
 
