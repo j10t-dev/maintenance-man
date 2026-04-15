@@ -99,6 +99,19 @@ class TestGetUvDirectDepNames:
         names = _get_uv_direct_dep_names(tmp_path)
         assert names == {"requests", "extra-pkg"}
 
+    def test_excludes_optional_dependencies(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[project]\n"
+            'dependencies = ["requests>=2.28"]\n'
+            "\n"
+            "[project.optional-dependencies]\n"
+            'cli = ["rich>=14.0"]\n'
+            'docs = ["mkdocs-material>=9.0"]\n'
+        )
+        names = _get_uv_direct_dep_names(tmp_path)
+        assert names == {"requests"}
+
     def test_empty_dependencies(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text("[project]\ndependencies = []\n")
