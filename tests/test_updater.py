@@ -16,9 +16,11 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.updater import (
     NoScanResultsError,
+    _apply_update,
     _consolidate_vulns,
+    _get_uv_update_command,
     _highest_fix_version,
-    get_update_command,
+    get_update_commands,
     load_scan_results,
     process_updates,
     process_vulns,
@@ -26,6 +28,7 @@ from maintenance_man.updater import (
     save_scan_results,
     sort_updates_by_risk,
 )
+from maintenance_man.uv_dependencies import UvDependencyError, UvDependencyLocation
 
 # -- Factory helpers --
 
@@ -159,39 +162,200 @@ class TestLoadScanResults:
             load_scan_results("nonexistent", scan_results_dir)
 
 
-# -- get_update_command --
+# -- get_update_commands --
 
 
-class TestGetUpdateCommand:
+class TestGetUpdateCommands:
+    def test_uv_runtime_dependency(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["requests>=2.28"]\n', encoding="utf-8"
+        )
+
+        assert get_update_commands("uv", "requests", "2.33.1", tmp_path) == [
+            ["uv", "add", "requests==2.33.1"]
+        ]
+
+    def test_uv_dev_dependency_group(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\ndependencies = []\n\n"
+            "[dependency-groups]\n"
+            'dev = ["pytest>=8.0"]\n',
+            encoding="utf-8",
+        )
+
+        assert get_update_commands("uv", "pytest", "9.0.3", tmp_path) == [
+            ["uv", "add", "--group", "dev", "pytest==9.0.3"]
+        ]
+
+    def test_uv_custom_dependency_group(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\ndependencies = []\n\n"
+            "[dependency-groups]\n"
+            'lint = ["ruff>=0.9.0"]\n',
+            encoding="utf-8",
+        )
+
+        assert get_update_commands("uv", "ruff", "0.13.0", tmp_path) == [
+            ["uv", "add", "--group", "lint", "ruff==0.13.0"]
+        ]
+
+    def test_uv_optional_dependency_is_not_supported(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\ndependencies = []\n\n"
+            "[project.optional-dependencies]\n"
+            'cli = ["rich>=14.0"]\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            UvDependencyError,
+            match=(
+                "Package reported as direct dependency but no matching declaration "
+                "was found in pyproject.toml: rich"
+            ),
+        ):
+            get_update_commands("uv", "rich", "14.3.3", tmp_path)
+
+    def test_uv_runtime_and_group_dependency(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\ndependencies = [\"pytest>=8.0\"]\n\n"
+            "[dependency-groups]\n"
+            'dev = ["pytest>=8.0"]\n',
+            encoding="utf-8",
+        )
+
+        assert get_update_commands("uv", "pytest", "9.0.3", tmp_path) == [
+            ["uv", "add", "pytest==9.0.3"],
+            ["uv", "add", "--group", "dev", "pytest==9.0.3"],
+        ]
+
+    def test_uv_missing_declaration_site_raises(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["requests>=2.28"]\n', encoding="utf-8"
+        )
+
+        with pytest.raises(
+            UvDependencyError,
+            match=(
+                "Package reported as direct dependency but no matching declaration "
+                "was found in pyproject.toml: pytest"
+            ),
+        ):
+            get_update_commands("uv", "pytest", "9.0.3", tmp_path)
+
     @pytest.mark.parametrize(
         ("manager", "pkg", "version", "expected"),
         [
             pytest.param(
-                "bun", "axios", "1.7.0", ["bun", "add", "axios@1.7.0"], id="bun"
-            ),
-            pytest.param(
-                "uv",
-                "requests",
-                "2.32.0",
-                ["uv", "add", "requests==2.32.0"],
-                id="uv",
+                "bun",
+                "axios",
+                "1.7.0",
+                [["bun", "add", "axios@1.7.0"]],
+                id="bun",
             ),
             pytest.param(
                 "mvn",
                 "org.example:lib",
                 "3.0.0",
-                [
+                [[
                     "mvn",
                     "versions:use-dep-version",
                     "-Dincludes=org.example:lib",
                     "-DdepVersion=3.0.0",
-                ],
+                ]],
                 id="mvn",
             ),
         ],
     )
-    def test_get_update_command(self, manager, pkg, version, expected):
-        assert get_update_command(manager, pkg, version) == expected
+    def test_non_uv_managers_unchanged(
+        self, tmp_path: Path, manager, pkg, version, expected
+    ):
+        assert get_update_commands(manager, pkg, version, tmp_path) == expected
+
+    def test_uv_group_command_requires_group_name(self):
+        with pytest.raises(
+            UvDependencyError,
+            match="group dependency location missing",
+        ):
+            _get_uv_update_command(
+                "pytest",
+                "9.0.3",
+                UvDependencyLocation(kind="group"),
+            )
+
+
+class TestApplyUpdate:
+    def test_uv_runs_all_matching_commands_in_order(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\ndependencies = [\"pytest>=8.0\"]\n\n"
+            "[dependency-groups]\n"
+            'dev = ["pytest>=8.0"]\n'
+            'lint = ["pytest>=8.0"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("maintenance_man.updater._project_env", lambda: {})
+        mock_run = MagicMock(
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+        )
+        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+
+        assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is True
+        assert [call.args[0] for call in mock_run.call_args_list] == [
+            ["uv", "add", "pytest==9.0.3"],
+            ["uv", "add", "--group", "dev", "pytest==9.0.3"],
+            ["uv", "add", "--group", "lint", "pytest==9.0.3"],
+        ]
+
+    def test_uv_stops_on_first_failing_command(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\ndependencies = [\"pytest>=8.0\"]\n\n"
+            "[dependency-groups]\n"
+            'dev = ["pytest>=8.0"]\n'
+            'lint = ["pytest>=8.0"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("maintenance_man.updater._project_env", lambda: {})
+        mock_run = MagicMock(
+            side_effect=[
+                subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="", stderr=""
+                ),
+                subprocess.CompletedProcess(
+                    args=[], returncode=1, stdout="", stderr="boom"
+                ),
+                subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="", stderr=""
+                ),
+            ]
+        )
+        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+
+        assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
+        assert mock_run.call_count == 2
+        assert "uv add --group dev pytest==9.0.3" in capsys.readouterr().out
+
+    def test_uv_pyproject_read_failure_is_apply_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.setattr("maintenance_man.updater._project_env", lambda: {})
+        mock_run = MagicMock()
+        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+
+        assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
+        assert mock_run.call_count == 0
+        assert "Failed to read" in capsys.readouterr().out
 
 
 # -- run_test_phases --

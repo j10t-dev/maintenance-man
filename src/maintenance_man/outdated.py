@@ -1,13 +1,17 @@
 import json
 import re
 import subprocess
-import tomllib
 from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import SemverTier, UpdateFinding
+from maintenance_man.uv_dependencies import (
+    UvDependencyError,
+    get_uv_direct_dep_names,
+    normalise_pkg_name,
+)
 
 
 class OutdatedCheckError(Exception):
@@ -44,38 +48,17 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
             return SemverTier.PATCH
 
 
-_PEP503_NORMALISE_RE = re.compile(r"[-_.]+")
 
 
 def _normalise_pkg_name(name: str) -> str:
-    """Normalise a package name per PEP 503 (lowercase, collapse separators)."""
-    return _PEP503_NORMALISE_RE.sub("-", name).lower()
-
-
-_PEP508_NAME_RE = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)")
+    return normalise_pkg_name(name)
 
 
 def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
-    """Read pyproject.toml and return normalised names of all direct dependencies."""
-    pyproject_path = project_path / "pyproject.toml"
     try:
-        with open(pyproject_path, "rb") as f:
-            data = tomllib.load(f)
-    except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
-        raise OutdatedCheckError(f"Failed to read {pyproject_path}: {e}") from e
-
-    names: set[str] = set()
-
-    for spec in data.get("project", {}).get("dependencies", []):
-        if m := _PEP508_NAME_RE.match(spec):
-            names.add(_normalise_pkg_name(m.group(1)))
-
-    for group_entries in data.get("dependency-groups", {}).values():
-        for entry in group_entries:
-            if isinstance(entry, str) and (m := _PEP508_NAME_RE.match(entry)):
-                names.add(_normalise_pkg_name(m.group(1)))
-
-    return names
+        return get_uv_direct_dep_names(project_path)
+    except UvDependencyError as e:
+        raise OutdatedCheckError(str(e)) from e
 
 
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:

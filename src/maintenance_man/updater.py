@@ -21,6 +21,11 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     VulnFinding,
 )
+from maintenance_man.uv_dependencies import (
+    UvDependencyError,
+    UvDependencyLocation,
+    get_uv_dependency_locations,
+)
 from maintenance_man.vcs import (
     branch_slug,
     discard_changes,
@@ -270,22 +275,43 @@ def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
     return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
 
 
-def get_update_command(package_manager: str, pkg_name: str, version: str) -> list[str]:
-    """Return the shell command to update a package to a specific version."""
+def get_update_commands(
+    package_manager: str,
+    pkg_name: str,
+    version: str,
+    project_path: Path,
+) -> list[list[str]]:
+    """Return the shell command or commands to update a package."""
     match package_manager:
         case "bun":
-            return ["bun", "add", f"{pkg_name}@{version}"]
+            return [["bun", "add", f"{pkg_name}@{version}"]]
         case "uv":
-            return ["uv", "add", f"{pkg_name}=={version}"]
-        case "mvn":
+            locations = get_uv_dependency_locations(project_path, pkg_name)
             return [
+                _get_uv_update_command(pkg_name, version, location)
+                for location in locations
+            ]
+        case "mvn":
+            return [[
                 "mvn",
                 "versions:use-dep-version",
                 f"-Dincludes={pkg_name}",
                 f"-DdepVersion={version}",
-            ]
+            ]]
         case _:
             raise ValueError(f"Unsupported package manager: {package_manager}")
+
+
+def _get_uv_update_command(
+    pkg_name: str, version: str, location: UvDependencyLocation
+) -> list[str]:
+    command = ["uv", "add"]
+    if location.kind == "group":
+        if location.group is None:
+            raise UvDependencyError("UV group dependency location missing group name")
+        command.extend(["--group", location.group])
+    command.append(f"{pkg_name}=={version}")
+    return command
 
 
 # TODO: extract as part of test command feature
@@ -572,21 +598,27 @@ def _apply_update(
 ) -> bool:
     """Apply a single package update. Returns True on success."""
     env = _project_env()
-    cmd = get_update_command(package_manager, pkg_name, version)
-    completed = subprocess.run(
-        cmd,
-        cwd=project_path,
-        timeout=300,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    if completed.returncode != 0:
-        rprint(
-            f"  [bold red]FAIL[/] Package manager command failed: "
-            f"{' '.join(cmd)}\n  {completed.stderr.strip()}"
-        )
+    try:
+        commands = get_update_commands(package_manager, pkg_name, version, project_path)
+    except UvDependencyError as e:
+        rprint(f"  [bold red]FAIL[/] {e}")
         return False
+
+    for cmd in commands:
+        completed = subprocess.run(
+            cmd,
+            cwd=project_path,
+            timeout=300,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if completed.returncode != 0:
+            rprint(
+                f"  [bold red]FAIL[/] Package manager command failed: "
+                f"{' '.join(cmd)}\n  {completed.stderr.strip()}"
+            )
+            return False
 
     # Maven needs a second command to finalise
     if package_manager == "mvn":
