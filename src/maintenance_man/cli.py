@@ -1,7 +1,6 @@
 import subprocess
 import sys
 import time
-from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
@@ -12,7 +11,7 @@ import cyclopts
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 from maintenance_man import __version__
@@ -39,7 +38,7 @@ from maintenance_man.models.activity import (
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
-    MaintenanceFlow,
+    Workflow,
     ScanResult,
     UpdateFinding,
     UpdateStatus,
@@ -60,21 +59,21 @@ from maintenance_man.updater import (
     load_scan_results,
     process_updates,
     process_vulns,
+    remove_completed_findings,
     run_test_phases,
     save_scan_results,
 )
 from maintenance_man.vcs import (
     GitHubCLINotFoundError,
-    RepoDirtyError,
-    branch_slug,
     check_gh_available,
-    check_repo_clean,
     create_worktree,
     ensure_on_main,
     get_current_branch,
-    push_and_create_pr,
+    git_branch_exists,
+    git_create_branch,
+    git_delete_branch,
+    git_merge_fast_forward,
     remove_worktree,
-    reset_to_main,
     sync_remote,
 )
 
@@ -100,6 +99,8 @@ class DeployResult:
 console = Console()
 
 _TABLE_STYLE = dict(show_edge=False, pad_edge=False, box=None)
+
+_UPDATE_BRANCH = "mm/update-dependencies"
 
 app = cyclopts.App(
     name="mm",
@@ -217,27 +218,17 @@ def _resolve_update_targets(
     projects: list[str],
     *,
     negate: bool,
-    continue_: bool,
 ) -> tuple[Literal["single", "batch"], list[str]]:
     ordered = _dedupe_preserve_order(projects)
     _validate_project_names(cfg, ordered)
 
     if negate:
-        if continue_:
-            _fatal(
-                "--continue requires exactly one project and cannot be used with -n."
-            )
         excluded = set(ordered)
         targets = [name for name in _sorted_project_names(cfg) if name not in excluded]
         return "batch", targets
 
     if not ordered:
-        if continue_:
-            _fatal("--continue requires a project name.")
         return "batch", _sorted_project_names(cfg)
-
-    if continue_ and len(ordered) != 1:
-        _fatal("--continue requires exactly one project.")
 
     if len(ordered) == 1:
         return "single", ordered
@@ -249,8 +240,6 @@ def _resolve_update_targets(
 def update(
     *projects: str,
     negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
-    continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
-    worktree: bool = False,
     config: Path | None = None,
 ) -> None:
     """Apply updates from scan results to one, many, or all projects.
@@ -263,24 +252,11 @@ def update(
         single-project flow.
     negate: bool
         Treat all positional project names as exclusions.
-    continue_: bool
-        Re-test a manually fixed failed finding on the current branch.
-    worktree: bool
-        Create a temporary git worktree for each project instead of working
-        in the main checkout.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
-    mode, targets = _resolve_update_targets(
-        cfg,
-        list(projects),
-        negate=negate,
-        continue_=continue_,
-    )
-
-    if continue_ and worktree:
-        _fatal("--continue and --worktree cannot be used together.")
+    mode, targets = _resolve_update_targets(cfg, list(projects), negate=negate)
 
     _exit_if_no_update_targets(cfg, targets)
 
@@ -290,274 +266,117 @@ def update(
         _fatal(str(e))
 
     if mode == "single":
-        _update_interactive(
-            cfg,
-            targets[0],
-            continue_=continue_,
-            use_worktree=worktree,
-        )
+        _update_interactive(cfg, targets[0])
 
-    _update_batch_targets(cfg, target_names=targets, use_worktree=worktree)
+    _update_batch_targets(cfg, target_names=targets)
 
 
-@contextmanager
-def _worktree_context(proj_config: ProjectConfig, project: str):
-    """Create a temporary worktree, yield a config pointing at it, then clean up."""
-    wt_path = _config.MM_HOME / "worktrees" / project
-    if wt_path.exists():
-        remove_worktree(proj_config.path, wt_path)
-    if not create_worktree(proj_config.path, wt_path):
-        yield None
-        return
-    try:
-        yield proj_config.model_copy(update={"path": wt_path})
-    finally:
-        remove_worktree(proj_config.path, wt_path)
-
-
-def _update_interactive(
-    cfg: MmConfig,
-    project: str,
-    *,
-    continue_: bool = False,
-    use_worktree: bool = False,
-) -> NoReturn:
+def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
     """Update a single project with interactive selection."""
     proj_config = _resolve_proj(cfg, project)
-    work_config = proj_config
+    results_dir = _config.MM_HOME / "scan-results"
 
-    with ExitStack() as stack:
-        if use_worktree:
-            wt_config = stack.enter_context(_worktree_context(proj_config, project))
-            if wt_config is None:
-                _fatal("Could not create worktree.")
-            work_config = wt_config
-        elif not continue_:
-            try:
-                check_repo_clean(proj_config.path)
-            except RepoDirtyError as e:
-                console.print(f"[bold yellow]Warning:[/] {e}")
-                if Confirm.ask("  Discard changes and reset to main?", default=False):
-                    reset_to_main(proj_config.path)
-                else:
-                    sys.exit(ExitCode.ERROR)
+    try:
+        scan_result = load_scan_results(project, results_dir)
+    except NoScanResultsError:
+        console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
+        sys.exit(ExitCode.OK)
 
-        if not continue_:
-            if not sync_remote(work_config.path):
-                _fatal("Failed to sync trunk. Check network and gh auth.")
+    _assert_supported_in_progress_state(scan_result)
+    _assert_no_conflicting_flow(scan_result, Workflow.UPDATE)
 
-        results_dir = _config.MM_HOME / "scan-results"
-        try:
-            scan_result = load_scan_results(project, results_dir)
-        except NoScanResultsError as e:
-            _fatal(str(e))
+    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
+    updates = scan_result.updates
+    if not actionable_vulns and not updates:
+        console.print(f"[bold green]{project}[/] — nothing to update.")
+        sys.exit(ExitCode.OK)
 
-        _require_test_config(project, proj_config)
+    _warn_missing_test_config(project, proj_config)
 
-        if continue_:
-            _handle_continue(project, work_config, scan_result, results_dir)
-
-        # Collect actionable findings
-        actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
-        updates = scan_result.updates
-
-        if not actionable_vulns and not updates:
-            console.print(f"[bold green]{project}[/] — nothing to update.")
-            sys.exit(ExitCode.OK)
-
-        _print_scan_result(scan_result)
-
-        numbered = _print_numbered_findings(actionable_vulns, updates)
-
-        # Interactive selection
-        parts = ["all"]
-        if actionable_vulns:
-            parts.append("vulns")
-        if updates:
-            parts.append("updates")
-        parts.extend(["1,2,...", "none"])
-        choices = "/".join(parts)
-
-        while True:
-            selection = Prompt.ask(
-                f"\n  Select updates [{choices}]",
-                default="all",
-            )
-            result = _parse_selection(
-                selection,
-                numbered,
-                actionable_vulns,
-                updates,
-            )
-            if result is not None:
-                selected_vulns, selected_updates = result
-                break
-            console.print(
-                f"[bold red]Invalid selection:[/] '{selection}'. Try again."
-            )
-
-        if not selected_vulns and not selected_updates:
-            sys.exit(ExitCode.OK)
-
-        # Process vulns (independent branches)
-        vuln_results = []
-        if selected_vulns:
-            console.print(
-                f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]"
-            )
-            vuln_results = process_vulns(
-                selected_vulns,
-                work_config,
-                flow=MaintenanceFlow.UPDATE,
-                scan_result=scan_result,
-                project_name=project,
-                results_dir=results_dir,
-            )
-
-        # Process updates (stacked, risk-ascending)
-        update_results = []
-        if selected_updates:
-            console.print(
-                f"\n[bold]Processing {len(selected_updates)} update(s)...[/]"
-            )
-            update_results = process_updates(
-                selected_updates,
-                work_config,
-                flow=MaintenanceFlow.UPDATE,
-                scan_result=scan_result,
-                project_name=project,
-                results_dir=results_dir,
-            )
-
-        # Summary
-        all_results = vuln_results + update_results
-        passed = [r for r in all_results if r.passed]
-        failed = [r for r in all_results if not r.passed]
-
-        console.print("\n" + "─" * 40)
-        console.print("[bold]Summary:[/]")
-        if passed:
-            console.print(f"  [green]{len(passed)} passed[/]")
-        if failed:
-            phase_labels = {
-                "apply": "install failed",
-                "branch": "branch creation failed",
-                "commit": "commit failed",
-            }
-            for r in failed:
-                label = phase_labels.get(
-                    r.failed_phase, r.failed_phase or "unknown"
-                )
-                console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
-        console.print("─" * 40)
-
-        sys.exit(ExitCode.UPDATE_FAILED if failed else ExitCode.OK)
+    exit_code = _run_update_flow(
+        project,
+        proj_config,
+        scan_result,
+        results_dir,
+        actionable_vulns,
+        updates,
+        interactive=True,
+    )
+    sys.exit(exit_code)
 
 
 def _update_batch(
     project: str,
     proj_config: ProjectConfig,
     results_dir: Path,
-    *,
-    use_worktree: bool = False,
-) -> list[UpdateResult] | None:
+) -> tuple[list[UpdateResult], bool] | None:
     """Process all actionable findings for a single project (batch mode).
 
-    Returns a list of results, an empty list if there was nothing to do,
-    or ``None`` if the project was skipped due to an error.
+    Returns ``(results, merge_failed)``. ``merge_failed`` is ``True`` only when
+    the post-batch merge-to-main step was attempted and failed; when merge was
+    skipped (per-finding failures) or succeeded it is ``False``. Returns
+    ``None`` if the project was skipped due to an error.
     """
-    # Check scan results and bail early before any git/network operations
     try:
         scan_result = load_scan_results(project, results_dir)
     except NoScanResultsError:
-        return []
+        return ([], False)
 
-    if not has_test_config(proj_config):
-        console.print(f"  [dim]Skipping {project} — no test configuration[/]")
-        return []
+    _assert_supported_in_progress_state(scan_result)
+    _assert_no_conflicting_flow(scan_result, Workflow.UPDATE)
 
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
-
     if not actionable_vulns and not updates:
         console.print(f"  [dim]{project} — nothing to update[/]")
-        return []
+        return ([], False)
 
-    # Only do expensive repo/network checks when there's actual work
-    work_config = proj_config
+    _warn_missing_test_config(project, proj_config)
 
-    # Sync trunk on the *original* repo before creating a worktree.
-    # In non-worktree mode the sync happens after we've confirmed we're on main.
-    if use_worktree:
-        if not sync_remote(proj_config.path):
-            console.print(f"  [bold red]Error:[/] {project} — failed to sync trunk")
-            return None
+    try:
+        wt_path = _enter_update_worktree(project, proj_config, scan_result)
+    except _UpdateSetupError as e:
+        console.print(f"  [bold red]Error:[/] {project} — {e}")
+        return None
 
-    with ExitStack() as stack:
-        if use_worktree:
-            wt_config = stack.enter_context(_worktree_context(proj_config, project))
-            if wt_config is None:
-                return None
-            work_config = wt_config
-        else:
-            try:
-                check_repo_clean(proj_config.path)
-            except RepoDirtyError as e:
-                console.print(f"[bold yellow]Warning:[/] {project} — {e}")
-                if Confirm.ask("  Discard changes and reset to main?", default=False):
-                    reset_to_main(proj_config.path)
-                else:
-                    console.print(f"  [dim]Skipping {project}[/]")
-                    return None
+    work_config = proj_config.model_copy(update={"path": wt_path})
 
-            if not ensure_on_main(proj_config.path):
-                console.print(
-                    f"  [bold red]Error:[/] {project} — could not checkout main"
-                )
-                return None
-
-            if not sync_remote(work_config.path):
-                console.print(
-                    f"  [bold red]Error:[/] {project} — failed to sync trunk"
-                )
-                return None
-
+    finalised = False
+    merge_attempted = False
+    try:
         _print_scan_result(scan_result)
 
-        vuln_results: list[UpdateResult] = []
-        if actionable_vulns:
-            console.print(
-                f"\n[bold]Processing {len(actionable_vulns)} vuln fix(es)...[/]"
-            )
-            vuln_results = process_vulns(
-                actionable_vulns,
-                work_config,
-                flow=MaintenanceFlow.UPDATE,
-                scan_result=scan_result,
-                project_name=project,
-                results_dir=results_dir,
-            )
+        selectable_vulns = _selectable_vulns(actionable_vulns)
+        selectable_updates = _selectable_updates(updates)
 
-        update_results: list[UpdateResult] = []
-        if updates:
-            console.print(f"\n[bold]Processing {len(updates)} update(s)...[/]")
-            update_results = process_updates(
-                updates,
-                work_config,
-                flow=MaintenanceFlow.UPDATE,
-                scan_result=scan_result,
-                project_name=project,
-                results_dir=results_dir,
-            )
+        vuln_results = _process_selected_vulns(
+            selectable_vulns, work_config, scan_result, project, results_dir
+        )
+        update_results = _process_selected_updates(
+            selectable_updates, work_config, scan_result, project, results_dir
+        )
+        all_results = vuln_results + update_results
 
-        return vuln_results + update_results
+        any_failed_result = any(not r.passed for r in all_results)
+        any_failed_finding = _has_update_failures(scan_result)
+
+        if not (any_failed_result or any_failed_finding):
+            merge_attempted = True
+            finalised = _finalise_local_update(
+                proj_config.path, scan_result, project, results_dir
+            )
+    finally:
+        remove_worktree(proj_config.path, wt_path)
+
+    if finalised:
+        git_delete_branch(_UPDATE_BRANCH, proj_config.path)
+    return (all_results, merge_attempted and not finalised)
 
 
 def _update_batch_targets(
     cfg: MmConfig,
     *,
     target_names: list[str],
-    use_worktree: bool = False,
 ) -> NoReturn:
     """Update an explicit ordered set of projects, auto-selecting all findings."""
     _exit_if_no_update_targets(cfg, target_names)
@@ -580,15 +399,14 @@ def _update_batch_targets(
         console.print(f"[bold]{name}[/]")
         console.print("═" * 40)
 
-        results = _update_batch(
-            name,
-            proj_config,
-            results_dir,
-            use_worktree=use_worktree,
-        )
-        if results is None:
+        outcome = _update_batch(name, proj_config, results_dir)
+        if outcome is None:
             had_errors = True
-        elif results:
+            continue
+        results, merge_failed = outcome
+        if merge_failed:
+            had_errors = True
+        if results:
             all_project_results.append((name, results))
 
     _print_mass_update_summary(all_project_results)
@@ -597,6 +415,306 @@ def _update_batch_targets(
         not r.passed for _, results in all_project_results for r in results
     )
     sys.exit(ExitCode.UPDATE_FAILED if any_failed else ExitCode.OK)
+
+
+class _UpdateSetupError(Exception):
+    pass
+
+
+def _enter_update_worktree(
+    project: str, proj_config: ProjectConfig, scan_result: ScanResult
+) -> Path:
+    """Create (fresh) or attach (resume) the update worktree. Returns its path."""
+    wt_path = _config.MM_HOME / "worktrees" / project
+    if wt_path.exists():
+        remove_worktree(proj_config.path, wt_path)
+
+    if _has_update_progress(scan_result):
+        if not git_branch_exists(_UPDATE_BRANCH, proj_config.path):
+            raise _UpdateSetupError(
+                f"update branch '{_UPDATE_BRANCH}' is missing but in-progress "
+                f"state exists — rescan required"
+            )
+        if not create_worktree(
+            proj_config.path, wt_path, branch=_UPDATE_BRANCH, detach=False
+        ):
+            raise _UpdateSetupError("could not attach worktree to update branch")
+        return wt_path
+
+    if git_branch_exists(_UPDATE_BRANCH, proj_config.path):
+        git_delete_branch(_UPDATE_BRANCH, proj_config.path)
+    if not sync_remote(proj_config.path):
+        raise _UpdateSetupError("failed to sync trunk")
+    if not create_worktree(proj_config.path, wt_path, branch="main", detach=True):
+        raise _UpdateSetupError("could not create worktree")
+    if not git_create_branch(_UPDATE_BRANCH, wt_path):
+        remove_worktree(proj_config.path, wt_path)
+        raise _UpdateSetupError("could not create update branch")
+    return wt_path
+
+
+def _run_update_flow(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+    actionable_vulns: list[VulnFinding],
+    updates: list[UpdateFinding],
+    *,
+    interactive: bool,
+) -> int:
+    """Set up the worktree, process findings, finalise. Returns exit code."""
+    try:
+        wt_path = _enter_update_worktree(project, proj_config, scan_result)
+    except _UpdateSetupError as e:
+        _fatal(str(e))
+
+    work_config = proj_config.model_copy(update={"path": wt_path})
+
+    finalised = False
+    try:
+        _print_scan_result(scan_result)
+
+        selectable_vulns = _selectable_vulns(actionable_vulns)
+        selectable_updates = _selectable_updates(updates)
+
+        if interactive and (selectable_vulns or selectable_updates):
+            selected_vulns, selected_updates = _prompt_selection(
+                selectable_vulns, selectable_updates
+            )
+        else:
+            selected_vulns, selected_updates = selectable_vulns, selectable_updates
+
+        vuln_results = _process_selected_vulns(
+            selected_vulns, work_config, scan_result, project, results_dir
+        )
+        update_results = _process_selected_updates(
+            selected_updates, work_config, scan_result, project, results_dir
+        )
+        all_results = vuln_results + update_results
+
+        _print_update_summary(all_results)
+
+        any_failed_result = any(not r.passed for r in all_results)
+        any_failed_finding = _has_update_failures(scan_result)
+
+        if any_failed_result or any_failed_finding:
+            return ExitCode.UPDATE_FAILED
+
+        finalised = _finalise_local_update(
+            proj_config.path, scan_result, project, results_dir
+        )
+    finally:
+        remove_worktree(proj_config.path, wt_path)
+
+    if not finalised:
+        return ExitCode.UPDATE_FAILED
+
+    git_delete_branch(_UPDATE_BRANCH, proj_config.path)
+    return ExitCode.OK
+
+
+def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
+    return [
+        v
+        for v in vulns
+        if v.update_status is None
+        or (
+            v.update_status == UpdateStatus.FAILED
+            and v.flow == Workflow.UPDATE
+        )
+    ]
+
+
+def _selectable_updates(updates: list[UpdateFinding]) -> list[UpdateFinding]:
+    return [
+        u
+        for u in updates
+        if u.update_status is None
+        or (
+            u.update_status == UpdateStatus.FAILED
+            and u.flow == Workflow.UPDATE
+        )
+    ]
+
+
+def _prompt_selection(
+    selectable_vulns: list[VulnFinding],
+    selectable_updates: list[UpdateFinding],
+) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+    numbered = _print_numbered_findings(selectable_vulns, selectable_updates)
+    parts = ["all"]
+    if selectable_vulns:
+        parts.append("vulns")
+    if selectable_updates:
+        parts.append("updates")
+    parts.extend(["1,2,...", "none"])
+    choices = "/".join(parts)
+
+    while True:
+        selection = Prompt.ask(
+            f"\n  Select updates [{choices}]", default="all"
+        )
+        result = _parse_selection(
+            selection, numbered, selectable_vulns, selectable_updates
+        )
+        if result is not None:
+            return result
+        console.print(
+            f"[bold red]Invalid selection:[/] '{selection}'. Try again."
+        )
+
+
+def _process_selected_vulns(
+    selected: list[VulnFinding],
+    work_config: ProjectConfig,
+    scan_result: ScanResult,
+    project: str,
+    results_dir: Path,
+) -> list[UpdateResult]:
+    if not selected:
+        return []
+    console.print(f"\n[bold]Processing {len(selected)} vuln fix(es)...[/]")
+    return process_vulns(
+        selected,
+        work_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan_result,
+        project_name=project,
+        results_dir=results_dir,
+    )
+
+
+def _process_selected_updates(
+    selected: list[UpdateFinding],
+    work_config: ProjectConfig,
+    scan_result: ScanResult,
+    project: str,
+    results_dir: Path,
+) -> list[UpdateResult]:
+    if not selected:
+        return []
+    console.print(f"\n[bold]Processing {len(selected)} update(s)...[/]")
+    return process_updates(
+        selected,
+        work_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan_result,
+        project_name=project,
+        results_dir=results_dir,
+    )
+
+
+def _print_update_summary(all_results: list[UpdateResult]) -> None:
+    passed = [r for r in all_results if r.passed]
+    failed = [r for r in all_results if not r.passed]
+    console.print("\n" + "─" * 40)
+    console.print("[bold]Summary:[/]")
+    if passed:
+        console.print(f"  [green]{len(passed)} passed[/]")
+    if failed:
+        phase_labels = {
+            "apply": "install failed",
+            "branch": "branch creation failed",
+            "commit": "commit failed",
+        }
+        for r in failed:
+            label = phase_labels.get(r.failed_phase, r.failed_phase or "unknown")
+            console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
+    console.print("─" * 40)
+
+
+def _has_update_progress(scan_result: ScanResult) -> bool:
+    return any(
+        f.update_status in (UpdateStatus.READY, UpdateStatus.FAILED)
+        and f.flow == Workflow.UPDATE
+        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+    )
+
+
+def _has_update_failures(scan_result: ScanResult) -> bool:
+    return any(
+        f.update_status == UpdateStatus.FAILED and f.flow == Workflow.UPDATE
+        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+    )
+
+
+def _assert_supported_in_progress_state(scan_result: ScanResult) -> None:
+    for f in (*scan_result.vulnerabilities, *scan_result.updates):
+        if f.update_status is not None and f.flow is None:
+            _fatal(
+                "Scan results contain findings with in-progress status but no "
+                "flow ownership — please rescan the project."
+            )
+
+
+def _assert_no_conflicting_flow(
+    scan_result: ScanResult, required_flow: Workflow
+) -> None:
+    conflicts = [
+        f
+        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+        if f.update_status is not None
+        and f.flow is not None
+        and f.flow != required_flow
+    ]
+    if conflicts:
+        other = conflicts[0].flow.value if conflicts[0].flow else "unknown"
+        _fatal(
+            f"Cannot run update: {len(conflicts)} finding(s) owned by the "
+            f"'{other}' flow. Complete or abandon that flow first."
+        )
+
+
+def _finalise_local_update(
+    orig_path: Path,
+    scan_result: ScanResult,
+    project_name: str,
+    results_dir: Path,
+) -> bool:
+    """Fast-forward `_UPDATE_BRANCH` into main and promote READY findings.
+
+    Refuses to merge when the main checkout has uncommitted changes — those
+    changes would otherwise be silently mixed with automation output. Branch
+    cleanup is deferred to the caller so the worktree can be removed first.
+    """
+    try:
+        check_repo_clean(orig_path)
+    except RepoDirtyError as e:
+        console.print(
+            f"[bold red]Merge aborted:[/] {orig_path} has uncommitted changes — "
+            f"{_UPDATE_BRANCH} kept for manual recovery.\n{e}"
+        )
+        return False
+    if not ensure_on_main(orig_path):
+        console.print("[bold red]Error:[/] could not checkout main for merge")
+        return False
+    if not git_merge_fast_forward(_UPDATE_BRANCH, orig_path):
+        console.print(
+            f"[bold red]Merge failed:[/] {_UPDATE_BRANCH} could not fast-forward "
+            f"into main"
+        )
+        return False
+
+    for v in scan_result.vulnerabilities:
+        if v.update_status == UpdateStatus.READY and v.flow == Workflow.UPDATE:
+            v.update_status = UpdateStatus.COMPLETED
+    for u in scan_result.updates:
+        if u.update_status == UpdateStatus.READY and u.flow == Workflow.UPDATE:
+            u.update_status = UpdateStatus.COMPLETED
+
+    remove_completed_findings(scan_result)
+    save_scan_results(project_name, results_dir, scan_result)
+    console.print(f"[bold green]Merged {_UPDATE_BRANCH} into main.[/]")
+    return True
+
+
+def _warn_missing_test_config(project: str, proj_config: ProjectConfig) -> None:
+    if not has_test_config(proj_config):
+        console.print(
+            f"  [bold yellow]Warning:[/] {project} — no test configuration "
+            f"(test phases will be skipped)"
+        )
 
 
 def _print_mass_update_summary(
@@ -1358,59 +1476,3 @@ def _parse_selection(
     return selected_vulns, selected_updates
 
 
-def _handle_continue(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    results_dir: Path,
-) -> NoReturn:
-    """Handle --continue: re-test a manually fixed failed finding."""
-    failed_vulns = [
-        v for v in scan_result.vulnerabilities if v.update_status == UpdateStatus.FAILED
-    ]
-    failed_updates = [
-        u for u in scan_result.updates if u.update_status == UpdateStatus.FAILED
-    ]
-    if not failed_vulns and not failed_updates:
-        _fatal("No failed findings to continue.")
-
-    branch = get_current_branch(proj_config.path)
-    finding = next(
-        (v for v in failed_vulns if branch == f"fix/{branch_slug(v.pkg_name)}"),
-        None,
-    ) or next(
-        (u for u in failed_updates if branch == f"bump/{branch_slug(u.pkg_name)}"),
-        None,
-    )
-    if finding is None:
-        _fatal(f"Current branch '{branch}' does not match any failed finding.")
-
-    console.print(f"\n[bold]Re-testing {finding.pkg_name} on {branch}...[/]")
-    passed, failed_phase = run_test_phases(proj_config, proj_config.path)
-
-    if not passed:
-        console.print(f"  [bold red]FAIL[/] {finding.pkg_name} — {failed_phase} failed")
-        sys.exit(ExitCode.UPDATE_FAILED)
-
-    finding.update_status = UpdateStatus.COMPLETED
-    save_scan_results(project, results_dir, scan_result)
-    console.print(f"  [bold green]PASS[/] {finding.pkg_name}")
-
-    remaining = [
-        f
-        for f in [*scan_result.vulnerabilities, *scan_result.updates]
-        if f.update_status == UpdateStatus.FAILED
-    ]
-    if remaining:
-        pkg_names = [f.pkg_name for f in remaining]
-        console.print(f"\n  [dim]Still failed: {', '.join(pkg_names)}[/]")
-        sys.exit(ExitCode.UPDATE_FAILED)
-
-    ok, output = push_and_create_pr(proj_config.path)
-    if ok:
-        console.print("  [bold green]PR submitted.[/]")
-    else:
-        console.print("  [bold red]PR submit failed.[/]")
-    if output:
-        console.print(f"  [dim]{output}[/]")
-    sys.exit(ExitCode.OK)

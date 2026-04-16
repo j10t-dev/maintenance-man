@@ -1,8 +1,46 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from maintenance_man.models.scan import (
+    ScanResult,
+    SemverTier,
+    Severity,
+    UpdateFinding,
+    VulnFinding,
+)
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def make_cli_scan_result() -> ScanResult:
+    """Standard scan result shared by CLI tests: 1 vuln + 1 update."""
+    return ScanResult(
+        project="vulnerable",
+        scanned_at=datetime.now(tz=timezone.utc),
+        trivy_target="tests/fixtures/vulnerable-project",
+        vulnerabilities=[
+            VulnFinding(
+                vuln_id="CVE-2024-0001",
+                pkg_name="some-pkg",
+                installed_version="1.0.0",
+                fixed_version="1.0.1",
+                severity=Severity.HIGH,
+                title="Test vuln",
+                description="desc",
+                status="fixed",
+            ),
+        ],
+        updates=[
+            UpdateFinding(
+                pkg_name="pkg-a",
+                installed_version="1.0.0",
+                latest_version="1.0.1",
+                semver_tier=SemverTier.PATCH,
+            ),
+        ],
+    )
 
 
 @pytest.fixture()
@@ -75,3 +113,39 @@ def scan_results_dir(mm_home: Path) -> Path:
     d = mm_home / "scan-results"
     d.mkdir(exist_ok=True)
     return d
+
+
+@pytest.fixture()
+def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Patch all update-CLI boundaries so tests focus on orchestration.
+
+    Returns a dict holding the live scan_result object (key: ``scan_result``)
+    so individual tests can mutate lifecycle state before ``app(...)`` runs.
+    """
+    scan_result = make_cli_scan_result()
+    state: dict[str, object] = {"scan_result": scan_result}
+
+    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
+    monkeypatch.setattr("maintenance_man.cli.sync_remote", lambda p: True)
+    monkeypatch.setattr(
+        "maintenance_man.cli.load_scan_results",
+        lambda name, d: state["scan_result"],
+    )
+    monkeypatch.setattr(
+        "maintenance_man.cli.save_scan_results",
+        lambda name, d, sr: None,
+    )
+    monkeypatch.setattr(
+        "maintenance_man.cli.create_worktree",
+        lambda p, w, **kw: True,
+    )
+    monkeypatch.setattr("maintenance_man.cli.remove_worktree", lambda p, w: None)
+    monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: False)
+    monkeypatch.setattr("maintenance_man.cli.git_create_branch", lambda b, p: True)
+    monkeypatch.setattr(
+        "maintenance_man.cli.git_merge_fast_forward", lambda b, p: True
+    )
+    monkeypatch.setattr("maintenance_man.cli.git_delete_branch", lambda b, p: True)
+    monkeypatch.setattr("maintenance_man.cli.ensure_on_main", lambda p: True)
+    monkeypatch.setattr("maintenance_man.cli.check_repo_clean", lambda p: None)
+    return state
