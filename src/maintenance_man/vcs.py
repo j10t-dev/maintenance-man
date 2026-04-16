@@ -13,6 +13,12 @@ class RepoDirtyError(Exception):
     pass
 
 
+_MANAGED_BRANCH_PREFIXES = (
+    "mm/update-dependencies",
+    "mm/resolve-dependencies",
+)
+
+
 def sync_remote(project_path: Path) -> bool:
     """Fetch from remote, prune stale refs, delete merged/closed branches.
 
@@ -28,10 +34,10 @@ def sync_remote(project_path: Path) -> bool:
         return False
 
     stale_branches = _gh_list_pr_branches(
-        "merged", ("bump/", "fix/"), project_path
+        "merged", _MANAGED_BRANCH_PREFIXES, project_path
     )
     stale_branches |= _gh_list_pr_branches(
-        "closed", ("bump/", "fix/"), project_path
+        "closed", _MANAGED_BRANCH_PREFIXES, project_path
     )
 
     local = _run(
@@ -52,8 +58,8 @@ def push_and_create_pr(project_path: Path) -> tuple[bool, str]:
     """Push current branch and create a GitHub PR.
 
     Pushes the current branch to origin. Automatic ``--force-with-lease``
-    retry is restricted to managed update branches (``bump/`` and ``fix/``),
-    where this tool owns the branch lifecycle.
+    retry is restricted to managed maintenance branches (see
+    ``_MANAGED_BRANCH_PREFIXES``), where this tool owns the branch lifecycle.
     """
     branch = get_current_branch(project_path)
     if not branch:
@@ -92,6 +98,12 @@ def push_and_create_pr(project_path: Path) -> tuple[bool, str]:
     return True, pr.stdout.strip()
 
 
+def git_branch_exists(branch: str, project_path: Path) -> bool:
+    """Return True if *branch* exists locally."""
+    r = _run(["git", "rev-parse", "--verify", branch], project_path)
+    return r.returncode == 0
+
+
 def git_checkout(branch: str, project_path: Path) -> bool:
     """Check out a git branch. Returns True on success."""
     completed = _run(["git", "checkout", branch], project_path)
@@ -102,6 +114,38 @@ def git_checkout(branch: str, project_path: Path) -> bool:
         )
         return False
     return True
+
+
+def git_has_changes(project_path: Path) -> bool:
+    """Return True when the repo has tracked or untracked changes."""
+    r = _run(["git", "status", "--porcelain"], project_path)
+    if r.returncode != 0:
+        return True
+    return bool(r.stdout.strip())
+
+
+def git_merge_fast_forward(branch: str, project_path: Path) -> bool:
+    """Fast-forward merge *branch* into the current branch. Returns True on success."""
+    r = _run(["git", "merge", "--ff-only", branch], project_path)
+    if r.returncode != 0:
+        rprint(
+            f"  [bold yellow]Warning:[/] git merge --ff-only {branch} failed: "
+            f"{r.stderr.strip()}"
+        )
+        return False
+    return True
+
+
+def git_replace_branch(branch: str, project_path: Path) -> bool:
+    """Replace *branch* by checking out main, deleting, and recreating.
+
+    A detached HEAD (empty current branch) skips the initial checkout.
+    """
+    if get_current_branch(project_path) and not git_checkout("main", project_path):
+        return False
+    if not git_delete_branch(branch, project_path):
+        return False
+    return git_create_branch(branch, project_path)
 
 
 def git_create_branch(branch_name: str, project_path: Path) -> bool:
@@ -184,10 +228,20 @@ def ensure_on_main(project_path: Path) -> bool:
     return git_checkout("main", project_path)
 
 
-def create_worktree(project_path: Path, worktree_path: Path) -> bool:
-    """Create a git worktree at worktree_path, checked out to main."""
+def create_worktree(
+    project_path: Path,
+    worktree_path: Path,
+    *,
+    branch: str = "main",
+    detach: bool = True,
+) -> bool:
+    """Create a git worktree at worktree_path on the requested branch."""
+    cmd = ["git", "worktree", "add"]
+    if detach:
+        cmd.append("--detach")
+    cmd.extend([str(worktree_path), branch])
     r = _run(
-        ["git", "worktree", "add", "--detach", str(worktree_path), "main"],
+        cmd,
         project_path,
         timeout=30,
     )
@@ -275,7 +329,7 @@ def _gh_list_pr_branches(
 
 def _is_managed_update_branch(branch: str) -> bool:
     """Return True for branches managed by the automated update flow."""
-    return branch.startswith(("bump/", "fix/"))
+    return branch.startswith(_MANAGED_BRANCH_PREFIXES)
 
 
 
