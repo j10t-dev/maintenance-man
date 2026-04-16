@@ -1,10 +1,17 @@
 from maintenance_man.models.scan import (
+    Workflow,
     SemverTier,
     Severity,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
 )
+
+
+class TestWorkflow:
+    def test_flow_members_are_string_values(self):
+        assert Workflow.UPDATE == "update"
+        assert Workflow.RESOLVE == "resolve"
 
 
 class TestUpdateStatus:
