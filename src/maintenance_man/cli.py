@@ -39,6 +39,7 @@ from maintenance_man.models.activity import (
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
+    MaintenanceFlow,
     ScanResult,
     UpdateFinding,
     UpdateStatus,
@@ -54,8 +55,8 @@ from maintenance_man.scanner import (
 from maintenance_man.updater import (
     NoScanResultsError,
     UpdateResult,
-    _has_test_config,
-    _highest_fix_version,
+    has_test_config,
+    highest_fix_version,
     load_scan_results,
     process_updates,
     process_vulns,
@@ -407,6 +408,7 @@ def _update_interactive(
             vuln_results = process_vulns(
                 selected_vulns,
                 work_config,
+                flow=MaintenanceFlow.UPDATE,
                 scan_result=scan_result,
                 project_name=project,
                 results_dir=results_dir,
@@ -421,6 +423,7 @@ def _update_interactive(
             update_results = process_updates(
                 selected_updates,
                 work_config,
+                flow=MaintenanceFlow.UPDATE,
                 scan_result=scan_result,
                 project_name=project,
                 results_dir=results_dir,
@@ -469,7 +472,7 @@ def _update_batch(
     except NoScanResultsError:
         return []
 
-    if not _has_test_config(proj_config):
+    if not has_test_config(proj_config):
         console.print(f"  [dim]Skipping {project} — no test configuration[/]")
         return []
 
@@ -529,6 +532,7 @@ def _update_batch(
             vuln_results = process_vulns(
                 actionable_vulns,
                 work_config,
+                flow=MaintenanceFlow.UPDATE,
                 scan_result=scan_result,
                 project_name=project,
                 results_dir=results_dir,
@@ -540,6 +544,7 @@ def _update_batch(
             update_results = process_updates(
                 updates,
                 work_config,
+                flow=MaintenanceFlow.UPDATE,
                 scan_result=scan_result,
                 project_name=project,
                 results_dir=results_dir,
@@ -1120,7 +1125,7 @@ def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
 
 
 def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
-    if not _has_test_config(proj_config):
+    if not has_test_config(proj_config):
         _fatal(
             f"No test configuration for [bold]{project}[/]. "
             f"Add test_unit to [projects.{project}] in ~/.mm/config.toml."
@@ -1219,7 +1224,7 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
         for pkg in pkg_counts:
             if pkg_counts[pkg] > 1:
                 group = [v for v in actionable if v.pkg_name == pkg]
-                win_versions[pkg] = _highest_fix_version(group)
+                win_versions[pkg] = highest_fix_version(group)
 
         table = Table(show_header=True, **_TABLE_STYLE)
         table.add_column("", style="bold red", width=4)
