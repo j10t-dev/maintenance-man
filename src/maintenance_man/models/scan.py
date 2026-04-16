@@ -21,9 +21,14 @@ class SemverTier(StrEnum):
 
 
 class UpdateStatus(StrEnum):
-    STARTED = auto()
-    COMPLETED = auto()
-    FAILED = auto()
+    FAILED = "failed"
+    READY = "ready"
+    COMPLETED = "completed"
+
+
+class Workflow(StrEnum):
+    UPDATE = "update"
+    RESOLVE = "resolve"
 
 
 class VulnFinding(BaseModel):
@@ -38,6 +43,8 @@ class VulnFinding(BaseModel):
     primary_url: str | None = None
     published_date: datetime | None = None
     update_status: UpdateStatus | None = None
+    failed_phase: str | None = None
+    flow: Workflow | None = None
 
     @property
     def actionable(self) -> bool:
@@ -68,6 +75,8 @@ class UpdateFinding(BaseModel):
     semver_tier: SemverTier
     published_date: datetime | None = None
     update_status: UpdateStatus | None = None
+    failed_phase: str | None = None
+    flow: Workflow | None = None
 
     @property
     def target_version(self) -> str:

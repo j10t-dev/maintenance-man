@@ -15,6 +15,7 @@ from maintenance_man import sanitise_project_name
 from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    MaintenanceFlow,
     ScanResult,
     SemverTier,
     UpdateFinding,
@@ -65,6 +66,8 @@ class Finding(Protocol):
     pkg_name: str
     installed_version: str
     update_status: UpdateStatus | None
+    failed_phase: str | None
+    flow: MaintenanceFlow | None
 
     @property
     def target_version(self) -> str: ...
@@ -141,9 +144,9 @@ class _ConsolidatedVuln:
     """Proxy that groups several vulns for the same package into one finding.
 
     Satisfies the :class:`Finding` protocol so it can be passed straight into
-    :func:`_process_stack`.  Writes to :attr:`update_status` are fanned out to
-    every original :class:`VulnFinding` so that serialisation (which works on
-    the originals) stays consistent.
+    :func:`_process_stack`.  Writes to :attr:`update_status`, :attr:`failed_phase`
+    and :attr:`flow` are fanned out to every original :class:`VulnFinding` so
+    that serialisation (which works on the originals) stays consistent.
     """
 
     pkg_name: str
@@ -152,6 +155,8 @@ class _ConsolidatedVuln:
     _detail: str
     _originals: list[VulnFinding] = field(repr=False)
     _update_status: UpdateStatus | None = None
+    _failed_phase: str | None = None
+    _flow: MaintenanceFlow | None = None
 
     @property
     def target_version(self) -> str:
@@ -170,6 +175,26 @@ class _ConsolidatedVuln:
         self._update_status = value
         for orig in self._originals:
             orig.update_status = value
+
+    @property
+    def failed_phase(self) -> str | None:
+        return self._failed_phase
+
+    @failed_phase.setter
+    def failed_phase(self, value: str | None) -> None:
+        self._failed_phase = value
+        for orig in self._originals:
+            orig.failed_phase = value
+
+    @property
+    def flow(self) -> MaintenanceFlow | None:
+        return self._flow
+
+    @flow.setter
+    def flow(self, value: MaintenanceFlow | None) -> None:
+        self._flow = value
+        for orig in self._originals:
+            orig.flow = value
 
 
 def _consolidate_vulns(
