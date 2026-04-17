@@ -14,32 +14,40 @@ from maintenance_man.models.scan import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-def make_cli_scan_result() -> ScanResult:
-    """Standard scan result shared by CLI tests: 1 vuln + 1 update."""
+def make_vuln(**overrides: object) -> VulnFinding:
+    defaults = dict(
+        vuln_id="CVE-2024-0001",
+        pkg_name="some-pkg",
+        installed_version="1.0.0",
+        fixed_version="1.0.1",
+        severity=Severity.HIGH,
+        title="Test vuln",
+        description="desc",
+        status="fixed",
+    )
+    return VulnFinding(**(defaults | overrides))
+
+
+def make_update(**overrides: object) -> UpdateFinding:
+    defaults = dict(
+        pkg_name="pkg-a",
+        installed_version="1.0.0",
+        latest_version="1.0.1",
+        semver_tier=SemverTier.PATCH,
+    )
+    return UpdateFinding(**(defaults | overrides))
+
+
+def make_scan_result(
+    vulns: list[VulnFinding] | None = None,
+    updates: list[UpdateFinding] | None = None,
+) -> ScanResult:
     return ScanResult(
         project="vulnerable",
         scanned_at=datetime.now(tz=timezone.utc),
         trivy_target="tests/fixtures/vulnerable-project",
-        vulnerabilities=[
-            VulnFinding(
-                vuln_id="CVE-2024-0001",
-                pkg_name="some-pkg",
-                installed_version="1.0.0",
-                fixed_version="1.0.1",
-                severity=Severity.HIGH,
-                title="Test vuln",
-                description="desc",
-                status="fixed",
-            ),
-        ],
-        updates=[
-            UpdateFinding(
-                pkg_name="pkg-a",
-                installed_version="1.0.0",
-                latest_version="1.0.1",
-                semver_tier=SemverTier.PATCH,
-            ),
-        ],
+        vulnerabilities=vulns if vulns is not None else [make_vuln()],
+        updates=updates if updates is not None else [make_update()],
     )
 
 
@@ -122,7 +130,7 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     Returns a dict holding the live scan_result object (key: ``scan_result``)
     so individual tests can mutate lifecycle state before ``app(...)`` runs.
     """
-    scan_result = make_cli_scan_result()
+    scan_result = make_scan_result()
     state: dict[str, object] = {"scan_result": scan_result}
 
     monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
