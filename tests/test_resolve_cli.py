@@ -182,8 +182,11 @@ class TestResolvePreChecks:
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
 
+        out = capsys.readouterr().out.lower()
         assert exc_info.value.code == 1
-        assert "update" in capsys.readouterr().out.lower()
+        assert "update" in out
+        assert "resolve" in out
+        assert "vulnerable" in out
         mock_process.assert_not_called()
 
     def test_legacy_findings_missing_flow_abort(

@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from maintenance_man.cli import app
+from maintenance_man.cli import ExitCode, app
 from maintenance_man.models.scan import (
     Workflow,
     ScanResult,
@@ -100,7 +100,30 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 1
-        assert "resolve" in capsys.readouterr().out.lower()
+        out = capsys.readouterr().out.lower()
+        assert "resolve" in out
+        assert "vulnerable" in out
+        assert "update" in out
+
+    def test_batch_skips_conflicted_project_and_continues(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: dict,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Batch mode must not abort on one project's flow conflict."""
+        scan_result: ScanResult = mock_update_cli_deps["scan_result"]
+        scan_result.updates[0].update_status = UpdateStatus.FAILED
+        scan_result.updates[0].flow = Workflow.RESOLVE
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "clean"])
+
+        out = capsys.readouterr().out.lower()
+        assert exc_info.value.code == ExitCode.UPDATE_FAILED
+        assert "vulnerable" in out
+        assert "clean" in out
 
     def test_legacy_findings_missing_flow_abort(
         self,
