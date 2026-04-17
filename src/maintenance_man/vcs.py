@@ -179,9 +179,7 @@ def git_commit_all(message: str, project_path: Path) -> bool:
 
     result = _run(["git", "commit", "-m", message], project_path)
     if result.returncode != 0:
-        rprint(
-            f"  [bold red]FAIL[/] git commit failed: {result.stderr.strip()}"
-        )
+        rprint(f"  [bold red]FAIL[/] git commit failed: {result.stderr.strip()}")
         return False
     return True
 
@@ -330,7 +328,6 @@ def _gh_list_pr_branches(
 def _is_managed_update_branch(branch: str) -> bool:
     """Return True for branches managed by the automated update flow."""
     return branch.startswith(_MANAGED_BRANCH_PREFIXES)
-
 
 
 def _is_non_fast_forward_push(stderr: str) -> bool:

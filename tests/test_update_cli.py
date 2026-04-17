@@ -5,9 +5,9 @@ import pytest
 
 from maintenance_man.cli import ExitCode, app
 from maintenance_man.models.scan import (
-    Workflow,
     ScanResult,
     UpdateStatus,
+    Workflow,
 )
 from maintenance_man.updater import NoScanResultsError, UpdateResult
 
@@ -62,9 +62,7 @@ class TestUpdatePreChecks:
         monkeypatch.setattr(
             "maintenance_man.cli.resolve_project",
             MagicMock(
-                return_value=ProjectConfig(
-                    path=Path("/tmp/x"), package_manager="bun"
-                )
+                return_value=ProjectConfig(path=Path("/tmp/x"), package_manager="bun")
             ),
         )
         mock_vulns = MagicMock(
@@ -392,6 +390,7 @@ class TestUpdateNumberedSelection:
         monkeypatch: pytest.MonkeyPatch,
     ):
         """Selecting '1' should pick the first finding."""
+
         def _mark(vulns, pc, *, flow, scan_result, project_name, results_dir):
             for v in vulns:
                 v.update_status = UpdateStatus.READY
@@ -702,9 +701,7 @@ class TestUpdateFinalise:
             for it in items:
                 it.update_status = UpdateStatus.READY
                 it.flow = flow
-            return [
-                UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)
-            ]
+            return [UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)]
 
         mock_merge = MagicMock(return_value=True)
         monkeypatch.setattr(
@@ -744,9 +741,7 @@ class TestUpdateFinalise:
             for it in items:
                 it.update_status = UpdateStatus.READY
                 it.flow = flow
-            return [
-                UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)
-            ]
+            return [UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)]
 
         call_order: list[str] = []
 
@@ -810,9 +805,7 @@ class TestUpdateAll:
         # Return passed results without mutating the shared scan_result so
         # each batch iteration sees the same actionable findings.
         def _process(items, pc, *, flow, scan_result, project_name, results_dir):
-            return [
-                UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)
-            ]
+            return [UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)]
 
         mock_vulns = MagicMock(side_effect=_process)
         mock_updates = MagicMock(side_effect=_process)
@@ -860,13 +853,12 @@ class TestUpdateAll:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Missing test config warns (not fatal) for single-project invocation."""
+
         def _mark(items, pc, *, flow, scan_result, project_name, results_dir):
             for it in items:
                 it.update_status = UpdateStatus.READY
                 it.flow = flow
-            return [
-                UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)
-            ]
+            return [UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)]
 
         mock_vulns = MagicMock(side_effect=_mark)
         mock_updates = MagicMock(side_effect=_mark)

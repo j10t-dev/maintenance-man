@@ -1,10 +1,10 @@
 from maintenance_man.models.scan import (
-    Workflow,
     SemverTier,
     Severity,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
+    Workflow,
 )
 
 
