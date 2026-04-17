@@ -11,7 +11,7 @@ import cyclopts
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from maintenance_man import __version__
@@ -52,28 +52,38 @@ from maintenance_man.scanner import (
     scan_project,
 )
 from maintenance_man.updater import (
+    Finding,
     NoScanResultsError,
     UpdateResult,
+    consolidate_vulns,
     has_test_config,
     highest_fix_version,
     load_scan_results,
+    process_findings,
     process_updates,
     process_vulns,
     remove_completed_findings,
     run_test_phases,
     save_scan_results,
+    sort_updates_by_risk,
 )
 from maintenance_man.vcs import (
     GitHubCLINotFoundError,
+    RepoDirtyError,
     check_gh_available,
+    check_repo_clean,
     create_worktree,
     ensure_on_main,
     get_current_branch,
     git_branch_exists,
+    git_checkout,
     git_create_branch,
     git_delete_branch,
     git_merge_fast_forward,
+    git_replace_branch,
+    push_and_create_pr,
     remove_worktree,
+    reset_to_main,
     sync_remote,
 )
 
@@ -101,6 +111,7 @@ console = Console()
 _TABLE_STYLE = dict(show_edge=False, pad_edge=False, box=None)
 
 _UPDATE_BRANCH = "mm/update-dependencies"
+_RESOLVE_BRANCH = "mm/resolve-dependencies"
 
 app = cyclopts.App(
     name="mm",
@@ -276,22 +287,9 @@ def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
     proj_config = _resolve_proj(cfg, project)
     results_dir = _config.MM_HOME / "scan-results"
 
-    try:
-        scan_result = load_scan_results(project, results_dir)
-    except NoScanResultsError:
-        console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
-        sys.exit(ExitCode.OK)
-
-    _assert_supported_in_progress_state(scan_result)
-    _assert_no_conflicting_flow(scan_result, Workflow.UPDATE)
-
-    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
-    updates = scan_result.updates
-    if not actionable_vulns and not updates:
-        console.print(f"[bold green]{project}[/] — nothing to update.")
-        sys.exit(ExitCode.OK)
-
-    _warn_missing_test_config(project, proj_config)
+    scan_result, actionable_vulns, updates = _load_validated_scan(
+        project, results_dir, proj_config, Workflow.UPDATE
+    )
 
     exit_code = _run_update_flow(
         project,
@@ -516,12 +514,12 @@ def _run_update_flow(
 
 def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
     return [
-        v
-        for v in vulns
-        if v.update_status is None
+        vuln
+        for vuln in vulns
+        if vuln.update_status is None
         or (
-            v.update_status == UpdateStatus.FAILED
-            and v.flow == Workflow.UPDATE
+            vuln.update_status == UpdateStatus.FAILED
+            and vuln.flow == Workflow.UPDATE
         )
     ]
 
@@ -715,6 +713,299 @@ def _warn_missing_test_config(project: str, proj_config: ProjectConfig) -> None:
             f"  [bold yellow]Warning:[/] {project} — no test configuration "
             f"(test phases will be skipped)"
         )
+
+
+def _load_validated_scan(
+    project: str,
+    results_dir: Path,
+    proj_config: ProjectConfig,
+    workflow: Workflow,
+) -> tuple[ScanResult, list[VulnFinding], list[UpdateFinding]]:
+    try:
+        scan_result = load_scan_results(project, results_dir)
+    except NoScanResultsError:
+        console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
+        sys.exit(ExitCode.OK)
+    _assert_supported_in_progress_state(scan_result)
+    _assert_no_conflicting_flow(scan_result, workflow)
+    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
+    updates = scan_result.updates
+    if not actionable_vulns and not updates:
+        console.print(f"[bold green]{project}[/] — nothing to {workflow}.")
+        sys.exit(ExitCode.OK)
+    _warn_missing_test_config(project, proj_config)
+    return scan_result, actionable_vulns, updates
+
+
+# -- Resolve command ---------------------------------------------------------
+
+
+@app.command
+def resolve(
+    project: str,
+    continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
+    config: Path | None = None,
+) -> None:
+    """Work through failed findings for a project.
+
+    Applies each failed finding on ``mm/resolve-dependencies``, runs tests, and
+    stops on the first failure so the operator can debug manually. Rerun with
+    ``--continue`` after committing a manual fix to re-test and advance. Submits
+    a PR once all candidates reach READY.
+
+    Parameters
+    ----------
+    project: str
+        Project name (required).
+    continue_: bool
+        Re-test a paused, manually fixed finding on the resolve branch.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
+    """
+    cfg = _load_cfg(config)
+    proj_config = _resolve_proj(cfg, project)
+    results_dir = _config.MM_HOME / "scan-results"
+
+    try:
+        check_gh_available()
+    except GitHubCLINotFoundError as e:
+        _fatal(str(e))
+
+    scan_result, actionable_vulns, updates = _load_validated_scan(
+        project, results_dir, proj_config, Workflow.RESOLVE
+    )
+
+    if continue_:
+        sys.exit(
+            _handle_resolve_continue(project, proj_config, scan_result, results_dir)
+        )
+
+    try:
+        check_repo_clean(proj_config.path)
+    except RepoDirtyError as e:
+        console.print(f"  [bold yellow]Warning:[/] {e}")
+        if not Confirm.ask(
+            "  Discard local changes and reset to main?", default=False
+        ):
+            _fatal("aborted: working tree is dirty")
+        reset_to_main(proj_config.path)
+
+    if not ensure_on_main(proj_config.path):
+        _fatal(f"could not checkout main for [bold]{project}[/]")
+    if not sync_remote(proj_config.path):
+        _fatal("failed to sync trunk")
+    if not _prepare_resolve_branch(project, proj_config.path):
+        _fatal(f"aborted resolve for [bold]{project}[/]")
+
+    candidates = _ordered_resolve_candidates(scan_result)
+    sys.exit(
+        _run_resolve_findings(
+            project, proj_config, scan_result, results_dir, candidates
+        )
+    )
+
+
+def _ordered_resolve_candidates(
+    scan_result: ScanResult,
+) -> list[Finding]:
+    """Return fresh + resolve-owned failed findings, ordered for processing."""
+    candidate_vulns = [
+        v
+        for v in scan_result.vulnerabilities
+        if v.actionable
+        and (
+            (v.flow is None and v.update_status is None)
+            or (
+                v.flow == Workflow.RESOLVE
+                and v.update_status == UpdateStatus.FAILED
+            )
+        )
+    ]
+    candidate_updates = [
+        u
+        for u in scan_result.updates
+        if (u.flow is None and u.update_status is None)
+        or (
+            u.flow == Workflow.RESOLVE
+            and u.update_status == UpdateStatus.FAILED
+        )
+    ]
+    return [
+        *consolidate_vulns(candidate_vulns),
+        *sort_updates_by_risk(candidate_updates),
+    ]
+
+
+def _ordered_failed_findings(
+    scan_result: ScanResult,
+) -> list[Finding]:
+    """Return resolve-owned FAILED findings in processing order."""
+    failed_vulns = [
+        v
+        for v in scan_result.vulnerabilities
+        if v.update_status == UpdateStatus.FAILED and v.flow == Workflow.RESOLVE
+    ]
+    failed_updates = [
+        u
+        for u in scan_result.updates
+        if u.update_status == UpdateStatus.FAILED and u.flow == Workflow.RESOLVE
+    ]
+    return [
+        *consolidate_vulns(failed_vulns),
+        *sort_updates_by_risk(failed_updates),
+    ]
+
+
+def _ordered_ready_findings(
+    scan_result: ScanResult,
+    *,
+    flow: Workflow,
+) -> list[Finding]:
+    """Return READY findings owned by *flow*, ordered for submission."""
+    ready_vulns = [
+        v
+        for v in scan_result.vulnerabilities
+        if v.update_status == UpdateStatus.READY and v.flow == flow
+    ]
+    ready_updates = [
+        u
+        for u in scan_result.updates
+        if u.update_status == UpdateStatus.READY and u.flow == flow
+    ]
+    return [
+        *consolidate_vulns(ready_vulns),
+        *sort_updates_by_risk(ready_updates),
+    ]
+
+
+def _prepare_resolve_branch(project: str, project_path: Path) -> bool:
+    """Create or replace ``_RESOLVE_BRANCH``, prompting on collision."""
+    if not git_branch_exists(_RESOLVE_BRANCH, project_path):
+        return git_create_branch(_RESOLVE_BRANCH, project_path)
+
+    choice = Prompt.ask(
+        f"  Branch {_RESOLVE_BRANCH} already exists for {project}. "
+        f"[r]esume/[d]iscard/[a]bort",
+        choices=["r", "d", "a"],
+        default="a",
+    )
+    if choice == "r":
+        return git_checkout(_RESOLVE_BRANCH, project_path)
+    if choice == "d":
+        return git_replace_branch(_RESOLVE_BRANCH, project_path)
+    return False
+
+
+def _run_resolve_findings(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+    findings: list[Finding],
+) -> int:
+    """Process resolve candidates; stop on first failure, submit when all READY."""
+    results = process_findings(
+        findings,
+        proj_config,
+        flow=Workflow.RESOLVE,
+        scan_result=scan_result,
+        project_name=project,
+        results_dir=results_dir,
+        on_failure="stop",
+    )
+    if any(not r.passed for r in results) or _ordered_failed_findings(scan_result):
+        console.print(
+            f"  [bold yellow]Resolve paused.[/] Continue with "
+            f"[bold]mm resolve {project} --continue[/]."
+        )
+        return ExitCode.UPDATE_FAILED
+
+    ready_findings = _ordered_ready_findings(
+        scan_result, flow=Workflow.RESOLVE
+    )
+    if not ready_findings:
+        return ExitCode.OK
+    return _submit_resolve_branch(
+        project, proj_config.path, results_dir, scan_result, ready_findings
+    )
+
+
+def _submit_resolve_branch(
+    project: str,
+    project_path: Path,
+    results_dir: Path,
+    scan_result: ScanResult,
+    ready_findings: list[Finding],
+) -> int:
+    """Push the resolve branch, open a PR, and promote READY findings on success."""
+    for f in ready_findings:
+        f.failed_phase = None
+
+    ok, output = push_and_create_pr(project_path)
+    if output:
+        console.print(f"  [dim]{output}[/]")
+    if not ok:
+        save_scan_results(project, results_dir, scan_result)
+        console.print(
+            f"  [bold yellow]Submit failed.[/] Keeping {_RESOLVE_BRANCH} "
+            f"for manual recovery."
+        )
+        return ExitCode.UPDATE_FAILED
+
+    for f in ready_findings:
+        f.update_status = UpdateStatus.COMPLETED
+        f.failed_phase = None
+        f.flow = None
+    remove_completed_findings(scan_result)
+    save_scan_results(project, results_dir, scan_result)
+    return ExitCode.OK
+
+
+def _handle_resolve_continue(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+) -> int:
+    """Retest the paused blocker on the resolve branch."""
+    if get_current_branch(proj_config.path) != _RESOLVE_BRANCH:
+        _fatal(f"--continue requires being on {_RESOLVE_BRANCH}")
+    try:
+        check_repo_clean(proj_config.path)
+    except RepoDirtyError:
+        _fatal(
+            "--continue requires a clean working tree — commit or discard "
+            "manual changes first"
+        )
+
+    failed = _ordered_failed_findings(scan_result)
+    if failed:
+        passed, failed_phase = run_test_phases(proj_config, proj_config.path)
+        for blocker in failed:
+            blocker.flow = Workflow.RESOLVE
+            if passed:
+                blocker.update_status = UpdateStatus.READY
+                blocker.failed_phase = None
+            else:
+                blocker.update_status = UpdateStatus.FAILED
+                blocker.failed_phase = failed_phase
+        save_scan_results(project, results_dir, scan_result)
+        if not passed:
+            names = ", ".join(b.pkg_name for b in failed)
+            console.print(
+                f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
+            )
+            return ExitCode.UPDATE_FAILED
+        for blocker in failed:
+            console.print(f"  [bold green]PASS[/] {blocker.pkg_name}")
+
+    return _run_resolve_findings(
+        project,
+        proj_config,
+        scan_result,
+        results_dir,
+        _ordered_resolve_candidates(scan_result),
+    )
 
 
 def _print_mass_update_summary(
