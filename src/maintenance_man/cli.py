@@ -320,8 +320,12 @@ def _update_batch(
     except NoScanResultsError:
         return ([], False)
 
-    _assert_supported_in_progress_state(scan_result)
-    _assert_no_conflicting_flow(scan_result, Workflow.UPDATE)
+    try:
+        _assert_supported_in_progress_state(scan_result, project)
+        _assert_no_conflicting_flow(scan_result, Workflow.UPDATE, project)
+    except _FlowConflictError as e:
+        console.print(f"  [bold yellow]Skipped:[/] {project} — {e}")
+        return None
 
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
@@ -637,30 +641,40 @@ def _has_update_failures(scan_result: ScanResult) -> bool:
     )
 
 
-def _assert_supported_in_progress_state(scan_result: ScanResult) -> None:
+class _FlowConflictError(Exception):
+    """Raised when scan-result flow state is incompatible with the active flow."""
+
+
+def _assert_supported_in_progress_state(
+    scan_result: ScanResult, project: str
+) -> None:
     for f in (*scan_result.vulnerabilities, *scan_result.updates):
         if f.update_status is not None and f.flow is None:
-            _fatal(
-                "Scan results contain findings with in-progress status but no "
-                "flow ownership — please rescan the project."
+            raise _FlowConflictError(
+                f"{project} has in-progress findings without flow ownership — "
+                f"please rescan the project."
             )
 
 
 def _assert_no_conflicting_flow(
-    scan_result: ScanResult, required_flow: Workflow
+    scan_result: ScanResult,
+    active_flow: Workflow,
+    project: str,
 ) -> None:
     conflicts = [
         f
         for f in (*scan_result.vulnerabilities, *scan_result.updates)
         if f.update_status is not None
         and f.flow is not None
-        and f.flow != required_flow
+        and f.flow != active_flow
     ]
     if conflicts:
-        other = conflicts[0].flow.value if conflicts[0].flow else "unknown"
-        _fatal(
-            f"Cannot run update: {len(conflicts)} finding(s) owned by the "
-            f"'{other}' flow. Complete or abandon that flow first."
+        assert conflicts[0].flow is not None
+        other = conflicts[0].flow.value
+        raise _FlowConflictError(
+            f"Cannot run {active_flow.value} on {project}: {len(conflicts)} "
+            f"finding(s) owned by the '{other}' flow. Complete or abandon "
+            f"that flow first."
         )
 
 
@@ -726,8 +740,11 @@ def _load_validated_scan(
     except NoScanResultsError:
         console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
         sys.exit(ExitCode.OK)
-    _assert_supported_in_progress_state(scan_result)
-    _assert_no_conflicting_flow(scan_result, workflow)
+    try:
+        _assert_supported_in_progress_state(scan_result, project)
+        _assert_no_conflicting_flow(scan_result, workflow, project)
+    except _FlowConflictError as e:
+        _fatal(str(e))
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
     if not actionable_vulns and not updates:
