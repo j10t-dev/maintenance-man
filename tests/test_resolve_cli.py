@@ -10,7 +10,6 @@ from maintenance_man.cli import (
     app,
 )
 from maintenance_man.models.scan import (
-    Workflow,
     ScanResult,
     UpdateStatus,
     Workflow,

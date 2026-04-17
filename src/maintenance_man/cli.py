@@ -38,11 +38,11 @@ from maintenance_man.models.activity import (
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
-    Workflow,
     ScanResult,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
+    Workflow,
     sort_vulns_by_severity,
 )
 from maintenance_man.scanner import (
@@ -533,10 +533,7 @@ def _selectable_updates(updates: list[UpdateFinding]) -> list[UpdateFinding]:
         u
         for u in updates
         if u.update_status is None
-        or (
-            u.update_status == UpdateStatus.FAILED
-            and u.flow == Workflow.UPDATE
-        )
+        or (u.update_status == UpdateStatus.FAILED and u.flow == Workflow.UPDATE)
     ]
 
 
@@ -554,17 +551,13 @@ def _prompt_selection(
     choices = "/".join(parts)
 
     while True:
-        selection = Prompt.ask(
-            f"\n  Select updates [{choices}]", default="all"
-        )
+        selection = Prompt.ask(f"\n  Select updates [{choices}]", default="all")
         result = _parse_selection(
             selection, numbered, selectable_vulns, selectable_updates
         )
         if result is not None:
             return result
-        console.print(
-            f"[bold red]Invalid selection:[/] '{selection}'. Try again."
-        )
+        console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
 
 
 def _process_selected_vulns(
@@ -645,9 +638,7 @@ class _FlowConflictError(Exception):
     """Raised when scan-result flow state is incompatible with the active flow."""
 
 
-def _assert_supported_in_progress_state(
-    scan_result: ScanResult, project: str
-) -> None:
+def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:
     for f in (*scan_result.vulnerabilities, *scan_result.updates):
         if f.update_status is not None and f.flow is None:
             raise _FlowConflictError(
@@ -664,9 +655,7 @@ def _assert_no_conflicting_flow(
     conflicts = [
         f
         for f in (*scan_result.vulnerabilities, *scan_result.updates)
-        if f.update_status is not None
-        and f.flow is not None
-        and f.flow != active_flow
+        if f.update_status is not None and f.flow is not None and f.flow != active_flow
     ]
     if conflicts:
         assert conflicts[0].flow is not None
@@ -801,9 +790,7 @@ def resolve(
         check_repo_clean(proj_config.path)
     except RepoDirtyError as e:
         console.print(f"  [bold yellow]Warning:[/] {e}")
-        if not Confirm.ask(
-            "  Discard local changes and reset to main?", default=False
-        ):
+        if not Confirm.ask("  Discard local changes and reset to main?", default=False):
             _fatal("aborted: working tree is dirty")
         reset_to_main(proj_config.path)
 
@@ -832,20 +819,14 @@ def _ordered_resolve_candidates(
         if v.actionable
         and (
             (v.flow is None and v.update_status is None)
-            or (
-                v.flow == Workflow.RESOLVE
-                and v.update_status == UpdateStatus.FAILED
-            )
+            or (v.flow == Workflow.RESOLVE and v.update_status == UpdateStatus.FAILED)
         )
     ]
     candidate_updates = [
         u
         for u in scan_result.updates
         if (u.flow is None and u.update_status is None)
-        or (
-            u.flow == Workflow.RESOLVE
-            and u.update_status == UpdateStatus.FAILED
-        )
+        or (u.flow == Workflow.RESOLVE and u.update_status == UpdateStatus.FAILED)
     ]
     return [
         *consolidate_vulns(candidate_vulns),
@@ -937,9 +918,7 @@ def _run_resolve_findings(
         )
         return ExitCode.UPDATE_FAILED
 
-    ready_findings = _ordered_ready_findings(
-        scan_result, flow=Workflow.RESOLVE
-    )
+    ready_findings = _ordered_ready_findings(scan_result, flow=Workflow.RESOLVE)
     if not ready_findings:
         return ExitCode.OK
     return _submit_resolve_branch(
@@ -1602,9 +1581,7 @@ def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanR
     try:
         sync_remote(proj_config.path)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        console.print(
-            f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}"
-        )
+        console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
 
     t0 = time.monotonic()
     result = scan_project(name, proj_config, min_age_days)
@@ -1782,5 +1759,3 @@ def _parse_selection(
                     selected_updates.append(finding)
 
     return selected_vulns, selected_updates
-
-

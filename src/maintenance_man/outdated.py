@@ -48,8 +48,6 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
             return SemverTier.PATCH
 
 
-
-
 def _normalise_pkg_name(name: str) -> str:
     return normalise_pkg_name(name)
 

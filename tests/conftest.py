@@ -150,9 +150,7 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     monkeypatch.setattr("maintenance_man.cli.remove_worktree", lambda p, w: None)
     monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: False)
     monkeypatch.setattr("maintenance_man.cli.git_create_branch", lambda b, p: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.git_merge_fast_forward", lambda b, p: True
-    )
+    monkeypatch.setattr("maintenance_man.cli.git_merge_fast_forward", lambda b, p: True)
     monkeypatch.setattr("maintenance_man.cli.git_delete_branch", lambda b, p: True)
     monkeypatch.setattr("maintenance_man.cli.ensure_on_main", lambda p: True)
     monkeypatch.setattr("maintenance_man.cli.check_repo_clean", lambda p: None)

@@ -15,6 +15,7 @@ class UvDependencyError(Exception):
 
 _PEP503_NORMALISE_RE = re.compile(r"[-_.]+")
 
+
 # Intentionally excludes [project.optional-dependencies]. maintenance-man only
 # supports UV runtime dependencies and dependency groups for scan/update flows.
 @dataclass(frozen=True, slots=True)
