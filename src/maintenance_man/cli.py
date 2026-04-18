@@ -647,6 +647,18 @@ def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -
             )
 
 
+_RESOLVE_CLAIMABLE_TEST_PHASES = {"unit", "integration", "component"}
+
+
+def _is_resolve_claimable_failure(f: Finding, active_flow: Workflow) -> bool:
+    return (
+        active_flow == Workflow.RESOLVE
+        and f.flow == Workflow.UPDATE
+        and f.update_status == UpdateStatus.FAILED
+        and f.failed_phase in _RESOLVE_CLAIMABLE_TEST_PHASES
+    )
+
+
 def _assert_no_conflicting_flow(
     scan_result: ScanResult,
     active_flow: Workflow,
@@ -655,7 +667,10 @@ def _assert_no_conflicting_flow(
     conflicts = [
         f
         for f in (*scan_result.vulnerabilities, *scan_result.updates)
-        if f.update_status is not None and f.flow is not None and f.flow != active_flow
+        if f.update_status is not None
+        and f.flow is not None
+        and f.flow != active_flow
+        and not _is_resolve_claimable_failure(f, active_flow)
     ]
     if conflicts:
         assert conflicts[0].flow is not None
@@ -820,6 +835,7 @@ def _ordered_resolve_candidates(
         and (
             (v.flow is None and v.update_status is None)
             or (v.flow == Workflow.RESOLVE and v.update_status == UpdateStatus.FAILED)
+            or _is_resolve_claimable_failure(v, Workflow.RESOLVE)
         )
     ]
     candidate_updates = [
@@ -827,6 +843,7 @@ def _ordered_resolve_candidates(
         for u in scan_result.updates
         if (u.flow is None and u.update_status is None)
         or (u.flow == Workflow.RESOLVE and u.update_status == UpdateStatus.FAILED)
+        or _is_resolve_claimable_failure(u, Workflow.RESOLVE)
     ]
     return [
         *consolidate_vulns(candidate_vulns),

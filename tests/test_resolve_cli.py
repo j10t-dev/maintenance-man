@@ -83,6 +83,7 @@ class TestResolveCandidates:
                     pkg_name="pkg-c",
                     update_status=UpdateStatus.FAILED,
                     flow=Workflow.UPDATE,
+                    failed_phase="apply",
                 ),
                 make_update(
                     pkg_name="pkg-d",
@@ -96,6 +97,23 @@ class TestResolveCandidates:
         candidates = _ordered_resolve_candidates(scan_result)
 
         assert {f.pkg_name for f in candidates} == {"pkg-a", "pkg-b", "pkg-e"}
+
+    def test_ordered_resolve_candidates_include_update_owned_test_failures(self):
+        scan_result = make_scan_result(
+            updates=[
+                make_update(
+                    pkg_name="pkg-a",
+                    update_status=UpdateStatus.FAILED,
+                    flow=Workflow.UPDATE,
+                    failed_phase="unit",
+                )
+            ],
+            vulns=[],
+        )
+
+        candidates = _ordered_resolve_candidates(scan_result)
+
+        assert [f.pkg_name for f in candidates] == ["pkg-a"]
 
     def test_ordered_failed_findings_only_resolve_failed(self):
         scan_result = make_scan_result(
@@ -175,6 +193,7 @@ class TestResolvePreChecks:
     ) -> None:
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
         scan_result.updates[0].flow = Workflow.UPDATE
+        scan_result.updates[0].failed_phase = "apply"
         mock_process = MagicMock()
         monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
 
@@ -187,6 +206,41 @@ class TestResolvePreChecks:
         assert "resolve" in out
         assert "vulnerable" in out
         mock_process.assert_not_called()
+
+    def test_update_owned_test_failure_is_claimable_by_resolve(
+        self,
+        mm_home_with_projects: Path,
+        mock_resolve_cli_deps: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scan_result = make_scan_result(
+            vulns=[],
+            updates=[
+                make_update(
+                    update_status=UpdateStatus.FAILED,
+                    flow=Workflow.UPDATE,
+                    failed_phase="unit",
+                )
+            ],
+        )
+        mock_resolve_cli_deps["scan_result"] = scan_result
+        mock_process = MagicMock(
+            return_value=[
+                UpdateResult(
+                    pkg_name="pkg-a",
+                    kind="update",
+                    passed=False,
+                    failed_phase="unit",
+                )
+            ]
+        )
+        monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["resolve", "vulnerable"])
+
+        assert exc_info.value.code == 4
+        assert [f.pkg_name for f in mock_process.call_args.args[0]] == ["pkg-a"]
 
     def test_legacy_findings_missing_flow_abort(
         self,
