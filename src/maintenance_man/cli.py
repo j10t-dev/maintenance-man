@@ -81,10 +81,11 @@ from maintenance_man.vcs import (
     git_delete_branch,
     git_merge_fast_forward,
     git_replace_branch,
+    prune_stale_branches,
     push_and_create_pr,
     remove_worktree,
     reset_to_main,
-    sync_remote,
+    sync_main,
 )
 
 
@@ -97,6 +98,7 @@ class ExitCode(IntEnum):
     TEST_FAILED = 5
     BUILD_FAILED = 6
     DEPLOY_FAILED = 7
+    SYNC_FAILED = 8
 
 
 @dataclass
@@ -282,6 +284,50 @@ def update(
     _update_batch_targets(cfg, target_names=targets)
 
 
+@app.command
+def sync(
+    *projects: str,
+    config: Path | None = None,
+) -> None:
+    """Sync local main with remote for one, many, or all configured projects.
+
+    Parameters
+    ----------
+    projects: str
+        Project names to sync. No names syncs all configured projects.
+    config: Path | None
+        Path to config file. Uses ~/.mm/config.toml if omitted.
+    """
+    cfg = _load_cfg(config)
+
+    if not cfg.projects:
+        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        sys.exit(ExitCode.OK)
+
+    ordered = _dedupe_preserve_order(list(projects))
+    _validate_project_names(cfg, ordered)
+    targets = ordered if ordered else _sorted_project_names(cfg)
+
+    had_errors = False
+    for name in targets:
+        proj_config = cfg.projects[name]
+        if not proj_config.path.exists():
+            console.print(
+                f"[bold yellow]Warning:[/] {name} — "
+                f"path does not exist: {proj_config.path}"
+            )
+            had_errors = True
+            continue
+        ok, msg = sync_main(proj_config.path)
+        if ok:
+            console.print(f"  {name} — ok")
+        else:
+            console.print(f"  [bold red]{name} — {msg}[/]")
+            had_errors = True
+
+    sys.exit(ExitCode.SYNC_FAILED if had_errors else ExitCode.OK)
+
+
 def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
     """Update a single project with interactive selection."""
     proj_config = _resolve_proj(cfg, project)
@@ -445,7 +491,7 @@ def _enter_update_worktree(
 
     if git_branch_exists(_UPDATE_BRANCH, proj_config.path):
         git_delete_branch(_UPDATE_BRANCH, proj_config.path)
-    if not sync_remote(proj_config.path):
+    if not prune_stale_branches(proj_config.path):
         raise _UpdateSetupError("failed to sync trunk")
     if not create_worktree(proj_config.path, wt_path, branch="main", detach=True):
         raise _UpdateSetupError("could not create worktree")
@@ -811,7 +857,7 @@ def resolve(
 
     if not ensure_on_main(proj_config.path):
         _fatal(f"could not checkout main for [bold]{project}[/]")
-    if not sync_remote(proj_config.path):
+    if not prune_stale_branches(proj_config.path):
         _fatal("failed to sync trunk")
     if not _prepare_resolve_branch(project, proj_config.path):
         _fatal(f"aborted resolve for [bold]{project}[/]")
@@ -1596,7 +1642,7 @@ def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -
 def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
     """Scan a single project with timing output."""
     try:
-        sync_remote(proj_config.path)
+        prune_stale_branches(proj_config.path)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
 

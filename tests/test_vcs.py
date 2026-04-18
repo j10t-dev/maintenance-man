@@ -22,10 +22,11 @@ from maintenance_man.vcs import (
     git_has_changes,
     git_merge_fast_forward,
     git_replace_branch,
+    prune_stale_branches,
     push_and_create_pr,
     remove_worktree,
     reset_to_main,
-    sync_remote,
+    sync_main,
 )
 
 
@@ -47,7 +48,7 @@ def _deleted_branch_names(mock_run: MagicMock) -> set[str]:
     }
 
 
-def _sync_remote_side_effect(pr_state: str, stale_branch: str):
+def _prune_stale_branches_side_effect(pr_state: str, stale_branch: str):
     """Build a `_run` side_effect where *stale_branch* appears in PR *pr_state*.
 
     The branch exists locally (alongside `main`) and its delete succeeds.
@@ -625,11 +626,11 @@ class TestPushAndCreatePr:
 
 
 # ---------------------------------------------------------------------------
-# sync_remote
+# prune_stale_branches
 # ---------------------------------------------------------------------------
 
 
-class TestSyncRemote:
+class TestPruneStale:
     @patch("maintenance_man.vcs._run")
     def test_deletes_merged_branches(self, mock_run: MagicMock, tmp_path: Path):
         def side_effect(cmd, *args, **kwargs):
@@ -656,7 +657,7 @@ class TestSyncRemote:
             return _completed()
 
         mock_run.side_effect = side_effect
-        assert sync_remote(tmp_path) is True
+        assert prune_stale_branches(tmp_path) is True
 
         assert _deleted_branch_names(mock_run) == {
             "mm/update-dependencies",
@@ -677,7 +678,7 @@ class TestSyncRemote:
             return _completed()
 
         mock_run.side_effect = side_effect
-        assert sync_remote(tmp_path) is True
+        assert prune_stale_branches(tmp_path) is True
 
     @patch("maintenance_man.vcs._run")
     def test_ignores_non_prefixed_branches(
@@ -697,7 +698,7 @@ class TestSyncRemote:
             return _completed()
 
         mock_run.side_effect = side_effect
-        assert sync_remote(tmp_path) is True
+        assert prune_stale_branches(tmp_path) is True
 
         assert _deleted_branch_names(mock_run) == set()
 
@@ -716,8 +717,8 @@ class TestSyncRemote:
         stale_branch: str,
         tmp_path: Path,
     ):
-        mock_run.side_effect = _sync_remote_side_effect(pr_state, stale_branch)
-        assert sync_remote(tmp_path) is True
+        mock_run.side_effect = _prune_stale_branches_side_effect(pr_state, stale_branch)
+        assert prune_stale_branches(tmp_path) is True
         assert _deleted_branch_names(mock_run) == {stale_branch}
 
 
@@ -784,3 +785,104 @@ class TestRemoveWorktree:
             Path("/repo"),
             timeout=30,
         )
+
+
+# ---------------------------------------------------------------------------
+# sync_main
+# ---------------------------------------------------------------------------
+
+
+class TestSyncMain:
+    @patch("maintenance_man.vcs._run")
+    def test_happy_path_on_main(self, mock_run: MagicMock, tmp_path: Path):
+        """pull + push succeeds when on main branch."""
+        def side_effect(cmd, *args, **kwargs):
+            if cmd == ["git", "branch", "--show-current"]:
+                return _completed(stdout="main\n")
+            return _completed()
+        mock_run.side_effect = side_effect
+        ok, msg = sync_main(tmp_path)
+        assert ok is True
+        assert msg == ""
+
+    @patch("maintenance_man.vcs._run")
+    def test_happy_path_off_main(self, mock_run: MagicMock, tmp_path: Path):
+        """fetch + fetch main:main + push succeeds when on feature branch."""
+        def side_effect(cmd, *args, **kwargs):
+            if cmd == ["git", "branch", "--show-current"]:
+                return _completed(stdout="feature/my-work\n")
+            return _completed()
+        mock_run.side_effect = side_effect
+        ok, msg = sync_main(tmp_path)
+        assert ok is True
+        assert msg == ""
+
+    @patch("maintenance_man.vcs._run")
+    def test_pull_failure_on_main(self, mock_run: MagicMock, tmp_path: Path):
+        """pull failure on main is surfaced."""
+        def side_effect(cmd, *args, **kwargs):
+            if cmd == ["git", "branch", "--show-current"]:
+                return _completed(stdout="main\n")
+            if cmd == ["git", "pull"]:
+                return _completed(returncode=1, stderr="network error")
+            return _completed()
+        mock_run.side_effect = side_effect
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "network error" in msg
+
+    @patch("maintenance_man.vcs._run")
+    def test_fetch_failure_off_main(self, mock_run: MagicMock, tmp_path: Path):
+        """fetch failure when off main is surfaced."""
+        def side_effect(cmd, *args, **kwargs):
+            if cmd == ["git", "branch", "--show-current"]:
+                return _completed(stdout="feature/my-work\n")
+            if cmd == ["git", "fetch", "origin"]:
+                return _completed(returncode=1, stderr="network error")
+            return _completed()
+        mock_run.side_effect = side_effect
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "network error" in msg
+
+    @patch("maintenance_man.vcs._run")
+    def test_diverged_off_main(self, mock_run: MagicMock, tmp_path: Path):
+        """fetch main:main failure (diverged) when off main is surfaced."""
+        def side_effect(cmd, *args, **kwargs):
+            if cmd == ["git", "branch", "--show-current"]:
+                return _completed(stdout="feature/my-work\n")
+            if cmd == ["git", "fetch", "origin", "main:main"]:
+                return _completed(
+                    returncode=1,
+                    stderr="! [rejected] main:main (non-fast-forward)",
+                )
+            return _completed()
+        mock_run.side_effect = side_effect
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "non-fast-forward" in msg
+
+    @patch("maintenance_man.vcs._run")
+    def test_detached_head(self, mock_run: MagicMock, tmp_path: Path):
+        """Detached HEAD returns error without running git push."""
+        def side_effect(cmd, *args, **kwargs):
+            if cmd == ["git", "branch", "--show-current"]:
+                return _completed(stdout="")
+            return _completed()
+        mock_run.side_effect = side_effect
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "detached" in msg.lower()
+
+    @patch("maintenance_man.vcs._run")
+    def test_push_failure(self, mock_run: MagicMock, tmp_path: Path):
+        def side_effect(cmd, *args, **kwargs):
+            if cmd == ["git", "branch", "--show-current"]:
+                return _completed(stdout="main\n")
+            if cmd[:2] == ["git", "push"]:
+                return _completed(returncode=1, stderr="push rejected")
+            return _completed()
+        mock_run.side_effect = side_effect
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "push rejected" in msg

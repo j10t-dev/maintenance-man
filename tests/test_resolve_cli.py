@@ -42,7 +42,7 @@ def mock_resolve_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     state: dict[str, object] = {"scan_result": scan_result}
 
     monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.sync_remote", lambda p: True)
+    monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", lambda p: True)
     monkeypatch.setattr(
         "maintenance_man.cli.load_scan_results",
         lambda name, d: state["scan_result"],
