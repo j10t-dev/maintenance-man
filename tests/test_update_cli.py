@@ -152,7 +152,7 @@ class TestUpdateNoOp:
     ):
         mock_sync = MagicMock(return_value=True)
         mock_worktree = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.sync_remote", mock_sync)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
         monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
         monkeypatch.setattr(
             "maintenance_man.cli.load_scan_results",
@@ -175,7 +175,7 @@ class TestUpdateNoOp:
         scan_result.updates = []
         mock_sync = MagicMock(return_value=True)
         mock_worktree = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.sync_remote", mock_sync)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
         monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
 
         with pytest.raises(SystemExit) as exc_info:
@@ -193,7 +193,7 @@ class TestUpdateNoOp:
         """Batch mode also performs the no-op check before any side effects."""
         mock_sync = MagicMock(return_value=True)
         mock_worktree = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.sync_remote", mock_sync)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
         monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
         monkeypatch.setattr(
             "maintenance_man.cli.load_scan_results",
@@ -429,7 +429,7 @@ class TestUpdateResume:
         mock_worktree = MagicMock(return_value=True)
         mock_sync = MagicMock(return_value=True)
         monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
-        monkeypatch.setattr("maintenance_man.cli.sync_remote", mock_sync)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
         monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: True)
 
         with pytest.raises(SystemExit) as exc_info:
@@ -541,7 +541,7 @@ class TestUpdateResume:
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """Resuming an existing branch does not call sync_remote."""
+        """Resuming an existing branch does not call prune_stale_branches."""
         scan_result: ScanResult = mock_update_cli_deps["scan_result"]
         scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
         scan_result.vulnerabilities[0].flow = Workflow.UPDATE
@@ -549,7 +549,7 @@ class TestUpdateResume:
         scan_result.updates[0].flow = Workflow.UPDATE
 
         mock_sync = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.sync_remote", mock_sync)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
         monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: True)
         monkeypatch.setattr(
             "maintenance_man.cli.process_vulns", MagicMock(return_value=[])

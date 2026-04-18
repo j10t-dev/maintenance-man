@@ -19,7 +19,7 @@ _MANAGED_BRANCH_PREFIXES = (
 )
 
 
-def sync_remote(project_path: Path) -> bool:
+def prune_stale_branches(project_path: Path) -> bool:
     """Fetch from remote, prune stale refs, delete merged/closed branches.
 
     Runs ``git fetch --prune`` to update remote state, then deletes any
@@ -96,6 +96,38 @@ def push_and_create_pr(project_path: Path) -> tuple[bool, str]:
         return False, pr.stderr.strip()
 
     return True, pr.stdout.strip()
+
+
+def sync_main(project_path: Path) -> tuple[bool, str]:
+    """Fetch, fast-forward local main, and push to origin.
+
+    Works without checking out main. When on main, uses merge --ff-only.
+    When on another branch, uses fetch origin main:main (which git rejects
+    for checked-out branches).
+    """
+    branch = get_current_branch(project_path)
+    if not branch:
+        return False, "Not on a branch (detached HEAD)."
+
+    if branch == "main":
+        pull = _run(["git", "pull"], project_path, timeout=120)
+        if pull.returncode != 0:
+            return False, _clean_git_stderr(pull.stderr)
+    else:
+        fetch = _run(["git", "fetch", "origin"], project_path, timeout=120)
+        if fetch.returncode != 0:
+            return False, _clean_git_stderr(fetch.stderr)
+        fetch_main = _run(
+            ["git", "fetch", "origin", "main:main"], project_path, timeout=120
+        )
+        if fetch_main.returncode != 0:
+            return False, _clean_git_stderr(fetch_main.stderr)
+
+    push = _run(["git", "push", "origin", "main"], project_path, timeout=120)
+    if push.returncode != 0:
+        return False, _clean_git_stderr(push.stderr)
+
+    return True, ""
 
 
 def git_branch_exists(branch: str, project_path: Path) -> bool:
@@ -334,3 +366,9 @@ def _is_non_fast_forward_push(stderr: str) -> bool:
     """Return True when a push failed due to remote divergence."""
     error = stderr.lower()
     return "non-fast-forward" in error or "fetch first" in error
+
+
+def _clean_git_stderr(stderr: str) -> str:
+    """Strip git hint lines from stderr, returning only the error message."""
+    lines = [line for line in stderr.splitlines() if not line.startswith("hint:")]
+    return "\n".join(lines).strip()
