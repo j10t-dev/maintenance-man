@@ -170,6 +170,7 @@ def _run_checked(
             text=True,
             cwd=cwd,
             timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as e:
         raise OutdatedCheckError(f"{label} timed out") from e
