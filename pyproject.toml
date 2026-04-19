@@ -14,7 +14,7 @@ dependencies = [
     "pydantic>=2.0",
     "pygments==2.20.0",
     "pytest==9.0.3",
-    "rich==14.3.3",
+    "rich==15.0.0",
 ]
 
 [project.scripts]
