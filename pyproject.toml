@@ -11,7 +11,7 @@ requires-python = ">=3.14"
 dependencies = [
     "cyclopts==4.11.0",
     "packaging==26.1",
-    "pydantic>=2.0",
+    "pydantic==2.13.3",
     "pygments==2.20.0",
     "pytest==9.0.3",
     "rich==15.0.0",
