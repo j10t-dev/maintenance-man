@@ -121,7 +121,7 @@ class TestEnsureMmHome:
         ensure_mm_home()
         assert mm_home.is_dir()
         assert (mm_home / "scan-results").is_dir()
-        assert (mm_home / "worktrees").is_dir()
+        assert (mm_home / "workspaces").is_dir()
         assert (mm_home / "config.toml").is_file()
 
     def test_idempotent(self, mm_home: Path):
@@ -151,7 +151,7 @@ class TestLoadConfig:
     def test_loads_valid_config(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 14\n")
         config = load_config()
         assert config.defaults.min_version_age_days == 14
@@ -216,7 +216,7 @@ class TestResolveProject:
         project_dir.mkdir()
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text(
             f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "bun"\n'
         )
@@ -227,7 +227,7 @@ class TestResolveProject:
     def test_unknown_project_raises_project_not_found(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text("[defaults]\n")
         config = load_config()
         with pytest.raises(ProjectNotFoundError):
@@ -236,7 +236,7 @@ class TestResolveProject:
     def test_missing_path_raises_project_not_found(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text(
             '[projects.myapp]\npath = "/nonexistent/path"\npackage_manager = "bun"\n'
         )

@@ -64,7 +64,7 @@ def mm_home_with_projects(mm_home: Path) -> Path:
     """MM_HOME populated with directory structure and real project config."""
     mm_home.mkdir(parents=True, exist_ok=True)
     (mm_home / "scan-results").mkdir(exist_ok=True)
-    (mm_home / "worktrees").mkdir(exist_ok=True)
+    (mm_home / "workspaces").mkdir(exist_ok=True)
 
     vuln_path = FIXTURES_DIR / "vulnerable-project"
     clean_path = FIXTURES_DIR / "clean-project"

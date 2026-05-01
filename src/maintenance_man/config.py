@@ -72,7 +72,7 @@ def ensure_mm_home() -> None:
     """Create ~/.mm/ directory structure and skeleton config if missing."""
     MM_HOME.mkdir(parents=True, exist_ok=True)
     (MM_HOME / "scan-results").mkdir(exist_ok=True)
-    (MM_HOME / "worktrees").mkdir(exist_ok=True)
+    (MM_HOME / "workspaces").mkdir(exist_ok=True)
 
     config_path = MM_HOME / "config.toml"
     if not config_path.exists():
