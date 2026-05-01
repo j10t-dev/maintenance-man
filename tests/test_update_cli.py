@@ -49,6 +49,23 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 1
 
+    def test_missing_jj_errors(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from maintenance_man.vcs import JJCLINotFoundError
+
+        monkeypatch.setattr(
+            "maintenance_man.cli.check_jj_available",
+            MagicMock(side_effect=JJCLINotFoundError("no jj")),
+            raising=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable"])
+        assert exc_info.value.code == 1
+
     def test_missing_test_config_warns_and_proceeds(
         self,
         mm_home_with_projects: Path,
@@ -150,10 +167,10 @@ class TestUpdateNoOp:
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        mock_sync = MagicMock(return_value=True)
-        mock_worktree = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
-        monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
+        mock_prune = MagicMock(return_value=True)
+        mock_workspace = MagicMock(return_value=True)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", mock_prune)
+        monkeypatch.setattr("maintenance_man.cli.create_workspace", mock_workspace)
         monkeypatch.setattr(
             "maintenance_man.cli.load_scan_results",
             MagicMock(side_effect=NoScanResultsError("No results")),
@@ -161,8 +178,8 @@ class TestUpdateNoOp:
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
-        mock_sync.assert_not_called()
-        mock_worktree.assert_not_called()
+        mock_prune.assert_not_called()
+        mock_workspace.assert_not_called()
 
     def test_no_actionable_findings_is_noop(
         self,
@@ -173,16 +190,16 @@ class TestUpdateNoOp:
         scan_result: ScanResult = mock_update_cli_deps["scan_result"]
         scan_result.vulnerabilities = []
         scan_result.updates = []
-        mock_sync = MagicMock(return_value=True)
-        mock_worktree = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
-        monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
+        mock_prune = MagicMock(return_value=True)
+        mock_workspace = MagicMock(return_value=True)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", mock_prune)
+        monkeypatch.setattr("maintenance_man.cli.create_workspace", mock_workspace)
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
-        mock_sync.assert_not_called()
-        mock_worktree.assert_not_called()
+        mock_prune.assert_not_called()
+        mock_workspace.assert_not_called()
 
     def test_batch_noop_is_identical(
         self,
@@ -191,10 +208,10 @@ class TestUpdateNoOp:
         monkeypatch: pytest.MonkeyPatch,
     ):
         """Batch mode also performs the no-op check before any side effects."""
-        mock_sync = MagicMock(return_value=True)
-        mock_worktree = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
-        monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
+        mock_prune = MagicMock(return_value=True)
+        mock_workspace = MagicMock(return_value=True)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", mock_prune)
+        monkeypatch.setattr("maintenance_man.cli.create_workspace", mock_workspace)
         monkeypatch.setattr(
             "maintenance_man.cli.load_scan_results",
             MagicMock(side_effect=NoScanResultsError("No results")),
@@ -203,8 +220,8 @@ class TestUpdateNoOp:
         with pytest.raises(SystemExit) as exc_info:
             app(["update"])
         assert exc_info.value.code == 0
-        mock_sync.assert_not_called()
-        mock_worktree.assert_not_called()
+        mock_prune.assert_not_called()
+        mock_workspace.assert_not_called()
 
 
 class TestUpdateSelection:
@@ -315,7 +332,7 @@ class TestUpdateExitCodes:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 4
 
-    def test_branch_failure_summary_uses_friendly_label(
+    def test_bookmark_failure_summary_uses_friendly_label(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -346,7 +363,7 @@ class TestUpdateExitCodes:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 4
-        assert "branch creation failed" in capsys.readouterr().out
+        assert "bookmark creation failed" in capsys.readouterr().out
 
     def test_commit_failure_summary_uses_friendly_label(
         self,
@@ -414,7 +431,7 @@ class TestUpdateNumberedSelection:
 class TestUpdateResume:
     """Interactive rerun with update-owned in-progress state."""
 
-    def test_resume_attaches_worktree_to_existing_branch(
+    def test_resume_attaches_workspace_to_existing_bookmark(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -426,28 +443,29 @@ class TestUpdateResume:
         scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
         scan_result.vulnerabilities[0].flow = Workflow.UPDATE
 
-        mock_worktree = MagicMock(return_value=True)
-        mock_sync = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.create_worktree", mock_worktree)
-        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
-        monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: True)
+        mock_workspace = MagicMock(return_value=True)
+        mock_prune = MagicMock(return_value=True)
+        monkeypatch.setattr("maintenance_man.cli.create_workspace", mock_workspace)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", mock_prune)
+        monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: True)
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
 
-        _, kwargs = mock_worktree.call_args
-        assert kwargs.get("branch") == "mm/update-dependencies"
-        assert kwargs.get("detach") is False
-        mock_sync.assert_not_called()
+        args, _ = mock_workspace.call_args
+        # create_workspace(repo_path, project, revision)
+        assert args[1] == "vulnerable"
+        assert args[2] == "mm/update-dependencies"
+        mock_prune.assert_not_called()
 
-    def test_resume_ready_only_skips_selection_and_merges(
+    def test_resume_ready_only_skips_selection_and_promotes(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """Only READY findings (no FAILED) => skip prompt, go straight to merge."""
+        """Only READY findings (no FAILED) => skip prompt, go straight to promote."""
         scan_result: ScanResult = mock_update_cli_deps["scan_result"]
         scan_result.updates[0].update_status = UpdateStatus.READY
         scan_result.updates[0].flow = Workflow.UPDATE
@@ -455,10 +473,12 @@ class TestUpdateResume:
         scan_result.vulnerabilities[0].flow = Workflow.UPDATE
 
         mock_prompt = MagicMock()
-        mock_merge = MagicMock(return_value=True)
+        mock_promote = MagicMock(return_value=True)
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", mock_prompt)
-        monkeypatch.setattr("maintenance_man.cli.git_merge_fast_forward", mock_merge)
-        monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: True)
+        monkeypatch.setattr(
+            "maintenance_man.cli.promote_bookmark_to_main", mock_promote
+        )
+        monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: True)
         monkeypatch.setattr(
             "maintenance_man.cli.process_vulns", MagicMock(return_value=[])
         )
@@ -470,8 +490,9 @@ class TestUpdateResume:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
         mock_prompt.assert_not_called()
-        mock_merge.assert_called_once()
-        assert mock_merge.call_args.args[0] == "mm/update-dependencies"
+        mock_promote.assert_called_once()
+        # promote_bookmark_to_main(path, source_bookmark)
+        assert mock_promote.call_args.args[1] == "mm/update-dependencies"
 
     def test_resume_shows_only_failed_findings(
         self,
@@ -496,7 +517,7 @@ class TestUpdateResume:
         monkeypatch.setattr(
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
         )
-        monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: True)
+        monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: True)
 
         with pytest.raises(SystemExit):
             app(["update", "vulnerable"])
@@ -507,22 +528,24 @@ class TestUpdateResume:
         after_update_line = output.split("Select updates")[0].split("UPDATE pkg-a")[-1]
         assert "some-pkg" not in after_update_line
 
-    def test_resume_ready_findings_preserved_through_merge(
+    def test_resume_ready_findings_preserved_through_promote(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """READY findings reach merge even though they're hidden from selection."""
+        """READY findings reach promote even though they're hidden from selection."""
         scan_result: ScanResult = mock_update_cli_deps["scan_result"]
         scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
         scan_result.vulnerabilities[0].flow = Workflow.UPDATE
         scan_result.updates[0].update_status = UpdateStatus.READY
         scan_result.updates[0].flow = Workflow.UPDATE
 
-        mock_merge = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.git_merge_fast_forward", mock_merge)
-        monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: True)
+        mock_promote = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "maintenance_man.cli.promote_bookmark_to_main", mock_promote
+        )
+        monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: True)
         monkeypatch.setattr(
             "maintenance_man.cli.process_vulns", MagicMock(return_value=[])
         )
@@ -533,7 +556,7 @@ class TestUpdateResume:
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
-        mock_merge.assert_called_once()
+        mock_promote.assert_called_once()
 
     def test_resume_does_not_sync_or_rebase(
         self,
@@ -541,16 +564,16 @@ class TestUpdateResume:
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """Resuming an existing branch does not call prune_stale_branches."""
+        """Resuming an existing bookmark does not call prune_stale_bookmarks."""
         scan_result: ScanResult = mock_update_cli_deps["scan_result"]
         scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
         scan_result.vulnerabilities[0].flow = Workflow.UPDATE
         scan_result.updates[0].update_status = UpdateStatus.READY
         scan_result.updates[0].flow = Workflow.UPDATE
 
-        mock_sync = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", mock_sync)
-        monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: True)
+        mock_prune = MagicMock(return_value=True)
+        monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", mock_prune)
+        monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: True)
         monkeypatch.setattr(
             "maintenance_man.cli.process_vulns", MagicMock(return_value=[])
         )
@@ -560,13 +583,13 @@ class TestUpdateResume:
 
         with pytest.raises(SystemExit):
             app(["update", "vulnerable"])
-        mock_sync.assert_not_called()
+        mock_prune.assert_not_called()
 
 
 class TestUpdateFinalise:
-    """Merge promotes READY -> COMPLETED only on success."""
+    """Promote moves READY -> COMPLETED only on success."""
 
-    def test_merge_success_promotes_ready_to_completed(
+    def test_promote_success_promotes_ready_to_completed(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -592,7 +615,8 @@ class TestUpdateFinalise:
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.git_merge_fast_forward", MagicMock(return_value=True)
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -603,7 +627,7 @@ class TestUpdateFinalise:
         assert scan_result.vulnerabilities == []
         assert scan_result.updates == []
 
-    def test_merge_failure_leaves_ready(
+    def test_promote_failure_leaves_ready(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -629,13 +653,14 @@ class TestUpdateFinalise:
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.git_merge_fast_forward", MagicMock(return_value=False)
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=False),
         )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
 
-        # Merge failure surfaces as UPDATE_FAILED but findings stay READY
+        # Promote failure surfaces as UPDATE_FAILED but findings stay READY
         assert exc_info.value.code == 4
         assert scan_result.vulnerabilities[0].update_status == UpdateStatus.READY
         assert scan_result.vulnerabilities[0].flow == Workflow.UPDATE
@@ -643,13 +668,13 @@ class TestUpdateFinalise:
         assert scan_result.updates[0].update_status == UpdateStatus.READY
         assert scan_result.updates[0].flow == Workflow.UPDATE
 
-    def test_failed_findings_block_merge(
+    def test_failed_findings_block_promote(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """If any finding fails, don't merge."""
+        """If any finding fails, don't promote."""
         scan_result: ScanResult = mock_update_cli_deps["scan_result"]
 
         def _mark_failed(items, pc, *, flow, scan_result, project_name, results_dir):
@@ -666,7 +691,7 @@ class TestUpdateFinalise:
                 )
             ]
 
-        mock_merge = MagicMock(return_value=True)
+        mock_promote = MagicMock(return_value=True)
         monkeypatch.setattr(
             "maintenance_man.cli.process_vulns",
             MagicMock(side_effect=_mark_failed),
@@ -677,65 +702,24 @@ class TestUpdateFinalise:
         monkeypatch.setattr(
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
         )
-        monkeypatch.setattr("maintenance_man.cli.git_merge_fast_forward", mock_merge)
+        monkeypatch.setattr(
+            "maintenance_man.cli.promote_bookmark_to_main", mock_promote
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 4
-        mock_merge.assert_not_called()
+        mock_promote.assert_not_called()
         assert scan_result.vulnerabilities[0].update_status == UpdateStatus.FAILED
 
-    def test_merge_aborts_when_main_is_dirty(
+    def test_promote_removes_workspace_before_deleting_bookmark(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """A dirty main checkout must not be merged into silently."""
-        from maintenance_man.vcs import RepoDirtyError
-
-        scan_result: ScanResult = mock_update_cli_deps["scan_result"]
-
-        def _mark_ready(items, pc, *, flow, scan_result, project_name, results_dir):
-            for it in items:
-                it.update_status = UpdateStatus.READY
-                it.flow = flow
-            return [UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)]
-
-        mock_merge = MagicMock(return_value=True)
-        monkeypatch.setattr(
-            "maintenance_man.cli.process_vulns",
-            MagicMock(side_effect=_mark_ready),
-        )
-        monkeypatch.setattr(
-            "maintenance_man.cli.process_updates",
-            MagicMock(side_effect=_mark_ready),
-        )
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
-        )
-        monkeypatch.setattr(
-            "maintenance_man.cli.check_repo_clean",
-            MagicMock(side_effect=RepoDirtyError("dirty local main")),
-        )
-        monkeypatch.setattr("maintenance_man.cli.git_merge_fast_forward", mock_merge)
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["update", "vulnerable"])
-
-        assert exc_info.value.code == 4
-        mock_merge.assert_not_called()
-        assert scan_result.vulnerabilities[0].update_status == UpdateStatus.READY
-        assert scan_result.updates[0].update_status == UpdateStatus.READY
-
-    def test_merge_removes_worktree_before_deleting_branch(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: dict,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """Branch delete must follow worktree removal, else git refuses."""
+        """Bookmark delete must follow workspace removal."""
 
         def _mark_ready(items, pc, *, flow, scan_result, project_name, results_dir):
             for it in items:
@@ -745,11 +729,11 @@ class TestUpdateFinalise:
 
         call_order: list[str] = []
 
-        def _track_remove_worktree(p, w):
-            call_order.append("remove_worktree")
+        def _track_remove_workspace(p, project):
+            call_order.append("remove_workspace")
 
-        def _track_delete_branch(b, p):
-            call_order.append(f"delete_branch:{b}")
+        def _track_delete_bookmark(b, p):
+            call_order.append(f"delete_bookmark:{b}")
             return True
 
         monkeypatch.setattr(
@@ -764,19 +748,73 @@ class TestUpdateFinalise:
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.remove_worktree", _track_remove_worktree
+            "maintenance_man.cli.remove_workspace", _track_remove_workspace
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.git_delete_branch", _track_delete_branch
+            "maintenance_man.cli.delete_bookmark", _track_delete_bookmark
         )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 0
-        delete_idx = call_order.index("delete_branch:mm/update-dependencies")
-        first_remove = call_order.index("remove_worktree")
+        delete_idx = call_order.index("delete_bookmark:mm/update-dependencies")
+        first_remove = call_order.index("remove_workspace")
         assert first_remove < delete_idx
+
+    def test_fresh_update_creates_workspace_bookmark_and_new_change(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        calls: list[tuple[str, tuple]] = []
+
+        monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: False)
+        monkeypatch.setattr(
+            "maintenance_man.cli.prune_stale_bookmarks",
+            lambda p: calls.append(("prune", (p,))) or True,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.ensure_main_bookmark",
+            lambda p: calls.append(("ensure-main", (p,))) or True,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.delete_bookmark",
+            lambda b, p: calls.append(("delete", (b, p))) or True,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.create_or_reset_bookmark",
+            lambda b, p, r: calls.append(("set", (b, p, r))) or True,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.create_workspace",
+            lambda repo, project, rev: calls.append(("workspace", (repo, project, rev)))
+            or True,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.edit_new_change",
+            lambda path, rev: calls.append(("new", (path, rev))) or True,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_vulns", MagicMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_updates", MagicMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
+        )
+
+        with pytest.raises(SystemExit):
+            app(["update", "vulnerable"])
+
+        names = [name for name, _ in calls]
+        assert names[:5] == ["prune", "ensure-main", "set", "workspace", "new"]
+        assert calls[2][1][0] == "mm/update-dependencies"
+        assert calls[2][1][2] == "main"
+        assert calls[3][1][2] == "main"
+        assert calls[4][1][1] == "mm/update-dependencies"
 
 
 class TestUpdateAll:

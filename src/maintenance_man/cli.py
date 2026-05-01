@@ -69,23 +69,31 @@ from maintenance_man.updater import (
 )
 from maintenance_man.vcs import (
     GitHubCLINotFoundError,
+    JJCLINotFoundError,
     RepoDirtyError,
+    bookmark_exists,
     check_gh_available,
+    check_jj_available,
     check_repo_clean,
-    create_worktree,
+    create_or_reset_bookmark,
+    create_workspace,
+    delete_bookmark,
+    edit_new_change,
+    ensure_main_bookmark,
     ensure_on_main,
     get_current_branch,
     git_branch_exists,
     git_checkout,
     git_create_branch,
-    git_delete_branch,
-    git_merge_fast_forward,
     git_replace_branch,
+    promote_bookmark_to_main,
+    prune_stale_bookmarks,
     prune_stale_branches,
     push_and_create_pr,
-    remove_worktree,
+    remove_workspace,
     reset_to_main,
     sync_main,
+    workspace_path_for_project,
 )
 
 
@@ -112,7 +120,7 @@ console = Console()
 
 _TABLE_STYLE = dict(show_edge=False, pad_edge=False, box=None)
 
-_UPDATE_BRANCH = "mm/update-dependencies"
+_UPDATE_BOOKMARK = "mm/update-dependencies"
 _RESOLVE_BRANCH = "mm/resolve-dependencies"
 
 app = cyclopts.App(
@@ -275,7 +283,8 @@ def update(
 
     try:
         check_gh_available()
-    except GitHubCLINotFoundError as e:
+        check_jj_available()
+    except (GitHubCLINotFoundError, JJCLINotFoundError) as e:
         _fatal(str(e))
 
     if mode == "single":
@@ -356,10 +365,10 @@ def _update_batch(
 ) -> tuple[list[UpdateResult], bool] | None:
     """Process all actionable findings for a single project (batch mode).
 
-    Returns ``(results, merge_failed)``. ``merge_failed`` is ``True`` only when
-    the post-batch merge-to-main step was attempted and failed; when merge was
-    skipped (per-finding failures) or succeeded it is ``False``. Returns
-    ``None`` if the project was skipped due to an error.
+    Returns ``(results, promotion_failed)``. ``promotion_failed`` is ``True``
+    only when the post-batch bookmark promotion step was attempted and failed;
+    when promotion was skipped (per-finding failures) or succeeded it is
+    ``False``. Returns ``None`` if the project was skipped due to an error.
     """
     try:
         scan_result = load_scan_results(project, results_dir)
@@ -382,7 +391,7 @@ def _update_batch(
     _warn_missing_test_config(project, proj_config)
 
     try:
-        wt_path = _enter_update_worktree(project, proj_config, scan_result)
+        wt_path = _enter_update_workspace(project, proj_config, scan_result)
     except _UpdateSetupError as e:
         console.print(f"  [bold red]Error:[/] {project} — {e}")
         return None
@@ -390,7 +399,7 @@ def _update_batch(
     work_config = proj_config.model_copy(update={"path": wt_path})
 
     finalised = False
-    merge_attempted = False
+    promotion_attempted = False
     try:
         _print_scan_result(scan_result)
 
@@ -409,16 +418,16 @@ def _update_batch(
         any_failed_finding = _has_update_failures(scan_result)
 
         if not (any_failed_result or any_failed_finding):
-            merge_attempted = True
+            promotion_attempted = True
             finalised = _finalise_local_update(
                 proj_config.path, scan_result, project, results_dir
             )
     finally:
-        remove_worktree(proj_config.path, wt_path)
+        remove_workspace(proj_config.path, project)
 
     if finalised:
-        git_delete_branch(_UPDATE_BRANCH, proj_config.path)
-    return (all_results, merge_attempted and not finalised)
+        delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
+    return (all_results, promotion_attempted and not finalised)
 
 
 def _update_batch_targets(
@@ -451,8 +460,8 @@ def _update_batch_targets(
         if outcome is None:
             had_errors = True
             continue
-        results, merge_failed = outcome
-        if merge_failed:
+        results, promotion_failed = outcome
+        if promotion_failed:
             had_errors = True
         if results:
             all_project_results.append((name, results))
@@ -469,36 +478,39 @@ class _UpdateSetupError(Exception):
     pass
 
 
-def _enter_update_worktree(
+def _enter_update_workspace(
     project: str, proj_config: ProjectConfig, scan_result: ScanResult
 ) -> Path:
-    """Create (fresh) or attach (resume) the update worktree. Returns its path."""
-    wt_path = _config.MM_HOME / "worktrees" / project
-    if wt_path.exists():
-        remove_worktree(proj_config.path, wt_path)
+    """Create a fresh or resumed update jj workspace. Returns its path."""
+    remove_workspace(proj_config.path, project)
+    workspace_path = workspace_path_for_project(project)
 
     if _has_update_progress(scan_result):
-        if not git_branch_exists(_UPDATE_BRANCH, proj_config.path):
+        if not bookmark_exists(_UPDATE_BOOKMARK, proj_config.path):
             raise _UpdateSetupError(
-                f"update branch '{_UPDATE_BRANCH}' is missing but in-progress "
+                f"update bookmark '{_UPDATE_BOOKMARK}' is missing but in-progress "
                 f"state exists — rescan required"
             )
-        if not create_worktree(
-            proj_config.path, wt_path, branch=_UPDATE_BRANCH, detach=False
-        ):
-            raise _UpdateSetupError("could not attach worktree to update branch")
-        return wt_path
+        if not create_workspace(proj_config.path, project, _UPDATE_BOOKMARK):
+            raise _UpdateSetupError("could not attach workspace to update bookmark")
+        if not edit_new_change(workspace_path, _UPDATE_BOOKMARK):
+            raise _UpdateSetupError("could not create clean change on update bookmark")
+        return workspace_path
 
-    if git_branch_exists(_UPDATE_BRANCH, proj_config.path):
-        git_delete_branch(_UPDATE_BRANCH, proj_config.path)
-    if not prune_stale_branches(proj_config.path):
+    if not prune_stale_bookmarks(proj_config.path):
         raise _UpdateSetupError("failed to sync trunk")
-    if not create_worktree(proj_config.path, wt_path, branch="main", detach=True):
-        raise _UpdateSetupError("could not create worktree")
-    if not git_create_branch(_UPDATE_BRANCH, wt_path):
-        remove_worktree(proj_config.path, wt_path)
-        raise _UpdateSetupError("could not create update branch")
-    return wt_path
+    if not ensure_main_bookmark(proj_config.path):
+        raise _UpdateSetupError("main bookmark not found")
+    if bookmark_exists(_UPDATE_BOOKMARK, proj_config.path):
+        delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
+    if not create_or_reset_bookmark(_UPDATE_BOOKMARK, proj_config.path, "main"):
+        raise _UpdateSetupError("could not create update bookmark")
+    if not create_workspace(proj_config.path, project, "main"):
+        raise _UpdateSetupError("could not create workspace")
+    if not edit_new_change(workspace_path, _UPDATE_BOOKMARK):
+        remove_workspace(proj_config.path, project)
+        raise _UpdateSetupError("could not create update change")
+    return workspace_path
 
 
 def _run_update_flow(
@@ -511,9 +523,9 @@ def _run_update_flow(
     *,
     interactive: bool,
 ) -> int:
-    """Set up the worktree, process findings, finalise. Returns exit code."""
+    """Set up the workspace, process findings, finalise. Returns exit code."""
     try:
-        wt_path = _enter_update_worktree(project, proj_config, scan_result)
+        wt_path = _enter_update_workspace(project, proj_config, scan_result)
     except _UpdateSetupError as e:
         _fatal(str(e))
 
@@ -553,12 +565,12 @@ def _run_update_flow(
             proj_config.path, scan_result, project, results_dir
         )
     finally:
-        remove_worktree(proj_config.path, wt_path)
+        remove_workspace(proj_config.path, project)
 
     if not finalised:
         return ExitCode.UPDATE_FAILED
 
-    git_delete_branch(_UPDATE_BRANCH, proj_config.path)
+    delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
     return ExitCode.OK
 
 
@@ -656,7 +668,7 @@ def _print_update_summary(all_results: list[UpdateResult]) -> None:
     if failed:
         phase_labels = {
             "apply": "install failed",
-            "branch": "branch creation failed",
+            "branch": "bookmark creation failed",
             "commit": "commit failed",
         }
         for r in failed:
@@ -734,27 +746,15 @@ def _finalise_local_update(
     project_name: str,
     results_dir: Path,
 ) -> bool:
-    """Fast-forward `_UPDATE_BRANCH` into main and promote READY findings.
+    """Promote `_UPDATE_BOOKMARK` to main and promote READY findings.
 
-    Refuses to merge when the main checkout has uncommitted changes — those
-    changes would otherwise be silently mixed with automation output. Branch
-    cleanup is deferred to the caller so the worktree can be removed first.
+    Dirty-tree checks are unnecessary here because update work runs in an
+    isolated jj workspace, then only the managed bookmark is promoted.
     """
-    try:
-        check_repo_clean(orig_path)
-    except RepoDirtyError as e:
+    if not promote_bookmark_to_main(orig_path, _UPDATE_BOOKMARK):
         console.print(
-            f"[bold red]Merge aborted:[/] {orig_path} has uncommitted changes — "
-            f"{_UPDATE_BRANCH} kept for manual recovery.\n{e}"
-        )
-        return False
-    if not ensure_on_main(orig_path):
-        console.print("[bold red]Error:[/] could not checkout main for merge")
-        return False
-    if not git_merge_fast_forward(_UPDATE_BRANCH, orig_path):
-        console.print(
-            f"[bold red]Merge failed:[/] {_UPDATE_BRANCH} could not fast-forward "
-            f"into main"
+            f"[bold red]Promotion failed:[/] {_UPDATE_BOOKMARK} could not be "
+            f"promoted to main"
         )
         return False
 
@@ -767,7 +767,7 @@ def _finalise_local_update(
 
     remove_completed_findings(scan_result)
     save_scan_results(project_name, results_dir, scan_result)
-    console.print(f"[bold green]Merged {_UPDATE_BRANCH} into main.[/]")
+    console.print(f"[bold green]Promoted {_UPDATE_BOOKMARK} to main.[/]")
     return True
 
 
