@@ -28,9 +28,10 @@ from maintenance_man.uv_dependencies import (
     get_uv_dependency_locations,
 )
 from maintenance_man.vcs import (
-    discard_changes,
-    git_commit_all,
-    git_has_changes,
+    commit_current_change,
+    create_or_reset_bookmark,
+    current_change_has_changes,
+    discard_current_change,
 )
 
 
@@ -106,6 +107,11 @@ _RISK_ORDER = {
     SemverTier.MINOR: 1,
     SemverTier.MAJOR: 2,
     SemverTier.UNKNOWN: 3,
+}
+
+_WORKFLOW_BOOKMARKS = {
+    Workflow.UPDATE: "mm/update-dependencies",
+    Workflow.RESOLVE: "mm/resolve-dependencies",
 }
 
 
@@ -267,7 +273,7 @@ def process_vulns(
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process vuln fixes in the single-branch update flow."""
+    """Process vuln fixes in the single-bookmark update flow."""
     actionable = [v for v in vulns if v.actionable]
     consolidated = consolidate_vulns(actionable)
     return process_findings(
@@ -290,7 +296,7 @@ def process_updates(
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process updates in the single-branch update flow, risk-ascending."""
+    """Process updates in the single-bookmark update flow, risk-ascending."""
     sorted_updates = sort_updates_by_risk(updates)
     return process_findings(
         sorted_updates,
@@ -421,7 +427,7 @@ def process_findings(
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
-    """Process findings on the current branch using plain git.
+    """Process findings on the current jj change.
 
     *on_failure* controls behaviour when an update or test fails:
 
@@ -469,7 +475,7 @@ def process_findings(
             passed, failed_phase = run_test_phases(project_config, project_path)
 
         if passed:
-            if not git_has_changes(project_path):
+            if not current_change_has_changes(project_path):
                 rprint(f"  [bold green]PASS[/] {f.pkg_name} [dim](already applied)[/]")
                 f.update_status = UpdateStatus.READY
                 f.failed_phase = None
@@ -481,7 +487,7 @@ def process_findings(
                     new=f.target_version,
                     detail=f.detail,
                 )
-                if not git_commit_all(msg, project_path):
+                if not commit_current_change(project_path, msg):
                     results.append(
                         _record_failure(
                             f,
@@ -498,6 +504,23 @@ def process_findings(
                     if on_failure == "stop":
                         break
                     continue
+                if not create_or_reset_bookmark(
+                    _WORKFLOW_BOOKMARKS[flow], project_path, "@-"
+                ):
+                    results.append(
+                        _record_failure(
+                            f,
+                            flow_cfg.kind,
+                            "commit",
+                            project_path,
+                            scan_result,
+                            flow,
+                            project_name,
+                            results_dir,
+                            discard=False,
+                        )
+                    )
+                    break
                 rprint(f"  [bold green]PASS[/] {f.pkg_name}")
                 f.update_status = UpdateStatus.READY
                 f.failed_phase = None
@@ -505,7 +528,7 @@ def process_findings(
         else:
             rprint(f"  [bold red]FAIL[/] {f.pkg_name} — {failed_phase} failed")
             if on_failure == "continue":
-                discard_changes(project_path)
+                discard_current_change(project_path)
             f.update_status = UpdateStatus.FAILED
             f.failed_phase = failed_phase
             f.flow = flow
@@ -551,7 +574,7 @@ def _record_failure(
 ) -> UpdateResult:
     """Mark finding as failed, optionally discard changes, persist and return."""
     if discard:
-        discard_changes(project_path)
+        discard_current_change(project_path)
     finding.update_status = UpdateStatus.FAILED
     finding.failed_phase = phase
     finding.flow = flow

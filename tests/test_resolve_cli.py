@@ -636,7 +636,7 @@ class TestResolveContinue:
         from maintenance_man import updater
 
         mock_commit = MagicMock(return_value=True)
-        monkeypatch.setattr(updater, "git_commit_all", mock_commit)
+        monkeypatch.setattr(updater, "commit_current_change", mock_commit)
         monkeypatch.setattr(
             "maintenance_man.cli.run_test_phases", lambda cfg, p: (True, None)
         )
