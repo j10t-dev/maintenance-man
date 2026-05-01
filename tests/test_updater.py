@@ -94,10 +94,12 @@ def scan_result() -> ScanResult:
 
 @pytest.fixture()
 def mock_local_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    """Mock VCS and updater calls for single-branch update processing."""
+    """Mock VCS and updater calls for single-bookmark update processing."""
     mocks = {}
     for name, default in [
-        ("git_commit_all", True),
+        ("commit_current_change", True),
+        ("current_change_has_changes", True),
+        ("create_or_reset_bookmark", True),
         ("_apply_update", True),
         ("run_test_phases", (True, None)),
     ]:
@@ -105,20 +107,22 @@ def mock_local_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
         mocks[name] = mock
     mock_discard = MagicMock()
-    monkeypatch.setattr("maintenance_man.updater.discard_changes", mock_discard)
-    mocks["discard_changes"] = mock_discard
+    monkeypatch.setattr("maintenance_man.updater.discard_current_change", mock_discard)
+    mocks["discard_current_change"] = mock_discard
     return mocks
 
 
 @pytest.fixture()
 def mock_resolve_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    """Mock VCS and updater calls for single-branch resolve processing."""
+    """Mock VCS and updater calls for single-bookmark resolve processing."""
     mocks = {}
     for name, default in [
-        ("git_commit_all", True),
+        ("commit_current_change", True),
+        ("current_change_has_changes", True),
+        ("create_or_reset_bookmark", True),
         ("_apply_update", True),
         ("run_test_phases", (True, None)),
-        ("discard_changes", None),
+        ("discard_current_change", None),
     ]:
         mock = MagicMock(return_value=default)
         monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
@@ -661,6 +665,20 @@ class TestProcessFindingsLocal:
         assert update.failed_phase is None
         assert update.flow == "update"
 
+    def test_success_moves_update_bookmark_to_finished_commit(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        update = make_update(SemverTier.PATCH)
+
+        process_findings([update], project_config, flow="update")
+
+        mock_local_vcs["commit_current_change"].assert_called_once()
+        mock_local_vcs["create_or_reset_bookmark"].assert_called_once_with(
+            "mm/update-dependencies",
+            project_config.path,
+            "@-",
+        )
+
     def test_already_applied_sets_ready_and_update_flow(
         self,
         mock_local_vcs: dict[str, MagicMock],
@@ -669,7 +687,7 @@ class TestProcessFindingsLocal:
     ):
         mock_has_changes = MagicMock(return_value=False)
         monkeypatch.setattr(
-            "maintenance_man.updater.git_has_changes",
+            "maintenance_man.updater.current_change_has_changes",
             mock_has_changes,
             raising=False,
         )
@@ -682,7 +700,7 @@ class TestProcessFindingsLocal:
         assert update.update_status == UpdateStatus.READY
         assert update.failed_phase is None
         assert update.flow == "update"
-        mock_local_vcs["git_commit_all"].assert_not_called()
+        mock_local_vcs["commit_current_change"].assert_not_called()
 
     def test_failure_sets_failed_and_active_flow(
         self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
@@ -699,6 +717,19 @@ class TestProcessFindingsLocal:
         assert update.failed_phase == "unit"
         assert update.flow == "update"
 
+    def test_failure_discards_current_change_and_continues(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_local_vcs["run_test_phases"].return_value = (False, "unit")
+        update = make_update(SemverTier.PATCH)
+
+        results = process_findings([update], project_config, flow="update")
+
+        assert results[0].passed is False
+        mock_local_vcs["discard_current_change"].assert_called_once_with(
+            project_config.path
+        )
+
     def test_all_pass(
         self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
@@ -713,8 +744,8 @@ class TestProcessFindingsLocal:
         assert all(r.passed for r in results)
         assert mock_local_vcs["_apply_update"].call_count == 2
         assert mock_local_vcs["run_test_phases"].call_count == 2
-        assert mock_local_vcs["git_commit_all"].call_count == 2
-        mock_local_vcs["discard_changes"].assert_not_called()
+        assert mock_local_vcs["commit_current_change"].call_count == 2
+        mock_local_vcs["discard_current_change"].assert_not_called()
 
     def test_failure_discards_and_continues(
         self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
@@ -736,8 +767,8 @@ class TestProcessFindingsLocal:
         assert results[0].passed is True
         assert results[1].passed is False
         assert results[2].passed is True
-        mock_local_vcs["discard_changes"].assert_called_once()
-        assert mock_local_vcs["git_commit_all"].call_count == 2
+        mock_local_vcs["discard_current_change"].assert_called_once()
+        assert mock_local_vcs["commit_current_change"].call_count == 2
 
     def test_apply_failure_continues(
         self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
@@ -769,12 +800,12 @@ class TestProcessFindingsLocal:
         assert len(results) == 1
         assert results[0].passed is True
         mock_local_vcs["run_test_phases"].assert_not_called()
-        mock_local_vcs["git_commit_all"].assert_called_once()
+        mock_local_vcs["commit_current_change"].assert_called_once()
 
     def test_commit_failure_marks_finding_failed_and_continues(
         self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        mock_local_vcs["git_commit_all"].side_effect = [False, True]
+        mock_local_vcs["commit_current_change"].side_effect = [False, True]
         updates = [
             make_update(SemverTier.PATCH),
             make_update(SemverTier.MINOR),
@@ -787,16 +818,34 @@ class TestProcessFindingsLocal:
         assert results[0].failed_phase == "commit"
         assert results[1].passed is True
 
+    def test_bookmark_advancement_failure_stops_after_successful_commit(
+        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        mock_local_vcs["create_or_reset_bookmark"].return_value = False
+        updates = [
+            make_update(SemverTier.PATCH),
+            make_update(SemverTier.MINOR),
+        ]
+
+        results = process_findings(updates, project_config, flow="update")
+
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert results[0].failed_phase == "commit"
+        mock_local_vcs["commit_current_change"].assert_called_once()
+        mock_local_vcs["_apply_update"].assert_called_once()
+        mock_local_vcs["discard_current_change"].assert_not_called()
+
     def test_noop_update_without_changes_counts_as_pass(
         self,
         mock_local_vcs: dict[str, MagicMock],
         monkeypatch: pytest.MonkeyPatch,
         project_config: ProjectConfig,
     ):
-        mock_local_vcs["git_commit_all"].return_value = False
+        mock_local_vcs["commit_current_change"].return_value = False
         mock_has_changes = MagicMock(return_value=False)
         monkeypatch.setattr(
-            "maintenance_man.updater.git_has_changes",
+            "maintenance_man.updater.current_change_has_changes",
             mock_has_changes,
             raising=False,
         )
@@ -808,7 +857,7 @@ class TestProcessFindingsLocal:
         assert results[0].passed is True
         assert results[0].failed_phase is None
         assert update.update_status == UpdateStatus.READY
-        mock_local_vcs["git_commit_all"].assert_not_called()
+        mock_local_vcs["commit_current_change"].assert_not_called()
 
     def test_status_tracking(
         self,
@@ -873,6 +922,24 @@ class TestProcessFindingsResolve:
         assert update.failed_phase is None
         assert update.flow == "resolve"
 
+    def test_success_moves_resolve_bookmark_to_finished_commit(
+        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
+    ):
+        update = make_update(SemverTier.PATCH)
+
+        process_findings(
+            [update],
+            project_config,
+            flow="resolve",
+            on_failure="stop",
+        )
+
+        mock_resolve_vcs["create_or_reset_bookmark"].assert_called_once_with(
+            "mm/resolve-dependencies",
+            project_config.path,
+            "@-",
+        )
+
     def test_failure_sets_failed_and_resolve_flow(
         self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
@@ -911,10 +978,10 @@ class TestProcessFindingsResolve:
         assert len(results) == 2
         assert all(r.passed for r in results)
         assert mock_resolve_vcs["_apply_update"].call_count == 2
-        assert mock_resolve_vcs["git_commit_all"].call_count == 2
+        assert mock_resolve_vcs["commit_current_change"].call_count == 2
         assert mock_resolve_vcs["run_test_phases"].call_count == 2
 
-    def test_failure_stops_and_preserves_branch_state(
+    def test_failure_stops_and_preserves_change_state(
         self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
         mock_resolve_vcs["run_test_phases"].side_effect = [
@@ -939,8 +1006,8 @@ class TestProcessFindingsResolve:
         assert results[1].passed is False
         assert results[1].failed_phase == "unit"
         assert mock_resolve_vcs["_apply_update"].call_count == 2
-        assert mock_resolve_vcs["git_commit_all"].call_count == 1
-        mock_resolve_vcs["discard_changes"].assert_not_called()
+        assert mock_resolve_vcs["commit_current_change"].call_count == 1
+        mock_resolve_vcs["discard_current_change"].assert_not_called()
 
     def test_no_test_config_treats_update_as_pass(
         self, mock_resolve_vcs: dict[str, MagicMock], tmp_path: Path
@@ -996,10 +1063,10 @@ class TestProcessFindingsResolve:
         monkeypatch: pytest.MonkeyPatch,
         project_config: ProjectConfig,
     ):
-        mock_resolve_vcs["git_commit_all"].return_value = False
+        mock_resolve_vcs["commit_current_change"].return_value = False
         mock_has_changes = MagicMock(return_value=False)
         monkeypatch.setattr(
-            "maintenance_man.updater.git_has_changes",
+            "maintenance_man.updater.current_change_has_changes",
             mock_has_changes,
             raising=False,
         )
@@ -1016,7 +1083,7 @@ class TestProcessFindingsResolve:
         assert results[0].passed is True
         assert results[0].failed_phase is None
         assert update.update_status == UpdateStatus.READY
-        mock_resolve_vcs["git_commit_all"].assert_not_called()
+        mock_resolve_vcs["commit_current_change"].assert_not_called()
 
 
 # -- process_vulns / process_updates --
