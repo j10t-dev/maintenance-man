@@ -134,7 +134,7 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     state: dict[str, object] = {"scan_result": scan_result}
 
     monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_branches", lambda p: True)
+    monkeypatch.setattr("maintenance_man.cli.check_jj_available", lambda: None)
     monkeypatch.setattr(
         "maintenance_man.cli.load_scan_results",
         lambda name, d: state["scan_result"],
@@ -143,15 +143,29 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         "maintenance_man.cli.save_scan_results",
         lambda name, d, sr: None,
     )
+    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda p: True)
+    monkeypatch.setattr("maintenance_man.cli.ensure_main_bookmark", lambda p: True)
     monkeypatch.setattr(
-        "maintenance_man.cli.create_worktree",
-        lambda p, w, **kw: True,
+        "maintenance_man.cli.create_workspace",
+        lambda repo_path, project, revision: True,
     )
-    monkeypatch.setattr("maintenance_man.cli.remove_worktree", lambda p, w: None)
-    monkeypatch.setattr("maintenance_man.cli.git_branch_exists", lambda b, p: False)
-    monkeypatch.setattr("maintenance_man.cli.git_create_branch", lambda b, p: True)
-    monkeypatch.setattr("maintenance_man.cli.git_merge_fast_forward", lambda b, p: True)
-    monkeypatch.setattr("maintenance_man.cli.git_delete_branch", lambda b, p: True)
-    monkeypatch.setattr("maintenance_man.cli.ensure_on_main", lambda p: True)
-    monkeypatch.setattr("maintenance_man.cli.check_repo_clean", lambda p: None)
+    monkeypatch.setattr(
+        "maintenance_man.cli.remove_workspace",
+        lambda repo_path, project: None,
+    )
+    monkeypatch.setattr(
+        "maintenance_man.cli.workspace_path_for_project",
+        lambda project: Path("/tmp/mm-workspaces") / project,
+    )
+    monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: False)
+    monkeypatch.setattr(
+        "maintenance_man.cli.create_or_reset_bookmark",
+        lambda b, p, r: True,
+    )
+    monkeypatch.setattr(
+        "maintenance_man.cli.promote_bookmark_to_main",
+        lambda p, b: True,
+    )
+    monkeypatch.setattr("maintenance_man.cli.delete_bookmark", lambda b, p: True)
+    monkeypatch.setattr("maintenance_man.cli.edit_new_change", lambda p, r: True)
     return state
