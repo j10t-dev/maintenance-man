@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "cyclopts==4.11.0",
-    "packaging==26.1",
+    "packaging==26.2",
     "pydantic==2.13.3",
     "pygments==2.20.0",
     "pytest==9.0.3",
