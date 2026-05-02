@@ -37,7 +37,7 @@ class TestDeployCommand:
         """Deploy with no project triggers mass mode (exits OK with no projects)."""
         mm_home.mkdir(parents=True, exist_ok=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy"])
@@ -65,7 +65,7 @@ class TestTodoCommand:
 
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text(
             f'[projects.alpha]\npath = "{alpha_dir}"\npackage_manager = "uv"\n\n'
             f'[projects.beta]\npath = "{beta_dir}"\npackage_manager = "uv"\n'
@@ -141,7 +141,7 @@ class TestTodoCommand:
         """mm todo with no projects configured prints message and exits 0."""
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
         with pytest.raises(SystemExit) as exc_info:
             app(["todo"])

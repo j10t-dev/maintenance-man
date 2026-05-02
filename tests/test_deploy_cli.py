@@ -334,7 +334,7 @@ class TestMassDeployCommand:
         """Mass deploy with no projects prints message and exits OK."""
         mm_home.mkdir(parents=True, exist_ok=True)
         (mm_home / "scan-results").mkdir()
-        (mm_home / "worktrees").mkdir()
+        (mm_home / "workspaces").mkdir()
         (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy"], exit_on_error=False)

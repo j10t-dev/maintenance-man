@@ -1,7 +1,9 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
+from maintenance_man.cli import _current_label
 from maintenance_man.models.activity import (
     ActivityEvent,
     load_activity,
@@ -51,6 +53,22 @@ class TestLoadActivity:
         assert "myapp" in result
         assert result["myapp"].last_build is not None
         assert result["myapp"].last_build.success is True
+
+
+class TestCliCurrentLabel:
+    def test_uses_jj_current_label(self, tmp_path: Path, monkeypatch):
+        mock_label = MagicMock(return_value="mm/update-dependencies")
+        monkeypatch.setattr("maintenance_man.cli.current_label", mock_label)
+
+        assert _current_label(tmp_path) == "mm/update-dependencies"
+        mock_label.assert_called_once_with(tmp_path)
+
+    def test_never_raises(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            "maintenance_man.cli.current_label", MagicMock(side_effect=RuntimeError)
+        )
+
+        assert _current_label(tmp_path) == "unknown"
 
 
 class TestRecordActivity:
