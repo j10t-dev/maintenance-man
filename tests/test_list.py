@@ -33,7 +33,7 @@ def list_project_home(mm_home: Path) -> Path:
     project_dir.mkdir()
     mm_home.mkdir(parents=True)
     (mm_home / "scan-results").mkdir()
-    (mm_home / "worktrees").mkdir()
+    (mm_home / "workspaces").mkdir()
     (mm_home / "config.toml").write_text(
         f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "uv"\n'
     )

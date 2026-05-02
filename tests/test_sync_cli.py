@@ -65,6 +65,23 @@ class TestSyncCommand:
         # Both projects were attempted despite the first failure
         assert mock_sync.call_count == 2
 
+    def test_delegates_to_sync_main_without_extra_vcs_context(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_sync = MagicMock(return_value=(True, ""))
+        mock_label = MagicMock(side_effect=AssertionError("must not inspect label"))
+        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
+        monkeypatch.setattr("maintenance_man.cli.current_label", mock_label)
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["sync", "vulnerable"])
+
+        assert exc_info.value.code == ExitCode.OK
+        mock_sync.assert_called_once()
+        mock_label.assert_not_called()
+
     def test_no_configured_projects(
         self,
         mm_home: Path,

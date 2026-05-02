@@ -11,7 +11,7 @@ import cyclopts
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 from maintenance_man import __version__
@@ -70,28 +70,21 @@ from maintenance_man.updater import (
 from maintenance_man.vcs import (
     GitHubCLINotFoundError,
     JJCLINotFoundError,
-    RepoDirtyError,
     bookmark_exists,
     check_gh_available,
     check_jj_available,
-    check_repo_clean,
     create_or_reset_bookmark,
     create_workspace,
+    current_change_has_changes,
+    current_label,
     delete_bookmark,
     edit_new_change,
     ensure_main_bookmark,
-    ensure_on_main,
-    get_current_branch,
-    git_branch_exists,
-    git_checkout,
-    git_create_branch,
-    git_replace_branch,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
-    prune_stale_branches,
-    push_and_create_pr,
+    push_bookmark_and_create_pr,
     remove_workspace,
-    reset_to_main,
+    resolve_bookmark_contains_current_change,
     sync_main,
     workspace_path_for_project,
 )
@@ -121,7 +114,7 @@ console = Console()
 _TABLE_STYLE = dict(show_edge=False, pad_edge=False, box=None)
 
 _UPDATE_BOOKMARK = "mm/update-dependencies"
-_RESOLVE_BRANCH = "mm/resolve-dependencies"
+_RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
 app = cyclopts.App(
     name="mm",
@@ -835,7 +828,8 @@ def resolve(
 
     try:
         check_gh_available()
-    except GitHubCLINotFoundError as e:
+        check_jj_available()
+    except (GitHubCLINotFoundError, JJCLINotFoundError) as e:
         _fatal(str(e))
 
     scan_result, actionable_vulns, updates = _load_validated_scan(
@@ -847,22 +841,17 @@ def resolve(
             _handle_resolve_continue(project, proj_config, scan_result, results_dir)
         )
 
-    try:
-        check_repo_clean(proj_config.path)
-    except RepoDirtyError as e:
-        console.print(f"  [bold yellow]Warning:[/] {e}")
-        if not Confirm.ask("  Discard local changes and reset to main?", default=False):
-            _fatal("aborted: working tree is dirty")
-        reset_to_main(proj_config.path)
-
-    if not ensure_on_main(proj_config.path):
-        _fatal(f"could not checkout main for [bold]{project}[/]")
-    if not prune_stale_branches(proj_config.path):
+    if not prune_stale_bookmarks(proj_config.path):
         _fatal("failed to sync trunk")
-    if not _prepare_resolve_branch(project, proj_config.path):
-        _fatal(f"aborted resolve for [bold]{project}[/]")
+    if not ensure_main_bookmark(proj_config.path):
+        _fatal("main bookmark not found")
+    if _ordered_failed_findings(scan_result):
+        _fatal(f"resolve already paused for [bold]{project}[/] — rerun with --continue")
 
     candidates = _ordered_resolve_candidates(scan_result)
+    if not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
+        _fatal(f"aborted resolve for [bold]{project}[/]")
+
     sys.exit(
         _run_resolve_findings(
             project, proj_config, scan_result, results_dir, candidates
@@ -939,22 +928,34 @@ def _ordered_ready_findings(
     ]
 
 
-def _prepare_resolve_branch(project: str, project_path: Path) -> bool:
-    """Create or replace ``_RESOLVE_BRANCH``, prompting on collision."""
-    if not git_branch_exists(_RESOLVE_BRANCH, project_path):
-        return git_create_branch(_RESOLVE_BRANCH, project_path)
-
-    choice = Prompt.ask(
-        f"  Branch {_RESOLVE_BRANCH} already exists for {project}. "
-        f"[r]esume/[d]iscard/[a]bort",
-        choices=["r", "d", "a"],
-        default="a",
+def _has_ready_resolve_progress(scan_result: ScanResult) -> bool:
+    return any(
+        f.update_status == UpdateStatus.READY and f.flow == Workflow.RESOLVE
+        for f in (*scan_result.vulnerabilities, *scan_result.updates)
     )
-    if choice == "r":
-        return git_checkout(_RESOLVE_BRANCH, project_path)
-    if choice == "d":
-        return git_replace_branch(_RESOLVE_BRANCH, project_path)
-    return False
+
+
+def _prepare_resolve_bookmark(
+    project_path: Path,
+    scan_result: ScanResult,
+    candidates: list[Finding],
+) -> bool:
+    """Create or resume the resolve bookmark without dropping committed progress."""
+    if _has_ready_resolve_progress(scan_result):
+        if not bookmark_exists(_RESOLVE_BOOKMARK, project_path):
+            _fatal(
+                f"resolve bookmark '{_RESOLVE_BOOKMARK}' is missing but "
+                "in-progress state exists — rescan or recover the bookmark manually"
+            )
+        if candidates:
+            return edit_new_change(project_path, _RESOLVE_BOOKMARK)
+        return True
+
+    if bookmark_exists(_RESOLVE_BOOKMARK, project_path):
+        delete_bookmark(_RESOLVE_BOOKMARK, project_path)
+    if not create_or_reset_bookmark(_RESOLVE_BOOKMARK, project_path, "main"):
+        return False
+    return edit_new_change(project_path, _RESOLVE_BOOKMARK)
 
 
 def _run_resolve_findings(
@@ -984,29 +985,29 @@ def _run_resolve_findings(
     ready_findings = _ordered_ready_findings(scan_result, flow=Workflow.RESOLVE)
     if not ready_findings:
         return ExitCode.OK
-    return _submit_resolve_branch(
+    return _submit_resolve_bookmark(
         project, proj_config.path, results_dir, scan_result, ready_findings
     )
 
 
-def _submit_resolve_branch(
+def _submit_resolve_bookmark(
     project: str,
     project_path: Path,
     results_dir: Path,
     scan_result: ScanResult,
     ready_findings: list[Finding],
 ) -> int:
-    """Push the resolve branch, open a PR, and promote READY findings on success."""
+    """Push the resolve bookmark, open a PR, and promote READY findings on success."""
     for f in ready_findings:
         f.failed_phase = None
 
-    ok, output = push_and_create_pr(project_path)
+    ok, output = push_bookmark_and_create_pr(project_path, _RESOLVE_BOOKMARK)
     if output:
         console.print(f"  [dim]{output}[/]")
     if not ok:
         save_scan_results(project, results_dir, scan_result)
         console.print(
-            f"  [bold yellow]Submit failed.[/] Keeping {_RESOLVE_BRANCH} "
+            f"  [bold yellow]Submit failed.[/] Keeping {_RESOLVE_BOOKMARK} "
             f"for manual recovery."
         )
         return ExitCode.UPDATE_FAILED
@@ -1026,14 +1027,17 @@ def _handle_resolve_continue(
     scan_result: ScanResult,
     results_dir: Path,
 ) -> int:
-    """Retest the paused blocker on the resolve branch."""
-    if get_current_branch(proj_config.path) != _RESOLVE_BRANCH:
-        _fatal(f"--continue requires being on {_RESOLVE_BRANCH}")
-    try:
-        check_repo_clean(proj_config.path)
-    except RepoDirtyError:
+    """Retest the paused blocker on the resolve bookmark."""
+    if not resolve_bookmark_contains_current_change(
+        proj_config.path, _RESOLVE_BOOKMARK
+    ):
         _fatal(
-            "--continue requires a clean working tree — commit or discard "
+            f"--continue requires current jj change to descend from "
+            f"{_RESOLVE_BOOKMARK}"
+        )
+    if current_change_has_changes(proj_config.path):
+        _fatal(
+            "--continue requires an empty current jj change — commit or discard "
             "manual changes first"
         )
 
@@ -1042,19 +1046,23 @@ def _handle_resolve_continue(
         passed, failed_phase = run_test_phases(proj_config, proj_config.path)
         for blocker in failed:
             blocker.flow = Workflow.RESOLVE
-            if passed:
-                blocker.update_status = UpdateStatus.READY
-                blocker.failed_phase = None
-            else:
+            if not passed:
                 blocker.update_status = UpdateStatus.FAILED
                 blocker.failed_phase = failed_phase
-        save_scan_results(project, results_dir, scan_result)
         if not passed:
+            save_scan_results(project, results_dir, scan_result)
             names = ", ".join(b.pkg_name for b in failed)
             console.print(
                 f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
             )
             return ExitCode.UPDATE_FAILED
+        if not create_or_reset_bookmark(_RESOLVE_BOOKMARK, proj_config.path, "@-"):
+            save_scan_results(project, results_dir, scan_result)
+            _fatal(f"could not move {_RESOLVE_BOOKMARK} to the committed manual fix")
+        for blocker in failed:
+            blocker.update_status = UpdateStatus.READY
+            blocker.failed_phase = None
+        save_scan_results(project, results_dir, scan_result)
         for blocker in failed:
             console.print(f"  [bold green]PASS[/] {blocker.pkg_name}")
 
@@ -1222,7 +1230,7 @@ def _record_deploy_activity(
 ) -> None:
     """Record build/deploy activity for a project."""
     activity_path = _config.MM_HOME / "activity.json"
-    branch = _safe_branch(project_path)
+    branch = _current_label(project_path)
     record_activity(activity_path, project, event_type, success=success, branch=branch)
 
 
@@ -1414,7 +1422,7 @@ def build(
     console.print(f"[bold]Building {project}[/]\n")
 
     activity_path = _config.MM_HOME / "activity.json"
-    branch = _safe_branch(proj_config.path)
+    branch = _current_label(proj_config.path)
     try:
         run_build(project, proj_config.build_command, proj_config.path)
     except BuildError as e:
@@ -1565,10 +1573,10 @@ def _print_project_todo(name: str, project_path: Path) -> None:
     console.print(Panel(Markdown(content), title=name))
 
 
-def _safe_branch(project_path: Path) -> str:
-    """Get current branch, returning 'unknown' on any failure."""
+def _current_label(project_path: Path) -> str:
+    """Get current jj label, returning 'unknown' on any failure."""
     try:
-        return get_current_branch(project_path)
+        return current_label(project_path)
     except Exception:
         return "unknown"
 
@@ -1642,7 +1650,7 @@ def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -
 def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
     """Scan a single project with timing output."""
     try:
-        prune_stale_branches(proj_config.path)
+        prune_stale_bookmarks(proj_config.path)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
 

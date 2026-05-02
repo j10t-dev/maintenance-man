@@ -6,11 +6,9 @@ Maintenance Man(ager) is a CLI helper that makes the routine maintenance of your
 
 `mm` is a CLI tool that assists in the maintenance of configured projects. It supports the following core workflow: 
 
-1. Scan project(s) for vulnerabilities, dependency updates and exposed secrets (via)
-2. Update dependencies, validate via the target project's unit/integration/component tests.
-  a. Each passing dependency update gets its own commit and branch. 
-  b. All passing updates are submitted as a GitHub pull request.
-3. Build the deploy artifacts for the updated project(s) (if relevant)
+1. Scan project(s) for vulnerabilities, dependency updates and exposed secrets.
+2. Update dependencies, validate via the target project's unit/integration/component tests, and create jj commits for passing updates.
+3. Build the deploy artefacts for the updated project(s), if relevant.
 4. Deploy updated application(s) and validate via healthchecking.
 
 ## Why 
@@ -97,9 +95,21 @@ min_version_age_days = 7 # how old dependencies should be before trivy reports t
 healthcheck_url = "http://healthchecker:8080" # the URL of your healthchecker service (if using)
 ```
 
+## VCS workflow
+
+Configured projects are expected to be colocated jj/Git repositories with a GitHub `origin` remote and a `main` bookmark. Git detached HEAD is normal under jj and is not treated as an error.
+
+`mm update` uses the `mm/update-dependencies` bookmark and a temporary jj workspace under `~/.mm/workspaces/<project>`. Passing findings are committed and the bookmark is promoted to `main` locally; run `mm sync` to publish `main`.
+
+`mm resolve` uses the `mm/resolve-dependencies` bookmark for manual fixes. When the findings are ready, the bookmark is pushed and a GitHub PR is opened from that bookmark.
+
+`mm sync` fetches and pushes the `main` bookmark directly. It does not switch branches or depend on Git checkout state.
+
 ## Requirements
 
 * trivy
+* jj
+* gh
 * Python 3.14
 * uv
 
