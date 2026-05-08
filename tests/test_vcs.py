@@ -26,6 +26,7 @@ from maintenance_man.vcs import (
     promote_bookmark_to_main,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
+    refresh_working_copy_from_main,
     remove_workspace,
     resolve_bookmark_contains_current_change,
     sync_main,
@@ -245,6 +246,19 @@ class TestChangeHelpers:
     ):
         mock_run.return_value = _completed(returncode=1, stderr="restore failed")
         assert discard_current_change(tmp_path) is False
+
+
+class TestRefreshWorkingCopyFromMain:
+    @patch("maintenance_man.vcs._run")
+    def test_success_returns_true(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed()
+        assert refresh_working_copy_from_main(tmp_path) is True
+        mock_run.assert_called_once_with(["jj", "new", "main"], tmp_path)
+
+    @patch("maintenance_man.vcs._run")
+    def test_failure_returns_false(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(returncode=1, stderr="new failed")
+        assert refresh_working_copy_from_main(tmp_path) is False
 
 
 class TestResolveBookmarkContainsCurrentChange:

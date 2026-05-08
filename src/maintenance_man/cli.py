@@ -83,6 +83,7 @@ from maintenance_man.vcs import (
     promote_bookmark_to_main,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
+    refresh_working_copy_from_main,
     remove_workspace,
     resolve_bookmark_contains_current_change,
     sync_main,
@@ -748,6 +749,13 @@ def _finalise_local_update(
         console.print(
             f"[bold red]Promotion failed:[/] {_UPDATE_BOOKMARK} could not be "
             f"promoted to main"
+        )
+        return False
+
+    if not refresh_working_copy_from_main(orig_path):
+        console.print(
+            f"[bold red]Workspace refresh failed:[/] {project_name} could not be "
+            "updated to the promoted main bookmark"
         )
         return False
 

@@ -118,6 +118,17 @@ def promote_bookmark_to_main(path: Path, source_bookmark: str) -> bool:
     return create_or_reset_bookmark("main", path, source_bookmark)
 
 
+def refresh_working_copy_from_main(path: Path) -> bool:
+    result = _run(["jj", "new", "main"], path)
+    if result.returncode != 0:
+        rprint(
+            f"  [bold yellow]Warning:[/] failed to refresh working copy from main: "
+            f"{result.stderr.strip()}"
+        )
+        return False
+    return True
+
+
 def delete_bookmark(bookmark: str, path: Path) -> bool:
     result = _run(["jj", "bookmark", "delete", bookmark], path)
     if result.returncode != 0:

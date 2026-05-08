@@ -589,6 +589,46 @@ class TestUpdateResume:
 class TestUpdateFinalise:
     """Promote moves READY -> COMPLETED only on success."""
 
+    def test_promote_refreshes_working_copy_from_main(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """After promoting the bookmark, the working copy must refresh from main."""
+
+        def _mark_ready(items, pc, *, flow, scan_result, project_name, results_dir):
+            for it in items:
+                it.update_status = UpdateStatus.READY
+                it.flow = flow
+            return [UpdateResult(pkg_name=items[0].pkg_name, kind="vuln", passed=True)]
+
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_vulns",
+            MagicMock(side_effect=_mark_ready),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.process_updates",
+            MagicMock(side_effect=_mark_ready),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
+        )
+        mock_refresh = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "maintenance_man.cli.refresh_working_copy_from_main", mock_refresh
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable"])
+
+        assert exc_info.value.code == 0
+        mock_refresh.assert_called_once()
+
     def test_promote_success_promotes_ready_to_completed(
         self,
         mm_home_with_projects: Path,
@@ -627,11 +667,21 @@ class TestUpdateFinalise:
         assert scan_result.vulnerabilities == []
         assert scan_result.updates == []
 
-    def test_promote_failure_leaves_ready(
+    @pytest.mark.parametrize(
+        ("failing_operation", "expected_message"),
+        [
+            ("promote_bookmark_to_main", "Promotion failed"),
+            ("refresh_working_copy_from_main", "Workspace refresh failed"),
+        ],
+    )
+    def test_finalise_failure_leaves_ready(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        failing_operation: str,
+        expected_message: str,
     ):
         scan_result: ScanResult = mock_update_cli_deps["scan_result"]
 
@@ -653,14 +703,14 @@ class TestUpdateFinalise:
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.promote_bookmark_to_main",
-            MagicMock(return_value=False),
+            f"maintenance_man.cli.{failing_operation}", MagicMock(return_value=False)
         )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
 
-        # Promote failure surfaces as UPDATE_FAILED but findings stay READY
+        output = capsys.readouterr().out
+        assert expected_message in output
         assert exc_info.value.code == 4
         assert scan_result.vulnerabilities[0].update_status == UpdateStatus.READY
         assert scan_result.vulnerabilities[0].flow == Workflow.UPDATE

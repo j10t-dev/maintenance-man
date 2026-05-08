@@ -167,5 +167,8 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         lambda p, b: True,
     )
     monkeypatch.setattr("maintenance_man.cli.delete_bookmark", lambda b, p: True)
+    monkeypatch.setattr(
+        "maintenance_man.cli.refresh_working_copy_from_main", lambda p: True
+    )
     monkeypatch.setattr("maintenance_man.cli.edit_new_change", lambda p, r: True)
     return state
