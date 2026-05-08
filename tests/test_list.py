@@ -98,6 +98,16 @@ class TestListCommand:
         assert "myapp" in output
         assert "uv" in output
 
+    def test_st_alias_shows_projects(
+        self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["st"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "myapp" in output
+        assert "uv" in output
+
 
 class TestListFindings:
     def test_shows_never_for_unscanned_projects(
