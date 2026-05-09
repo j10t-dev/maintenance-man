@@ -1,7 +1,9 @@
 import json
 import logging
+import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,9 +46,17 @@ def scan_project(
     if not project_path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
 
-    vulns, secrets = _run_trivy_scan(
-        project_path, project.scan_secrets, project.scan_skip_dirs
-    )
+    if project.package_manager == "uv":
+        vulns = _run_uv_audit(project_path)
+        secrets = (
+            _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
+            if project.scan_secrets
+            else []
+        )
+    else:
+        vulns, secrets = _run_trivy_scan(
+            project_path, project.scan_secrets, project.scan_skip_dirs
+        )
     updates = _check_outdated(name, project, vulns, min_version_age_days)
 
     scan_result = ScanResult(
@@ -103,13 +113,125 @@ def _check_outdated(
         return []
 
 
+def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
+    """Run uv's native lockfile-based audit against a project."""
+    cmd = ["uv", "audit", "--locked"]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=project_path,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise TrivyScanError(f"uv audit timed out scanning {project_path}") from e
+
+    if completed.returncode not in {0, 1}:
+        raise TrivyScanError(
+            f"uv audit exited with code {completed.returncode}: "
+            f"{completed.stderr.strip()}"
+        )
+
+    return _parse_uv_audit_vulns(completed.stdout)
+
+
+@dataclass(frozen=True)
+class _UvAuditPackage:
+    name: str
+    version: str
+
+
+@dataclass
+class _UvAuditAdvisory:
+    vuln_id: str
+    title: str
+    fixed_version: str | None = None
+    url: str | None = None
+
+
+def _parse_uv_audit_vulns(output: str) -> list[VulnFinding]:
+    """Parse uv audit's human-readable vulnerability output."""
+    findings: list[VulnFinding] = []
+    package: _UvAuditPackage | None = None
+    advisory: _UvAuditAdvisory | None = None
+
+    for line in output.splitlines():
+        if match := _UV_AUDIT_PACKAGE_RE.match(line):
+            _append_uv_audit_finding(findings, package, advisory)
+            package = _UvAuditPackage(match.group("pkg"), match.group("version"))
+            advisory = None
+            continue
+
+        if match := _UV_AUDIT_VULN_RE.match(line):
+            _append_uv_audit_finding(findings, package, advisory)
+            advisory = _UvAuditAdvisory(match.group("id"), match.group("title"))
+            continue
+
+        if advisory is None:
+            continue
+
+        if match := _UV_AUDIT_FIXED_RE.match(line):
+            advisory.fixed_version = match.group("version")
+        elif match := _UV_AUDIT_URL_RE.match(line):
+            advisory.url = match.group("url")
+
+    _append_uv_audit_finding(findings, package, advisory)
+    return findings
+
+
+def _append_uv_audit_finding(
+    findings: list[VulnFinding],
+    package: _UvAuditPackage | None,
+    advisory: _UvAuditAdvisory | None,
+) -> None:
+    if package is None or advisory is None:
+        return
+
+    findings.append(
+        VulnFinding(
+            vuln_id=advisory.vuln_id,
+            pkg_name=package.name,
+            installed_version=package.version,
+            fixed_version=advisory.fixed_version,
+            severity=Severity.UNKNOWN,
+            title=advisory.title or "No summary provided",
+            description=advisory.title or "",
+            status="affected",
+            primary_url=advisory.url,
+        )
+    )
+
+
+_UV_AUDIT_PACKAGE_RE = re.compile(
+    r"^(?P<pkg>\S+)\s+(?P<version>\S+)\s+has\s+\d+\s+known vulnerabilit(?:y|ies):$"
+)
+_UV_AUDIT_VULN_RE = re.compile(
+    r"^-\s+(?P<id>(?:GHSA|CVE|PYSEC)-[^:]+):\s+(?P<title>.+)$"
+)
+_UV_AUDIT_FIXED_RE = re.compile(r"^\s+Fixed in:\s+(?P<version>\S+)\s*$")
+_UV_AUDIT_URL_RE = re.compile(r"^\s+Advisory information:\s+(?P<url>\S+)\s*$")
+
+
+def _run_trivy_secret_scan(
+    project_path: Path,
+    skip_dirs: list[str] | None = None,
+) -> list[SecretFinding]:
+    """Run Trivy secrets-only scan against *project_path*."""
+    _, secrets = _run_trivy_scan(
+        project_path, scan_secrets=True, skip_dirs=skip_dirs, scanners="secret"
+    )
+    return secrets
+
+
 def _run_trivy_scan(
     project_path: Path,
     scan_secrets: bool,
     skip_dirs: list[str] | None = None,
+    scanners: str | None = None,
 ) -> tuple[list[VulnFinding], list[SecretFinding]]:
     """Run Trivy against *project_path* and return parsed findings."""
-    scanners = "vuln,secret" if scan_secrets else "vuln"
+    scanners = scanners or ("vuln,secret" if scan_secrets else "vuln")
     cmd = [
         "trivy",
         "fs",

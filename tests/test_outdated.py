@@ -130,6 +130,45 @@ class TestGetUvDirectDepNames:
 
 
 class TestUvOutdated:
+    def test_syncs_environment_before_checking_outdated(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('[project]\ndependencies = ["requests==2.31.0"]\n')
+        sync_completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        list_completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="[]", stderr=""
+        )
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
+
+        with patch(
+            "maintenance_man.outdated.subprocess.run",
+            side_effect=[sync_completed, list_completed],
+        ) as run:
+            updates = uv_outdated(project)
+
+        assert updates == []
+        assert run.call_args_list[0].args[0] == ["uv", "sync", "--locked"]
+        assert run.call_args_list[1].args[0][:5] == [
+            "uv",
+            "pip",
+            "list",
+            "--outdated",
+            "--format",
+        ]
+
+    def test_sync_failure_raises(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('[project]\ndependencies = ["requests==2.31.0"]\n')
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="lock stale"
+        )
+        project = ProjectConfig(path=tmp_path, package_manager="uv")
+
+        with patch("maintenance_man.outdated.subprocess.run", return_value=failed):
+            with pytest.raises(OutdatedCheckError, match="uv sync --locked"):
+                uv_outdated(project)
+
     def test_parses_json_output(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text(
@@ -152,12 +191,18 @@ class TestUvOutdated:
                 },
             ]
         )
-        completed = subprocess.CompletedProcess(
+        sync_completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        list_completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=fake_json, stderr=""
         )
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch(
+            "maintenance_man.outdated.subprocess.run",
+            side_effect=[sync_completed, list_completed],
+        ):
             updates = uv_outdated(project)
 
         assert len(updates) == 2
@@ -171,24 +216,36 @@ class TestUvOutdated:
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text("[project]\ndependencies = []\n")
 
-        completed = subprocess.CompletedProcess(
+        sync_completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        list_completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="[]", stderr=""
         )
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch(
+            "maintenance_man.outdated.subprocess.run",
+            side_effect=[sync_completed, list_completed],
+        ):
             updates = uv_outdated(project)
 
         assert updates == []
 
     def test_command_failure_raises(self, tmp_path):
-        completed = subprocess.CompletedProcess(
+        sync_completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        list_failed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="error"
         )
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            with pytest.raises(OutdatedCheckError):
+        with patch(
+            "maintenance_man.outdated.subprocess.run",
+            side_effect=[sync_completed, list_failed],
+        ):
+            with pytest.raises(OutdatedCheckError, match="uv pip list --outdated"):
                 uv_outdated(project)
 
     def test_excludes_transitive_deps(self, tmp_path):
@@ -217,12 +274,18 @@ class TestUvOutdated:
                 },
             ]
         )
-        completed = subprocess.CompletedProcess(
+        sync_completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        list_completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=fake_json, stderr=""
         )
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch(
+            "maintenance_man.outdated.subprocess.run",
+            side_effect=[sync_completed, list_completed],
+        ):
             updates = uv_outdated(project)
 
         pkg_names = [u.pkg_name for u in updates]
