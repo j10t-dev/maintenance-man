@@ -132,13 +132,14 @@ class TestCheckHealth:
             url="http://pihost:8080/api/status/unknown",
             code=404,
             msg="Not Found",
-            hdrs=None,
+            hdrs=None,  # ty:ignore[invalid-argument-type]
             fp=None,
         )
 
         result = check_health("http://pihost:8080", "unknown")
 
         assert result.is_up is False
+        assert result.error is not None
         assert "not found" in result.error.lower()
 
     @patch("maintenance_man.deployer.urllib.request.urlopen")
@@ -192,7 +193,13 @@ class TestCheckHealth:
         mock_response.__exit__ = MagicMock(return_value=False)
 
         mock_urlopen.side_effect = [
-            HTTPError(url="", code=503, msg="Service Unavailable", hdrs=None, fp=None),
+            HTTPError(
+                url="",
+                code=503,
+                msg="Service Unavailable",
+                hdrs=None,  # ty:ignore[invalid-argument-type]
+                fp=None,
+            ),
             mock_response,
         ]
 
@@ -214,7 +221,7 @@ class TestCheckHealth:
             url="",
             code=502,
             msg="Bad Gateway",
-            hdrs=None,
+            hdrs=None,  # ty:ignore[invalid-argument-type]
             fp=None,
         )
 
@@ -226,6 +233,7 @@ class TestCheckHealth:
         )
 
         assert result.is_up is False
+        assert result.error is not None
         assert "502" in result.error
         assert mock_urlopen.call_count == 3
 
@@ -237,7 +245,7 @@ class TestCheckHealth:
             url="",
             code=403,
             msg="Forbidden",
-            hdrs=None,
+            hdrs=None,  # ty:ignore[invalid-argument-type]
             fp=None,
         )
 
@@ -249,6 +257,7 @@ class TestCheckHealth:
         )
 
         assert result.is_up is False
+        assert result.error is not None
         assert "403" in result.error
         assert mock_urlopen.call_count == 1
 
@@ -263,4 +272,5 @@ class TestCheckHealth:
         result = check_health("http://pihost:8080", "lifts")
 
         assert result.is_up is False
+        assert result.error is not None
         assert "non-JSON" in result.error

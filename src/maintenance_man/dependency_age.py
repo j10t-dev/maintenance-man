@@ -33,7 +33,7 @@ def filter_by_age(
 
     # bun info needs a cwd with a package.json
     if manager == "bun" and project_path:
-        lookup_fn = functools.partial(lookup_fn, cwd=project_path)
+        lookup_fn = functools.partial(lookup_fn, cwd=project_path)  # type: ignore
 
     cutoff = _utcnow() - timedelta(days=min_age_days)
 

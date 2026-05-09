@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from typing import Literal
 from unittest.mock import patch
 
 import pytest
@@ -19,7 +20,9 @@ from maintenance_man.outdated import (
 )
 
 
-def _make_project(pm: str, path: str = "/tmp/fake") -> ProjectConfig:
+def _make_project(
+    pm: Literal["bun", "uv", "mvn"], path: str = "/tmp/fake"
+) -> ProjectConfig:
     return ProjectConfig(path=Path(path), package_manager=pm)
 
 

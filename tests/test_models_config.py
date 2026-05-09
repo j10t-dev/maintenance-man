@@ -34,7 +34,7 @@ class TestProjectConfigTestFields:
 
     def test_rejects_extra_fields(self):
         with pytest.raises(ValidationError, match="unknown"):
-            ProjectConfig(path=Path("/tmp/x"), package_manager="bun", unknown="bad")
+            ProjectConfig(path=Path("/tmp/x"), package_manager="bun", unknown="bad")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
 
 
 class TestProjectConfigScanSkipDirs:

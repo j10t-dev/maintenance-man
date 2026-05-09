@@ -11,6 +11,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
+    Workflow,
     sort_vulns_by_severity,
 )
 
@@ -53,7 +54,7 @@ class TestVulnFinding:
                 vuln_id="CVE-2025-00001",
                 pkg_name="pkg",
                 installed_version="1.0",
-                severity="BOGUS",
+                severity="BOGUS",  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
                 title="t",
                 description="d",
                 status="fixed",
@@ -66,7 +67,7 @@ class TestSecretFinding:
             file="creds/service.json",
             rule_id="gcp-service-account",
             title="Google (GCP) Service-account",
-            severity="CRITICAL",
+            severity=Severity.CRITICAL,
         )
         assert finding.rule_id == "gcp-service-account"
 
@@ -88,7 +89,7 @@ class TestScanResult:
                     description="d",
                     status="fixed",
                     update_status=UpdateStatus.READY,
-                    flow="update",
+                    flow=Workflow.UPDATE,
                 )
             ],
             updates=[
@@ -98,7 +99,7 @@ class TestScanResult:
                     latest_version="19.0.0",
                     semver_tier=SemverTier.MAJOR,
                     update_status=UpdateStatus.READY,
-                    flow="update",
+                    flow=Workflow.UPDATE,
                 )
             ],
         )
@@ -126,7 +127,7 @@ class TestScanResult:
                     description="d",
                     status="fixed",
                     update_status=UpdateStatus.READY,
-                    flow="resolve",
+                    flow=Workflow.RESOLVE,
                 )
             ],
             updates=[
@@ -136,7 +137,7 @@ class TestScanResult:
                     latest_version="5.1.0",
                     semver_tier=SemverTier.MINOR,
                     update_status=UpdateStatus.READY,
-                    flow="resolve",
+                    flow=Workflow.RESOLVE,
                 )
             ],
         )

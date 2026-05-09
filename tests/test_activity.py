@@ -110,6 +110,7 @@ class TestRecordActivity:
         record_activity(path, "myapp", "build", success=True, branch="main")
         record_activity(path, "myapp", "build", success=False, branch="feat/x")
         result = load_activity(path)
+        assert result["myapp"].last_build is not None
         assert result["myapp"].last_build.success is False
         assert result["myapp"].last_build.branch == "feat/x"
 

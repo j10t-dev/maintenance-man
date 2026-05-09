@@ -26,7 +26,7 @@ class TestDefaultsConfig:
 
     def test_defaults_rejects_unknown_keys(self):
         with pytest.raises(ValidationError, match="extra_field"):
-            DefaultsConfig(extra_field="bad")
+            DefaultsConfig(extra_field="bad")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
 
 
 class TestProjectConfig:
@@ -37,24 +37,24 @@ class TestProjectConfig:
 
     @pytest.mark.parametrize("pm", ["bun", "uv", "mvn"])
     def test_all_package_managers_accepted(self, tmp_path: Path, pm: str):
-        proj = ProjectConfig(path=tmp_path, package_manager=pm)
+        proj = ProjectConfig(path=tmp_path, package_manager=pm)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
         assert proj.package_manager == pm
 
     def test_missing_path_raises(self):
         with pytest.raises(ValidationError, match="path"):
-            ProjectConfig(package_manager="bun")
+            ProjectConfig(package_manager="bun")  # type: ignore[call-arg]  # ty:ignore[missing-argument]
 
     def test_missing_package_manager_raises(self, tmp_path: Path):
         with pytest.raises(ValidationError, match="package_manager"):
-            ProjectConfig(path=tmp_path)
+            ProjectConfig(path=tmp_path)  # type: ignore[call-arg]  # ty:ignore[missing-argument]
 
     def test_invalid_package_manager_raises(self, tmp_path: Path):
         with pytest.raises(ValidationError, match="package_manager"):
-            ProjectConfig(path=tmp_path, package_manager="npm")
+            ProjectConfig(path=tmp_path, package_manager="npm")  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
 
     def test_rejects_unknown_keys(self, tmp_path: Path):
         with pytest.raises(ValidationError, match="language"):
-            ProjectConfig(path=tmp_path, package_manager="bun", language="typescript")
+            ProjectConfig(path=tmp_path, package_manager="bun", language="typescript")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
 
 
 class TestMmConfig:

@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from typing import Literal
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +18,9 @@ from maintenance_man.scanner import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-def _make_project(path: str | Path, pm: str = "uv") -> ProjectConfig:
+def _make_project(
+    path: str | Path, pm: Literal["bun", "uv", "mvn"] = "uv"
+) -> ProjectConfig:
     return ProjectConfig(path=Path(path), package_manager=pm)
 
 

@@ -24,6 +24,7 @@ mm = "maintenance_man.cli:main"
 dev = [
     "pytest>=8.0",
     "ruff==0.15.12",
+    "ty>=0.0.34",
 ]
 
 [tool.ruff]
@@ -31,6 +32,12 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.ty.src]
+include = ["src/**/*.py", "tests/**/*.py"]
+
+[tool.ty.environment]
+python-version = "3.14"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

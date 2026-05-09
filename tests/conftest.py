@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,7 +15,7 @@ from maintenance_man.models.scan import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-def make_vuln(**overrides: object) -> VulnFinding:
+def make_vuln(**overrides: Any) -> VulnFinding:
     defaults = dict(
         vuln_id="CVE-2024-0001",
         pkg_name="some-pkg",
@@ -25,17 +26,17 @@ def make_vuln(**overrides: object) -> VulnFinding:
         description="desc",
         status="fixed",
     )
-    return VulnFinding(**(defaults | overrides))
+    return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
-def make_update(**overrides: object) -> UpdateFinding:
+def make_update(**overrides: Any) -> UpdateFinding:
     defaults = dict(
         pkg_name="pkg-a",
         installed_version="1.0.0",
         latest_version="1.0.1",
         semver_tier=SemverTier.PATCH,
     )
-    return UpdateFinding(**(defaults | overrides))
+    return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
 def make_scan_result(

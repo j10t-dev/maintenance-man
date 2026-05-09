@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Annotated, Literal, NoReturn
+from typing import Annotated, Any, Literal, NoReturn
 
 import cyclopts
 from rich.console import Console
@@ -112,7 +112,7 @@ class DeployResult:
 
 console = Console()
 
-_TABLE_STYLE = dict(show_edge=False, pad_edge=False, box=None)
+_TABLE_STYLE: dict[str, Any] = dict(show_edge=False, pad_edge=False, box=None)
 
 _UPDATE_BOOKMARK = "mm/update-dependencies"
 _RESOLVE_BOOKMARK = "mm/resolve-dependencies"
@@ -666,7 +666,8 @@ def _print_update_summary(all_results: list[UpdateResult]) -> None:
             "commit": "commit failed",
         }
         for r in failed:
-            label = phase_labels.get(r.failed_phase, r.failed_phase or "unknown")
+            phase = r.failed_phase or "unknown"
+            label = phase_labels.get(phase, phase)
             console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
     console.print("─" * 40)
 
@@ -1491,7 +1492,7 @@ def list_projects(
         ("Built", {}),
         ("Deployed", {}),
     ]:
-        table.add_column(col, **kw)
+        table.add_column(col, **kw)  # type: ignore
 
     for name, project in sorted(cfg.projects.items()):
         sr = scan_results.get(name)

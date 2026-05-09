@@ -1,6 +1,7 @@
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,6 +14,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
+    Workflow,
 )
 from maintenance_man.updater import (
     NoScanResultsError,
@@ -35,7 +37,7 @@ from maintenance_man.uv_dependencies import UvDependencyError, UvDependencyLocat
 # -- Factory helpers --
 
 
-def make_vuln(**overrides) -> VulnFinding:
+def make_vuln(**overrides: Any) -> VulnFinding:
     defaults = dict(
         vuln_id="CVE-2024-0001",
         pkg_name="some-pkg",
@@ -46,10 +48,10 @@ def make_vuln(**overrides) -> VulnFinding:
         description="desc",
         status="fixed",
     )
-    return VulnFinding(**(defaults | overrides))
+    return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
-def make_update(tier: SemverTier = SemverTier.PATCH, **overrides) -> UpdateFinding:
+def make_update(tier: SemverTier = SemverTier.PATCH, **overrides: Any) -> UpdateFinding:
     tier_defaults = {
         SemverTier.PATCH: ("pkg-a", "1.0.0", "1.0.1"),
         SemverTier.MINOR: ("pkg-b", "1.0.0", "1.1.0"),
@@ -62,7 +64,7 @@ def make_update(tier: SemverTier = SemverTier.PATCH, **overrides) -> UpdateFindi
         latest_version=latest,
         semver_tier=tier,
     )
-    return UpdateFinding(**(defaults | overrides))
+    return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
 # -- Fixtures --
@@ -568,7 +570,7 @@ class TestConsolidateVulns:
 
         consolidated[0].update_status = UpdateStatus.READY
         consolidated[0].failed_phase = "unit"
-        consolidated[0].flow = "resolve"
+        consolidated[0].flow = Workflow.RESOLVE
 
         assert v1.update_status == UpdateStatus.READY
         assert v2.update_status == UpdateStatus.READY
@@ -657,7 +659,7 @@ class TestProcessFindingsLocal:
     ):
         update = make_update(SemverTier.PATCH)
 
-        results = process_findings([update], project_config, flow="update")
+        results = process_findings([update], project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 1
         assert results[0].passed is True
@@ -670,7 +672,7 @@ class TestProcessFindingsLocal:
     ):
         update = make_update(SemverTier.PATCH)
 
-        process_findings([update], project_config, flow="update")
+        process_findings([update], project_config, flow=Workflow.UPDATE)
 
         mock_local_vcs["commit_current_change"].assert_called_once()
         mock_local_vcs["create_or_reset_bookmark"].assert_called_once_with(
@@ -693,7 +695,7 @@ class TestProcessFindingsLocal:
         )
         update = make_update(SemverTier.PATCH)
 
-        results = process_findings([update], project_config, flow="update")
+        results = process_findings([update], project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 1
         assert results[0].passed is True
@@ -708,7 +710,7 @@ class TestProcessFindingsLocal:
         mock_local_vcs["run_test_phases"].return_value = (False, "unit")
         update = make_update(SemverTier.PATCH)
 
-        results = process_findings([update], project_config, flow="update")
+        results = process_findings([update], project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 1
         assert results[0].passed is False
@@ -723,7 +725,7 @@ class TestProcessFindingsLocal:
         mock_local_vcs["run_test_phases"].return_value = (False, "unit")
         update = make_update(SemverTier.PATCH)
 
-        results = process_findings([update], project_config, flow="update")
+        results = process_findings([update], project_config, flow=Workflow.UPDATE)
 
         assert results[0].passed is False
         mock_local_vcs["discard_current_change"].assert_called_once_with(
@@ -738,7 +740,7 @@ class TestProcessFindingsLocal:
             make_update(SemverTier.MINOR),
         ]
 
-        results = process_findings(updates, project_config, flow="update")
+        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 2
         assert all(r.passed for r in results)
@@ -761,7 +763,7 @@ class TestProcessFindingsLocal:
             make_update(SemverTier.MAJOR),
         ]
 
-        results = process_findings(updates, project_config, flow="update")
+        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 3
         assert results[0].passed is True
@@ -779,7 +781,7 @@ class TestProcessFindingsLocal:
             make_update(SemverTier.MINOR),
         ]
 
-        results = process_findings(updates, project_config, flow="update")
+        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 2
         assert results[0].passed is False
@@ -794,7 +796,7 @@ class TestProcessFindingsLocal:
         results = process_findings(
             [make_update(SemverTier.PATCH)],
             project_config,
-            flow="update",
+            flow=Workflow.UPDATE,
         )
 
         assert len(results) == 1
@@ -811,7 +813,7 @@ class TestProcessFindingsLocal:
             make_update(SemverTier.MINOR),
         ]
 
-        results = process_findings(updates, project_config, flow="update")
+        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 2
         assert results[0].passed is False
@@ -827,7 +829,7 @@ class TestProcessFindingsLocal:
             make_update(SemverTier.MINOR),
         ]
 
-        results = process_findings(updates, project_config, flow="update")
+        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 1
         assert results[0].passed is False
@@ -851,7 +853,7 @@ class TestProcessFindingsLocal:
         )
         update = make_update(SemverTier.PATCH)
 
-        results = process_findings([update], project_config, flow="update")
+        results = process_findings([update], project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 1
         assert results[0].passed is True
@@ -883,7 +885,7 @@ class TestProcessFindingsLocal:
         process_findings(
             [upd_pass, upd_fail],
             project_config,
-            flow="update",
+            flow=Workflow.UPDATE,
             scan_result=scan,
             project_name="myapp",
             results_dir=Path("/tmp/fake"),
@@ -896,7 +898,7 @@ class TestProcessFindingsLocal:
     def test_empty_findings(
         self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
     ):
-        results = process_findings([], project_config, flow="update")
+        results = process_findings([], project_config, flow=Workflow.UPDATE)
         assert results == []
 
 
@@ -912,7 +914,7 @@ class TestProcessFindingsResolve:
         results = process_findings(
             [update],
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             on_failure="stop",
         )
 
@@ -930,7 +932,7 @@ class TestProcessFindingsResolve:
         process_findings(
             [update],
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             on_failure="stop",
         )
 
@@ -949,7 +951,7 @@ class TestProcessFindingsResolve:
         results = process_findings(
             [update],
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             on_failure="stop",
         )
 
@@ -971,7 +973,7 @@ class TestProcessFindingsResolve:
         results = process_findings(
             updates,
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             on_failure="stop",
         )
 
@@ -997,7 +999,7 @@ class TestProcessFindingsResolve:
         results = process_findings(
             updates,
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             on_failure="stop",
         )
 
@@ -1017,7 +1019,7 @@ class TestProcessFindingsResolve:
         results = process_findings(
             [make_update(SemverTier.PATCH)],
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             on_failure="stop",
         )
 
@@ -1047,7 +1049,7 @@ class TestProcessFindingsResolve:
         process_findings(
             [upd_fail],
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             scan_result=scan,
             project_name="myapp",
             results_dir=Path("/tmp/fake"),
@@ -1075,7 +1077,7 @@ class TestProcessFindingsResolve:
         results = process_findings(
             [update],
             project_config,
-            flow="resolve",
+            flow=Workflow.RESOLVE,
             on_failure="stop",
         )
 
@@ -1096,7 +1098,7 @@ class TestProcessVulnsLocal:
         v1 = make_vuln(vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0")
         v2 = make_vuln(vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4")
 
-        results = process_vulns([v1, v2], project_config, flow="update")
+        results = process_vulns([v1, v2], project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 1
         assert results[0].passed is True
@@ -1112,7 +1114,7 @@ class TestProcessUpdatesLocal:
             make_update(SemverTier.PATCH),
         ]
 
-        results = process_updates(updates, project_config, flow="update")
+        results = process_updates(updates, project_config, flow=Workflow.UPDATE)
 
         assert len(results) == 2
         assert results[0].pkg_name == "pkg-a"
