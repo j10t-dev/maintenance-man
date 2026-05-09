@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from rich import print as rprint
@@ -14,6 +15,21 @@ class GitHubCLINotFoundError(Exception):
 
 class JJCLINotFoundError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class RevisionCheck:
+    ok: bool
+    value: bool = False
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class RevisionResolve:
+    ok: bool
+    commit_id: str = ""
+    error: str = ""
+
 
 _MANAGED_BOOKMARK_PREFIXES = (
     "mm/update-dependencies",
@@ -106,6 +122,32 @@ def current_change_has_changes(path: Path) -> bool:
     return bool(result.stdout.strip())
 
 
+def _current_change_is_reusable_empty(path: Path) -> bool:
+    diff = _run(["jj", "diff", "--summary"], path)
+    if diff.returncode != 0 or diff.stdout.strip():
+        return False
+
+    description = _run(
+        ["jj", "log", "-r", "@", "--no-graph", "-T", "description"], path
+    )
+    if description.returncode != 0 or description.stdout.strip():
+        return False
+
+    bookmarks = _run(
+        [
+            "jj",
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            'bookmarks.join(" ")',
+        ],
+        path,
+    )
+    return bookmarks.returncode == 0 and not bookmarks.stdout.strip()
+
+
 def discard_current_change(path: Path) -> bool:
     result = _run(["jj", "restore", "--from", "@-"], path)
     if result.returncode != 0:
@@ -118,15 +160,45 @@ def promote_bookmark_to_main(path: Path, source_bookmark: str) -> bool:
     return create_or_reset_bookmark("main", path, source_bookmark)
 
 
-def refresh_working_copy_from_main(path: Path) -> bool:
+def _refresh_working_copy_from_main_result(path: Path) -> tuple[bool, str]:
+    if _current_change_is_reusable_empty(path):
+        descendant = is_ancestor(path, "main", "@")
+        if not descendant.ok:
+            message = f"failed to inspect working copy ancestry: {descendant.error}"
+            rprint(f"  [bold yellow]Warning:[/] {message}")
+            return False, message
+        if descendant.value:
+            return True, ""
+
+        result = _run(["jj", "rebase", "-r", "@", "-d", "main"], path)
+        if result.returncode != 0:
+            message = (
+                "failed to rebase working copy onto main: "
+                f"{result.stderr.strip()}"
+            )
+            rprint(f"  [bold yellow]Warning:[/] {message}")
+            return False, message
+        return True, ""
+
+    descendant = is_ancestor(path, "main", "@")
+    if not descendant.ok:
+        message = f"failed to inspect working copy ancestry: {descendant.error}"
+        rprint(f"  [bold yellow]Warning:[/] {message}")
+        return False, message
+    if descendant.value:
+        return True, ""
+
     result = _run(["jj", "new", "main"], path)
     if result.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] failed to refresh working copy from main: "
-            f"{result.stderr.strip()}"
-        )
-        return False
-    return True
+        message = f"failed to refresh working copy from main: {result.stderr.strip()}"
+        rprint(f"  [bold yellow]Warning:[/] {message}")
+        return False, message
+    return True, ""
+
+
+def refresh_working_copy_from_main(path: Path) -> bool:
+    ok, _message = _refresh_working_copy_from_main_result(path)
+    return ok
 
 
 def delete_bookmark(bookmark: str, path: Path) -> bool:
@@ -203,17 +275,69 @@ def remove_workspace(repo_path: Path, project: str) -> None:
         shutil.rmtree(workspace_path)
 
 
-def _revision_exists(revision: str, path: Path) -> bool:
+def _revision_check(path: Path, revset: str) -> RevisionCheck:
+    result = _run(["jj", "log", "-r", revset, "--no-graph", "-T", "commit_id"], path)
+    if result.returncode != 0:
+        return RevisionCheck(ok=False, error=result.stderr.strip())
+    return RevisionCheck(ok=True, value=bool(result.stdout.strip()))
+
+
+def _single_commit_id(path: Path, revision: str) -> RevisionResolve:
     result = _run(
-        ["jj", "log", "-r", revision, "--no-graph", "-T", "commit_id"], path
+        ["jj", "log", "-r", revision, "--no-graph", "-T", 'commit_id ++ "\\n"'],
+        path,
     )
-    return result.returncode == 0 and bool(result.stdout.strip())
+    if result.returncode != 0:
+        return RevisionResolve(ok=False, error=result.stderr.strip())
+
+    commit_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(commit_ids) != 1:
+        return RevisionResolve(
+            ok=False,
+            error=(
+                f"{revision} must resolve to exactly one commit, got {len(commit_ids)}"
+            ),
+        )
+    return RevisionResolve(ok=True, commit_id=commit_ids[0])
+
+
+def same_revision(path: Path, left: str, right: str) -> RevisionCheck:
+    """Return whether two revisions identify the same unambiguous commit."""
+    left_commit = _single_commit_id(path, left)
+    if not left_commit.ok:
+        return RevisionCheck(ok=False, error=left_commit.error)
+    right_commit = _single_commit_id(path, right)
+    if not right_commit.ok:
+        return RevisionCheck(ok=False, error=right_commit.error)
+    return RevisionCheck(ok=True, value=left_commit.commit_id == right_commit.commit_id)
+
+
+def is_ancestor(path: Path, ancestor: str, descendant: str) -> RevisionCheck:
+    """Return whether ancestor is in descendant's ancestry."""
+    ancestor_commit = _single_commit_id(path, ancestor)
+    if not ancestor_commit.ok:
+        return RevisionCheck(ok=False, error=ancestor_commit.error)
+    descendant_commit = _single_commit_id(path, descendant)
+    if not descendant_commit.ok:
+        return RevisionCheck(ok=False, error=descendant_commit.error)
+    return _revision_check(
+        path,
+        f"{ancestor_commit.commit_id}::{descendant_commit.commit_id} "
+        f"& {descendant_commit.commit_id}",
+    )
 
 
 def ensure_main_bookmark(path: Path) -> bool:
     if bookmark_exists("main", path):
         return True
-    if not _revision_exists("main@origin", path):
+    origin_check = _revision_check(path, "main@origin")
+    if not origin_check.ok:
+        rprint(
+            f"  [bold red]Error:[/] could not check main@origin: "
+            f"{origin_check.error}"
+        )
+        return False
+    if not origin_check.value:
         rprint("  [bold red]Error:[/] main bookmark not found")
         return False
     result = _run(["jj", "bookmark", "create", "main", "-r", "main@origin"], path)
@@ -340,13 +464,21 @@ def prune_stale_bookmarks(project_path: Path) -> bool:
     return True
 
 
-def sync_main(project_path: Path) -> tuple[bool, str]:
-    """Fetch remote main and push local main bookmark directly."""
-    fetch = _run(
+def _fetch_origin_main(project_path: Path) -> subprocess.CompletedProcess[str]:
+    return _run(
         ["jj", "git", "fetch", "--remote", "origin", "--branch", "main"],
         project_path,
         timeout=120,
     )
+
+
+def _refresh_after_sync(project_path: Path) -> tuple[bool, str]:
+    return _refresh_working_copy_from_main_result(project_path)
+
+
+def sync_main(project_path: Path) -> tuple[bool, str]:
+    """Reconcile local main and origin/main bidirectionally."""
+    fetch = _fetch_origin_main(project_path)
     if fetch.returncode != 0:
         return False, fetch.stderr.strip()
 
@@ -360,15 +492,53 @@ def sync_main(project_path: Path) -> tuple[bool, str]:
             "before syncing",
         )
 
-    push = _run(
-        ["jj", "git", "push", "--bookmark", "main", "--remote", "origin"],
-        project_path,
-        timeout=120,
-    )
-    if push.returncode != 0:
-        return False, push.stderr.strip()
+    same = same_revision(project_path, "main", "main@origin")
+    if not same.ok:
+        return False, f"could not compare main and origin/main: {same.error}"
+    if same.value:
+        return _refresh_after_sync(project_path)
 
-    return True, ""
+    remote_ahead = is_ancestor(project_path, "main", "main@origin")
+    if not remote_ahead.ok:
+        return (
+            False,
+            f"could not determine whether origin/main is ahead: {remote_ahead.error}",
+        )
+    if remote_ahead.value:
+        if not create_or_reset_bookmark("main", project_path, "main@origin"):
+            return False, "failed to move main to origin/main"
+        return _refresh_after_sync(project_path)
+
+    local_ahead = is_ancestor(project_path, "main@origin", "main")
+    if not local_ahead.ok:
+        return (
+            False,
+            f"could not determine whether local main is ahead: {local_ahead.error}",
+        )
+    if local_ahead.value:
+        push = _run(
+            ["jj", "git", "push", "--bookmark", "main", "--remote", "origin"],
+            project_path,
+            timeout=120,
+        )
+        if push.returncode != 0:
+            return False, push.stderr.strip()
+
+        post_push_fetch = _fetch_origin_main(project_path)
+        if post_push_fetch.returncode != 0:
+            return False, post_push_fetch.stderr.strip()
+
+        verified = same_revision(project_path, "main", "main@origin")
+        if not verified.ok:
+            return False, f"could not verify pushed main: {verified.error}"
+        if not verified.value:
+            return False, "pushed main but origin/main did not update to match"
+        return _refresh_after_sync(project_path)
+
+    return (
+        False,
+        "local main and origin/main have diverged; resolve manually before syncing",
+    )
 
 
 def check_gh_available() -> None:

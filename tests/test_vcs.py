@@ -8,6 +8,7 @@ import maintenance_man.vcs as vcs
 from maintenance_man.vcs import (
     GitHubCLINotFoundError,
     JJCLINotFoundError,
+    RevisionCheck,
     _main_bookmark_is_conflicted,
     assert_safe_workspace_path,
     bookmark_exists,
@@ -23,12 +24,14 @@ from maintenance_man.vcs import (
     discard_current_change,
     edit_new_change,
     ensure_main_bookmark,
+    is_ancestor,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
     resolve_bookmark_contains_current_change,
+    same_revision,
     sync_main,
     workspace_path_for_project,
 )
@@ -249,15 +252,111 @@ class TestChangeHelpers:
 
 
 class TestRefreshWorkingCopyFromMain:
+    @patch("maintenance_man.vcs.is_ancestor")
     @patch("maintenance_man.vcs._run")
-    def test_success_returns_true(self, mock_run: MagicMock, tmp_path: Path):
-        mock_run.return_value = _completed()
-        assert refresh_working_copy_from_main(tmp_path) is True
-        mock_run.assert_called_once_with(["jj", "new", "main"], tmp_path)
+    def test_reusable_empty_working_copy_already_on_main_is_left_alone(
+        self, mock_run: MagicMock, mock_is_ancestor: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(stdout=""),
+            _completed(stdout=""),
+            _completed(stdout=""),
+        ]
+        mock_is_ancestor.return_value = RevisionCheck(ok=True, value=True)
 
+        assert refresh_working_copy_from_main(tmp_path) is True
+        mock_is_ancestor.assert_called_once_with(tmp_path, "main", "@")
+        assert mock_run.call_args_list == [
+            call(["jj", "diff", "--summary"], tmp_path),
+            call(["jj", "log", "-r", "@", "--no-graph", "-T", "description"], tmp_path),
+            call(
+                ["jj", "log", "-r", "@", "--no-graph", "-T", 'bookmarks.join(" ")'],
+                tmp_path,
+            ),
+        ]
+
+    @patch("maintenance_man.vcs.is_ancestor")
     @patch("maintenance_man.vcs._run")
-    def test_failure_returns_false(self, mock_run: MagicMock, tmp_path: Path):
-        mock_run.return_value = _completed(returncode=1, stderr="new failed")
+    def test_rebases_reusable_empty_working_copy_onto_main_when_stale(
+        self, mock_run: MagicMock, mock_is_ancestor: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(stdout=""),
+            _completed(stdout=""),
+            _completed(stdout=""),
+            _completed(),
+        ]
+        mock_is_ancestor.return_value = RevisionCheck(ok=True, value=False)
+
+        assert refresh_working_copy_from_main(tmp_path) is True
+        mock_is_ancestor.assert_called_once_with(tmp_path, "main", "@")
+        assert mock_run.call_args_list[-1] == call(
+            ["jj", "rebase", "-r", "@", "-d", "main"], tmp_path
+        )
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs._run")
+    def test_reusable_descendant_check_failure_returns_false(
+        self, mock_run: MagicMock, mock_is_ancestor: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(stdout=""),
+            _completed(stdout=""),
+            _completed(stdout=""),
+        ]
+        mock_is_ancestor.return_value = RevisionCheck(ok=False, error="revset failed")
+
+        assert refresh_working_copy_from_main(tmp_path) is False
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs._run")
+    def test_rebase_failure_returns_false(
+        self, mock_run: MagicMock, mock_is_ancestor: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(stdout=""),
+            _completed(stdout=""),
+            _completed(stdout=""),
+            _completed(returncode=1, stderr="rebase failed"),
+        ]
+        mock_is_ancestor.return_value = RevisionCheck(ok=True, value=False)
+
+        assert refresh_working_copy_from_main(tmp_path) is False
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs._run")
+    def test_non_reusable_descendant_working_copy_is_left_alone(
+        self, mock_run: MagicMock, mock_is_ancestor: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [_completed(stdout="M pyproject.toml\n")]
+        mock_is_ancestor.return_value = RevisionCheck(ok=True, value=True)
+
+        assert refresh_working_copy_from_main(tmp_path) is True
+        mock_is_ancestor.assert_called_once_with(tmp_path, "main", "@")
+        assert mock_run.call_args_list == [call(["jj", "diff", "--summary"], tmp_path)]
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs._run")
+    def test_non_reusable_non_descendant_gets_new_child_of_main(
+        self, mock_run: MagicMock, mock_is_ancestor: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [_completed(stdout="M pyproject.toml\n"), _completed()]
+        mock_is_ancestor.return_value = RevisionCheck(ok=True, value=False)
+
+        assert refresh_working_copy_from_main(tmp_path) is True
+        assert mock_run.call_args_list == [
+            call(["jj", "diff", "--summary"], tmp_path),
+            call(["jj", "new", "main"], tmp_path),
+        ]
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs._run")
+    def test_descendant_check_failure_returns_false(
+        self, mock_run: MagicMock, mock_is_ancestor: MagicMock, tmp_path: Path
+    ):
+        mock_run.return_value = _completed(stdout="M pyproject.toml\n")
+        mock_is_ancestor.return_value = RevisionCheck(ok=False, error="revset failed")
+
         assert refresh_working_copy_from_main(tmp_path) is False
 
 
@@ -534,6 +633,22 @@ class TestEnsureMainBookmark:
             tmp_path,
         )
 
+    @patch("maintenance_man.vcs.bookmark_exists", return_value=False)
+    @patch("maintenance_man.vcs._run")
+    def test_origin_revision_failure_reports_underlying_error(
+        self,
+        mock_run: MagicMock,
+        _mock_exists: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        mock_run.return_value = _completed(returncode=1, stderr="jj backend failed")
+
+        assert ensure_main_bookmark(tmp_path) is False
+
+        captured = capsys.readouterr()
+        assert "jj backend failed" in captured.out
+
 
 class TestMainBookmarkConflictDetection:
     @patch("maintenance_man.vcs._run")
@@ -562,21 +677,279 @@ class TestMainBookmarkConflictDetection:
         assert _main_bookmark_is_conflicted(tmp_path) is True
 
 
-class TestSyncMain:
-    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
-    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+class TestRevisionRelationshipHelpers:
     @patch("maintenance_man.vcs._run")
-    def test_fetches_then_pushes_main_bookmark(
-        self,
-        mock_run: MagicMock,
-        _mock_conflict: MagicMock,
-        _mock_ensure: MagicMock,
-        tmp_path: Path,
+    def test_same_revision_returns_error_when_left_revision_is_ambiguous(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.return_value = _completed(stdout="abc123\ndef456\n")
+
+        result = same_revision(tmp_path, "main", "main@origin")
+
+        assert result.ok is False
+        assert result.value is False
+        assert "main" in result.error
+        assert "exactly one commit" in result.error
+
+    @patch("maintenance_man.vcs._run")
+    def test_single_commit_id_returns_commit_id_as_value_data(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.return_value = _completed(stdout="abc123\n")
+
+        result = vcs._single_commit_id(tmp_path, "main")
+
+        assert result.ok is True
+        assert result.commit_id == "abc123"
+        assert result.error == ""
+
+    @patch("maintenance_man.vcs._run")
+    def test_same_revision_false_when_commits_differ(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(stdout="abc123\n"),
+            _completed(stdout="def456\n"),
+        ]
+
+        result = same_revision(tmp_path, "main", "main@origin")
+
+        assert result == RevisionCheck(ok=True, value=False)
+
+    @patch("maintenance_man.vcs._run")
+    def test_same_revision_error_when_jj_fails(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.return_value = _completed(returncode=1, stderr="revset error")
+
+        result = same_revision(tmp_path, "main", "main@origin")
+
+        assert result.ok is False
+        assert result.value is False
+        assert result.error == "revset error"
+
+    @patch("maintenance_man.vcs._run")
+    def test_is_ancestor_true_when_descendant_selected(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(stdout="abc123\n"),
+            _completed(stdout="def456\n"),
+            _completed(stdout="def456\n"),
+        ]
+
+        result = is_ancestor(tmp_path, "main", "main@origin")
+
+        assert result == RevisionCheck(ok=True, value=True)
+        assert mock_run.call_args_list[-1] == call(
+            [
+                "jj",
+                "log",
+                "-r",
+                "abc123::def456 & def456",
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            tmp_path,
+        )
+
+    @patch("maintenance_man.vcs._run")
+    def test_is_ancestor_false_when_revset_empty(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(stdout="abc123\n"),
+            _completed(stdout="def456\n"),
+            _completed(stdout=""),
+        ]
+
+        result = is_ancestor(tmp_path, "main", "main@origin")
+
+        assert result == RevisionCheck(ok=True, value=False)
+
+    @patch("maintenance_man.vcs._run")
+    def test_is_ancestor_error_when_jj_fails(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(returncode=1, stderr="bad revision")
+
+        result = is_ancestor(tmp_path, "main", "main@origin")
+
+        assert result.ok is False
+        assert result.value is False
+        assert result.error == "bad revision"
+
+
+class TestSyncMain:
+    @patch("maintenance_man.vcs._run")
+    def test_fetch_failure(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(returncode=1, stderr="network error")
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "network error" in msg
+
+    @patch(
+        "maintenance_man.vcs._refresh_working_copy_from_main_result",
+        return_value=(True, ""),
+    )
+    @patch(
+        "maintenance_man.vcs.same_revision",
+        return_value=RevisionCheck(ok=True, value=True),
+    )
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_equal_main_refreshes_working_copy_only(
+        self, mock_run, mock_ensure, mock_conflict, mock_same, mock_refresh, tmp_path
     ):
         mock_run.return_value = _completed()
         ok, msg = sync_main(tmp_path)
         assert ok is True
         assert msg == ""
+        mock_ensure.assert_called_once_with(tmp_path)
+        mock_conflict.assert_called_once_with(tmp_path)
+        mock_same.assert_called_once_with(tmp_path, "main", "main@origin")
+        mock_refresh.assert_called_once_with(tmp_path)
+        assert mock_run.call_args_list == [
+            call(
+                ["jj", "git", "fetch", "--remote", "origin", "--branch", "main"],
+                tmp_path,
+                timeout=120,
+            )
+        ]
+
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=False)
+    @patch("maintenance_man.vcs._run")
+    def test_missing_main_returns_error(self, mock_run, _mock_ensure, tmp_path):
+        mock_run.return_value = _completed()
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "main bookmark not found" in msg
+
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_conflicted_main_stops_before_relationship_checks(
+        self, mock_run, _mock_conflict, _mock_ensure, tmp_path
+    ):
+        mock_run.return_value = _completed()
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "conflicted" in msg.lower()
+        assert mock_run.call_count == 1
+
+    @patch(
+        "maintenance_man.vcs.same_revision",
+        return_value=RevisionCheck(ok=False, error="revset failed"),
+    )
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_same_revision_failure_returns_error(
+        self, mock_run, _mock_ensure, _mock_conflict, _mock_same, tmp_path
+    ):
+        mock_run.return_value = _completed()
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "could not compare main and origin/main" in msg
+        assert "revset failed" in msg
+
+    @patch(
+        "maintenance_man.vcs._refresh_working_copy_from_main_result",
+        return_value=(True, ""),
+    )
+    @patch("maintenance_man.vcs.create_or_reset_bookmark", return_value=True)
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch(
+        "maintenance_man.vcs.same_revision",
+        return_value=RevisionCheck(ok=True, value=False),
+    )
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_remote_ahead_moves_local_main_to_origin(
+        self,
+        mock_run,
+        _mock_ensure,
+        _mock_conflict,
+        _mock_same,
+        mock_is_ancestor,
+        mock_reset_bookmark,
+        mock_refresh,
+        tmp_path,
+    ):
+        mock_run.return_value = _completed()
+        mock_is_ancestor.side_effect = [RevisionCheck(ok=True, value=True)]
+        ok, msg = sync_main(tmp_path)
+        assert ok is True
+        assert msg == ""
+        mock_is_ancestor.assert_called_once_with(tmp_path, "main", "main@origin")
+        mock_reset_bookmark.assert_called_once_with("main", tmp_path, "main@origin")
+        mock_refresh.assert_called_once_with(tmp_path)
+
+    @patch("maintenance_man.vcs.create_or_reset_bookmark", return_value=False)
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch(
+        "maintenance_man.vcs.same_revision",
+        return_value=RevisionCheck(ok=True, value=False),
+    )
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_remote_ahead_bookmark_move_failure_returns_error(
+        self,
+        mock_run,
+        _mock_ensure,
+        _mock_conflict,
+        _mock_same,
+        mock_is_ancestor,
+        _mock_reset_bookmark,
+        tmp_path,
+    ):
+        mock_run.return_value = _completed()
+        mock_is_ancestor.return_value = RevisionCheck(ok=True, value=True)
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "failed to move main" in msg
+
+    @patch(
+        "maintenance_man.vcs._refresh_working_copy_from_main_result",
+        return_value=(True, ""),
+    )
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs.same_revision")
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_local_ahead_pushes_refetches_and_verifies(
+        self,
+        mock_run,
+        _mock_ensure,
+        _mock_conflict,
+        mock_same,
+        mock_is_ancestor,
+        mock_refresh,
+        tmp_path,
+    ):
+        mock_run.return_value = _completed()
+        mock_same.side_effect = [
+            RevisionCheck(ok=True, value=False),
+            RevisionCheck(ok=True, value=True),
+        ]
+        mock_is_ancestor.side_effect = [
+            RevisionCheck(ok=True, value=False),
+            RevisionCheck(ok=True, value=True),
+        ]
+        ok, msg = sync_main(tmp_path)
+        assert ok is True
+        assert msg == ""
+        assert mock_is_ancestor.call_args_list == [
+            call(tmp_path, "main", "main@origin"),
+            call(tmp_path, "main@origin", "main"),
+        ]
+        assert mock_same.call_args_list == [
+            call(tmp_path, "main", "main@origin"),
+            call(tmp_path, "main", "main@origin"),
+        ]
         assert mock_run.call_args_list == [
             call(
                 ["jj", "git", "fetch", "--remote", "origin", "--branch", "main"],
@@ -588,27 +961,121 @@ class TestSyncMain:
                 tmp_path,
                 timeout=120,
             ),
+            call(
+                ["jj", "git", "fetch", "--remote", "origin", "--branch", "main"],
+                tmp_path,
+                timeout=120,
+            ),
         ]
+        mock_refresh.assert_called_once_with(tmp_path)
 
-    @patch("maintenance_man.vcs._run")
-    def test_fetch_failure(self, mock_run: MagicMock, tmp_path: Path):
-        mock_run.return_value = _completed(returncode=1, stderr="network error")
-        ok, msg = sync_main(tmp_path)
-        assert ok is False
-        assert "network error" in msg
-
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs.same_revision")
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
     @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
-    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=True)
     @patch("maintenance_man.vcs._run")
-    def test_conflicted_main_stops_before_push(
+    def test_post_push_verification_false_returns_error(
         self,
-        mock_run: MagicMock,
-        _mock_conflict: MagicMock,
-        _mock_ensure: MagicMock,
-        tmp_path: Path,
+        mock_run,
+        _mock_ensure,
+        _mock_conflict,
+        mock_same,
+        mock_is_ancestor,
+        tmp_path,
     ):
         mock_run.return_value = _completed()
+        mock_same.side_effect = [
+            RevisionCheck(ok=True, value=False),
+            RevisionCheck(ok=True, value=False),
+        ]
+        mock_is_ancestor.side_effect = [
+            RevisionCheck(ok=True, value=False),
+            RevisionCheck(ok=True, value=True),
+        ]
         ok, msg = sync_main(tmp_path)
         assert ok is False
-        assert "conflicted" in msg.lower()
-        assert mock_run.call_count == 1
+        assert "did not update" in msg
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch("maintenance_man.vcs.same_revision")
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_post_push_verification_error_returns_error(
+        self,
+        mock_run,
+        _mock_ensure,
+        _mock_conflict,
+        mock_same,
+        mock_is_ancestor,
+        tmp_path,
+    ):
+        mock_run.return_value = _completed()
+        mock_same.side_effect = [
+            RevisionCheck(ok=True, value=False),
+            RevisionCheck(ok=False, error="verify failed"),
+        ]
+        mock_is_ancestor.side_effect = [
+            RevisionCheck(ok=True, value=False),
+            RevisionCheck(ok=True, value=True),
+        ]
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "could not verify pushed main" in msg
+        assert "verify failed" in msg
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch(
+        "maintenance_man.vcs.same_revision",
+        return_value=RevisionCheck(ok=True, value=False),
+    )
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_diverged_returns_error_without_push(
+        self,
+        mock_run,
+        _mock_ensure,
+        _mock_conflict,
+        _mock_same,
+        mock_is_ancestor,
+        tmp_path,
+    ):
+        mock_run.return_value = _completed()
+        mock_is_ancestor.side_effect = [
+            RevisionCheck(ok=True, value=False),
+            RevisionCheck(ok=True, value=False),
+        ]
+        ok, msg = sync_main(tmp_path)
+        assert ok is False
+        assert "diverged" in msg.lower()
+        assert all("push" not in args[0][0] for args in mock_run.call_args_list)
+
+    @patch("maintenance_man.vcs.is_ancestor")
+    @patch(
+        "maintenance_man.vcs.same_revision",
+        return_value=RevisionCheck(ok=True, value=True),
+    )
+    @patch("maintenance_man.vcs._main_bookmark_is_conflicted", return_value=False)
+    @patch("maintenance_man.vcs.ensure_main_bookmark", return_value=True)
+    @patch("maintenance_man.vcs._run")
+    def test_refresh_failure_returns_underlying_error(
+        self,
+        mock_run,
+        _mock_ensure,
+        _mock_conflict,
+        _mock_same,
+        mock_is_ancestor,
+        tmp_path,
+    ):
+        mock_run.side_effect = [
+            _completed(),
+            _completed(stdout="M pyproject.toml\n"),
+        ]
+        mock_is_ancestor.return_value = RevisionCheck(ok=False, error="revset failed")
+
+        ok, msg = sync_main(tmp_path)
+
+        assert ok is False
+        assert "working copy ancestry" in msg
+        assert "revset failed" in msg
