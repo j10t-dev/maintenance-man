@@ -61,6 +61,12 @@ def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
 
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `uv pip list --outdated --format json` and parse results."""
+    _run_checked(
+        ["uv", "sync", "--locked"],
+        cwd=project.path,
+        timeout=300,
+        label="uv sync --locked",
+    )
     venv_python = Path(project.path) / ".venv" / "bin" / "python"
     cmd = ["uv", "pip", "list", "--outdated", "--format", "json"]
     if venv_python.exists():
