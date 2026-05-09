@@ -804,7 +804,7 @@ class TestSyncMain:
         mock_run.return_value = _completed()
         ok, msg = sync_main(tmp_path)
         assert ok is True
-        assert msg == ""
+        assert msg == "already up to date"
         mock_ensure.assert_called_once_with(tmp_path)
         mock_conflict.assert_called_once_with(tmp_path)
         mock_same.assert_called_once_with(tmp_path, "main", "main@origin")
@@ -881,7 +881,7 @@ class TestSyncMain:
         mock_is_ancestor.side_effect = [RevisionCheck(ok=True, value=True)]
         ok, msg = sync_main(tmp_path)
         assert ok is True
-        assert msg == ""
+        assert msg == "pulled from remote"
         mock_is_ancestor.assert_called_once_with(tmp_path, "main", "main@origin")
         mock_reset_bookmark.assert_called_once_with("main", tmp_path, "main@origin")
         mock_refresh.assert_called_once_with(tmp_path)
@@ -941,7 +941,7 @@ class TestSyncMain:
         ]
         ok, msg = sync_main(tmp_path)
         assert ok is True
-        assert msg == ""
+        assert msg == "pushed to remote"
         assert mock_is_ancestor.call_args_list == [
             call(tmp_path, "main", "main@origin"),
             call(tmp_path, "main@origin", "main"),

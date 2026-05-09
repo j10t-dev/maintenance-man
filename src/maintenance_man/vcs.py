@@ -472,8 +472,9 @@ def _fetch_origin_main(project_path: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _refresh_after_sync(project_path: Path) -> tuple[bool, str]:
-    return _refresh_working_copy_from_main_result(project_path)
+def _refresh_after_sync(project_path: Path, action: str) -> tuple[bool, str]:
+    ok, err = _refresh_working_copy_from_main_result(project_path)
+    return ok, action if ok else err
 
 
 def sync_main(project_path: Path) -> tuple[bool, str]:
@@ -496,7 +497,7 @@ def sync_main(project_path: Path) -> tuple[bool, str]:
     if not same.ok:
         return False, f"could not compare main and origin/main: {same.error}"
     if same.value:
-        return _refresh_after_sync(project_path)
+        return _refresh_after_sync(project_path, "already up to date")
 
     remote_ahead = is_ancestor(project_path, "main", "main@origin")
     if not remote_ahead.ok:
@@ -507,7 +508,7 @@ def sync_main(project_path: Path) -> tuple[bool, str]:
     if remote_ahead.value:
         if not create_or_reset_bookmark("main", project_path, "main@origin"):
             return False, "failed to move main to origin/main"
-        return _refresh_after_sync(project_path)
+        return _refresh_after_sync(project_path, "pulled from remote")
 
     local_ahead = is_ancestor(project_path, "main@origin", "main")
     if not local_ahead.ok:
@@ -533,7 +534,7 @@ def sync_main(project_path: Path) -> tuple[bool, str]:
             return False, f"could not verify pushed main: {verified.error}"
         if not verified.value:
             return False, "pushed main but origin/main did not update to match"
-        return _refresh_after_sync(project_path)
+        return _refresh_after_sync(project_path, "pushed to remote")
 
     return (
         False,

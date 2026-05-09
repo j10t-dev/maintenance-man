@@ -323,7 +323,7 @@ def sync(
             continue
         ok, msg = sync_main(proj_config.path)
         if ok:
-            console.print(f"  {name} — ok")
+            console.print(f"  {name} — {msg}")
         else:
             console.print(f"  [bold red]{name} — {msg}[/]")
             had_errors = True
