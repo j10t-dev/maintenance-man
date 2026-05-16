@@ -573,10 +573,7 @@ def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
         vuln
         for vuln in vulns
         if vuln.update_status is None
-        or (
-            vuln.update_status == UpdateStatus.FAILED
-            and vuln.flow == Workflow.UPDATE
-        )
+        or (vuln.update_status == UpdateStatus.FAILED and vuln.flow == Workflow.UPDATE)
     ]
 
 
@@ -1041,8 +1038,7 @@ def _handle_resolve_continue(
         proj_config.path, _RESOLVE_BOOKMARK
     ):
         _fatal(
-            f"--continue requires current jj change to descend from "
-            f"{_RESOLVE_BOOKMARK}"
+            f"--continue requires current jj change to descend from {_RESOLVE_BOOKMARK}"
         )
     if current_change_has_changes(proj_config.path):
         _fatal(

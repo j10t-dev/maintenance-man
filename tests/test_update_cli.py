@@ -839,8 +839,9 @@ class TestUpdateFinalise:
         )
         monkeypatch.setattr(
             "maintenance_man.cli.create_workspace",
-            lambda repo, project, rev: calls.append(("workspace", (repo, project, rev)))
-            or True,
+            lambda repo, project, rev: (
+                calls.append(("workspace", (repo, project, rev))) or True
+            ),
         )
         monkeypatch.setattr(
             "maintenance_man.cli.edit_new_change",

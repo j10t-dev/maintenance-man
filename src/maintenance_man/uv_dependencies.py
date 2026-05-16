@@ -16,11 +16,12 @@ class UvDependencyError(Exception):
 _PEP503_NORMALISE_RE = re.compile(r"[-_.]+")
 
 
-# Intentionally excludes [project.optional-dependencies]. maintenance-man only
-# supports UV runtime dependencies and dependency groups for scan/update flows.
+# Scans [project.dependencies] and [dependency-groups] only.
+# [project.optional-dependencies] are not scanned; packages declared only there
+# (or packages that are purely transitive) fall through to kind="transitive".
 @dataclass(frozen=True, slots=True)
 class UvDependencyLocation:
-    kind: Literal["runtime", "group"]
+    kind: Literal["runtime", "group", "transitive"]
     group: str | None = None
 
 
@@ -49,7 +50,12 @@ def get_uv_direct_dep_names(project_path: Path) -> set[str]:
 def get_uv_dependency_locations(
     project_path: Path, pkg_name: str
 ) -> list[UvDependencyLocation]:
-    """Return every direct UV declaration location matching *pkg_name*."""
+    """Return UV declaration locations for *pkg_name*.
+
+    Returns runtime and/or group locations when the package is declared directly.
+    Returns ``[UvDependencyLocation(kind="transitive")]`` when no direct declaration
+    is found (transitive dependency or optional-extras-only declaration).
+    """
     data = _load_pyproject(project_path)
     target = normalise_pkg_name(pkg_name)
     locations: list[UvDependencyLocation] = []
@@ -63,10 +69,7 @@ def get_uv_dependency_locations(
             locations.append(UvDependencyLocation(kind="group", group=group))
 
     if not locations:
-        raise UvDependencyError(
-            "Package reported as direct dependency but no matching declaration "
-            f"was found in pyproject.toml: {pkg_name}"
-        )
+        return [UvDependencyLocation(kind="transitive")]
 
     return locations
 

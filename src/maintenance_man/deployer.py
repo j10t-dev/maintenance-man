@@ -92,7 +92,7 @@ def check_health(
                 is_up=False,
                 error="Healthchecker returned non-JSON response",
             )
-        except (urllib.error.URLError, TimeoutError):
+        except urllib.error.URLError, TimeoutError:
             if attempt < max_retries - 1:
                 time.sleep(delay)
                 delay *= 2

@@ -173,8 +173,7 @@ def _refresh_working_copy_from_main_result(path: Path) -> tuple[bool, str]:
         result = _run(["jj", "rebase", "-r", "@", "-d", "main"], path)
         if result.returncode != 0:
             message = (
-                "failed to rebase working copy onto main: "
-                f"{result.stderr.strip()}"
+                f"failed to rebase working copy onto main: {result.stderr.strip()}"
             )
             rprint(f"  [bold yellow]Warning:[/] {message}")
             return False, message
@@ -333,8 +332,7 @@ def ensure_main_bookmark(path: Path) -> bool:
     origin_check = _revision_check(path, "main@origin")
     if not origin_check.ok:
         rprint(
-            f"  [bold red]Error:[/] could not check main@origin: "
-            f"{origin_check.error}"
+            f"  [bold red]Error:[/] could not check main@origin: {origin_check.error}"
         )
         return False
     if not origin_check.value:

@@ -377,6 +377,8 @@ def get_update_commands(
 def _get_uv_update_command(
     pkg_name: str, version: str, location: UvDependencyLocation
 ) -> list[str]:
+    if location.kind == "transitive":
+        return ["uv", "lock", "--upgrade-package", pkg_name]
     command = ["uv", "add"]
     if location.kind == "group":
         if location.group is None:

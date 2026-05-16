@@ -32,7 +32,11 @@ from maintenance_man.updater import (
     save_scan_results,
     sort_updates_by_risk,
 )
-from maintenance_man.uv_dependencies import UvDependencyError, UvDependencyLocation
+from maintenance_man.uv_dependencies import (
+    UvDependencyError,
+    UvDependencyLocation,
+    get_uv_dependency_locations,
+)
 
 # -- Factory helpers --
 
@@ -223,7 +227,7 @@ class TestGetUpdateCommands:
             ["uv", "add", "--group", "lint", "ruff==0.13.0"]
         ]
 
-    def test_uv_optional_dependency_is_not_supported(self, tmp_path: Path):
+    def test_uv_optional_dependency_uses_lock_upgrade(self, tmp_path: Path):
         (tmp_path / "pyproject.toml").write_text(
             "[project]\ndependencies = []\n\n"
             "[project.optional-dependencies]\n"
@@ -231,14 +235,9 @@ class TestGetUpdateCommands:
             encoding="utf-8",
         )
 
-        with pytest.raises(
-            UvDependencyError,
-            match=(
-                "Package reported as direct dependency but no matching declaration "
-                "was found in pyproject.toml: rich"
-            ),
-        ):
-            get_update_commands("uv", "rich", "14.3.3", tmp_path)
+        assert get_update_commands("uv", "rich", "14.3.3", tmp_path) == [
+            ["uv", "lock", "--upgrade-package", "rich"]
+        ]
 
     def test_uv_runtime_and_group_dependency(self, tmp_path: Path):
         (tmp_path / "pyproject.toml").write_text(
@@ -253,19 +252,14 @@ class TestGetUpdateCommands:
             ["uv", "add", "--group", "dev", "pytest==9.0.3"],
         ]
 
-    def test_uv_missing_declaration_site_raises(self, tmp_path: Path):
+    def test_uv_missing_declaration_uses_lock_upgrade(self, tmp_path: Path):
         (tmp_path / "pyproject.toml").write_text(
             '[project]\ndependencies = ["requests>=2.28"]\n', encoding="utf-8"
         )
 
-        with pytest.raises(
-            UvDependencyError,
-            match=(
-                "Package reported as direct dependency but no matching declaration "
-                "was found in pyproject.toml: pytest"
-            ),
-        ):
-            get_update_commands("uv", "pytest", "9.0.3", tmp_path)
+        assert get_update_commands("uv", "urllib3", "2.7.0", tmp_path) == [
+            ["uv", "lock", "--upgrade-package", "urllib3"]
+        ]
 
     @pytest.mark.parametrize(
         ("manager", "pkg", "version", "expected"),
@@ -308,6 +302,34 @@ class TestGetUpdateCommands:
                 "9.0.3",
                 UvDependencyLocation(kind="group"),
             )
+
+    def test_uv_transitive_location_emits_lock_upgrade_command(self):
+        assert _get_uv_update_command(
+            "urllib3", "2.7.0", UvDependencyLocation(kind="transitive")
+        ) == ["uv", "lock", "--upgrade-package", "urllib3"]
+
+
+class TestGetUvDependencyLocations:
+    def test_returns_transitive_when_package_not_in_pyproject(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["requests>=2.28"]\n', encoding="utf-8"
+        )
+
+        result = get_uv_dependency_locations(tmp_path, "urllib3")
+        assert result == [UvDependencyLocation(kind="transitive")]
+
+    def test_returns_transitive_for_optional_dependency(self, tmp_path: Path):
+        # project.optional-dependencies are intentionally not scanned for direct deps;
+        # packages declared only there fall through to the transitive path.
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\ndependencies = []\n\n"
+            "[project.optional-dependencies]\n"
+            'cli = ["rich>=14.0"]\n',
+            encoding="utf-8",
+        )
+
+        result = get_uv_dependency_locations(tmp_path, "rich")
+        assert result == [UvDependencyLocation(kind="transitive")]
 
 
 class TestApplyUpdate:
