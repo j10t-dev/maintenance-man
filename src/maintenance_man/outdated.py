@@ -101,8 +101,8 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
 
 
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
-    """Run `bun outdated` and parse the table output."""
-    cmd = ["bun", "outdated"]
+    """Run `bun outdated` without progress output and parse the table output."""
+    cmd = ["bun", "outdated", "--no-progress"]
     completed = _run_checked(
         cmd,
         cwd=project.path,

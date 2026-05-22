@@ -352,6 +352,17 @@ class TestBunOutdated:
 
         assert updates == []
 
+    def test_disables_progress_output_to_avoid_bun_resolving_hangs(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        project = _make_project("bun")
+
+        with patch("maintenance_man.outdated.subprocess.run", return_value=completed) as run:
+            bun_outdated(project)
+
+        assert run.call_args.args[0] == ["bun", "outdated", "--no-progress"]
+
     def test_command_failure_raises(self):
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="error"
