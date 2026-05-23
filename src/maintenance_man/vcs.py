@@ -281,6 +281,15 @@ def _revision_check(path: Path, revset: str) -> RevisionCheck:
     return RevisionCheck(ok=True, value=bool(result.stdout.strip()))
 
 
+def main_commit_id(path: Path) -> RevisionResolve:
+    """Resolve the local main bookmark to its single commit_id.
+
+    Returns ok=False when main is absent, ambiguous, or jj errors — the
+    fail-closed trigger for the deploy change-detection gate.
+    """
+    return _single_commit_id(path, "main")
+
+
 def _single_commit_id(path: Path, revision: str) -> RevisionResolve:
     result = _run(
         ["jj", "log", "-r", revision, "--no-graph", "-T", 'commit_id ++ "\\n"'],

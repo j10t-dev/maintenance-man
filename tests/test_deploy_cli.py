@@ -1,13 +1,120 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from maintenance_man.cli import ExitCode, app
+from maintenance_man.cli import ExitCode, GateDecision, app, should_deploy
 from maintenance_man.deployer import BuildError, DeployError, HealthCheckResult
+from maintenance_man.models.activity import ActivityEvent, ProjectActivity
+from maintenance_man.vcs import RevisionResolve
+
+
+def _activity(*, success: bool, commit_id: str | None) -> dict[str, ProjectActivity]:
+    return {
+        "app": ProjectActivity(
+            last_deploy=ActivityEvent(
+                timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                success=success,
+                branch="main",
+                commit_id=commit_id,
+            )
+        )
+    }
+
+
+@pytest.fixture
+def _open_deploy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "maintenance_man.cli.main_commit_id",
+        lambda path: RevisionResolve(ok=True, commit_id="gateopen0001"),
+    )
+    monkeypatch.setattr("maintenance_man.cli.load_activity", lambda path: {})
+
+
+class TestShouldDeploy:
+    @pytest.mark.parametrize(
+        "resolved, activity, force, expected, expected_id",
+        [
+            (
+                RevisionResolve(ok=True, commit_id="C"),
+                _activity(success=True, commit_id="C"),
+                False,
+                "SKIP_UNCHANGED",
+                "C",
+            ),
+            (
+                RevisionResolve(ok=True, commit_id="C"),
+                _activity(success=True, commit_id="OLD"),
+                False,
+                "DEPLOY",
+                "C",
+            ),
+            (
+                RevisionResolve(ok=True, commit_id="C"),
+                _activity(success=False, commit_id="C"),
+                False,
+                "DEPLOY",
+                "C",
+            ),
+            (
+                RevisionResolve(ok=True, commit_id="C"),
+                _activity(success=True, commit_id=None),
+                False,
+                "DEPLOY",
+                "C",
+            ),
+            (RevisionResolve(ok=True, commit_id="C"), {}, False, "DEPLOY", "C"),
+            (
+                RevisionResolve(ok=False, error="no main"),
+                {},
+                False,
+                "SKIP_BLOCKED",
+                None,
+            ),
+            (
+                RevisionResolve(ok=True, commit_id="C"),
+                _activity(success=True, commit_id="C"),
+                True,
+                "DEPLOY",
+                "C",
+            ),
+            (RevisionResolve(ok=False, error="no main"), {}, True, "DEPLOY", None),
+        ],
+    )
+    def test_gate_decision(
+        self, monkeypatch, tmp_path, resolved, activity, force, expected, expected_id
+    ):
+        monkeypatch.setattr("maintenance_man.cli.main_commit_id", lambda path: resolved)
+        decision, current_id = should_deploy("app", tmp_path, activity, force=force)
+        assert decision == getattr(GateDecision, expected)
+        assert current_id == expected_id
+
+    def test_last_build_only_does_not_gate(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=True, commit_id="C"),
+        )
+        activity = {
+            "app": ProjectActivity(
+                last_build=ActivityEvent(
+                    timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                    success=True,
+                    branch="main",
+                    commit_id="C",
+                )
+            )
+        }
+        decision, current_id = should_deploy("app", tmp_path, activity, force=False)
+        assert decision == GateDecision.DEPLOY
+        assert current_id == "C"
 
 
 class TestDeployCommand:
+    @pytest.fixture(autouse=True)
+    def _gate(self, _open_deploy_gate: None) -> None:
+        pass
+
     def test_no_deploy_config(self, mm_home_with_projects: Path) -> None:
         """Error when project has no deploy_command configured."""
         with pytest.raises(SystemExit) as exc_info:
@@ -135,6 +242,10 @@ class TestDeployCommand:
 
 
 class TestDeployCheck:
+    @pytest.fixture(autouse=True)
+    def _gate(self, _open_deploy_gate: None) -> None:
+        pass
+
     @patch(
         "maintenance_man.cli.check_health",
         return_value=HealthCheckResult(is_up=True),
@@ -198,6 +309,10 @@ class TestDeployCheck:
 
 
 class TestMassDeployCommand:
+    @pytest.fixture(autouse=True)
+    def _gate(self, _open_deploy_gate: None) -> None:
+        pass
+
     @patch("maintenance_man.cli.run_deploy")
     @patch("maintenance_man.cli.run_build")
     def test_deploys_all_projects_with_deploy_command(
@@ -340,3 +455,239 @@ class TestMassDeployCommand:
             app(["deploy"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
         assert "no projects" in capsys.readouterr().out.lower()
+
+
+class TestDeployGateWiring:
+    @patch("maintenance_man.cli.run_deploy")
+    def test_explicit_unchanged_skips_with_warning(
+        self,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=True, commit_id="C"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.load_activity",
+            lambda path: (
+                _activity(success=True, commit_id="C")
+                | {
+                    "deploy-only": ProjectActivity(
+                        last_deploy=ActivityEvent(
+                            timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                            success=True,
+                            branch="main",
+                            commit_id="C",
+                        )
+                    )
+                }
+            ),
+        )
+        with pytest.raises(SystemExit) as exc:
+            app(["deploy", "deploy-only"], exit_on_error=False)
+        assert exc.value.code == ExitCode.OK
+        mock_deploy.assert_not_called()
+        assert "force" in capsys.readouterr().out.lower()
+
+    @patch("maintenance_man.cli.record_activity")
+    @patch("maintenance_man.cli.run_deploy")
+    def test_explicit_unchanged_records_nothing(
+        self,
+        mock_deploy: MagicMock,
+        mock_record: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=True, commit_id="C"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.load_activity",
+            lambda path: {
+                "deploy-only": ProjectActivity(
+                    last_deploy=ActivityEvent(
+                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        success=True,
+                        branch="main",
+                        commit_id="C",
+                    )
+                )
+            },
+        )
+        with pytest.raises(SystemExit):
+            app(["deploy", "deploy-only"], exit_on_error=False)
+        mock_record.assert_not_called()
+
+    @patch("maintenance_man.cli.record_activity")
+    @patch("maintenance_man.cli.run_deploy")
+    def test_force_redeploys_unchanged_and_records_commit_id(
+        self,
+        mock_deploy: MagicMock,
+        mock_record: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=True, commit_id="C"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.load_activity",
+            lambda path: {
+                "deploy-only": ProjectActivity(
+                    last_deploy=ActivityEvent(
+                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        success=True,
+                        branch="main",
+                        commit_id="C",
+                    )
+                )
+            },
+        )
+        with pytest.raises(SystemExit) as exc:
+            app(["deploy", "deploy-only", "--force"], exit_on_error=False)
+        assert exc.value.code == ExitCode.OK
+        mock_deploy.assert_called_once()
+        assert mock_record.call_args.kwargs["commit_id"] == "C"
+
+    @patch("maintenance_man.cli.run_deploy")
+    def test_explicit_blocked_exits_error(
+        self,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=False, error="no main"),
+        )
+        monkeypatch.setattr("maintenance_man.cli.load_activity", lambda path: {})
+        with pytest.raises(SystemExit) as exc:
+            app(["deploy", "deploy-only"], exit_on_error=False)
+        assert exc.value.code == ExitCode.ERROR
+        mock_deploy.assert_not_called()
+
+    @patch("maintenance_man.cli.run_deploy")
+    def test_batch_blocked_exits_ok(
+        self,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=False, error="no main"),
+        )
+        monkeypatch.setattr("maintenance_man.cli.load_activity", lambda path: {})
+        with pytest.raises(SystemExit) as exc:
+            app(["deploy"], exit_on_error=False)
+        assert exc.value.code == ExitCode.OK
+        mock_deploy.assert_not_called()
+
+    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.cli.run_deploy")
+    def test_batch_skips_unchanged_deploys_changed(
+        self,
+        mock_deploy: MagicMock,
+        mock_build: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=True, commit_id="C"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.load_activity",
+            lambda path: {
+                "deployable": ProjectActivity(
+                    last_deploy=ActivityEvent(
+                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        success=True,
+                        branch="main",
+                        commit_id="C",
+                    )
+                )
+            },
+        )
+        with pytest.raises(SystemExit) as exc:
+            app(["deploy"], exit_on_error=False)
+        assert exc.value.code == ExitCode.OK
+        deployed = [c.args[0] for c in mock_deploy.call_args_list]
+        assert "deployable" not in deployed
+        assert "deploy-only" in deployed
+        mock_build.assert_not_called()
+
+    @patch(
+        "maintenance_man.cli.check_health",
+        return_value=HealthCheckResult(is_up=True),
+    )
+    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.cli.run_deploy")
+    def test_check_not_run_for_skipped(
+        self,
+        mock_deploy: MagicMock,
+        mock_build: MagicMock,
+        mock_check: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config_path = mm_home_with_projects / "config.toml"
+        config_path.write_text(
+            config_path.read_text().replace(
+                "min_version_age_days = 7",
+                'min_version_age_days = 7\nhealthcheck_url = "http://h:8080"',
+            )
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=True, commit_id="C"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.load_activity",
+            lambda path: {
+                "deployable": ProjectActivity(
+                    last_deploy=ActivityEvent(
+                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        success=True,
+                        branch="main",
+                        commit_id="C",
+                    )
+                ),
+                "deploy-only": ProjectActivity(
+                    last_deploy=ActivityEvent(
+                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        success=True,
+                        branch="main",
+                        commit_id="C",
+                    )
+                ),
+            },
+        )
+        with pytest.raises(SystemExit):
+            app(["deploy", "--check"], exit_on_error=False)
+        mock_check.assert_not_called()
+
+    @patch("maintenance_man.cli.run_deploy")
+    def test_loop_closes_real_activity(
+        self,
+        mock_deploy: MagicMock,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Deploy once records the id; second run skips. The headline behaviour."""
+        monkeypatch.setattr(
+            "maintenance_man.cli.main_commit_id",
+            lambda path: RevisionResolve(ok=True, commit_id="STABLE"),
+        )
+        with pytest.raises(SystemExit):
+            app(["deploy", "deploy-only"], exit_on_error=False)
+        assert mock_deploy.call_count == 1
+        with pytest.raises(SystemExit) as exc:
+            app(["deploy", "deploy-only"], exit_on_error=False)
+        assert exc.value.code == ExitCode.OK
+        assert mock_deploy.call_count == 1

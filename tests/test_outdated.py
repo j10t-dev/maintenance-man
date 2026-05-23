@@ -358,7 +358,9 @@ class TestBunOutdated:
         )
         project = _make_project("bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed) as run:
+        with patch(
+            "maintenance_man.outdated.subprocess.run", return_value=completed
+        ) as run:
             bun_outdated(project)
 
         assert run.call_args.args[0] == ["bun", "outdated", "--no-progress"]

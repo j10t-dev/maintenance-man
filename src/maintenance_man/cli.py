@@ -3,7 +3,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
@@ -33,6 +33,7 @@ from maintenance_man.deployer import (
 )
 from maintenance_man.models.activity import (
     ActivityEvent,
+    ProjectActivity,
     load_activity,
     record_activity,
 )
@@ -80,6 +81,7 @@ from maintenance_man.vcs import (
     delete_bookmark,
     edit_new_change,
     ensure_main_bookmark,
+    main_commit_id,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
@@ -103,11 +105,45 @@ class ExitCode(IntEnum):
     SYNC_FAILED = 8
 
 
+class GateDecision(StrEnum):
+    DEPLOY = "deploy"
+    SKIP_UNCHANGED = "unchanged"
+    SKIP_BLOCKED = "blocked"
+
+
 @dataclass
 class DeployResult:
     project: str
     build_status: Literal["pass", "fail", "skip"]
-    deploy_status: Literal["pass", "fail", "skip"]
+    deploy_status: Literal["pass", "fail", "skip", "unchanged", "blocked"]
+
+
+def should_deploy(
+    name: str,
+    project_path: Path,
+    activity: dict[str, ProjectActivity],
+    *,
+    force: bool,
+) -> tuple[GateDecision, str | None]:
+    """Decide whether a project needs deploying.
+
+    Returns the decision and the main commit_id it gated on (None when
+    unresolvable). The caller records this id rather than re-resolving, so the
+    recorded identity matches what was gated even if main moves concurrently.
+    """
+    resolved = main_commit_id(project_path)
+    current_id = resolved.commit_id if resolved.ok else None
+
+    if force:
+        return GateDecision.DEPLOY, current_id
+    if not resolved.ok:
+        return GateDecision.SKIP_BLOCKED, None
+
+    proj = activity.get(name)
+    last = proj.last_deploy if proj else None
+    if last is not None and last.success and last.commit_id == current_id:
+        return GateDecision.SKIP_UNCHANGED, current_id
+    return GateDecision.DEPLOY, current_id
 
 
 console = Console()
@@ -1109,6 +1145,7 @@ def _deploy_one(
     name: str,
     proj_config: ProjectConfig,
     cfg: MmConfig,
+    commit_id: str | None,
     *,
     check: bool = False,
 ) -> DeployResult:
@@ -1132,7 +1169,7 @@ def _deploy_one(
 
     console.print("  [bold]Deploying...[/]")
     try:
-        _run_deploy_step(name, proj_config)
+        _run_deploy_step(name, proj_config, commit_id)
     except DeployError as e:
         console.print(f"  [bold red]Deploy failed:[/] {e}")
         deploy_status = "fail"
@@ -1153,12 +1190,13 @@ def _deploy_one(
     )
 
 
-def _deploy_all(cfg: MmConfig, *, check: bool = False) -> NoReturn:
+def _deploy_all(cfg: MmConfig, *, check: bool = False, force: bool = False) -> NoReturn:
     """Deploy all configured projects that have a deploy_command."""
     if not cfg.projects:
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         sys.exit(ExitCode.OK)
 
+    activity = load_activity(_config.MM_HOME / "activity.json")
     results: list[DeployResult] = []
 
     for name, proj_config in sorted(cfg.projects.items()):
@@ -1179,14 +1217,36 @@ def _deploy_all(cfg: MmConfig, *, check: bool = False) -> NoReturn:
             )
             continue
 
+        decision, current_id = should_deploy(
+            name, proj_config.path, activity, force=force
+        )
+        if decision is GateDecision.SKIP_UNCHANGED:
+            console.print(f"[dim]{name} — unchanged since last deploy[/]")
+            results.append(
+                DeployResult(
+                    project=name, build_status="skip", deploy_status="unchanged"
+                )
+            )
+            continue
+        if decision is GateDecision.SKIP_BLOCKED:
+            console.print(
+                f"[bold yellow]Warning:[/] {name} — could not resolve main "
+                f"revision; skipping (use --force to deploy anyway)"
+            )
+            results.append(
+                DeployResult(project=name, build_status="skip", deploy_status="blocked")
+            )
+            continue
+
         console.print(f"\n{'═' * 40}")
         console.print(f"[bold]{name}[/]")
         console.print("═" * 40)
 
-        results.append(_deploy_one(name, proj_config, cfg, check=check))
+        results.append(_deploy_one(name, proj_config, cfg, current_id, check=check))
 
     _print_deploy_summary(results)
 
+    # Only "fail" counts; "unchanged"/"blocked" are deliberate skips, not failures.
     any_failed = any(
         r.deploy_status == "fail" or r.build_status == "fail" for r in results
     )
@@ -1203,6 +1263,8 @@ def _print_deploy_summary(results: list[DeployResult]) -> None:
         "pass": "[green]PASS[/]",
         "fail": "[red]FAIL[/]",
         "skip": "[dim]SKIP[/]",
+        "unchanged": "[dim]UNCHANGED[/]",
+        "blocked": "[yellow]BLOCKED[/]",
     }
 
     table = Table(title="Deploy Summary")
@@ -1232,11 +1294,19 @@ def _record_deploy_activity(
     *,
     success: bool,
     project_path: Path,
+    commit_id: str | None = None,
 ) -> None:
     """Record build/deploy activity for a project."""
     activity_path = _config.MM_HOME / "activity.json"
     branch = _current_label(project_path)
-    record_activity(activity_path, project, event_type, success=success, branch=branch)
+    record_activity(
+        activity_path,
+        project,
+        event_type,
+        success=success,
+        branch=branch,
+        commit_id=commit_id,
+    )
 
 
 def _run_build_step(project: str, proj_config: ProjectConfig) -> None:
@@ -1260,7 +1330,9 @@ def _run_build_step(project: str, proj_config: ProjectConfig) -> None:
     )
 
 
-def _run_deploy_step(project: str, proj_config: ProjectConfig) -> None:
+def _run_deploy_step(
+    project: str, proj_config: ProjectConfig, commit_id: str | None
+) -> None:
     """Run deploy and record activity, raising DeployError on failure."""
     assert proj_config.deploy_command is not None
     try:
@@ -1271,6 +1343,7 @@ def _run_deploy_step(project: str, proj_config: ProjectConfig) -> None:
             "deploy",
             success=False,
             project_path=proj_config.path,
+            commit_id=None,
         )
         raise
     _record_deploy_activity(
@@ -1278,6 +1351,7 @@ def _run_deploy_step(project: str, proj_config: ProjectConfig) -> None:
         "deploy",
         success=True,
         project_path=proj_config.path,
+        commit_id=commit_id,
     )
 
 
@@ -1303,6 +1377,7 @@ def deploy(
     *,
     build: bool = False,
     check: bool = False,
+    force: Annotated[bool, cyclopts.Parameter(name=["--force", "-f"])] = False,
     config: Path | None = None,
 ) -> None:
     """Deploy a project.
@@ -1316,6 +1391,9 @@ def deploy(
         is configured. Always enabled when deploying all projects.
     check: bool
         Verify deployment health via healthchecker after deploy.
+    force: bool
+        Deploy even when main is unchanged since the last successful deploy or
+        could not be resolved.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
@@ -1324,7 +1402,7 @@ def deploy(
     if not project:
         if check and not cfg.defaults.healthcheck_url:
             _warn_missing_healthcheck_url()
-        _deploy_all(cfg, check=check)
+        _deploy_all(cfg, check=check, force=force)
         return  # _deploy_all calls sys.exit(); guard against refactors
 
     proj_config = _resolve_proj(cfg, project)
@@ -1339,6 +1417,23 @@ def deploy(
             f"Add deploy_command to [projects.{project}] in ~/.mm/config.toml."
         )
 
+    activity = load_activity(_config.MM_HOME / "activity.json")
+    decision, current_id = should_deploy(
+        project, proj_config.path, activity, force=force
+    )
+    if decision is GateDecision.SKIP_UNCHANGED:
+        console.print(
+            f"[bold yellow]{project}[/] unchanged since last deploy "
+            f"(use --force to redeploy)."
+        )
+        sys.exit(ExitCode.OK)
+    if decision is GateDecision.SKIP_BLOCKED:
+        _fatal(
+            f"Could not resolve main revision for [bold]{project}[/]; refusing "
+            f"to deploy unverified state (use --force to override).",
+            code=ExitCode.ERROR,
+        )
+
     if build and proj_config.build_command:
         console.print(f"[bold]Building {project}[/]\n")
         try:
@@ -1350,7 +1445,7 @@ def deploy(
     console.print(f"[bold]Deploying {project}[/]\n")
 
     try:
-        _run_deploy_step(project, proj_config)
+        _run_deploy_step(project, proj_config, current_id)
     except DeployError as e:
         _fatal(str(e), code=ExitCode.DEPLOY_FAILED)
 

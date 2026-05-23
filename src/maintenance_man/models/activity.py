@@ -10,6 +10,7 @@ class ActivityEvent(BaseModel):
     timestamp: datetime
     success: bool
     branch: str
+    commit_id: str | None = None
 
     @field_validator("timestamp", mode="before")
     @classmethod
@@ -40,6 +41,7 @@ def record_activity(
     *,
     success: bool,
     branch: str,
+    commit_id: str | None = None,
 ) -> None:
     """Record a build/deploy event. Fire-and-forget — never raises."""
     try:
@@ -49,6 +51,7 @@ def record_activity(
             timestamp=datetime.now(timezone.utc),
             success=success,
             branch=branch,
+            commit_id=commit_id,
         )
         if event_type == "build":
             proj.last_build = event

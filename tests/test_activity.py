@@ -119,3 +119,37 @@ class TestRecordActivity:
         path = tmp_path / "nonexistent-dir" / "activity.json"
         # Should not raise
         record_activity(path, "myapp", "build", success=True, branch="main")
+
+
+class TestCommitId:
+    def test_records_commit_id_on_deploy(self, tmp_path: Path):
+        path = tmp_path / "activity.json"
+        record_activity(
+            path, "myapp", "deploy", success=True, branch="main", commit_id="abc123"
+        )
+        result = load_activity(path)
+        assert result["myapp"].last_deploy is not None
+        assert result["myapp"].last_deploy.commit_id == "abc123"
+
+    def test_commit_id_defaults_to_none(self, tmp_path: Path):
+        path = tmp_path / "activity.json"
+        record_activity(path, "myapp", "build", success=True, branch="main")
+        result = load_activity(path)
+        assert result["myapp"].last_build is not None
+        assert result["myapp"].last_build.commit_id is None
+
+    def test_legacy_record_without_commit_id_loads_as_none(self, tmp_path: Path):
+        path = tmp_path / "activity.json"
+        data = {
+            "myapp": {
+                "last_deploy": {
+                    "timestamp": "2026-03-20T15:01:00Z",
+                    "success": True,
+                    "branch": "main",
+                }
+            }
+        }
+        path.write_text(json.dumps(data))
+        result = load_activity(path)
+        assert result["myapp"].last_deploy is not None
+        assert result["myapp"].last_deploy.commit_id is None

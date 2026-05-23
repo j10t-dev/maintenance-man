@@ -13,6 +13,7 @@ from maintenance_man.vcs import (
     delete_bookmark,
     edit_new_change,
     is_ancestor,
+    main_commit_id,
     promote_bookmark_to_main,
     refresh_working_copy_from_main,
     same_revision,
@@ -99,6 +100,50 @@ def test_revision_relationship_helpers_with_real_jj_repo(tmp_path: Path):
     assert same_revision(repo, "main", "child") == RevisionCheck(ok=True, value=False)
     assert is_ancestor(repo, "main", "child") == RevisionCheck(ok=True, value=True)
     assert is_ancestor(repo, "child", "main") == RevisionCheck(ok=True, value=False)
+
+
+def test_main_commit_id_tracks_content_changes(tmp_path: Path):
+    repo = init_repo(tmp_path)
+
+    first = main_commit_id(repo)
+    assert first.ok is True
+    assert first.commit_id
+
+    assert _jj(repo, "new", "main").returncode == 0
+    (repo / "README.md").write_text("v2\n")
+    assert _jj(repo, "commit", "-m", "v2").returncode == 0
+    assert _jj(repo, "bookmark", "set", "main", "-r", "@-").returncode == 0
+
+    second = main_commit_id(repo)
+    assert second.ok is True
+    assert second.commit_id != first.commit_id
+
+    # No change between two resolves → stable identity (no spurious redeploy).
+    third = main_commit_id(repo)
+    assert third.commit_id == second.commit_id
+
+
+def test_main_commit_id_changes_on_amend(tmp_path: Path):
+    """Amending the deployed tip changes commit_id (why change_id was rejected)."""
+    repo = init_repo(tmp_path)
+    before = main_commit_id(repo)
+
+    assert _jj(repo, "edit", "main").returncode == 0
+    (repo / "README.md").write_text("amended\n")
+
+    # The next main_commit_id call runs jj, which snapshots the working copy
+    # and auto-amends the edited commit — that is what changes the commit_id.
+    after = main_commit_id(repo)
+    assert after.ok is True
+    assert after.commit_id != before.commit_id
+
+
+def test_main_commit_id_unresolved_without_bookmark(tmp_path: Path):
+    repo = tmp_path / "repo-no-main"
+    repo.mkdir()
+    run(["jj", "git", "init", "--colocate"], repo)
+    result = main_commit_id(repo)
+    assert result.ok is False
 
 
 def test_refresh_rebases_reusable_empty_working_copy(tmp_path: Path):

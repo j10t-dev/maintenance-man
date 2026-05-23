@@ -25,6 +25,7 @@ from maintenance_man.vcs import (
     edit_new_change,
     ensure_main_bookmark,
     is_ancestor,
+    main_commit_id,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
@@ -777,6 +778,23 @@ class TestRevisionRelationshipHelpers:
         assert result.ok is False
         assert result.value is False
         assert result.error == "bad revision"
+
+
+class TestMainCommitId:
+    @patch("maintenance_man.vcs._run")
+    def test_resolves_main_commit_id(self, mock_run: MagicMock, tmp_path: Path):
+        mock_run.return_value = _completed(stdout="abc123\n")
+        result = main_commit_id(tmp_path)
+        assert result.ok is True
+        assert result.commit_id == "abc123"
+
+    @patch("maintenance_man.vcs._run")
+    def test_unresolvable_main_returns_not_ok(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.return_value = _completed(stdout="", returncode=1, stderr="no main")
+        result = main_commit_id(tmp_path)
+        assert result.ok is False
 
 
 class TestSyncMain:
