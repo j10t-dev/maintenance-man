@@ -23,7 +23,7 @@ mm = "maintenance_man.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
-    "ruff==0.15.12",
+    "ruff==0.15.20",
     "ty>=0.0.34",
 ]
 
