@@ -13,7 +13,7 @@ dependencies = [
     "packaging==26.2",
     "pydantic==2.13.4",
     "pygments==2.20.0",
-    "pytest==9.0.3",
+    "pytest==9.1.1",
     "rich==15.0.0",
 ]
 
@@ -22,7 +22,7 @@ mm = "maintenance_man.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest==9.1.1",
     "ruff==0.15.20",
     "ty>=0.0.34",
 ]
