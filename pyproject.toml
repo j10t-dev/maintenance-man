@@ -12,7 +12,7 @@ dependencies = [
     "cyclopts==4.25.2",
     "packaging==26.3",
     "pydantic==2.13.5",
-    "pygments==2.20.0",
+    "pygments==2.21.0",
     "pytest==9.1.1",
     "rich==15.0.0",
 ]
