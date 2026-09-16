@@ -85,5 +85,5 @@ min_version_age_days = 7
 
 # [projects.my-project]
 # path = "/home/user/dev/my-project"
-# package_manager = "bun"        # bun | uv | mvn
+# package_manager = "bun"        # bun | uv | mvn | gradle
 """
