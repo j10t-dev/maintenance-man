@@ -1,0 +1,3 @@
+[libraries]
+room-runtime = "androidx.room:room-runtime:2.8.5"
+room-compiler = "androidx.room:room-compiler:2.8.5"

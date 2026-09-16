@@ -15,7 +15,7 @@ class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: Path
-    package_manager: Literal["bun", "uv", "mvn"]
+    package_manager: Literal["bun", "uv", "mvn", "gradle"]
     scan_secrets: bool = True
     scan_skip_dirs: list[str] = []
     test_unit: str | None = None

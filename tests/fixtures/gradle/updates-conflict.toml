@@ -1,0 +1,4 @@
+[libraries]
+room-runtime = "androidx.room:room-runtime:2.8.5"
+room-compiler = "androidx.room:room-compiler:2.8.6"
+room-testing = "androidx.room:room-testing:2.8.5"

@@ -3,10 +3,9 @@ import re
 import subprocess
 from pathlib import Path
 
-from packaging.version import InvalidVersion, Version
-
+from maintenance_man.gradle import discover_gradle_updates
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import SemverTier, UpdateFinding
+from maintenance_man.models.scan import UpdateFinding, classify_semver
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     get_uv_direct_dep_names,
@@ -26,26 +25,6 @@ def get_outdated(project: ProjectConfig) -> list[UpdateFinding]:
             f"No outdated checker for package manager: {project.package_manager}"
         )
     return checker(project)
-
-
-def classify_semver(installed: str, latest: str) -> SemverTier:
-    """Compare two version strings and return the semver tier of the change."""
-    try:
-        old = Version(installed)
-        new = Version(latest)
-    except InvalidVersion:
-        return SemverTier.UNKNOWN
-
-    if old == new:
-        return SemverTier.UNKNOWN
-
-    match (old.major != new.major, old.minor != new.minor):
-        case (True, _):
-            return SemverTier.MAJOR
-        case (_, True):
-            return SemverTier.MINOR
-        case _:
-            return SemverTier.PATCH
 
 
 def _normalise_pkg_name(name: str) -> str:
@@ -157,6 +136,7 @@ _CHECKERS = {
     "bun": bun_outdated,
     "uv": uv_outdated,
     "mvn": mvn_outdated,
+    "gradle": discover_gradle_updates,
 }
 
 

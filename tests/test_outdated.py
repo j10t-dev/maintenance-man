@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+import maintenance_man.outdated
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import SemverTier
 from maintenance_man.outdated import (
@@ -18,10 +19,11 @@ from maintenance_man.outdated import (
     mvn_outdated,
     uv_outdated,
 )
+from tests.conftest import make_update
 
 
 def _make_project(
-    pm: Literal["bun", "uv", "mvn"], path: str = "/tmp/fake"
+    pm: Literal["bun", "uv", "mvn", "gradle"], path: str = "/tmp/fake"
 ) -> ProjectConfig:
     return ProjectConfig(path=Path(path), package_manager=pm)
 
@@ -460,3 +462,19 @@ class TestGetOutdated:
         object.__setattr__(project, "package_manager", "npm")
         with pytest.raises(OutdatedCheckError):
             get_outdated(project)
+
+
+def test_get_outdated_dispatches_gradle(monkeypatch):
+    project = ProjectConfig(path=Path("/tmp/fake"), package_manager="gradle")
+    seen: list[ProjectConfig] = []
+    sentinel = [make_update(pkg_name="room")]
+    # _CHECKERS captures the function object at import time, so patching the
+    # module attribute would not change what get_outdated calls.
+    monkeypatch.setitem(
+        maintenance_man.outdated._CHECKERS,
+        "gradle",
+        lambda p: (seen.append(p), sentinel)[1],
+    )
+
+    assert get_outdated(project) is sentinel
+    assert seen == [project]

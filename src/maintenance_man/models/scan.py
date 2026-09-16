@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import StrEnum, auto
+from typing import Literal
 
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
@@ -20,6 +21,26 @@ class SemverTier(StrEnum):
     UNKNOWN = auto()
 
 
+def classify_semver(installed: str, latest: str) -> SemverTier:
+    """Compare two version strings and return the semver tier of the change."""
+    try:
+        old = Version(installed)
+        new = Version(latest)
+    except InvalidVersion:
+        return SemverTier.UNKNOWN
+
+    if old == new:
+        return SemverTier.UNKNOWN
+
+    match (old.major != new.major, old.minor != new.minor):
+        case (True, _):
+            return SemverTier.MAJOR
+        case (_, True):
+            return SemverTier.MINOR
+        case _:
+            return SemverTier.PATCH
+
+
 class UpdateStatus(StrEnum):
     FAILED = "failed"
     READY = "ready"
@@ -29,6 +50,46 @@ class UpdateStatus(StrEnum):
 class Workflow(StrEnum):
     UPDATE = "update"
     RESOLVE = "resolve"
+
+
+type GradleKind = Literal["library", "plugin"]
+type GradleBlockKind = Literal["age", "mapping", "conflict", "stale"]
+
+
+class GradleMember(BaseModel):
+    """One catalogue alias changed by a Gradle update target."""
+
+    kind: GradleKind
+    alias: str
+    coordinate: str
+    installed_version: str
+
+
+class GradleUpdateTarget(BaseModel):
+    """An editable catalogue version and every alias that shares it."""
+
+    version_ref: str | None = None
+    members: list[GradleMember]
+    target_version: str
+
+    @property
+    def group_key(self) -> str:
+        """Stable identity used to group findings into one update attempt."""
+        if self.version_ref is not None:
+            return f"ref:{self.version_ref}"
+        member = self.members[0]
+        return f"{member.kind}:{member.alias}"
+
+    @property
+    def display_name(self) -> str:
+        return self.version_ref or self.members[0].coordinate
+
+
+class GradleBlock(BaseModel):
+    """Policy state that withholds an automatic change. Not a failure."""
+
+    kind: GradleBlockKind
+    reason: str
 
 
 class VulnFinding(BaseModel):
@@ -45,6 +106,9 @@ class VulnFinding(BaseModel):
     update_status: UpdateStatus | None = None
     failed_phase: str | None = None
     flow: Workflow | None = None
+    gradle_target: GradleUpdateTarget | None = None
+    blocked_reason: str | None = None
+    gradle_block_kind: GradleBlockKind | None = None
 
     @property
     def actionable(self) -> bool:
@@ -77,6 +141,9 @@ class UpdateFinding(BaseModel):
     update_status: UpdateStatus | None = None
     failed_phase: str | None = None
     flow: Workflow | None = None
+    gradle_target: GradleUpdateTarget | None = None
+    blocked_reason: str | None = None
+    gradle_block_kind: GradleBlockKind | None = None
 
     @property
     def target_version(self) -> str:

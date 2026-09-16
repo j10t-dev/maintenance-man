@@ -35,7 +35,7 @@ class TestProjectConfig:
         assert proj.path == tmp_path
         assert proj.package_manager == "bun"
 
-    @pytest.mark.parametrize("pm", ["bun", "uv", "mvn"])
+    @pytest.mark.parametrize("pm", ["bun", "uv", "mvn", "gradle"])
     def test_all_package_managers_accepted(self, tmp_path: Path, pm: str):
         proj = ProjectConfig(path=tmp_path, package_manager=pm)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
         assert proj.package_manager == pm

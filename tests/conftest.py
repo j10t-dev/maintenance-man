@@ -4,7 +4,10 @@ from typing import Any
 
 import pytest
 
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    GradleMember,
+    GradleUpdateTarget,
     ScanResult,
     SemverTier,
     Severity,
@@ -13,6 +16,9 @@ from maintenance_man.models.scan import (
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+GRADLE_FIXTURES = FIXTURES_DIR / "gradle"
+
+_GRADLEW_STUB = "#!/bin/sh\nexit 0\n"
 
 
 def make_vuln(**overrides: Any) -> VulnFinding:
@@ -173,3 +179,49 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     )
     monkeypatch.setattr("maintenance_man.cli.edit_new_change", lambda p, r: True)
     return state
+
+
+def make_gradle_member(**overrides: Any) -> GradleMember:
+    defaults = dict(
+        kind="library",
+        alias="room-runtime",
+        coordinate="androidx.room:room-runtime",
+        installed_version="2.8.4",
+    )
+    return GradleMember(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
+
+
+def make_gradle_target(**overrides: Any) -> GradleUpdateTarget:
+    defaults = dict(
+        version_ref="room",
+        members=[
+            make_gradle_member(
+                alias="room-runtime", coordinate="androidx.room:room-runtime"
+            ),
+            make_gradle_member(
+                alias="room-compiler", coordinate="androidx.room:room-compiler"
+            ),
+            make_gradle_member(
+                alias="room-testing", coordinate="androidx.room:room-testing"
+            ),
+        ],
+        target_version="2.8.5",
+    )
+    return GradleUpdateTarget(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
+
+
+@pytest.fixture()
+def gradle_project(tmp_path: Path) -> ProjectConfig:
+    """A real on-disk Gradle project with an executable wrapper substitute."""
+    root = tmp_path / "gradle-project"
+    (root / "gradle").mkdir(parents=True)
+    (root / "gradle" / "libs.versions.toml").write_text(
+        (GRADLE_FIXTURES / "libs.versions.toml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    wrapper = root / "gradlew"
+    wrapper.write_text(_GRADLEW_STUB, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return ProjectConfig(
+        path=root, package_manager="gradle", test_unit="./gradlew test"
+    )

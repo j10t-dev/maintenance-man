@@ -77,6 +77,12 @@ class TestProjectConfigDeployFields:
         assert pc.deploy_command == "scripts/deploy.sh"
 
 
+def test_gradle_package_manager_is_accepted(tmp_path):
+    project = ProjectConfig(path=tmp_path, package_manager="gradle")
+
+    assert project.package_manager == "gradle"
+
+
 class TestDefaultsConfigHealthcheck:
     def test_no_healthcheck_url(self):
         dc = DefaultsConfig()

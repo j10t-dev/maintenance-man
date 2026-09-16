@@ -4,6 +4,8 @@ import pytest
 from pydantic import ValidationError
 
 from maintenance_man.models.scan import (
+    GradleMember,
+    GradleUpdateTarget,
     ScanResult,
     SecretFinding,
     SemverTier,
@@ -14,6 +16,7 @@ from maintenance_man.models.scan import (
     Workflow,
     sort_vulns_by_severity,
 )
+from tests.conftest import make_scan_result, make_update
 
 
 class TestVulnFinding:
@@ -333,3 +336,92 @@ class TestSemverTier:
         assert SemverTier.MINOR == "minor"
         assert SemverTier.MAJOR == "major"
         assert SemverTier.UNKNOWN == "unknown"
+
+
+def test_historical_results_without_gradle_fields_still_load():
+    payload = {
+        "project": "legacy",
+        "scanned_at": "2026-01-01T00:00:00+00:00",
+        "trivy_target": "/tmp/legacy",
+        "vulnerabilities": [
+            {
+                "vuln_id": "CVE-2024-0001",
+                "pkg_name": "some-pkg",
+                "installed_version": "1.0.0",
+                "fixed_version": "1.0.1",
+                "severity": "HIGH",
+                "title": "t",
+                "description": "d",
+                "status": "fixed",
+            }
+        ],
+        "updates": [
+            {
+                "pkg_name": "pkg-a",
+                "installed_version": "1.0.0",
+                "latest_version": "1.0.1",
+                "semver_tier": "patch",
+            }
+        ],
+    }
+
+    result = ScanResult.model_validate(payload)
+
+    assert result.vulnerabilities[0].gradle_target is None
+    assert result.vulnerabilities[0].blocked_reason is None
+    assert result.vulnerabilities[0].gradle_block_kind is None
+    assert result.vulnerabilities[0].actionable is True
+    assert result.updates[0].gradle_target is None
+
+
+def test_gradle_target_round_trips_through_scan_result_json():
+    target = GradleUpdateTarget(
+        version_ref="room",
+        members=[
+            GradleMember(
+                kind="library",
+                alias="room-runtime",
+                coordinate="androidx.room:room-runtime",
+                installed_version="2.8.4",
+            ),
+            GradleMember(
+                kind="plugin",
+                alias="ksp",
+                coordinate="com.google.devtools.ksp",
+                installed_version="2.3.10",
+            ),
+        ],
+        target_version="2.8.5",
+    )
+    update = make_update(
+        gradle_target=target,
+        blocked_reason="no publication date",
+        gradle_block_kind="age",
+    )
+    result = make_scan_result(vulns=[], updates=[update])
+
+    reloaded = ScanResult.model_validate_json(result.model_dump_json())
+
+    assert reloaded.updates[0].gradle_target == target
+    assert (reloaded_target := reloaded.updates[0].gradle_target) is not None
+    assert reloaded_target.group_key == "ref:room"
+    assert reloaded_target.display_name == "room"
+    assert reloaded.updates[0].blocked_reason == "no publication date"
+    assert reloaded.updates[0].gradle_block_kind == "age"
+
+
+def test_inline_target_display_name_is_its_coordinate():
+    target = GradleUpdateTarget(
+        members=[
+            GradleMember(
+                kind="library",
+                alias="gson",
+                coordinate="com.google.code.gson:gson",
+                installed_version="2.11.0",
+            )
+        ],
+        target_version="2.12.0",
+    )
+
+    assert target.group_key == "library:gson"
+    assert target.display_name == "com.google.code.gson:gson"
