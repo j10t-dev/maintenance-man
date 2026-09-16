@@ -1097,3 +1097,75 @@ class TestSyncMain:
         assert ok is False
         assert "working copy ancestry" in msg
         assert "revset failed" in msg
+
+
+@pytest.mark.parametrize(
+    "listing, expected",
+    [
+        ("file\n", True),
+        ("", False),
+        ("symlink\n", False),
+        ("conflict\n", False),
+        ("tree\n", False),
+    ],
+)
+def test_revision_file_inspects_exact_pinned_regular_file_without_snapshot(
+    tmp_path, monkeypatch, listing, expected
+):
+    commands = []
+
+    def run(cmd, path):
+        assert path == tmp_path
+        commands.append(cmd)
+        assert cmd[:4] == ["jj", "--ignore-working-copy", "--color", "never"]
+        if cmd[4] == "log":
+            assert cmd[6] == "main"
+            return _completed(stdout="a" * 40 + "\n")
+        assert cmd[4:9] == ["file", "list", "-r", "a" * 40, "-T"]
+        assert cmd[-1] == "root-file:local.properties"
+        return _completed(stdout=listing)
+
+    monkeypatch.setattr(vcs, "_run", run)
+    result = vcs.revision_file(tmp_path, "main", "local.properties")
+    assert result.ok
+    assert result.value is expected
+    assert result.commit_id == "a" * 40
+    assert len(commands) == 2
+
+
+@pytest.mark.parametrize("phase", ["resolve", "list"])
+@pytest.mark.parametrize("failure", ["exit", "launch", "timeout"])
+def test_revision_file_inspection_failure_is_explicit(
+    tmp_path, monkeypatch, phase, failure
+):
+    def run(cmd, path):
+        if cmd[4] == "log" and phase == "list":
+            return _completed(stdout="a" * 40 + "\n")
+        if failure == "launch":
+            raise FileNotFoundError("missing jj")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(cmd, 30)
+        return _completed(1, stdout="file\n", stderr="inspection failed")
+
+    monkeypatch.setattr(vcs, "_run", run)
+    result = vcs.revision_file(tmp_path, "main", "local.properties")
+    assert not result.ok
+    assert not result.value
+    assert result.error
+
+
+@pytest.mark.parametrize(
+    "listing", ["file\nfile\n", "regular\n", "file local.properties\n"]
+)
+def test_revision_file_malformed_listing_fails_closed(tmp_path, monkeypatch, listing):
+    monkeypatch.setattr(
+        vcs,
+        "_run",
+        lambda cmd, path: _completed(
+            stdout="a" * 40 + "\n" if cmd[4] == "log" else listing
+        ),
+    )
+    result = vcs.revision_file(tmp_path, "main", "local.properties")
+    assert not result.ok
+    assert not result.value
+    assert result.error

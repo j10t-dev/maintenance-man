@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -238,3 +238,19 @@ def mm_home_with_gradle(
         f'package_manager = "gradle"\ntest_unit = "./gradlew testDebugUnitTest"\n'
     )
     return mm_home_with_projects
+
+
+def set_maven_dates(
+    monkeypatch: pytest.MonkeyPatch, *, undated: set[str], days_old: int = 900
+) -> None:
+    """Substitute Maven Central lookups with controlled, relative publication dates.
+
+    Coordinates in *undated* have no evidence at all; every other coordinate was
+    published *days_old* days ago.  The date is relative to now so an age
+    threshold in a test means what it says regardless of the current date.
+    """
+    published = datetime.now(timezone.utc) - timedelta(days=days_old)
+    monkeypatch.setattr(
+        "maintenance_man.dependency_age._get_maven_publish_date",
+        lambda pkg, version: None if pkg in undated else published,
+    )

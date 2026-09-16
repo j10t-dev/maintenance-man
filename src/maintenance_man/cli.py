@@ -32,7 +32,7 @@ from maintenance_man.deployer import (
     run_build,
     run_deploy,
 )
-from maintenance_man.gradle import GradleError
+from maintenance_man.gradle import GradleError, workspace_environment_reason
 from maintenance_man.models.activity import (
     ActivityEvent,
     ProjectActivity,
@@ -56,12 +56,14 @@ from maintenance_man.scanner import (
 )
 from maintenance_man.updater import (
     Finding,
+    GradleFinding,
     NoScanResultsError,
     UpdateResult,
     consolidate_vulns,
     has_test_config,
     highest_fix_version,
     load_scan_results,
+    prepare_gradle_findings,
     process_findings,
     process_updates,
     process_vulns,
@@ -399,6 +401,7 @@ def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
         actionable_vulns,
         updates,
         interactive=True,
+        minimum_age_days=cfg.defaults.min_version_age_days,
     )
     sys.exit(exit_code)
 
@@ -407,13 +410,14 @@ def _update_batch(
     project: str,
     proj_config: ProjectConfig,
     results_dir: Path,
+    minimum_age_days: int,
 ) -> tuple[list[UpdateResult], bool] | None:
     """Process all actionable findings for a single project (batch mode).
 
     Returns ``(results, promotion_failed)``. ``promotion_failed`` is ``True``
-    only when the post-batch bookmark promotion step was attempted and failed;
-    when promotion was skipped (per-finding failures) or succeeded it is
-    ``False``. Returns ``None`` if the project was skipped due to an error.
+    when outstanding blocks remain or bookmark promotion was attempted and
+    failed. Per-finding failures are reported in ``results``. Returns ``None``
+    if the project was skipped due to an error.
     """
     try:
         scan_result = load_scan_results(project, results_dir)
@@ -429,11 +433,35 @@ def _update_batch(
 
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
-    if not actionable_vulns and not updates:
+    if proj_config.package_manager != "gradle" and not actionable_vulns and not updates:
         console.print(f"  [dim]{project} — nothing to update[/]")
         return ([], False)
 
     _warn_missing_test_config(project, proj_config)
+
+    gradle_groups: list[GradleFinding] | None = None
+    if proj_config.package_manager == "gradle":
+        gradle_groups = _prepare_gradle_update_groups(
+            project, proj_config, scan_result, results_dir, minimum_age_days
+        )
+        if not gradle_groups:
+            return (
+                [],
+                _finish_gradle_update_without_application(
+                    project, proj_config, scan_result, results_dir
+                )
+                != ExitCode.OK,
+            )
+        try:
+            _gradle_workspace_revision(
+                project,
+                proj_config,
+                _UPDATE_BOOKMARK if _has_update_progress(scan_result) else "main",
+            )
+        except _UpdateSetupError as e:
+            reason = str(e)
+            console.print(f"  [bold red]Skipped:[/] {project} — {reason}")
+            return None
 
     try:
         wt_path = _enter_update_workspace(project, proj_config, scan_result)
@@ -446,23 +474,38 @@ def _update_batch(
     finalised = False
     promotion_attempted = False
     try:
-        _print_scan_result(scan_result)
+        _print_scan_result(scan_result, show_blocked=gradle_groups is None)
 
-        selectable_vulns = _selectable_vulns(actionable_vulns)
-        selectable_updates = _selectable_updates(updates)
-
-        vuln_results = _process_selected_vulns(
-            selectable_vulns, work_config, scan_result, project, results_dir
-        )
-        update_results = _process_selected_updates(
-            selectable_updates, work_config, scan_result, project, results_dir
-        )
-        all_results = vuln_results + update_results
+        if gradle_groups is not None:
+            all_results = _process_gradle_update_groups(
+                gradle_groups,
+                work_config,
+                scan_result,
+                project,
+                results_dir,
+                minimum_age_days,
+            )
+        else:
+            all_results = _process_selected_vulns(
+                _selectable_vulns(actionable_vulns),
+                work_config,
+                scan_result,
+                project,
+                results_dir,
+            ) + _process_selected_updates(
+                _selectable_updates(updates),
+                work_config,
+                scan_result,
+                project,
+                results_dir,
+            )
 
         any_failed_result = any(not r.passed for r in all_results)
         any_failed_finding = _has_update_failures(scan_result)
 
-        if not (any_failed_result or any_failed_finding):
+        if not (
+            any_failed_result or any_failed_finding or scan_result.blocked_findings
+        ):
             promotion_attempted = True
             finalised = _finalise_local_update(
                 proj_config.path, scan_result, project, results_dir
@@ -472,7 +515,10 @@ def _update_batch(
 
     if finalised:
         delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
-    return (all_results, promotion_attempted and not finalised)
+    return (
+        all_results,
+        bool(scan_result.blocked_findings) or (promotion_attempted and not finalised),
+    )
 
 
 def _update_batch_targets(
@@ -501,7 +547,9 @@ def _update_batch_targets(
         console.print(f"[bold]{name}[/]")
         console.print("═" * 40)
 
-        outcome = _update_batch(name, proj_config, results_dir)
+        outcome = _update_batch(
+            name, proj_config, results_dir, cfg.defaults.min_version_age_days
+        )
         if outcome is None:
             had_errors = True
             continue
@@ -567,8 +615,37 @@ def _run_update_flow(
     updates: list[UpdateFinding],
     *,
     interactive: bool,
+    minimum_age_days: int,
 ) -> int:
     """Set up the workspace, process findings, finalise. Returns exit code."""
+    gradle_groups: list[GradleFinding] | None = None
+    if proj_config.package_manager == "gradle":
+        gradle_groups = _prepare_gradle_update_groups(
+            project, proj_config, scan_result, results_dir, minimum_age_days
+        )
+        if not gradle_groups:
+            return _finish_gradle_update_without_application(
+                project, proj_config, scan_result, results_dir
+            )
+        if interactive:
+            gradle_groups = _prompt_gradle_selection(gradle_groups)
+            if not gradle_groups:
+                return (
+                    ExitCode.UPDATE_FAILED
+                    if scan_result.blocked_findings
+                    else ExitCode.OK
+                )
+        try:
+            _gradle_workspace_revision(
+                project,
+                proj_config,
+                _UPDATE_BOOKMARK if _has_update_progress(scan_result) else "main",
+            )
+        except _UpdateSetupError as e:
+            reason = str(e)
+            console.print(f"[bold red]Cannot update {project}:[/] {reason}")
+            return ExitCode.ERROR
+
     try:
         wt_path = _enter_update_workspace(project, proj_config, scan_result)
     except _UpdateSetupError as e:
@@ -578,32 +655,42 @@ def _run_update_flow(
 
     finalised = False
     try:
-        _print_scan_result(scan_result)
+        # Gradle blocks were printed before the workspace was created.
+        _print_scan_result(scan_result, show_blocked=gradle_groups is None)
 
-        selectable_vulns = _selectable_vulns(actionable_vulns)
-        selectable_updates = _selectable_updates(updates)
-
-        if interactive and (selectable_vulns or selectable_updates):
-            selected_vulns, selected_updates = _prompt_selection(
-                selectable_vulns, selectable_updates
+        if gradle_groups is not None:
+            all_results = _process_gradle_update_groups(
+                gradle_groups,
+                work_config,
+                scan_result,
+                project,
+                results_dir,
+                minimum_age_days,
             )
         else:
-            selected_vulns, selected_updates = selectable_vulns, selectable_updates
+            selectable_vulns = _selectable_vulns(actionable_vulns)
+            selectable_updates = _selectable_updates(updates)
 
-        vuln_results = _process_selected_vulns(
-            selected_vulns, work_config, scan_result, project, results_dir
-        )
-        update_results = _process_selected_updates(
-            selected_updates, work_config, scan_result, project, results_dir
-        )
-        all_results = vuln_results + update_results
+            if interactive and (selectable_vulns or selectable_updates):
+                selected_vulns, selected_updates = _prompt_selection(
+                    selectable_vulns, selectable_updates
+                )
+            else:
+                selected_vulns, selected_updates = selectable_vulns, selectable_updates
+
+            all_results = _process_selected_vulns(
+                selected_vulns, work_config, scan_result, project, results_dir
+            ) + _process_selected_updates(
+                selected_updates, work_config, scan_result, project, results_dir
+            )
 
         _print_update_summary(all_results)
 
-        any_failed_result = any(not r.passed for r in all_results)
-        any_failed_finding = _has_update_failures(scan_result)
-
-        if any_failed_result or any_failed_finding:
+        if (
+            any(not r.passed for r in all_results)
+            or _has_update_failures(scan_result)
+            or scan_result.blocked_findings
+        ):
             return ExitCode.UPDATE_FAILED
 
         finalised = _finalise_local_update(
@@ -617,6 +704,60 @@ def _run_update_flow(
 
     delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
     return ExitCode.OK
+
+
+def _finish_gradle_update_without_application(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+) -> int:
+    if scan_result.blocked_findings or _has_update_failures(scan_result):
+        return ExitCode.UPDATE_FAILED
+    if not _has_update_progress(scan_result):
+        return ExitCode.OK
+    if not bookmark_exists(_UPDATE_BOOKMARK, proj_config.path):
+        console.print(
+            f"[bold red]Cannot update {project}:[/] update bookmark is missing"
+        )
+        return ExitCode.UPDATE_FAILED
+    if not _finalise_local_update(proj_config.path, scan_result, project, results_dir):
+        return ExitCode.UPDATE_FAILED
+    delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
+    return ExitCode.OK
+
+
+def _prepare_gradle_update_groups(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+    minimum_age_days: int,
+) -> list[GradleFinding]:
+    groups = prepare_gradle_findings(scan_result, proj_config, minimum_age_days)
+    save_scan_results(project, results_dir, scan_result)
+    _print_blocked_findings(scan_result)
+    return groups
+
+
+def _process_gradle_update_groups(
+    groups: list[GradleFinding],
+    work_config: ProjectConfig,
+    scan_result: ScanResult,
+    project: str,
+    results_dir: Path,
+    minimum_age_days: int,
+) -> list[UpdateResult]:
+    console.print(f"\n[bold]Processing {len(groups)} Gradle group(s)...[/]")
+    return process_findings(
+        groups,
+        work_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan_result,
+        project_name=project,
+        results_dir=results_dir,
+        minimum_age_days=minimum_age_days,
+    )
 
 
 def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
@@ -700,13 +841,49 @@ def _process_selected_updates(
     )
 
 
+def _prompt_gradle_selection(groups: list[GradleFinding]) -> list[GradleFinding]:
+    """Select whole catalogue groups; every affected alias is shown first."""
+    console.print()
+    for idx, group in enumerate(groups, 1):
+        label = "[bold red]VULN[/]" if group.kind == "vuln" else "[bold cyan]UPDATE[/]"
+        console.print(
+            f"  [dim]{idx:>3}.[/] {label} {group.pkg_name} "
+            f"{group.installed_version} -> {group.target_version} ({group.detail})"
+        )
+        aliases = ", ".join(m.alias for m in group.target.members)
+        console.print(f"       [dim]affects: {aliases}[/]")
+
+    while True:
+        selection = Prompt.ask("\n  Select updates [all/1,2,.../none]", default="all")
+        if selection == "none":
+            return []
+        if selection == "all":
+            return groups
+        try:
+            indices = [int(s.strip()) for s in selection.split(",")]
+        except ValueError:
+            console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
+            continue
+        chosen = [
+            groups[i - 1] for i in dict.fromkeys(indices) if 1 <= i <= len(groups)
+        ]
+        if chosen:
+            return chosen
+        console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
+
+
 def _print_update_summary(all_results: list[UpdateResult]) -> None:
-    passed = [r for r in all_results if r.passed]
-    failed = [r for r in all_results if not r.passed]
+    blocked = [r for r in all_results if r.blocked_reason]
+    passed = [r for r in all_results if r.passed and not r.blocked_reason]
+    failed = [r for r in all_results if not r.passed and not r.blocked_reason]
     console.print("\n" + "─" * 40)
     console.print("[bold]Summary:[/]")
     if passed:
         console.print(f"  [green]{len(passed)} passed[/]")
+    if blocked:
+        console.print(f"  [yellow]{len(blocked)} blocked[/]")
+        for r in blocked:
+            console.print(f"  [yellow]BLOCKED[/] {r.pkg_name} — {r.blocked_reason}")
     if failed:
         phase_labels = {
             "apply": "install failed",
@@ -847,7 +1024,11 @@ def _load_validated_scan(
         _fatal(str(e))
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
-    if not actionable_vulns and not updates:
+    if (
+        not (proj_config.package_manager == "gradle" and workflow == Workflow.UPDATE)
+        and not actionable_vulns
+        and not updates
+    ):
         console.print(f"[bold green]{project}[/] — nothing to {workflow}.")
         sys.exit(ExitCode.OK)
     _warn_missing_test_config(project, proj_config)
@@ -1148,7 +1329,11 @@ def _print_mass_update_summary(
     for proj_name, results in project_results:
         for r in results:
             status = (
-                "[green]PASS[/]" if r.passed else f"[red]FAIL ({r.failed_phase})[/]"
+                f"[yellow]BLOCKED ({r.blocked_reason})[/]"
+                if r.blocked_reason
+                else "[green]PASS[/]"
+                if r.passed
+                else f"[red]FAIL ({r.failed_phase})[/]"
             )
             table.add_row(proj_name, r.pkg_name, r.kind, status)
 

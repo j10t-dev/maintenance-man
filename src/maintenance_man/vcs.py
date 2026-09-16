@@ -31,6 +31,57 @@ class RevisionResolve:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class RevisionFileCheck:
+    ok: bool
+    value: bool = False
+    commit_id: str = ""
+    error: str = ""
+
+
+def revision_file(path: Path, revision: str, filename: str) -> RevisionFileCheck:
+    """Inspect an exact regular file in one revision without snapshotting."""
+    resolved = _single_commit_id(path, revision, read_only=True)
+    if not resolved.ok:
+        return RevisionFileCheck(ok=False, error=resolved.error)
+    try:
+        result = _run(
+            [
+                "jj",
+                "--ignore-working-copy",
+                "--color",
+                "never",
+                "file",
+                "list",
+                "-r",
+                resolved.commit_id,
+                "-T",
+                'file_type ++ "\\n"',
+                f"root-file:{filename}",
+            ],
+            path,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return RevisionFileCheck(ok=False, error=str(e))
+    if result.returncode != 0:
+        return RevisionFileCheck(ok=False, error=result.stderr.strip())
+    types = result.stdout.splitlines()
+    if types not in (
+        [],
+        ["file"],
+        ["symlink"],
+        ["tree"],
+        ["git-submodule"],
+        ["conflict"],
+    ):
+        return RevisionFileCheck(ok=False, error="unexpected revision file listing")
+    return RevisionFileCheck(
+        ok=True,
+        value=types == ["file"],
+        commit_id=resolved.commit_id,
+    )
+
+
 _MANAGED_BOOKMARK_PREFIXES = (
     "mm/update-dependencies",
     "mm/resolve-dependencies",
@@ -290,11 +341,21 @@ def main_commit_id(path: Path) -> RevisionResolve:
     return _single_commit_id(path, "main")
 
 
-def _single_commit_id(path: Path, revision: str) -> RevisionResolve:
-    result = _run(
-        ["jj", "log", "-r", revision, "--no-graph", "-T", 'commit_id ++ "\\n"'],
-        path,
+def _single_commit_id(
+    path: Path, revision: str, *, read_only: bool = False
+) -> RevisionResolve:
+    prefix = (
+        ["jj", "--ignore-working-copy", "--color", "never"] if read_only else ["jj"]
     )
+    try:
+        result = _run(
+            [*prefix, "log", "-r", revision, "--no-graph", "-T", 'commit_id ++ "\\n"'],
+            path,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if not read_only:
+            raise
+        return RevisionResolve(ok=False, error=str(e))
     if result.returncode != 0:
         return RevisionResolve(ok=False, error=result.stderr.strip())
 
