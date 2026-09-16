@@ -151,6 +151,7 @@ def apply_gradle_update(
     if block is not None:
         return block
 
+    reclaim_gradle_outputs(root)
     before = parse_catalogue(catalogue_path)
     report_text = render_selected_report(target)
 
@@ -195,6 +196,11 @@ def validate_gradle_target_shape(target: GradleUpdateTarget) -> GradleBlock | No
         target.members
     ):
         reason = "duplicate Gradle target aliases"
+    elif (
+        target.version_ref is not None
+        and len({member.installed_version for member in target.members}) != 1
+    ):
+        reason = "inconsistent installed versions in shared Gradle target"
     else:
         try:
             assert_safe_text(target.target_version, "target version")
@@ -379,7 +385,12 @@ def build_update_findings(
             continue
         if entry.coordinate != proposal.coordinate:
             findings.append(
-                _blocked_finding(
+                _known_group_block(
+                    catalogue,
+                    catalogue.members_of_ref(entry.version_ref)
+                    if entry.version_ref is not None
+                    else [entry],
+                    entry.version_ref,
                     entry.alias,
                     proposal.version,
                     "mapping",
@@ -447,15 +458,27 @@ def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
     """
     root = Path(project.path)
     inventory_dir = root / GRADLE_INVENTORY_RELPATH
+    _validate_owned_output_parents(root)
     claim_owned_dir(inventory_dir, "Gradle inventory directory")
-    inventory_dir.mkdir(parents=True)
-    (root / GRADLE_INVENTORY_MARKER_RELPATH).write_bytes(b"")
     try:
-        run_gradle(root, _BOM_ARGS, label="cyclonedxBom")
-        bom = root / GRADLE_INVENTORY_BOM_RELPATH
-        _validate_inventory(bom)
+        inventory_dir.mkdir(parents=True)
+    except OSError as e:
+        raise GradleError(
+            f"Could not create Gradle inventory {inventory_dir}: {e}"
+        ) from e
+    try:
+        try:
+            (root / GRADLE_INVENTORY_MARKER_RELPATH).write_bytes(b"")
+            run_gradle(root, _BOM_ARGS, label="cyclonedxBom")
+            bom = root / GRADLE_INVENTORY_BOM_RELPATH
+            _validate_inventory(bom)
+        except OSError as e:
+            raise GradleError(
+                f"Could not generate Gradle inventory in {root}: {e}"
+            ) from e
         yield bom
     finally:
+        _validate_owned_output_parents(root)
         _remove_owned_tree(inventory_dir)
 
 
@@ -555,6 +578,7 @@ def run_gradle(
     root: Path, args: list[str], *, label: str | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Run the project's wrapper with a bounded timeout and isolated environment."""
+    _validate_owned_output_parents(root)
     wrapper = root / "gradlew"
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
         raise GradleError(f"No executable Gradle wrapper at {wrapper}")
@@ -575,6 +599,9 @@ def run_gradle(
             f"./gradlew {label} timed out after {GRADLE_TIMEOUT_SECONDS}s in {root}"
         ) from e
 
+    except (OSError, UnicodeDecodeError) as e:
+        raise GradleError(f"Could not run ./gradlew {label} in {root}: {e}") from e
+
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()[-2000:]
         raise GradleError(
@@ -591,36 +618,78 @@ def claim_owned_file(path: Path, marker: Path, label: str) -> None:
     file at the same path is not.  Reclaim never inspects the file's content:
     a report is written by the Gradle plugin, not by mm.
     """
-    if path.is_symlink() or marker.is_symlink():
-        raise _collision(path, label)
-    if not path.exists():
-        marker.unlink(missing_ok=True)
-        return
-    if not marker.is_file():
-        raise _collision(path, label)
-    path.unlink()
+    try:
+        if path.is_symlink() or marker.is_symlink():
+            raise _collision(path, label)
+        if not path.exists():
+            marker.unlink(missing_ok=True)
+            return
+        if not marker.is_file():
+            raise _collision(path, label)
+        path.unlink()
+    except OSError as e:
+        raise GradleError(f"Could not claim {label} at {path}: {e}") from e
 
 
 def claim_owned_dir(path: Path, label: str) -> None:
     """Claim a generated directory, reclaiming only a marked mm leftover."""
-    if path.is_symlink() or (path.exists() and not path.is_dir()):
-        raise _collision(path, label)
-    if not path.exists():
-        return
-    marker = path / Path(GRADLE_INVENTORY_MARKER_RELPATH).name
-    if marker.is_symlink() or not marker.is_file():
-        raise _collision(path, label)
-    shutil.rmtree(path)
+    try:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise _collision(path, label)
+        if not path.exists():
+            return
+        marker = path / Path(GRADLE_INVENTORY_MARKER_RELPATH).name
+        if marker.is_symlink() or not marker.is_file():
+            raise _collision(path, label)
+        shutil.rmtree(path)
+    except OSError as e:
+        raise GradleError(f"Could not claim {label} at {path}: {e}") from e
 
 
-def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str | None:
+def _validate_owned_output_parents(root: Path) -> None:
+    """Refuse fixed output parents that redirect adapter ownership."""
+    try:
+        report_parent = (root / GRADLE_UPDATE_REPORT_RELPATH).parent
+        if root.is_symlink():
+            raise _collision(root, "Gradle project directory")
+        if report_parent.is_symlink() or (
+            report_parent.exists() and not report_parent.is_dir()
+        ):
+            raise _collision(report_parent, "Gradle report directory")
+    except OSError as e:
+        raise GradleError(
+            f"Could not inspect Gradle output parents in {root}: {e}"
+        ) from e
+
+
+def reclaim_gradle_outputs(root: Path) -> None:
+    """Release only fixed marked adapter leftovers before application or recovery."""
+    report = root / GRADLE_UPDATE_REPORT_RELPATH
+    marker = root / GRADLE_REPORT_MARKER_RELPATH
+    inventory = root / GRADLE_INVENTORY_RELPATH
+    _validate_owned_output_parents(root)
+    try:
+        claim_owned_file(report, marker, "version catalogue update report")
+        marker.unlink(missing_ok=True)
+        claim_owned_dir(inventory, "Gradle inventory directory")
+    except (OSError, GradleError) as e:
+        raise GradleError(
+            f"Could not reclaim interrupted Gradle outputs in {root}: {e}"
+        ) from e
+
+
+def workspace_environment_reason(
+    source_root: Path, workspace_root: Path, *, tracked_local_properties: bool = False
+) -> str | None:
     """Explain why a workspace build could not resolve the Android SDK.
 
     ``mm update`` applies inside a jj workspace, which checks out tracked files
     only.  A gitignored ``local.properties`` — where Android projects keep
     ``sdk.dir`` — is therefore absent there, and ``project_env()`` adds nothing
-    to the inherited environment.  Returns None when the SDK is reachable or
-    the project does not depend on ``local.properties`` at all.
+    to the inherited environment. Tracked-file evidence must come from the
+    selected revision, never from a prospective workspace directory. Returns
+    None when that evidence or the environment supplies the SDK, or the source
+    does not depend on ``local.properties``.
     """
     env = project_env()
     if env.get("ANDROID_HOME") or env.get("ANDROID_SDK_ROOT"):
@@ -628,10 +697,11 @@ def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str
     source = source_root / GRADLE_LOCAL_PROPERTIES_RELPATH
     if not source.is_file():
         return None
-    if (workspace_root / GRADLE_LOCAL_PROPERTIES_RELPATH).is_file():
+    if tracked_local_properties:
         return None
     return (
-        f"{source} is untracked, so it is absent from the update workspace at "
+        f"{source} is not a tracked regular file in the selected revision, so it is "
+        f"absent from the update workspace at "
         f"{workspace_root} and Gradle cannot resolve sdk.dir there. Export "
         f"ANDROID_HOME or ANDROID_SDK_ROOT before running mm update, or track "
         f"local.properties in the repository."
@@ -667,13 +737,23 @@ def _owned_update_report(root: Path) -> Iterator[Path]:
     """
     path = root / GRADLE_UPDATE_REPORT_RELPATH
     marker = root / GRADLE_REPORT_MARKER_RELPATH
+    _validate_owned_output_parents(root)
     claim_owned_file(path, marker, "version catalogue update report")
-    marker.write_bytes(b"")
     try:
+        try:
+            marker.write_bytes(b"")
+        except OSError as e:
+            raise GradleError(f"Could not mark Gradle update report {path}: {e}") from e
         yield path
     finally:
-        path.unlink(missing_ok=True)
-        marker.unlink(missing_ok=True)
+        try:
+            _validate_owned_output_parents(root)
+            path.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+        except OSError as e:
+            raise GradleError(
+                f"Could not remove owned Gradle update report {path}: {e}"
+            ) from e
 
 
 def _group_finding(
@@ -689,20 +769,27 @@ def _group_finding(
     if version_ref is not None:
         expected = catalogue.members_of_ref(version_ref)
         missing = sorted(
-            {entry.alias for entry in expected} - {entry.alias for entry in entries}
+            {entry.key for entry in expected} - {entry.key for entry in entries}
         )
         if missing:
-            return _blocked_finding(
+            return _known_group_block(
+                catalogue,
+                expected,
+                version_ref,
                 display,
                 sorted(versions)[-1],
                 "conflict",
                 f"incomplete proposal for version reference '{version_ref}': "
-                f"{', '.join(missing)} not proposed",
+                f"{', '.join(f'{kind} {alias}' for kind, alias in missing)} "
+                "not proposed",
             )
         entries = expected
 
     if len(versions) != 1:
-        return _blocked_finding(
+        return _known_group_block(
+            catalogue,
+            entries,
+            version_ref,
             display,
             sorted(versions)[-1],
             "conflict",
@@ -731,6 +818,39 @@ def _group_finding(
             version_ref=version_ref, members=members, target_version=target_version
         ),
     )
+
+
+def _known_group_block(
+    catalogue: Catalogue,
+    entries: list[CatalogueEntry],
+    version_ref: str | None,
+    name: str,
+    proposed: str,
+    kind: GradleBlockKind,
+    reason: str,
+) -> UpdateFinding:
+    """Retain known group identity solely to withhold linked findings.
+
+    The installed version is inert metadata, never an approved proposal.
+    Structural blocks persist until a fresh scan.
+    """
+    finding = _blocked_finding(name, proposed, kind, reason)
+    installed = catalogue.version_of(entries[0])
+    if installed is not None and installed.value is not None:
+        finding.gradle_target = GradleUpdateTarget(
+            version_ref=version_ref,
+            members=[
+                GradleMember(
+                    kind=entry.kind,
+                    alias=entry.alias,
+                    coordinate=entry.coordinate,
+                    installed_version=installed.value,
+                )
+                for entry in entries
+            ],
+            target_version=installed.value,
+        )
+    return finding
 
 
 def _blocked_finding(
@@ -822,14 +942,17 @@ def _unsupported_entry(kind: GradleKind, alias: str, reason: str) -> CatalogueEn
 
 
 def _table(raw: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
-    table = raw.get(name) or {}
+    table = raw.get(name, {})
     if not isinstance(table, dict):
         raise GradleError(f"malformed [{name}] table in {path}")
     return table
 
 
 def _digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as e:
+        raise GradleError(f"Could not read Gradle catalogue {path}: {e}") from e
 
 
 def _validate_inventory(path: Path) -> None:

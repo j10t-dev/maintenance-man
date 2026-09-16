@@ -536,9 +536,19 @@ def prepare_gradle_findings(
     order: list[str] = []
 
     for vuln in scan_result.vulnerabilities:
-        if vuln.update_status == UpdateStatus.COMPLETED or not vuln.actionable:
+        if vuln.update_status == UpdateStatus.COMPLETED:
             continue
         recorded = vuln.gradle_target
+        if vuln.gradle_block_kind in {"mapping", "conflict"} and recorded is None:
+            _apply_block(
+                vuln,
+                GradleBlock(
+                    kind=vuln.gradle_block_kind,
+                    reason=vuln.blocked_reason
+                    or "structural Gradle block; run 'mm scan' again",
+                ),
+            )
+            continue
         if recorded is None:
             _apply_block(
                 vuln,
@@ -552,6 +562,24 @@ def prepare_gradle_findings(
             _add_to_group(groups, order, recorded, vuln, vuln.vuln_id, is_vuln=True)
             continue
         block = validate_gradle_target_shape(recorded)
+        if block is None and not vuln.actionable:
+            outcome = resolve_gradle_vulnerability_target(project, vuln)
+            if isinstance(outcome, GradleBlock):
+                block = outcome
+        if block is None and vuln.update_status != UpdateStatus.READY:
+            block = validate_gradle_target(project, recorded)
+            if block is None:
+                outcome = resolve_gradle_vulnerability_target(project, vuln)
+                if isinstance(outcome, GradleBlock):
+                    block = outcome
+                elif _target_identity(outcome) != _target_identity(recorded):
+                    block = GradleBlock(
+                        kind="stale",
+                        reason=(
+                            "advisory mapping no longer matches recorded Gradle "
+                            "target; run 'mm scan' again"
+                        ),
+                    )
         if block is None and (
             recorded.target_version != vuln.fixed_version
             or not any(
@@ -568,22 +596,9 @@ def prepare_gradle_findings(
                     "run 'mm scan' again"
                 ),
             )
-        if block is None and vuln.update_status != UpdateStatus.READY:
-            block = validate_gradle_target(project, recorded)
-            if block is None:
-                outcome = resolve_gradle_vulnerability_target(project, vuln)
-                if isinstance(outcome, GradleBlock):
-                    block = outcome
-                elif _target_identity(outcome) != _target_identity(recorded):
-                    block = GradleBlock(
-                        kind="stale",
-                        reason=(
-                            "advisory mapping no longer matches recorded Gradle "
-                            "target; run 'mm scan' again"
-                        ),
-                    )
         if block is not None:
             _apply_block(vuln, block)
+            _add_to_group(groups, order, recorded, vuln, vuln.vuln_id, is_vuln=True)
             continue
         _add_to_group(groups, order, recorded, vuln, vuln.vuln_id, is_vuln=True)
 
@@ -594,6 +609,14 @@ def prepare_gradle_findings(
             update.gradle_block_kind in {"mapping", "conflict"}
             and update.gradle_target is None
         ):
+            _apply_block(
+                update,
+                GradleBlock(
+                    kind=update.gradle_block_kind,
+                    reason=update.blocked_reason
+                    or "structural Gradle block; run 'mm scan' again",
+                ),
+            )
             continue  # no known target to join; fresh scan required
         if update.gradle_target is None:
             _apply_block(
@@ -662,6 +685,59 @@ def prepare_gradle_findings(
     return prepared
 
 
+def gradle_groups_from_targets(
+    findings: Sequence[VulnFinding | UpdateFinding],
+) -> list[GradleFinding]:
+    """Order recorded groups without live catalogue or publication checks.
+
+    Validate historical group consistency before constructing lifecycle proxies.
+    Invalid originals remain available to the caller as raw blockers.
+    """
+    groups: dict[str, _GradleGroup] = {}
+    order: list[str] = []
+    for finding in findings:
+        if finding.gradle_target is None:
+            _apply_block(
+                finding,
+                GradleBlock(
+                    kind="stale",
+                    reason="no Gradle target recorded; run 'mm scan' again",
+                ),
+            )
+            continue
+        _add_to_group(
+            groups,
+            order,
+            finding.gradle_target,
+            finding,
+            finding.detail,
+            is_vuln=isinstance(finding, VulnFinding),
+        )
+    proxies: list[GradleFinding] = []
+    for key in order:
+        group = groups[key]
+        block = _group_consistency_block(group)
+        if block is not None:
+            for original in group.originals:
+                _apply_block(original, block)
+            continue
+        status, phase, flow = _consolidated_lifecycle_state(group.originals)
+        proxies.append(
+            GradleFinding(
+                pkg_name=group.target.display_name,
+                installed_version=group.target.members[0].installed_version,
+                target=group.target,
+                kind="vuln" if group.has_vuln else "update",
+                _detail=_group_detail(group),
+                _originals=group.originals,
+                _update_status=status,
+                _failed_phase=phase,
+                _flow=flow,
+            )
+        )
+    return proxies
+
+
 def _target_identity(target: GradleUpdateTarget):
     return (
         normalise_alias(target.version_ref) if target.version_ref is not None else None,
@@ -685,23 +761,8 @@ def _add_to_group(
     block = validate_gradle_target_shape(target)
     if block is not None:
         _apply_block(finding, block)
-        return
-    key = (
-        f"ref:{normalise_alias(target.version_ref)}"
-        if target.version_ref is not None
-        else f"{target.members[0].kind}:{normalise_alias(target.members[0].alias)}"
-    )
-    group = groups.get(key)
-    if group is None:
-        group = _GradleGroup(target=target)
-        groups[key] = group
-        order.append(key)
-    group.originals.append(finding)
-    group.versions.add(target.target_version)
-    if is_vuln:
-        group.vuln_details.append(detail)
-        group.has_vuln = True
-        group.target = target
+    if target.version_ref is not None:
+        keys = [f"ref:{normalise_alias(target.version_ref)}"]
     else:
         identities: set[tuple[str, str]] = set()
         for member in target.members:
@@ -749,6 +810,11 @@ def _group_consistency_block(group: _GradleGroup) -> GradleBlock | None:
                 reason=original.blocked_reason
                 or "structural Gradle block; run 'mm scan' again",
             )
+    for original in group.originals:
+        if original.gradle_target is not None:
+            block = validate_gradle_target_shape(original.gradle_target)
+            if block is not None:
+                return block
     if len(group.versions) > 1:
         return GradleBlock(
             kind="conflict",
@@ -768,7 +834,60 @@ def _group_consistency_block(group: _GradleGroup) -> GradleBlock | None:
             kind="stale",
             reason="inconsistent historical Gradle target members; run 'mm scan' again",
         )
-    if len({original.update_status for original in group.originals}) > 1:
+    for original in group.originals:
+        target = original.gradle_target
+        if target is None:
+            continue
+        if isinstance(original, VulnFinding) and original.fixed_version is None:
+            return GradleBlock(
+                kind="mapping", reason=f"{original.vuln_id} names no fix version"
+            )
+        finding_version = (
+            original.fixed_version
+            if isinstance(original, VulnFinding)
+            else original.latest_version
+        )
+        if finding_version != target.target_version:
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    "finding version no longer matches recorded Gradle target; "
+                    "run 'mm scan' again"
+                ),
+            )
+        if isinstance(original, UpdateFinding) and any(
+            member.installed_version != original.installed_version
+            for member in target.members
+        ):
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    "update installed version no longer matches recorded Gradle "
+                    "members; run 'mm scan' again"
+                ),
+            )
+        if isinstance(original, VulnFinding) and not any(
+            m.kind == "library"
+            and m.coordinate == original.pkg_name
+            and m.installed_version == original.installed_version
+            for m in target.members
+        ):
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    "advisory no longer matches recorded Gradle members; "
+                    "run 'mm scan' again"
+                ),
+            )
+    if (
+        len(
+            {
+                (original.update_status, original.flow, original.failed_phase)
+                for original in group.originals
+            }
+        )
+        > 1
+    ):
         return GradleBlock(
             kind="stale",
             reason=(
@@ -780,6 +899,12 @@ def _group_consistency_block(group: _GradleGroup) -> GradleBlock | None:
 
 
 def _apply_block(finding: VulnFinding | UpdateFinding, block: GradleBlock) -> None:
+    if finding.gradle_block_kind in {"mapping", "conflict"}:
+        block = GradleBlock(
+            kind=finding.gradle_block_kind,
+            reason=finding.blocked_reason
+            or "structural Gradle block; run 'mm scan' again",
+        )
     finding.blocked_reason = block.reason
     finding.gradle_block_kind = block.kind
 

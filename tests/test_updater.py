@@ -1643,3 +1643,532 @@ def test_three_room_originals_use_real_adapter_and_one_test_sequence(
         assert original.update_status == UpdateStatus.READY
         assert original.flow == Workflow.UPDATE
         assert original.failed_phase is None
+
+
+@pytest.mark.parametrize(
+    "target,expected", [(None, "stale"), (make_gradle_target(), "mapping")]
+)
+def test_nonactionable_gradle_advisory_is_rechecked(gradle_project, target, expected):
+    finding = make_vuln(
+        pkg_name="androidx.room:room-runtime",
+        installed_version="2.8.4",
+        fixed_version=None,
+        gradle_target=target,
+    )
+    scan = make_scan_result(vulns=[finding], updates=[])
+    assert prepare_gradle_findings(scan, gradle_project, 0) == []
+    assert finding.gradle_block_kind == expected
+    assert finding.blocked_reason
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["updates-conflict.toml", "updates-incomplete.toml", "updates-unmatched.toml"],
+)
+def test_real_discovery_structural_block_withholds_cross_kind_group(
+    gradle_project, old_dates, monkeypatch, fixture
+):
+    from maintenance_man.gradle import (
+        GRADLE_UPDATE_REPORT_RELPATH,
+        discover_gradle_updates,
+    )
+    from tests.conftest import GRADLE_FIXTURES
+
+    def run(cmd, **kwargs):
+        (Path(kwargs["cwd"]) / GRADLE_UPDATE_REPORT_RELPATH).write_bytes(
+            (GRADLE_FIXTURES / fixture).read_bytes()
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    scan = _room_scan_result()
+    independent = scan.updates[1]
+    scan.updates = discover_gradle_updates(gradle_project) + [independent]
+    for _ in range(2):
+        assert [
+            p.pkg_name for p in prepare_gradle_findings(scan, gradle_project, 7)
+        ] == ["com.google.code.gson:gson"]
+        assert scan.vulnerabilities[0].gradle_block_kind == (
+            "mapping" if fixture == "updates-unmatched.toml" else "conflict"
+        )
+        assert scan.vulnerabilities[0].blocked_reason
+
+
+def test_known_structural_ref_survives_malformed_recorded_members(
+    gradle_project, old_dates
+):
+    scan = _room_scan_result()
+    scan.updates[0].gradle_block_kind = "conflict"
+    scan.updates[0].blocked_reason = "incomplete proposal requires fresh scan"
+    scan.updates[0].gradle_target.members = []
+    assert [p.pkg_name for p in prepare_gradle_findings(scan, gradle_project, 7)] == [
+        "com.google.code.gson:gson"
+    ]
+    assert scan.vulnerabilities[0].gradle_block_kind == "conflict"
+    assert scan.updates[0].blocked_reason == "incomplete proposal requires fresh scan"
+
+
+@pytest.mark.parametrize("inventory_state", ["marked", "unmarked", "cleanup-error"])
+def test_real_application_reclaims_owned_inventory_before_tests_and_commit(
+    gradle_project, old_dates, monkeypatch, inventory_state
+):
+    from maintenance_man.gradle import (
+        GRADLE_INVENTORY_MARKER_RELPATH,
+        GRADLE_INVENTORY_RELPATH,
+        GRADLE_REPORT_MARKER_RELPATH,
+        GRADLE_UPDATE_REPORT_RELPATH,
+    )
+
+    root = Path(gradle_project.path)
+    catalogue = root / GRADLE_CATALOGUE_RELPATH
+    inventory = root / GRADLE_INVENTORY_RELPATH
+    inventory.mkdir()
+    (inventory / "bom.json").write_bytes(b"inventory bytes")
+    if inventory_state != "unmarked":
+        (root / GRADLE_INVENTORY_MARKER_RELPATH).write_bytes(b"")
+    (root / GRADLE_UPDATE_REPORT_RELPATH).write_bytes(b"leftover generated report")
+    (root / GRADLE_REPORT_MARKER_RELPATH).write_bytes(b"")
+    scan = _room_scan_result()
+    scan.updates = scan.updates[:1]
+    effects = []
+    commands = []
+
+    def clear():
+        assert not inventory.exists()
+        assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()
+        assert not (root / GRADLE_REPORT_MARKER_RELPATH).exists()
+
+    def run(cmd, **kwargs):
+        assert cmd[1] == "versionCatalogApplyUpdates"
+        assert not inventory.exists()
+        commands.append(cmd)
+        catalogue.write_text(
+            catalogue.read_text().replace('room = "2.8.4"', 'room = "2.8.5"')
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def tests(*args):
+        clear()
+        effects.append("tests")
+        return True, None
+
+    def dirty(*args):
+        clear()
+        effects.append("dirty")
+        return True
+
+    def commit(*args):
+        clear()
+        effects.append("commit")
+        return True
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("maintenance_man.updater.run_test_phases", tests)
+    monkeypatch.setattr("maintenance_man.updater.current_change_has_changes", dirty)
+    monkeypatch.setattr("maintenance_man.updater.commit_current_change", commit)
+    monkeypatch.setattr(
+        "maintenance_man.updater.create_or_reset_bookmark", lambda *args: True
+    )
+    monkeypatch.setattr(
+        "maintenance_man.updater.discard_current_change",
+        lambda *args: pytest.fail("stop-on-failure must not discard"),
+    )
+    if inventory_state == "cleanup-error":
+
+        def fail(*args, **kwargs):
+            raise PermissionError("cannot reclaim inventory")
+
+        monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
+    prepared = prepare_gradle_findings(scan, gradle_project, 7)
+    results = process_findings(
+        prepared,
+        gradle_project,
+        flow=Workflow.RESOLVE,
+        on_failure="stop",
+        minimum_age_days=7,
+    )
+    if inventory_state == "marked":
+        assert [r.passed for r in results] == [True]
+        assert effects == ["tests", "dirty", "commit"]
+        assert len(commands) == 1
+        clear()
+    else:
+        assert [r.passed for r in results] == [False]
+        assert results[0].failed_phase == "apply"
+        assert commands == []
+        assert effects == []
+        assert (inventory / "bom.json").read_bytes() == b"inventory bytes"
+        assert 'room = "2.8.4"' in catalogue.read_text()
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_real_same_alias_library_plugin_proposals_withhold_cross_kind_group_on_retry(
+    gradle_project, old_dates, monkeypatch, complete
+):
+    from maintenance_man.gradle import (
+        GRADLE_UPDATE_REPORT_RELPATH,
+        discover_gradle_updates,
+        resolve_gradle_vulnerability_target,
+    )
+
+    root = Path(gradle_project.path)
+    (root / GRADLE_CATALOGUE_RELPATH).write_text(
+        '[versions]\nshared = "1.0.0"\n'
+        '[libraries]\nsame = { module = "org.example:library", '
+        'version.ref = "shared" }\n'
+        '[plugins]\nsame = { id = "org.example.plugin", version.ref = "shared" }\n'
+    )
+    report = '[libraries]\nsame = "org.example:library:1.0.1"\n'
+    if complete:
+        report += '[plugins]\nsame = "org.example.plugin:1.0.1"\n'
+
+    def run(cmd, **kwargs):
+        assert cmd[1] == "versionCatalogUpdate"
+        (Path(kwargs["cwd"]) / GRADLE_UPDATE_REPORT_RELPATH).write_text(report)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    vuln = make_vuln(
+        pkg_name="org.example:library", installed_version="1.0.0", fixed_version="1.0.1"
+    )
+    target = resolve_gradle_vulnerability_target(gradle_project, vuln)
+    assert isinstance(target, GradleUpdateTarget)
+    vuln.gradle_target = target
+    scan = make_scan_result(
+        vulns=[vuln], updates=discover_gradle_updates(gradle_project)
+    )
+    for _ in range(2):
+        prepared = prepare_gradle_findings(scan, gradle_project, 7)
+        if complete:
+            assert len(prepared) == 1
+            assert prepared[0].kind == "vuln"
+            assert prepared[0].target_version == "1.0.1"
+        else:
+            assert prepared == []
+            assert all(
+                f.gradle_block_kind == "conflict"
+                for f in (*scan.vulnerabilities, *scan.updates)
+            )
+            assert all(
+                f.blocked_reason and "plugin same" in f.blocked_reason
+                for f in (*scan.vulnerabilities, *scan.updates)
+            )
+
+
+def _actual_inline_sibling_scan(project, *, malformed_first=False, defect="duplicate"):
+    from maintenance_man.gradle import (
+        build_update_findings,
+        parse_catalogue,
+        parse_update_report,
+        resolve_gradle_vulnerability_target,
+    )
+
+    root = Path(project.path)
+    catalogue = root / GRADLE_CATALOGUE_RELPATH
+    catalogue.write_text(
+        "[libraries]\n"
+        'gson-json = { module = "com.google.code.gson:gson", version = "2.11.0" }\n'
+        'other = { module = "org.example:other", version = "1.0.0" }\n'
+        '[plugins]\ngson-json = { id = "org.example.plugin", version = "1.0.0" }\n'
+    )
+    report = root / "test-proposals.toml"
+    report.write_text(
+        '[libraries]\ngson-json = "com.google.code.gson:gson:2.12.0"\n'
+        'other = "org.example:other:1.0.1"\n'
+        '[plugins]\ngson-json = "org.example.plugin:1.0.1"\n'
+    )
+    updates = build_update_findings(
+        parse_catalogue(catalogue), parse_update_report(report)
+    )
+    report.unlink()
+    update = next(u for u in updates if u.pkg_name == "com.google.code.gson:gson")
+    assert update.gradle_target is not None
+    malformed = update.model_copy(deep=True)
+    assert malformed.gradle_target is not None
+    malformed.gradle_target.members[0].alias = "gson_json"
+    if defect == "duplicate":
+        malformed.gradle_target.members.append(
+            malformed.gradle_target.members[0].model_copy(update={"alias": "gson.json"})
+        )
+    elif defect == "coordinate":
+        malformed.gradle_target.members[0].coordinate = ""
+    elif defect == "history":
+        malformed.gradle_target.members[0].installed_version = ""
+    elif defect == "version":
+        malformed.gradle_target.target_version = ""
+    vuln = make_vuln(
+        pkg_name="com.google.code.gson:gson",
+        installed_version="2.11.0",
+        fixed_version="2.12.0",
+    )
+    target = resolve_gradle_vulnerability_target(project, vuln)
+    assert isinstance(target, GradleUpdateTarget)
+    vuln.gradle_target = target
+    scan = make_scan_result(
+        vulns=[vuln],
+        updates=[malformed, *updates] if malformed_first else [*updates, malformed],
+    )
+    return scan
+
+
+@pytest.mark.parametrize("malformed_first", [False, True])
+def test_actual_inline_duplicate_member_withholds_all_cross_kind_siblings_on_retry(
+    gradle_project, old_dates, malformed_first
+):
+    scan = _actual_inline_sibling_scan(gradle_project, malformed_first=malformed_first)
+    for _ in range(2):
+        prepared = prepare_gradle_findings(scan, gradle_project, 7)
+        assert {p.pkg_name for p in prepared} == {
+            "org.example:other",
+            "org.example.plugin",
+        }
+        linked = [
+            scan.vulnerabilities[0],
+            *(u for u in scan.updates if u.pkg_name == "com.google.code.gson:gson"),
+        ]
+        assert all(f.gradle_block_kind == "stale" for f in linked)
+        assert all(
+            f.blocked_reason and "inline Gradle target" in f.blocked_reason
+            for f in linked
+        )
+
+
+@pytest.mark.parametrize("defect", ["coordinate", "history", "version"])
+def test_known_inline_identity_withholds_malformed_metadata_cross_kind_siblings(
+    gradle_project, old_dates, defect
+):
+    scan = _actual_inline_sibling_scan(gradle_project, defect=defect)
+    for _ in range(2):
+        assert {
+            p.pkg_name for p in prepare_gradle_findings(scan, gradle_project, 7)
+        } == {"org.example:other", "org.example.plugin"}
+        assert scan.vulnerabilities[0].gradle_block_kind == "stale"
+
+
+@pytest.mark.parametrize("malformed_first", [False, True])
+@pytest.mark.parametrize(
+    "second_pkg, independent_pkg",
+    [
+        ("org.example.plugin", "org.example:other"),
+        ("org.example:other", "org.example.plugin"),
+    ],
+)
+def test_malformed_inline_multiple_known_keys_only_fan_out_as_blockers(
+    gradle_project, old_dates, malformed_first, second_pkg, independent_pkg
+):
+    scan = _actual_inline_sibling_scan(gradle_project, malformed_first=malformed_first)
+    malformed = next(
+        u for u in scan.updates if u.gradle_target and len(u.gradle_target.members) == 2
+    )
+    second = next(u for u in scan.updates if u.pkg_name == second_pkg)
+    malformed.gradle_target.members[1] = second.gradle_target.members[0].model_copy()
+    for _ in range(2):
+        assert [
+            p.pkg_name for p in prepare_gradle_findings(scan, gradle_project, 7)
+        ] == [independent_pkg]
+        assert second.gradle_block_kind == "stale"
+        assert scan.vulnerabilities[0].gradle_block_kind == "stale"
+
+
+@pytest.mark.parametrize("aliases", [[], [""], ["unsafe\n"]])
+def test_inline_unknown_alias_identity_never_invents_package_linkage(
+    gradle_project, old_dates, aliases
+):
+    scan = _actual_inline_sibling_scan(gradle_project)
+    malformed = scan.updates[-1]
+    member = malformed.gradle_target.members[0]
+    malformed.gradle_target.members = [
+        member.model_copy(update={"alias": alias}) for alias in aliases
+    ]
+    prepared = prepare_gradle_findings(scan, gradle_project, 7)
+    assert {p.pkg_name for p in prepared} == {
+        "com.google.code.gson:gson",
+        "org.example:other",
+        "org.example.plugin",
+    }
+    assert malformed.gradle_block_kind == "stale"
+    assert malformed.blocked_reason and "mm scan" in malformed.blocked_reason
+
+
+@pytest.mark.parametrize("malformed_first", [False, True])
+def test_inline_target_proxy_replacement_cannot_erase_recorded_blockers(
+    gradle_project, malformed_first
+):
+    from maintenance_man.updater import gradle_groups_from_targets
+
+    scan = _actual_inline_sibling_scan(gradle_project)
+    malformed = scan.updates[-1]
+    valid = scan.vulnerabilities[0]
+    findings = [malformed, valid] if malformed_first else [valid, malformed]
+    assert gradle_groups_from_targets(findings) == []
+    assert malformed.gradle_block_kind == "stale"
+    assert valid.gradle_block_kind == "stale"
+
+
+def test_inline_sibling_lifecycle_inconsistency_blocks_group_and_preserves_failure(
+    gradle_project, old_dates
+):
+    scan = _actual_inline_sibling_scan(gradle_project, defect="coordinate")
+    malformed = scan.updates[-1]
+    malformed.update_status = UpdateStatus.FAILED
+    malformed.failed_phase = "unit"
+    malformed.flow = Workflow.RESOLVE
+    for _ in range(2):
+        assert {
+            p.pkg_name for p in prepare_gradle_findings(scan, gradle_project, 7)
+        } == {"org.example:other", "org.example.plugin"}
+        assert scan.vulnerabilities[0].gradle_block_kind == "stale"
+        assert malformed.update_status == UpdateStatus.FAILED
+        assert malformed.failed_phase == "unit"
+        assert malformed.flow == Workflow.RESOLVE
+
+
+@pytest.mark.parametrize("status", [None, UpdateStatus.READY, UpdateStatus.FAILED])
+@pytest.mark.parametrize("mismatch_first", [False, True])
+@pytest.mark.parametrize("preparation", [False, True])
+def test_ordinary_update_installed_history_mismatch_blocks_recorded_group(
+    gradle_project, old_dates, status, mismatch_first, preparation
+):
+    from maintenance_man.updater import gradle_groups_from_targets
+
+    scan = _room_scan_result()
+    scan.vulnerabilities = []
+    valid = scan.updates[0]
+    valid.update_status = status
+    valid.flow = Workflow.RESOLVE if status else None
+    valid.failed_phase = "unit" if status == UpdateStatus.FAILED else None
+    mismatch = valid.model_copy(deep=True)
+    mismatch.installed_version = "9.0.0"
+    independent = scan.updates[1]
+    scan.updates = (
+        [mismatch, valid, independent]
+        if mismatch_first
+        else [valid, mismatch, independent]
+    )
+    groups = (
+        prepare_gradle_findings(scan, gradle_project, 7)
+        if preparation
+        else gradle_groups_from_targets(scan.updates)
+    )
+    assert [g.pkg_name for g in groups] == ["com.google.code.gson:gson"]
+    assert all(u.gradle_block_kind == "stale" for u in [valid, mismatch])
+    assert all(
+        u.blocked_reason and "installed" in u.blocked_reason for u in [valid, mismatch]
+    )
+    assert valid.update_status == status
+    assert mismatch.update_status == status
+
+
+@pytest.mark.parametrize("status", [None, UpdateStatus.READY, UpdateStatus.FAILED])
+@pytest.mark.parametrize("preparation", [False, True])
+def test_matching_ordinary_installed_history_preserves_valid_lifecycle_group(
+    gradle_project, old_dates, status, preparation
+):
+    from maintenance_man.updater import gradle_groups_from_targets
+
+    scan = _room_scan_result()
+    scan.vulnerabilities = []
+    valid = scan.updates[0]
+    valid.update_status = status
+    valid.flow = Workflow.RESOLVE if status else None
+    valid.failed_phase = "unit" if status == UpdateStatus.FAILED else None
+    scan.updates.insert(1, valid.model_copy(deep=True))
+    groups = (
+        prepare_gradle_findings(scan, gradle_project, 7)
+        if preparation
+        else gradle_groups_from_targets(scan.updates)
+    )
+    expected = (
+        {"com.google.code.gson:gson"}
+        if preparation and status == UpdateStatus.READY
+        else {"room", "com.google.code.gson:gson"}
+    )
+    assert {g.pkg_name for g in groups} == expected
+    assert all(u.gradle_block_kind is None for u in scan.updates)
+    assert valid.update_status == status
+
+
+@pytest.mark.parametrize("preparation", [False, True])
+def test_actual_structural_block_inert_history_preserves_original_block_kind(
+    gradle_project, old_dates, preparation
+):
+    from maintenance_man.gradle import (
+        build_update_findings,
+        parse_catalogue,
+        parse_update_report,
+    )
+    from maintenance_man.updater import gradle_groups_from_targets
+    from tests.conftest import GRADLE_FIXTURES
+
+    scan = _room_scan_result()
+    independent = scan.updates[1]
+    scan.updates = build_update_findings(
+        parse_catalogue(Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH),
+        parse_update_report(GRADLE_FIXTURES / "updates-conflict.toml"),
+    ) + [independent]
+    blocked = next(u for u in scan.updates if u.pkg_name == "room")
+    assert blocked.installed_version == "unknown"
+    reason = blocked.blocked_reason
+    groups = (
+        prepare_gradle_findings(scan, gradle_project, 7)
+        if preparation
+        else gradle_groups_from_targets([*scan.vulnerabilities, *scan.updates])
+    )
+    assert [g.pkg_name for g in groups] == ["com.google.code.gson:gson"]
+    assert blocked.gradle_block_kind == "conflict"
+    assert blocked.blocked_reason == reason
+    assert scan.vulnerabilities[0].gradle_block_kind == "conflict"
+
+
+@pytest.mark.parametrize("preparation", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_vulnerability_only_mixed_shared_installed_history_blocks_before_proxy(
+    gradle_project, old_dates, preparation, reverse
+):
+    from maintenance_man.updater import gradle_groups_from_targets
+
+    scan = _room_scan_result()
+    scan.updates = scan.updates[1:]
+    vuln = scan.vulnerabilities[0]
+    assert vuln.gradle_target is not None
+    vuln.gradle_target.members[0].installed_version = "9.9.9"
+    if reverse:
+        vuln.gradle_target.members.reverse()
+    vuln.update_status = UpdateStatus.FAILED
+    vuln.failed_phase = "unit"
+    vuln.flow = Workflow.RESOLVE
+    for _ in range(2):
+        groups = (
+            prepare_gradle_findings(scan, gradle_project, 7)
+            if preparation
+            else gradle_groups_from_targets([*scan.vulnerabilities, *scan.updates])
+        )
+        assert [g.pkg_name for g in groups] == ["com.google.code.gson:gson"]
+        assert vuln.gradle_block_kind == "stale"
+        assert vuln.blocked_reason and "installed" in vuln.blocked_reason
+        assert vuln.update_status == UpdateStatus.FAILED
+        assert vuln.failed_phase == "unit"
+        assert vuln.flow == Workflow.RESOLVE
+
+
+@pytest.mark.parametrize("preparation", [False, True])
+def test_structural_vulnerability_block_precedes_mixed_shared_history(
+    gradle_project, old_dates, preparation
+):
+    from maintenance_man.updater import gradle_groups_from_targets
+
+    scan = _room_scan_result()
+    scan.updates = scan.updates[1:]
+    vuln = scan.vulnerabilities[0]
+    assert vuln.gradle_target is not None
+    vuln.gradle_target.members[0].installed_version = "9.9.9"
+    vuln.gradle_block_kind = "mapping"
+    vuln.blocked_reason = "recorded mapping requires fresh scan"
+    groups = (
+        prepare_gradle_findings(scan, gradle_project, 7)
+        if preparation
+        else gradle_groups_from_targets([*scan.vulnerabilities, *scan.updates])
+    )
+    assert [g.pkg_name for g in groups] == ["com.google.code.gson:gson"]
+    assert vuln.gradle_block_kind == "mapping"
+    assert vuln.blocked_reason == "recorded mapping requires fresh scan"
