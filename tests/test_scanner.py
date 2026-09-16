@@ -1,19 +1,32 @@
 import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from unittest.mock import patch
 
 import pytest
 
+from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import ScanResult, SemverTier, Severity, UpdateFinding
+from maintenance_man.models.scan import (
+    GradleMember,
+    GradleUpdateTarget,
+    ScanResult,
+    SemverTier,
+    Severity,
+    UpdateFinding,
+)
 from maintenance_man.scanner import (
     TrivyNotFoundError,
+    _check_outdated,
     _parse_uv_audit_vulns,
     check_trivy_available,
     scan_project,
 )
+from tests.conftest import make_gradle_target, make_update, make_vuln
+
+_OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -334,3 +347,103 @@ class TestRunTrivyScanSkipDirs:
 
         cmd = mock_run.call_args.args[0]
         assert "--skip-dirs" not in cmd
+
+
+def _gradle_scan(monkeypatch, findings, dates):
+    monkeypatch.setattr(
+        "maintenance_man.scanner.get_outdated", lambda project: findings
+    )
+    monkeypatch.setattr(
+        "maintenance_man.dependency_age._get_maven_publish_date",
+        lambda pkg, version: dates.get(pkg),
+    )
+
+
+def test_gradle_outdated_retains_blocked_candidates(
+    gradle_project, monkeypatch, mm_home
+):
+    eligible = make_update(pkg_name="room", gradle_target=make_gradle_target())
+    withheld = make_update(
+        pkg_name="ksp",
+        installed_version="2.3.10",
+        latest_version="2.3.12",
+        gradle_target=GradleUpdateTarget(
+            version_ref="ksp",
+            members=[
+                GradleMember(
+                    kind="plugin",
+                    alias="ksp",
+                    coordinate="com.google.devtools.ksp",
+                    installed_version="2.3.10",
+                )
+            ],
+            target_version="2.3.12",
+        ),
+    )
+    _gradle_scan(
+        monkeypatch,
+        [eligible, withheld],
+        {
+            "androidx.room:room-runtime": _OLD,
+            "androidx.room:room-compiler": _OLD,
+            "androidx.room:room-testing": _OLD,
+        },
+    )
+    result = _check_outdated("android", gradle_project, [], 7)
+
+    names = {u.pkg_name: u for u in result}
+    assert names["room"].blocked_reason is None
+    assert names["room"].published_date == _OLD
+    assert names["ksp"].gradle_block_kind == "age"
+    assert names["ksp"].blocked_reason is not None
+    assert "no Maven Central publication date" in names["ksp"].blocked_reason
+
+
+def test_gradle_discovery_failure_is_not_swallowed(gradle_project, monkeypatch):
+    def _boom(project):
+        raise GradleError("versionCatalogUpdate failed (exit 1): boom")
+
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", _boom)
+
+    with pytest.raises(GradleError, match="versionCatalogUpdate failed"):
+        _check_outdated("android", gradle_project, [], 7)
+
+
+def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
+    gradle_project, monkeypatch
+):
+    finding = make_update(pkg_name="room", gradle_target=make_gradle_target())
+    _gradle_scan(
+        monkeypatch,
+        [finding],
+        {
+            "androidx.room:room-runtime": _OLD,
+            "androidx.room:room-compiler": _OLD,
+            "androidx.room:room-testing": _OLD,
+        },
+    )
+    vulns = [make_vuln(pkg_name="androidx.room:room-runtime")]
+
+    result = _check_outdated("android", gradle_project, vulns, 7)
+
+    assert [u.pkg_name for u in result] == ["room"]
+
+
+def test_gradle_finding_without_target_or_reason_is_blocked_not_eligible(
+    gradle_project, monkeypatch
+):
+    """A finding with neither a target nor a reason must not be presented as an
+    eligible update with zero publication evidence.  This combination should
+    not occur today, but the branch must fail closed if it ever does.
+    """
+    finding = make_update(pkg_name="mystery", latest_version="9.9.9")
+    monkeypatch.setattr(
+        "maintenance_man.scanner.get_outdated", lambda project: [finding]
+    )
+
+    result = _check_outdated("android", gradle_project, [], 7)
+
+    assert len(result) == 1
+    assert result[0].blocked_reason is not None
+    assert result[0].gradle_block_kind == "age"
+    assert "no catalogue target" in result[0].blocked_reason

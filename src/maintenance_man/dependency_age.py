@@ -10,7 +10,103 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from maintenance_man.models.scan import UpdateFinding
+from maintenance_man.models.scan import (
+    GradleBlock,
+    GradleMember,
+    GradleUpdateTarget,
+    UpdateFinding,
+)
+
+
+def gradle_lookup_coordinate(member: GradleMember) -> str:
+    """Return the Maven coordinate that carries *member*'s publication timestamp.
+
+    Plugins are published as marker artifacts, not under their plugin id.
+    """
+    if member.kind == "plugin":
+        return f"{member.coordinate}:{member.coordinate}.gradle.plugin"
+    return member.coordinate
+
+
+def check_gradle_update_age(
+    target: GradleUpdateTarget, minimum_age_days: int
+) -> GradleBlock | None:
+    """Return an age block, or None when every member has sufficient evidence."""
+    return evaluate_gradle_group_age(target, minimum_age_days)[0]
+
+
+def evaluate_gradle_group_age(
+    target: GradleUpdateTarget, minimum_age_days: int
+) -> tuple[GradleBlock | None, datetime | None]:
+    """Resolve publication evidence for every member changed by *target*.
+
+    Returns ``(block, youngest_verified_date)``.  One missing, failed or
+    too-recent lookup blocks the whole group: for Gradle, unknown release age is
+    never treated as eligible, and ``minimum_age_days == 0`` removes only the
+    waiting period, not the evidence requirement.
+    """
+    if not target.members:
+        # target.display_name indexes members[0] when version_ref is unset, so
+        # it cannot be used here without risking the same empty-list failure.
+        name = target.version_ref or "inline target"
+        return (
+            GradleBlock(
+                kind="age",
+                reason=(
+                    f"{name} {target.target_version} has no members to verify; "
+                    f"rescan to refresh this target"
+                ),
+            ),
+            None,
+        )
+
+    dated: list[tuple[str, datetime]] = []
+    for member in target.members:
+        coordinate = gradle_lookup_coordinate(member)
+        try:
+            published = _get_maven_publish_date(coordinate, target.target_version)
+        except Exception as e:
+            return (
+                GradleBlock(
+                    kind="age",
+                    reason=(
+                        f"publication lookup failed for {coordinate} "
+                        f"{target.target_version}: {type(e).__name__}; "
+                        f"release age cannot be verified"
+                    ),
+                ),
+                None,
+            )
+        if published is None:
+            return (
+                GradleBlock(
+                    kind="age",
+                    reason=(
+                        f"no Maven Central publication date for {coordinate} "
+                        f"{target.target_version}; mm does not update on unknown "
+                        f"release age"
+                    ),
+                ),
+                None,
+            )
+        dated.append((coordinate, published))
+
+    coordinate, youngest = max(dated, key=lambda item: item[1])
+    now = _utcnow()
+    cutoff = now - timedelta(days=minimum_age_days)
+    if minimum_age_days > 0 and youngest >= cutoff:
+        age_days = (now - youngest).days
+        return (
+            GradleBlock(
+                kind="age",
+                reason=(
+                    f"{coordinate} {target.target_version} was published "
+                    f"{age_days} day(s) ago; minimum is {minimum_age_days}"
+                ),
+            ),
+            youngest,
+        )
+    return (None, youngest)
 
 
 def filter_by_age(

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man.cli import app
+from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
 from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,
@@ -11,6 +11,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
+from tests.conftest import make_scan_result, make_update
 
 
 def _make_vulnerable_result() -> ScanResult:
@@ -158,3 +159,55 @@ class TestScanAllWithUpdates:
             app(["scan"])
         # vulnerable has vulns → exit 2 takes precedence
         assert exc_info.value.code == 2
+
+
+def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
+    result = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(
+                pkg_name="ksp",
+                installed_version="2.3.10",
+                latest_version="2.3.12",
+                blocked_reason=(
+                    "no Maven Central publication date for "
+                    "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin "
+                    "2.3.12"
+                ),
+                gradle_block_kind="age",
+            )
+        ],
+    )
+
+    _print_scan_result(result)
+    out = capsys.readouterr().out
+
+    assert "clean" not in out
+    assert "ksp" in out
+    assert "1 blocked" in out
+    assert "no Maven Central publication date" in out
+
+
+def test_blocked_update_candidates_still_exit_updates_found():
+    """A ScanResult whose only update is blocked must still reach
+    UPDATES_FOUND: has_updates counts blocked candidates (they stay in
+    ``updates``), and that count is what drives the exit code — not whether
+    any update happens to be eligible.
+    """
+    result = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(
+                pkg_name="ksp",
+                installed_version="2.3.10",
+                latest_version="2.3.12",
+                blocked_reason="no Maven Central publication date",
+                gradle_block_kind="age",
+            )
+        ],
+    )
+
+    assert result.has_updates is True
+    assert _scan_exit_code(result.has_actionable_vulns, result.has_updates) == (
+        ExitCode.UPDATES_FOUND
+    )

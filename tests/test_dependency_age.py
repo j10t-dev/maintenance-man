@@ -1,9 +1,22 @@
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from maintenance_man.dependency_age import filter_by_age
-from maintenance_man.models.scan import SemverTier, UpdateFinding
+import pytest
+
+from maintenance_man.dependency_age import (
+    check_gradle_update_age,
+    evaluate_gradle_group_age,
+    filter_by_age,
+    gradle_lookup_coordinate,
+)
+from maintenance_man.models.scan import (
+    GradleMember,
+    GradleUpdateTarget,
+    SemverTier,
+    UpdateFinding,
+)
+from tests.conftest import make_gradle_member, make_gradle_target
 
 _PATCH_FETCH = "maintenance_man.dependency_age._fetch_json"
 _PATCH_SUBRUN = "maintenance_man.dependency_age.subprocess.run"
@@ -141,3 +154,183 @@ class TestFilterByAge:
 
         assert len(result) == 1
         assert result[0].published_date is not None
+
+
+_OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+def _dates(mapping, monkeypatch):
+    """Substitute Maven Central lookup with a coordinate -> date|None|raise map."""
+
+    def _lookup(pkg: str, version: str):
+        outcome = mapping[pkg]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(
+        "maintenance_man.dependency_age._get_maven_publish_date", _lookup
+    )
+
+
+@pytest.mark.parametrize(
+    "kind, coordinate, expected",
+    [
+        ("library", "androidx.room:room-runtime", "androidx.room:room-runtime"),
+        (
+            "plugin",
+            "com.google.devtools.ksp",
+            "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin",
+        ),
+    ],
+)
+def test_lookup_coordinate_uses_plugin_markers(kind, coordinate, expected):
+    member = make_gradle_member(kind=kind, coordinate=coordinate)
+
+    assert gradle_lookup_coordinate(member) == expected
+
+
+class TestGradleGroupAge:
+    def test_all_members_old_enough_is_eligible(self, monkeypatch):
+        target = make_gradle_target()
+        _dates(
+            {
+                "androidx.room:room-runtime": _OLD,
+                "androidx.room:room-compiler": _OLD,
+                "androidx.room:room-testing": _OLD + timedelta(days=1),
+            },
+            monkeypatch,
+        )
+
+        block, published = evaluate_gradle_group_age(target, 7)
+
+        assert block is None
+        assert published == _OLD + timedelta(days=1)
+
+    @pytest.mark.parametrize(
+        "third_outcome, reason_fragment",
+        [
+            (None, "no Maven Central publication date"),
+            (RuntimeError("network down"), "publication lookup failed"),
+        ],
+    )
+    def test_one_member_without_evidence_blocks_the_group(
+        self, monkeypatch, third_outcome, reason_fragment
+    ):
+        target = make_gradle_target()
+        _dates(
+            {
+                "androidx.room:room-runtime": _OLD,
+                "androidx.room:room-compiler": _OLD,
+                "androidx.room:room-testing": third_outcome,
+            },
+            monkeypatch,
+        )
+
+        block = check_gradle_update_age(target, 7)
+
+        assert block is not None
+        assert block.kind == "age"
+        assert reason_fragment in block.reason
+        assert "androidx.room:room-testing" in block.reason
+
+    def test_too_recent_member_blocks_the_group(self, monkeypatch):
+        now = datetime.now(timezone.utc)
+        target = make_gradle_target()
+        _dates(
+            {
+                "androidx.room:room-runtime": _OLD,
+                "androidx.room:room-compiler": _OLD,
+                "androidx.room:room-testing": now - timedelta(days=2),
+            },
+            monkeypatch,
+        )
+
+        block = check_gradle_update_age(target, 7)
+
+        assert block is not None
+        assert block.kind == "age"
+        assert "2 day(s) ago" in block.reason
+        assert "minimum is 7" in block.reason
+
+    def test_member_published_exactly_at_cutoff_blocks_the_group(self, monkeypatch):
+        """A publication exactly ``minimum_age_days`` old is not yet old enough.
+
+        Matches ``filter_by_age``'s existing ``>=`` semantics: pinned so a
+        future refactor to ``>`` fails the suite instead of passing silently.
+        """
+        fixed_now = datetime(2024, 2, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr("maintenance_man.dependency_age._utcnow", lambda: fixed_now)
+        target = make_gradle_target()
+        exactly_at_cutoff = fixed_now - timedelta(days=7)
+        _dates(
+            {
+                "androidx.room:room-runtime": _OLD,
+                "androidx.room:room-compiler": _OLD,
+                "androidx.room:room-testing": exactly_at_cutoff,
+            },
+            monkeypatch,
+        )
+
+        block = check_gradle_update_age(target, 7)
+
+        assert block is not None
+        assert block.kind == "age"
+        assert "androidx.room:room-testing" in block.reason
+        assert "7 day(s) ago" in block.reason
+        assert "minimum is 7" in block.reason
+
+    def test_zero_waiting_period_allows_recent_but_not_unknown(self, monkeypatch):
+        now = datetime.now(timezone.utc)
+        target = make_gradle_target(
+            members=[make_gradle_member(alias="room-runtime")], version_ref=None
+        )
+        _dates({"androidx.room:room-runtime": now - timedelta(hours=1)}, monkeypatch)
+
+        assert check_gradle_update_age(target, 0) is None
+
+        _dates({"androidx.room:room-runtime": None}, monkeypatch)
+        block = check_gradle_update_age(target, 0)
+
+        assert block is not None and block.kind == "age"
+
+    def test_plugin_member_is_looked_up_by_marker_coordinate(self, monkeypatch):
+        seen: list[str] = []
+
+        def _lookup(pkg: str, version: str):
+            seen.append(pkg)
+            return _OLD
+
+        monkeypatch.setattr(
+            "maintenance_man.dependency_age._get_maven_publish_date", _lookup
+        )
+        target = GradleUpdateTarget(
+            version_ref="ksp",
+            members=[
+                GradleMember(
+                    kind="plugin",
+                    alias="ksp",
+                    coordinate="com.google.devtools.ksp",
+                    installed_version="2.3.10",
+                )
+            ],
+            target_version="2.3.12",
+        )
+
+        assert check_gradle_update_age(target, 7) is None
+        assert seen == ["com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin"]
+
+    def test_empty_member_list_blocks_instead_of_raising(self):
+        """A target with no members (e.g. malformed historical scan JSON) must
+        block for a rescan, not raise out of ``max()`` on an empty sequence.
+        """
+        target = GradleUpdateTarget(
+            version_ref="room", members=[], target_version="2.8.5"
+        )
+
+        block, published = evaluate_gradle_group_age(target, 7)
+
+        assert block is not None
+        assert block.kind == "age"
+        assert "no members" in block.reason
+        assert published is None

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
-from maintenance_man.dependency_age import filter_by_age
+from maintenance_man.dependency_age import evaluate_gradle_group_age, filter_by_age
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     ScanResult,
@@ -94,6 +94,9 @@ def _check_outdated(
     min_version_age_days: int,
 ) -> list[UpdateFinding]:
     """Run outdated checks and return de-duplicated update findings."""
+    if project.package_manager == "gradle":
+        return _check_gradle_outdated(project, min_version_age_days)
+
     try:
         raw_updates = get_outdated(project)
         aged_updates = filter_by_age(
@@ -111,6 +114,41 @@ def _check_outdated(
             exc_info=True,
         )
         return []
+
+
+def _check_gradle_outdated(
+    project: ProjectConfig, min_version_age_days: int
+) -> list[UpdateFinding]:
+    """Discover Gradle catalogue updates and record their age eligibility.
+
+    Blocked candidates are retained with their reason rather than filtered out,
+    and discovery failures propagate: for Gradle a broken check is an explicit
+    scan error, never a silently empty update list.  Package-name suppression
+    against vulnerability findings does not apply — Gradle targets are catalogue
+    groups, not packages.
+    """
+    findings = get_outdated(project)
+    for finding in findings:
+        if finding.blocked_reason is not None:
+            continue
+        if finding.gradle_target is None:
+            # No target attached and no reason set: this combination should
+            # not occur, but treat it as blocked rather than as eligible with
+            # zero publication evidence.
+            finding.blocked_reason = (
+                f"{finding.pkg_name} {finding.latest_version} has no catalogue "
+                f"target; rescan to refresh this finding"
+            )
+            finding.gradle_block_kind = "age"
+            continue
+        block, published = evaluate_gradle_group_age(
+            finding.gradle_target, min_version_age_days
+        )
+        finding.published_date = published
+        if block is not None:
+            finding.blocked_reason = block.reason
+            finding.gradle_block_kind = block.kind
+    return findings
 
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:

@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal, NoReturn
 import cyclopts
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -1761,7 +1762,22 @@ def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanR
     return result
 
 
-def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
+def _print_blocked_findings(scan_result: ScanResult) -> None:
+    """Show current policy blocks with their count. These are not failures."""
+    blocked = scan_result.blocked_findings
+    if not blocked:
+        return
+    console.print(
+        f"\n[bold yellow]{len(blocked)} blocked[/] — not applied automatically:"
+    )
+    for f in blocked:
+        assert f.blocked_reason is not None
+        console.print(f"  [yellow]BLOCKED[/] {f.pkg_name} — {escape(f.blocked_reason)}")
+
+
+def _print_scan_result(
+    result: ScanResult, elapsed_s: float | None = None, *, show_blocked: bool = True
+) -> None:
     """Print a Rich-formatted summary of scan results for one project."""
     actionable = sort_vulns_by_severity(
         [v for v in result.vulnerabilities if v.actionable]
@@ -1869,6 +1885,9 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
                 age,
             )
         console.print(table)
+
+    if show_blocked:
+        _print_blocked_findings(result)
 
 
 def _print_numbered_findings(

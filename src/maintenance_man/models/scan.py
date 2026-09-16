@@ -170,6 +170,15 @@ class ScanResult(BaseModel):
     def has_updates(self) -> bool:
         return bool(self.updates)
 
+    @property
+    def blocked_findings(self) -> list[VulnFinding | UpdateFinding]:
+        """Findings withheld by current policy. Orthogonal to update lifecycle."""
+        return [
+            f
+            for f in (*self.vulnerabilities, *self.updates)
+            if f.blocked_reason is not None
+        ]
+
 
 _SEVERITY_ORDER: dict[Severity, int] = {
     Severity.CRITICAL: 0,
