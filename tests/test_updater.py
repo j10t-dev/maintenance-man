@@ -6,8 +6,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from maintenance_man.gradle import (
+    GRADLE_CATALOGUE_RELPATH,
+    GradleError,
+    validate_gradle_target,
+)
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    GradleMember,
+    GradleUpdateTarget,
     ScanResult,
     SemverTier,
     Severity,
@@ -17,6 +24,7 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.updater import (
+    GradleFinding,
     NoScanResultsError,
     _apply_update,
     _get_uv_update_command,
@@ -24,6 +32,7 @@ from maintenance_man.updater import (
     get_update_commands,
     highest_fix_version,
     load_scan_results,
+    prepare_gradle_findings,
     process_findings,
     process_updates,
     process_vulns,
@@ -37,6 +46,7 @@ from maintenance_man.uv_dependencies import (
     UvDependencyLocation,
     get_uv_dependency_locations,
 )
+from tests.conftest import make_gradle_target, make_scan_result
 
 # -- Factory helpers --
 
@@ -1141,3 +1151,495 @@ class TestProcessUpdatesLocal:
         assert len(results) == 2
         assert results[0].pkg_name == "pkg-a"
         assert results[1].pkg_name == "pkg-c"
+
+
+def _room_scan_result():
+    """One advisory and two update findings, all owned by the 'room' reference."""
+    target = make_gradle_target()
+    return make_scan_result(
+        vulns=[
+            make_vuln(
+                vuln_id="CVE-2026-6666",
+                pkg_name="androidx.room:room-compiler",
+                installed_version="2.8.4",
+                fixed_version="2.8.5",
+                gradle_target=target,
+            )
+        ],
+        updates=[
+            make_update(
+                pkg_name="room",
+                installed_version="2.8.4",
+                latest_version="2.8.5",
+                gradle_target=target,
+            ),
+            make_update(
+                pkg_name="com.google.code.gson:gson",
+                installed_version="2.11.0",
+                latest_version="2.12.0",
+                gradle_target=GradleUpdateTarget(
+                    members=[
+                        GradleMember(
+                            kind="library",
+                            alias="gson",
+                            coordinate="com.google.code.gson:gson",
+                            installed_version="2.11.0",
+                        )
+                    ],
+                    target_version="2.12.0",
+                ),
+            ),
+        ],
+    )
+
+
+@pytest.fixture()
+def old_dates(monkeypatch):
+    monkeypatch.setattr(
+        "maintenance_man.dependency_age._get_maven_publish_date",
+        lambda pkg, version: datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+
+
+class TestPrepareGradleFindings:
+    def test_cross_kind_group_becomes_one_vulnerability_proxy(
+        self, gradle_project, old_dates
+    ):
+        scan_result = _room_scan_result()
+
+        prepared = prepare_gradle_findings(scan_result, gradle_project, 7)
+
+        rooms = [p for p in prepared if p.pkg_name == "room"]
+        assert len(prepared) == 2
+        assert len(rooms) == 1
+        assert rooms[0].kind == "vuln"
+        assert rooms[0].target_version == "2.8.5"
+        assert "CVE-2026-6666" in rooms[0].detail
+        assert len(rooms[0]._originals) == 2
+
+    def test_conflicting_target_versions_block_the_group(
+        self, gradle_project, old_dates
+    ):
+        scan_result = _room_scan_result()
+        scan_result.updates[0].gradle_target = make_gradle_target(
+            target_version="2.9.0"
+        )
+        scan_result.updates[0].latest_version = "2.9.0"
+
+        prepared = prepare_gradle_findings(scan_result, gradle_project, 7)
+
+        assert [p.pkg_name for p in prepared] == ["com.google.code.gson:gson"]
+        assert scan_result.vulnerabilities[0].gradle_block_kind == "conflict"
+        assert scan_result.updates[0].gradle_block_kind == "conflict"
+        assert (reason := scan_result.updates[0].blocked_reason) is not None
+        assert "conflicting target versions" in reason
+
+    def test_age_block_clears_on_a_later_invocation(self, gradle_project, monkeypatch):
+        scan_result = _room_scan_result()
+        scan_result.updates[0].blocked_reason = "was too young"
+        scan_result.updates[0].gradle_block_kind = "age"
+        monkeypatch.setattr(
+            "maintenance_man.dependency_age._get_maven_publish_date",
+            lambda pkg, version: datetime(2024, 1, 1, tzinfo=timezone.utc),
+        )
+
+        prepared = prepare_gradle_findings(scan_result, gradle_project, 7)
+
+        assert "room" in {p.pkg_name for p in prepared}
+        assert scan_result.updates[0].blocked_reason is None
+        assert scan_result.updates[0].gradle_block_kind is None
+
+    def test_structural_block_survives_without_a_fresh_scan(
+        self, gradle_project, old_dates
+    ):
+        scan_result = _room_scan_result()
+        scan_result.updates[1].gradle_target = None
+        scan_result.updates[1].blocked_reason = "rich version"
+        scan_result.updates[1].gradle_block_kind = "mapping"
+
+        prepared = prepare_gradle_findings(scan_result, gradle_project, 7)
+
+        assert [p.pkg_name for p in prepared] == ["room"]
+        assert scan_result.updates[1].gradle_block_kind == "mapping"
+
+    def test_missing_target_metadata_asks_for_a_rescan(self, gradle_project, old_dates):
+        scan_result = make_scan_result(
+            vulns=[], updates=[make_update(pkg_name="room", gradle_target=None)]
+        )
+
+        assert prepare_gradle_findings(scan_result, gradle_project, 7) == []
+        assert scan_result.updates[0].gradle_block_kind == "stale"
+        assert (reason := scan_result.updates[0].blocked_reason) is not None
+        assert "mm scan" in reason
+
+    def test_completed_and_ready_groups_are_not_reapplied(
+        self, gradle_project, old_dates
+    ):
+        scan_result = _room_scan_result()
+        scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
+        scan_result.updates[0].update_status = UpdateStatus.READY
+
+        prepared = prepare_gradle_findings(scan_result, gradle_project, 7)
+
+        assert [p.pkg_name for p in prepared] == ["com.google.code.gson:gson"]
+
+    def test_a_ready_group_on_an_applied_catalogue_is_not_marked_stale(
+        self, gradle_project, old_dates
+    ):
+        catalogue = Path(gradle_project.path) / "gradle" / "libs.versions.toml"
+        catalogue.write_text(
+            catalogue.read_text(encoding="utf-8").replace(
+                'room = "2.8.4"', 'room = "2.8.5"'
+            ),
+            encoding="utf-8",
+        )
+        scan_result = _room_scan_result()
+        scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
+        scan_result.updates[0].update_status = UpdateStatus.READY
+
+        prepared = prepare_gradle_findings(scan_result, gradle_project, 7)
+
+        assert [p.pkg_name for p in prepared] == ["com.google.code.gson:gson"]
+        assert scan_result.vulnerabilities[0].blocked_reason is None
+        assert scan_result.updates[0].blocked_reason is None
+
+    def test_inconsistent_lifecycle_within_a_group_is_stale(
+        self, gradle_project, old_dates
+    ):
+        scan_result = _room_scan_result()
+        scan_result.vulnerabilities[0].update_status = UpdateStatus.FAILED
+
+        prepared = prepare_gradle_findings(scan_result, gradle_project, 7)
+
+        assert [p.pkg_name for p in prepared] == ["com.google.code.gson:gson"]
+        assert scan_result.updates[0].gradle_block_kind == "stale"
+
+    def test_age_block_is_not_a_failed_status(self, gradle_project, monkeypatch):
+        scan_result = _room_scan_result()
+        monkeypatch.setattr(
+            "maintenance_man.dependency_age._get_maven_publish_date",
+            lambda pkg, version: None,
+        )
+
+        assert prepare_gradle_findings(scan_result, gradle_project, 7) == []
+        for finding in (*scan_result.vulnerabilities, *scan_result.updates):
+            assert finding.gradle_block_kind == "age"
+            assert finding.update_status is None
+            assert finding.failed_phase is None
+            assert finding.flow is None
+
+
+class TestProcessGradleFindings:
+    def test_one_group_produces_one_apply_one_test_run_and_one_commit(
+        self, gradle_project, old_dates, monkeypatch
+    ):
+        applies: list[GradleUpdateTarget] = []
+        commits: list[str] = []
+        tests: list[int] = []
+        monkeypatch.setattr(
+            "maintenance_man.updater.apply_gradle_update",
+            lambda project, target: applies.append(target) or None,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.updater.run_test_phases",
+            lambda cfg, path: (tests.append(1), (True, None))[1],
+        )
+        monkeypatch.setattr(
+            "maintenance_man.updater.current_change_has_changes", lambda path: True
+        )
+        monkeypatch.setattr(
+            "maintenance_man.updater.commit_current_change",
+            lambda path, msg: commits.append(msg) or True,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.updater.create_or_reset_bookmark", lambda b, p, r: True
+        )
+        scan_result = _room_scan_result()
+        prepared = [
+            p
+            for p in prepare_gradle_findings(scan_result, gradle_project, 7)
+            if p.pkg_name == "room"
+        ]
+
+        results = process_findings(
+            prepared, gradle_project, flow=Workflow.UPDATE, minimum_age_days=7
+        )
+
+        assert len(applies) == 1
+        assert [m.alias for m in applies[0].members] == [
+            "room-runtime",
+            "room-compiler",
+            "room-testing",
+        ]
+        assert tests == [1]
+        assert commits == ["fix: upgrade room 2.8.4 -> 2.8.5 for CVE-2026-6666"]
+        assert [r.passed for r in results] == [True]
+        assert scan_result.vulnerabilities[0].update_status == UpdateStatus.READY
+        assert scan_result.updates[0].update_status == UpdateStatus.READY
+
+    def test_a_block_found_before_mutation_never_tests_or_commits(
+        self, gradle_project, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.updater.apply_gradle_update",
+            lambda project, target: pytest.fail("blocked work must not apply"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.updater.run_test_phases",
+            lambda cfg, path: pytest.fail("blocked work must not test"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.updater.commit_current_change",
+            lambda path, msg: pytest.fail("blocked work must not commit"),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.dependency_age._get_maven_publish_date",
+            lambda pkg, version: None,
+        )
+        catalogue = Path(gradle_project.path) / "gradle" / "libs.versions.toml"
+        before = catalogue.read_bytes()
+        finding = GradleFinding(
+            pkg_name="room",
+            installed_version="2.8.4",
+            target=make_gradle_target(),
+            kind="update",
+            _detail="minor",
+            _originals=[
+                make_update(pkg_name="room", gradle_target=make_gradle_target())
+            ],
+        )
+
+        results = process_findings(
+            [finding], gradle_project, flow=Workflow.UPDATE, minimum_age_days=7
+        )
+
+        assert catalogue.read_bytes() == before
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert results[0].failed_phase is None
+        assert results[0].blocked_reason is not None
+        assert "no Maven Central publication date" in results[0].blocked_reason
+        assert finding.update_status is None
+        assert finding._originals[0].gradle_block_kind == "age"
+
+    def test_apply_error_fans_failure_out_to_every_original(
+        self, gradle_project, old_dates, monkeypatch
+    ):
+        discarded: list[Path] = []
+
+        def _boom(project, target):
+            raise GradleError("./gradlew versionCatalogApplyUpdates failed (exit 1)")
+
+        monkeypatch.setattr("maintenance_man.updater.apply_gradle_update", _boom)
+        monkeypatch.setattr(
+            "maintenance_man.updater.discard_current_change",
+            lambda path: discarded.append(path) or True,
+        )
+        scan_result = _room_scan_result()
+        prepared = [
+            p
+            for p in prepare_gradle_findings(scan_result, gradle_project, 7)
+            if p.pkg_name == "room"
+        ]
+
+        results = process_findings(
+            prepared, gradle_project, flow=Workflow.UPDATE, minimum_age_days=7
+        )
+
+        assert [r.failed_phase for r in results] == ["apply"]
+        assert len(discarded) == 1
+        assert scan_result.vulnerabilities[0].update_status == UpdateStatus.FAILED
+        assert scan_result.updates[0].update_status == UpdateStatus.FAILED
+        assert scan_result.updates[0].failed_phase == "apply"
+
+    def test_resolve_preserves_the_change_on_apply_error(
+        self, gradle_project, old_dates, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.updater.apply_gradle_update",
+            lambda project, target: (_ for _ in ()).throw(GradleError("boom")),
+        )
+        monkeypatch.setattr(
+            "maintenance_man.updater.discard_current_change",
+            lambda path: pytest.fail("resolve must preserve the change"),
+        )
+        scan_result = _room_scan_result()
+        prepared = [
+            p
+            for p in prepare_gradle_findings(scan_result, gradle_project, 7)
+            if p.pkg_name == "room"
+        ]
+
+        results = process_findings(
+            prepared,
+            gradle_project,
+            flow=Workflow.RESOLVE,
+            on_failure="stop",
+            minimum_age_days=7,
+        )
+
+        assert [r.failed_phase for r in results] == ["apply"]
+
+
+def test_get_update_commands_refuses_gradle(tmp_path):
+    with pytest.raises(ValueError, match="Gradle"):
+        get_update_commands("gradle", "room", "2.8.5", tmp_path)
+
+
+def test_get_update_commands_refusal_records_a_failure_not_a_crash(tmp_path):
+    """Unreachable by design; it must still degrade, not unwind the flow."""
+    assert _apply_update("gradle", "room", "2.8.5", tmp_path) is False
+
+
+def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
+    project_config, monkeypatch
+):
+    def _timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 600)
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+
+    assert run_test_phases(project_config, Path(project_config.path)) == (False, "unit")
+
+
+def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(
+    gradle_project, tmp_path
+):
+    target = make_gradle_target()
+    catalogue = Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
+    catalogue.write_text(
+        catalogue.read_text(encoding="utf-8").replace(
+            'room = "2.8.4"', 'room = "2.8.6"'
+        ),
+        encoding="utf-8",
+    )
+
+    block = validate_gradle_target(gradle_project, target)
+
+    assert block is not None and block.kind == "stale"
+    assert "update workspace" in block.reason
+
+
+def test_historical_vulnerability_requires_recorded_metadata(gradle_project, old_dates):
+    scan = _room_scan_result()
+    scan.vulnerabilities[0].gradle_target = None
+    prepare_gradle_findings(scan, gradle_project, 7)
+    assert scan.vulnerabilities[0].gradle_block_kind == "stale"
+    assert scan.vulnerabilities[0].blocked_reason is not None
+    assert "mm scan" in scan.vulnerabilities[0].blocked_reason
+
+
+def test_historical_vulnerability_drift_is_not_reconstructed(gradle_project, old_dates):
+    scan = _room_scan_result()
+    scan.vulnerabilities[0].gradle_target = make_gradle_target()
+    scan.updates = []
+    catalogue = Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
+    catalogue.write_text(
+        catalogue.read_text().replace('room = "2.8.4"', 'room = "2.8.9"')
+    )
+    assert prepare_gradle_findings(scan, gradle_project, 7) == []
+    assert scan.vulnerabilities[0].gradle_block_kind == "stale"
+
+
+def test_empty_historical_update_blocks_in_preparation(gradle_project, old_dates):
+    scan = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(gradle_target=make_gradle_target(version_ref=None, members=[]))
+        ],
+    )
+    assert prepare_gradle_findings(scan, gradle_project, 7) == []
+    assert scan.updates[0].gradle_block_kind == "stale"
+
+
+def test_shared_group_rejects_inconsistent_historical_members(
+    gradle_project, old_dates
+):
+    scan = _room_scan_result()
+    scan.updates[0].gradle_target = make_gradle_target(
+        members=make_gradle_target().members[:1]
+    )
+    assert [p.pkg_name for p in prepare_gradle_findings(scan, gradle_project, 7)] == [
+        "com.google.code.gson:gson"
+    ]
+    assert scan.updates[0].gradle_block_kind == "stale"
+    assert scan.vulnerabilities[0].gradle_block_kind == "stale"
+
+
+def test_repeated_preparation_preserves_cross_kind_conflict(gradle_project, old_dates):
+    scan = _room_scan_result()
+    scan.updates[0].gradle_target = make_gradle_target(target_version="2.9.0")
+    scan.updates[0].latest_version = "2.9.0"
+    for _ in range(2):
+        assert [
+            p.pkg_name for p in prepare_gradle_findings(scan, gradle_project, 7)
+        ] == ["com.google.code.gson:gson"]
+        for original in (scan.vulnerabilities[0], scan.updates[0]):
+            assert original.gradle_block_kind == "conflict"
+            assert original.blocked_reason is not None
+            assert "conflicting target versions" in original.blocked_reason
+
+
+def test_three_room_originals_use_real_adapter_and_one_test_sequence(
+    gradle_project, old_dates, monkeypatch
+):
+    scan = _room_scan_result()
+    scan.updates[1] = make_update(
+        pkg_name="room",
+        installed_version="2.8.4",
+        latest_version="2.8.5",
+        gradle_target=make_gradle_target(),
+    )
+    root = Path(gradle_project.path)
+    catalogue = root / GRADLE_CATALOGUE_RELPATH
+    calls: list[list[str]] = []
+    reports: list[str] = []
+    commits: list[str] = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        assert Path(kwargs["cwd"]) == root
+        if cmd[1] == "versionCatalogApplyUpdates":
+            from maintenance_man.gradle import GRADLE_UPDATE_REPORT_RELPATH
+
+            reports.append((root / GRADLE_UPDATE_REPORT_RELPATH).read_text())
+            catalogue.write_text(
+                catalogue.read_text().replace('room = "2.8.4"', 'room = "2.8.5"')
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(
+        "maintenance_man.updater.current_change_has_changes", lambda path: True
+    )
+    monkeypatch.setattr(
+        "maintenance_man.updater.commit_current_change",
+        lambda path, msg: commits.append(msg) or True,
+    )
+    monkeypatch.setattr(
+        "maintenance_man.updater.create_or_reset_bookmark", lambda b, p, r: True
+    )
+    prepared = prepare_gradle_findings(scan, gradle_project, 7)
+    assert len(prepared) == 1
+    assert len(prepared[0]._originals) == 3
+    results = process_findings(
+        prepared, gradle_project, flow=Workflow.UPDATE, minimum_age_days=7
+    )
+    assert [cmd[1:] for cmd in calls] == [
+        ["versionCatalogApplyUpdates", "--no-daemon", "--console=plain"],
+        ["test"],
+    ]
+    assert len(reports) == 1
+    assert reports[0].splitlines() == [
+        "[libraries]",
+        '"room-runtime" = "androidx.room:room-runtime:2.8.5"',
+        '"room-compiler" = "androidx.room:room-compiler:2.8.5"',
+        '"room-testing" = "androidx.room:room-testing:2.8.5"',
+    ]
+    assert 'room = "2.8.5"' in catalogue.read_text()
+    assert commits == ["fix: upgrade room 2.8.4 -> 2.8.5 for CVE-2026-6666"]
+    assert [r.passed for r in results] == [True]
+    for original in (*scan.vulnerabilities, *scan.updates):
+        assert original.update_status == UpdateStatus.READY
+        assert original.flow == Workflow.UPDATE
+        assert original.failed_phase is None

@@ -18,7 +18,7 @@ import subprocess
 import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +98,8 @@ class Catalogue:
     versions: dict[str, CatalogueVersion]
     entries: dict[tuple[str, str], CatalogueEntry]
 
+    preserved_semantics: dict[str, Any] = field(default_factory=dict)
+
     def entry(self, kind: GradleKind, alias: str) -> CatalogueEntry | None:
         return self.entries.get((kind, normalise_alias(alias)))
 
@@ -126,6 +128,108 @@ class ReportProposal:
     alias: str
     coordinate: str
     version: str
+
+
+_APPLY_ARGS = ["versionCatalogApplyUpdates", "--no-daemon", "--console=plain"]
+
+
+def apply_gradle_update(
+    project: ProjectConfig, target: GradleUpdateTarget
+) -> GradleBlock | None:
+    """Apply exactly one catalogue version group.
+
+    Returns a typed block — and runs no command — when the target or catalogue
+    has drifted.  Returns None after a verified apply.  Raises GradleError for
+    command, invalid-output or post-mutation safety failures, because mutation
+    may already have begun.  The caller must perform the current age check
+    first; this function has no VCS side effects.
+    """
+    root = Path(project.path)
+    catalogue_path = root / GRADLE_CATALOGUE_RELPATH
+
+    block = validate_gradle_target(project, target)
+    if block is not None:
+        return block
+
+    before = parse_catalogue(catalogue_path)
+    report_text = render_selected_report(target)
+
+    try:
+        with _owned_update_report(root) as report_path:
+            late = validate_gradle_target(project, target)
+            if late is not None:
+                return late
+            report_path.write_text(report_text, encoding="utf-8")
+            run_gradle(root, _APPLY_ARGS, label="versionCatalogApplyUpdates")
+            _assert_only_target_changed(before, parse_catalogue(catalogue_path), target)
+    except OSError as e:
+        raise GradleError(f"versionCatalogApplyUpdates failed: {e}") from e
+    return None
+
+
+def validate_gradle_target(
+    project: ProjectConfig, target: GradleUpdateTarget
+) -> GradleBlock | None:
+    """Confirm the catalogue still matches the recorded pre-update target."""
+    return _validate_catalogue_state(project, target, expect_applied=False)
+
+
+def validate_gradle_recovery(
+    project: ProjectConfig, target: GradleUpdateTarget
+) -> GradleBlock | None:
+    """Confirm a manual repair already carries the intended versions.
+
+    Never applies changes; a different manual fix requires a rescan.
+    """
+    return _validate_catalogue_state(project, target, expect_applied=True)
+
+
+def validate_gradle_target_shape(target: GradleUpdateTarget) -> GradleBlock | None:
+    """Validate serialized target metadata before indexing or effect."""
+    reason = None
+    if not target.members:
+        reason = "empty Gradle target"
+    elif target.version_ref is None and len(target.members) != 1:
+        reason = "inline Gradle target must have exactly one member"
+    elif len({(m.kind, normalise_alias(m.alias)) for m in target.members}) != len(
+        target.members
+    ):
+        reason = "duplicate Gradle target aliases"
+    else:
+        try:
+            assert_safe_text(target.target_version, "target version")
+            if target.version_ref is not None:
+                assert_safe_text(target.version_ref, "version reference")
+            for member in target.members:
+                assert_safe_text(member.alias, "catalogue alias")
+                assert_safe_text(member.coordinate, "catalogue coordinate")
+                assert_safe_text(member.installed_version, "installed version")
+        except GradleError as e:
+            reason = str(e)
+    return (
+        GradleBlock(kind="stale", reason=f"{reason}; run 'mm scan' again")
+        if reason
+        else None
+    )
+
+
+def render_selected_report(target: GradleUpdateTarget) -> str:
+    """Render an update report containing only *target*'s entries."""
+    version = assert_safe_text(target.target_version, "target version")
+    sections: list[str] = []
+    for kind, heading in (("library", "[libraries]"), ("plugin", "[plugins]")):
+        members = [member for member in target.members if member.kind == kind]
+        if not members:
+            continue
+        lines = [heading]
+        for member in members:
+            coordinate = assert_safe_text(member.coordinate, "catalogue coordinate")
+            lines.append(
+                f"{_toml_string(assert_safe_text(member.alias, 'catalogue alias'))} = "
+                f"{_toml_string(f'{coordinate}:{version}')}"
+            )
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections) + "\n"
 
 
 def discover_gradle_updates(project: ProjectConfig) -> list[UpdateFinding]:
@@ -190,7 +294,24 @@ def parse_catalogue(path: Path) -> Catalogue:
         entry = _parse_plugin(alias, value)
         entries[entry.key] = entry
 
-    return Catalogue(versions=versions, entries=entries)
+    preserved: dict[str, Any] = {
+        key: value
+        for key, value in raw.items()
+        if key not in {"versions", "libraries", "plugins"}
+    }
+    preserved = {"sections": preserved}
+    preserved["rich_versions"] = {
+        normalise_alias(name): value
+        for name, value in _table(raw, "versions", path).items()
+        if not isinstance(value, str)
+    }
+    preserved["rich_entries"] = {
+        entry.key: value
+        for heading, kind in (("libraries", "library"), ("plugins", "plugin"))
+        for alias, value in _table(raw, heading, path).items()
+        if (entry := entries[(kind, normalise_alias(alias))]).unsupported is not None
+    }
+    return Catalogue(versions=versions, entries=entries, preserved_semantics=preserved)
 
 
 def parse_update_report(path: Path) -> list[ReportProposal]:
@@ -777,3 +898,160 @@ def _remove_owned_tree(path: Path) -> None:
         pass
     except OSError as e:
         raise GradleError(f"failed to remove owned Gradle inventory {path}: {e}") from e
+
+
+def _validate_catalogue_state(
+    project: ProjectConfig, target: GradleUpdateTarget, *, expect_applied: bool
+) -> GradleBlock | None:
+    shape = validate_gradle_target_shape(target)
+    if shape is not None:
+        return shape
+    try:
+        catalogue = parse_catalogue(Path(project.path) / GRADLE_CATALOGUE_RELPATH)
+    except GradleError as e:
+        return GradleBlock(kind="stale", reason=f"{e}; rescan required")
+
+    expected_version = target.target_version if expect_applied else None
+    for member in target.members:
+        entry = catalogue.entry(member.kind, member.alias)
+        if entry is None:
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    f"the catalogue no longer declares {member.kind} "
+                    f"'{member.alias}'; rescan required"
+                ),
+            )
+        if entry.coordinate != member.coordinate:
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    f"'{member.alias}' now resolves to {entry.coordinate}, not "
+                    f"{member.coordinate}; rescan required"
+                ),
+            )
+        if entry.unsupported is not None:
+            return GradleBlock(kind="mapping", reason=entry.unsupported)
+        if _ref_key(entry) != (
+            normalise_alias(target.version_ref) if target.version_ref else None
+        ):
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    f"'{member.alias}' no longer shares version reference "
+                    f"'{target.version_ref}'; rescan required"
+                ),
+            )
+        version = catalogue.version_of(entry)
+        if version is None or version.value is None:
+            return GradleBlock(
+                kind="mapping",
+                reason=(
+                    f"'{member.alias}' no longer has a simple catalogue version; "
+                    f"resolve manually"
+                ),
+            )
+        expected = expected_version or member.installed_version
+        if version.value != expected:
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    f"'{member.alias}' is at {version.value}, expected {expected}; "
+                    f"the catalogue no longer matches the scan; note that an "
+                    f"uncommitted catalogue edit is not visible in the update "
+                    f"workspace. Rescan required"
+                ),
+            )
+
+    if target.version_ref is not None:
+        current = {entry.key for entry in catalogue.members_of_ref(target.version_ref)}
+        recorded = {
+            (member.kind, normalise_alias(member.alias)) for member in target.members
+        }
+        if current != recorded:
+            return GradleBlock(
+                kind="stale",
+                reason=(
+                    f"version reference '{target.version_ref}' now covers a different "
+                    f"set of aliases; rescan required"
+                ),
+            )
+    return None
+
+
+def _assert_only_target_changed(
+    before: Catalogue, after: Catalogue, target: GradleUpdateTarget
+) -> None:
+    """The semantic change must be exactly the intended version group.
+
+    Formatting, comment loss and equivalent coordinate notation are accepted
+    because both sides are compared as parsed models, not as text.
+    """
+    if before.preserved_semantics != after.preserved_semantics:
+        raise GradleError(
+            "versionCatalogApplyUpdates changed bundles or unsupported "
+            "catalogue declarations"
+        )
+    changed = {
+        (member.kind, normalise_alias(member.alias)) for member in target.members
+    }
+    if set(before.entries) != set(after.entries):
+        raise GradleError(
+            "versionCatalogApplyUpdates added or removed catalogue aliases; "
+            "the catalogue change was not the selected group"
+        )
+
+    for key, old in before.entries.items():
+        new = after.entries[key]
+        if old.coordinate != new.coordinate or _ref_key(old) != _ref_key(new):
+            raise GradleError(
+                f"alias '{old.alias}' changed identity during apply: "
+                f"{old.coordinate}/{_ref_key(old)} -> {new.coordinate}/{_ref_key(new)}"
+            )
+        old_value = _version_value(before, old)
+        new_value = _version_value(after, new)
+        if key in changed:
+            if new.unsupported is not None or new_value is None:
+                raise GradleError(
+                    f"selected alias {new.alias!r} no longer has a simple version"
+                )
+            if new_value != target.target_version:
+                raise GradleError(
+                    f"'{old.alias}' is {new_value!r} after apply, "
+                    f"expected {target.target_version!r}"
+                )
+        elif old_value != new_value:
+            raise GradleError(
+                f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
+            )
+
+    if set(before.versions) != set(after.versions):
+        raise GradleError("versionCatalogApplyUpdates added or removed version entries")
+
+    changed_ref = normalise_alias(target.version_ref) if target.version_ref else None
+    for name, old_version in before.versions.items():
+        new_version = after.versions[name]
+        if name == changed_ref:
+            if new_version.value != target.target_version:
+                raise GradleError(
+                    f"version '{old_version.name}' is {new_version.value!r} after "
+                    f"apply, expected {target.target_version!r}"
+                )
+        elif new_version.value != old_version.value:
+            raise GradleError(
+                f"unexpected change to version '{old_version.name}': "
+                f"{old_version.value!r} -> {new_version.value!r}"
+            )
+
+
+def _version_value(catalogue: Catalogue, entry: CatalogueEntry) -> str | None:
+    version = catalogue.version_of(entry)
+    return version.value if version is not None else None
+
+
+def _ref_key(entry: CatalogueEntry) -> str | None:
+    return normalise_alias(entry.version_ref) if entry.version_ref else None
+
+
+def _toml_string(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
