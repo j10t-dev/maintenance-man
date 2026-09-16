@@ -425,3 +425,16 @@ def test_inline_target_display_name_is_its_coordinate():
 
     assert target.group_key == "library:gson"
     assert target.display_name == "com.google.code.gson:gson"
+
+
+def test_old_scan_does_not_require_gradle_resolution():
+    from maintenance_man.models.scan import ScanResult
+
+    result = ScanResult.model_validate(
+        {
+            "project": "demo",
+            "scanned_at": "2030-01-01T00:00:00Z",
+            "trivy_target": "/tmp/demo",
+        }
+    )
+    assert result.gradle_resolution is None

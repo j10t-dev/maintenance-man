@@ -43,6 +43,7 @@ def _fake_gradle(
     report: str | None,
     *,
     returncode: int = 0,
+    stdout: str = "",
     stderr: str = "",
     mutate_catalogue: bool = False,
     timeout: bool = False,
@@ -61,13 +62,18 @@ def _fake_gradle(
                 catalogue.read_text(encoding="utf-8").replace("2.8.4", "2.8.5"),
                 encoding="utf-8",
             )
-        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr=stderr)
+        return subprocess.CompletedProcess(
+            cmd, returncode, stdout=stdout, stderr=stderr
+        )
 
     return _run
 
 
 def _clean_report() -> str:
     return (GRADLE_FIXTURES / "updates-clean.toml").read_text(encoding="utf-8")
+
+
+_NO_UPDATES_OUTPUT = "There are no updates available\n"
 
 
 class TestParseCatalogue:
@@ -413,6 +419,59 @@ class TestDiscoverGradleUpdates:
             discover_gradle_updates(gradle_project)
 
         assert not (Path(gradle_project.path) / GRADLE_UPDATE_REPORT_RELPATH).exists()
+
+    @pytest.mark.parametrize(
+        "stdout, stderr",
+        [
+            ("\n" + _NO_UPDATES_OUTPUT, ""),
+            ("", "\n" + _NO_UPDATES_OUTPUT),
+        ],
+    )
+    def test_no_updates_signal_without_report_returns_empty(
+        self, gradle_project, monkeypatch, stdout, stderr
+    ):
+        root = Path(gradle_project.path)
+        before = (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
+        runner = _fake_gradle(None, stdout=stdout, stderr=stderr)
+        monkeypatch.setattr(subprocess, "run", runner)
+
+        assert discover_gradle_updates(gradle_project) == []
+        assert (root / GRADLE_CATALOGUE_RELPATH).read_bytes() == before
+        assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()
+        assert not (root / GRADLE_REPORT_MARKER_RELPATH).exists()
+
+    @pytest.mark.parametrize(
+        "runner, expected",
+        [
+            (
+                _fake_gradle(None, stdout="Warning: " + _NO_UPDATES_OUTPUT),
+                "produced no report",
+            ),
+            (
+                _fake_gradle(None, stdout=_NO_UPDATES_OUTPUT, returncode=1),
+                r"failed \(exit 1\)",
+            ),
+            (
+                _fake_gradle(
+                    None,
+                    stdout=_NO_UPDATES_OUTPUT,
+                    mutate_catalogue=True,
+                ),
+                "discovery must leave the source catalogue unchanged",
+            ),
+        ],
+    )
+    def test_no_updates_signal_cannot_hide_discovery_failures(
+        self, gradle_project, monkeypatch, runner, expected
+    ):
+        monkeypatch.setattr(subprocess, "run", runner)
+
+        with pytest.raises(GradleError, match=expected):
+            discover_gradle_updates(gradle_project)
+
+        root = Path(gradle_project.path)
+        assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()
+        assert not (root / GRADLE_REPORT_MARKER_RELPATH).exists()
 
     def test_missing_wrapper_raises_before_any_command(
         self, gradle_project, monkeypatch

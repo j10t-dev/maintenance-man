@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from itertools import repeat
 from pathlib import Path
 
 from maintenance_man.models.scan import (
@@ -109,6 +110,21 @@ def evaluate_gradle_group_age(
     return (None, youngest)
 
 
+def evaluate_gradle_group_ages(
+    targets: list[GradleUpdateTarget], minimum_age_days: int
+) -> list[tuple[GradleBlock | None, datetime | None]]:
+    """Evaluate independent groups concurrently, retaining their input order."""
+    if not targets:
+        return []
+    pool = ThreadPoolExecutor(max_workers=8)
+    try:
+        return list(
+            pool.map(evaluate_gradle_group_age, targets, repeat(minimum_age_days))
+        )
+    finally:
+        pool.shutdown(cancel_futures=True)
+
+
 def filter_by_age(
     updates: list[UpdateFinding],
     manager: str,
@@ -139,8 +155,11 @@ def filter_by_age(
         except Exception:
             return update, None
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    pool = ThreadPoolExecutor(max_workers=8)
+    try:
         lookups = list(pool.map(_lookup_one, updates))
+    finally:
+        pool.shutdown(cancel_futures=True)
 
     result: list[UpdateFinding] = []
     for update, pub_date in lookups:

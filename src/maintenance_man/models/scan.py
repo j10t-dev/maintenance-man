@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum, auto
-from typing import Literal
+from typing import Any, Literal
 
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
@@ -109,6 +109,7 @@ class VulnFinding(BaseModel):
     gradle_target: GradleUpdateTarget | None = None
     blocked_reason: str | None = None
     gradle_block_kind: GradleBlockKind | None = None
+    gradle_scopes: tuple[str, ...] = ()
 
     @property
     def actionable(self) -> bool:
@@ -161,6 +162,7 @@ class ScanResult(BaseModel):
     vulnerabilities: list[VulnFinding] = []
     secrets: list[SecretFinding] = []
     updates: list[UpdateFinding] = []
+    gradle_resolution: dict[str, Any] | None = None
 
     @property
     def has_actionable_vulns(self) -> bool:

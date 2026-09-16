@@ -1,0 +1,113 @@
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class GradleRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class ScopeId(GradleRecord):
+    project_path: str
+    domain: Literal["project", "buildscript"]
+    configuration: str
+
+
+class ModuleId(GradleRecord):
+    group: str
+    artifact: str
+    version: str
+
+    @property
+    def coordinate(self) -> str:
+        return f"{self.group}:{self.artifact}"
+
+
+class RepositoryDeclaration(GradleRecord):
+    project_path: str
+    domain: Literal["library", "plugin"]
+    url: str | None
+
+
+class ResolvedComponent(GradleRecord):
+    id: str
+    kind: Literal["root", "project", "module"]
+    module: ModuleId | None
+    variants: tuple[str, ...]
+
+
+class ResolutionEdge(GradleRecord):
+    source: str
+    target: str
+    requested: str
+    constraint: bool
+
+
+class ScopeResolution(GradleRecord):
+    scope: ScopeId
+    components: tuple[ResolvedComponent, ...]
+    edges: tuple[ResolutionEdge, ...]
+    unresolved: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def graph_references(self):
+        ids = {component.id for component in self.components}
+        if len(ids) != len(self.components):
+            raise ValueError("duplicate component ID")
+        if sum(component.kind == "root" for component in self.components) != 1:
+            raise ValueError("scope requires exactly one root")
+        for component in self.components:
+            if (component.kind == "module") != (component.module is not None):
+                raise ValueError("component/module kind mismatch")
+        if any(edge.source not in ids or edge.target not in ids for edge in self.edges):
+            raise ValueError("unknown graph reference")
+        return self
+
+
+class ResolutionReport(GradleRecord):
+    schema_version: Literal[1]
+    root_project: str
+    producer_versions: dict[str, str]
+    catalogue_digest: str
+    repositories: tuple[RepositoryDeclaration, ...]
+    selected_scopes: tuple[ScopeId, ...]
+    scopes: tuple[ScopeResolution, ...]
+    selection_errors: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def unique_scopes(self):
+        if len(set(self.selected_scopes)) != len(self.selected_scopes):
+            raise ValueError("duplicate selected scope")
+        if len({scope.scope for scope in self.scopes}) != len(self.scopes):
+            raise ValueError("duplicate scope report")
+        if any(scope.scope not in self.selected_scopes for scope in self.scopes):
+            raise ValueError("unselected scope result")
+        if set(self.producer_versions) != {"gradle", "cyclonedx", "report"}:
+            raise ValueError("producer versions missing")
+        return self
+
+
+class CompleteResolution(GradleRecord):
+    kind: Literal["complete"] = "complete"
+    report: ResolutionReport
+
+    @model_validator(mode="after")
+    def complete(self):
+        if self.report.selection_errors or any(
+            s.unresolved for s in self.report.scopes
+        ):
+            raise ValueError("incomplete graph")
+        if set(self.report.selected_scopes) != {s.scope for s in self.report.scopes}:
+            raise ValueError("missing scope result")
+        return self
+
+
+class IncompleteResolution(GradleRecord):
+    kind: Literal["incomplete"] = "incomplete"
+    report: ResolutionReport
+    reasons: tuple[str, ...] = Field(min_length=1)
+
+
+type ResolutionOutcome = Annotated[
+    CompleteResolution | IncompleteResolution, Field(discriminator="kind")
+]

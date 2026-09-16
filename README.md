@@ -143,8 +143,10 @@ Because the workspace is created fresh and deleted after every run, each `mm upd
 | --- | --- |
 | Discovery | `./gradlew versionCatalogUpdate --interactive --no-daemon --console=plain` |
 | Application | `./gradlew versionCatalogApplyUpdates --no-daemon --console=plain` |
-| Inventory | `./gradlew cyclonedxBom --no-daemon --console=plain --rerun-tasks --no-build-cache` |
+| Inventory + resolution | `./gradlew mmGradleReport --init-script <packaged script> --no-daemon --console=plain --rerun-tasks --no-build-cache` |
 | Vulnerabilities | `trivy sbom --format json --scanners vuln .mm-gradle-inventory/bom.json` |
+
+`mmGradleReport` is mm's own packaged task, added through an init script rather than a project plugin. It depends on `cyclonedxBom` for the inventory and additionally records, for every selected configuration, the resolved modules, variants and dependency edges Gradle's public resolution APIs report. mm reads both the inventory and this resolution report before removing its owned output, and every vulnerability finding is checked against a module the resolution actually selected.
 
 Each Gradle command runs from the project root with a 900-second timeout, closed standard input and the project environment. mm strips `VIRTUAL_ENV` and inherits the remaining environment. mm owns exactly two temporary paths, `gradle/libs.versions.updates.toml` and `.mm-gradle-inventory/`, and removes both before tests, change detection or a commit. mm reclaims leftovers from interrupted runs only when their ownership markers are intact. It rejects unmarked paths and symlinks and preserves their contents. It never touches your `build` directories.
 
@@ -174,6 +176,7 @@ Vulnerability scanning covers the project configurations your CycloneDX configur
 ### Known limitations
 
 - Verified against Gradle 9.6.1 and JDK 21. Version Catalogue Update 1.1.1 uses an API deprecated for Gradle 10; Gradle 10 is not supported.
+- When Version Catalogue Update 1.1.1 omits an update report, mm recognizes the no-update case from that release's exact log line. Other plugin versions may change this contract.
 - CycloneDX and Trivy emit configuration-resolution and unsupported-hash warnings on this stack. Verify the generated inventory rather than relying on warnings or exit status alone; these warnings do not imply missing catalogue coordinates.
 - A configured test phase that runs longer than 600 seconds is recorded as a failure of that phase. A cold workspace build plus a large unit-test suite can reach this limit. Split the phase or narrow the Gradle task if it does.
 - Only `gradle/libs.versions.toml` is supported. Custom catalogue locations, dependency overrides and hard-coded versions in build scripts are out of scope.

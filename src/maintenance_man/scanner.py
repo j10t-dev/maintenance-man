@@ -12,14 +12,21 @@ from pydantic import ValidationError
 
 from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
-from maintenance_man.dependency_age import evaluate_gradle_group_age, filter_by_age
+from maintenance_man.dependency_age import (
+    evaluate_gradle_group_age,
+    evaluate_gradle_group_ages,
+    filter_by_age,
+)
 from maintenance_man.gradle import (
-    generate_gradle_inventory,
+    GradleError,
     resolve_gradle_vulnerability_target,
 )
+from maintenance_man.gradle_resolution import generate_gradle_report
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.gradle import CompleteResolution, IncompleteResolution
 from maintenance_man.models.scan import (
     GradleBlock,
+    GradleUpdateTarget,
     ScanResult,
     SecretFinding,
     Severity,
@@ -54,6 +61,7 @@ def scan_project(
     if not project_path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
 
+    gradle_resolution = None
     if project.package_manager == "uv":
         vulns = _run_uv_audit(project_path)
         secrets = (
@@ -62,7 +70,7 @@ def scan_project(
             else []
         )
     elif project.package_manager == "gradle":
-        vulns = _run_gradle_vuln_scan(project)
+        vulns, gradle_resolution = _run_gradle_scan(project)
         _map_gradle_vulns(project, vulns, min_version_age_days)
         secrets = (
             _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
@@ -82,6 +90,11 @@ def scan_project(
         vulnerabilities=vulns,
         secrets=secrets,
         updates=updates,
+        gradle_resolution=(
+            gradle_resolution.report.model_dump(mode="json")
+            if gradle_resolution is not None
+            else None
+        ),
     )
 
     results_dir = _config.MM_HOME / "scan-results"
@@ -144,6 +157,8 @@ def _check_gradle_outdated(
     groups, not packages.
     """
     findings = get_outdated(project)
+    eligible: list[UpdateFinding] = []
+    targets: list[GradleUpdateTarget] = []
     for finding in findings:
         if finding.blocked_reason is not None:
             continue
@@ -157,9 +172,14 @@ def _check_gradle_outdated(
             )
             finding.gradle_block_kind = "age"
             continue
-        block, published = evaluate_gradle_group_age(
-            finding.gradle_target, min_version_age_days
-        )
+        eligible.append(finding)
+        targets.append(finding.gradle_target)
+
+    if not eligible:
+        return findings
+
+    results = evaluate_gradle_group_ages(targets, min_version_age_days)
+    for finding, (block, published) in zip(eligible, results, strict=True):
         finding.published_date = published
         if block is not None:
             finding.blocked_reason = block.reason
@@ -167,9 +187,15 @@ def _check_gradle_outdated(
     return findings
 
 
-def _run_gradle_vuln_scan(project: ProjectConfig) -> list[VulnFinding]:
-    """Scan the project's own freshly generated CycloneDX inventory."""
-    with generate_gradle_inventory(project) as bom:
+def _run_gradle_scan(
+    project: ProjectConfig,
+) -> tuple[list[VulnFinding], CompleteResolution]:
+    """Scan the project's own freshly captured resolution and inventory."""
+    with generate_gradle_report(project) as (bom, outcome):
+        if isinstance(outcome, IncompleteResolution):
+            raise GradleError(
+                "Incomplete Gradle resolution: " + "; ".join(outcome.reasons)
+            )
         cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
         try:
             completed = subprocess.run(
@@ -189,7 +215,42 @@ def _run_gradle_vuln_scan(project: ProjectConfig) -> list[VulnFinding]:
                 f"Trivy exited with code {completed.returncode}: "
                 f"{completed.stderr.strip()}"
             )
-        return _parse_gradle_trivy_output(completed.stdout)
+        findings = _parse_gradle_trivy_output(completed.stdout)
+        scoped: dict[tuple[str, str], set[str]] = {}
+        for scope in outcome.report.scopes:
+            for component in scope.components:
+                if component.module is not None:
+                    module = component.module
+                    scoped.setdefault((module.coordinate, module.version), set()).add(
+                        f"{scope.scope.project_path}/{scope.scope.domain}/"
+                        f"{scope.scope.configuration}"
+                    )
+        inventory = json.loads(bom.read_text())
+        for component in inventory["components"]:
+            if not str(component.get("purl", "")).startswith("pkg:maven/"):
+                continue
+            key = (
+                f"{component.get('group', '')}:{component.get('name', '')}",
+                component.get("version"),
+            )
+            if key not in scoped:
+                raise GradleError(
+                    f"Inventory module has no selected resolution identity: {key}"
+                )
+        for finding in findings:
+            scopes = scoped.get((finding.pkg_name, finding.installed_version))
+            if not scopes:
+                raise GradleError(
+                    f"Security finding has no selected resolution scope: "
+                    f"{finding.pkg_name}"
+                )
+            finding.gradle_scopes = tuple(sorted(scopes))
+        return findings, outcome
+
+
+def _run_gradle_vuln_scan(project: ProjectConfig) -> list[VulnFinding]:
+    findings, _ = _run_gradle_scan(project)
+    return findings
 
 
 def _is_trivy_object(value: object) -> TypeGuard[dict[str, object]]:

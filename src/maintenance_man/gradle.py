@@ -44,6 +44,7 @@ GRADLE_INVENTORY_MARKER_RELPATH = ".mm-gradle-inventory/.mm-owned"
 GRADLE_REPORT_MARKER_RELPATH = "gradle/.mm-owned-report"
 GRADLE_LOCAL_PROPERTIES_RELPATH = "local.properties"
 GRADLE_TIMEOUT_SECONDS = 900
+GRADLE_NO_UPDATES_SIGNAL = "There are no updates available"
 
 _DISCOVER_ARGS = [
     "versionCatalogUpdate",
@@ -251,14 +252,22 @@ def discover_gradle_updates(project: ProjectConfig) -> list[UpdateFinding]:
     before = _digest(catalogue_path)
 
     with _owned_update_report(root) as report_path:
-        run_gradle(root, _DISCOVER_ARGS, label="versionCatalogUpdate")
+        completed = run_gradle(root, _DISCOVER_ARGS, label="versionCatalogUpdate")
         if not report_path.is_file():
-            raise GradleError(
-                f"versionCatalogUpdate produced no report at "
-                f"{GRADLE_UPDATE_REPORT_RELPATH} — is version-catalog-update 1.1.1 "
-                f"applied to {root}?"
-            )
-        proposals = parse_update_report(report_path)
+            # Plugin 1.1.1 logs this signal and omits the report when no
+            # candidates remain. An unexplained missing report is still an error.
+            output = f"{completed.stdout}\n{completed.stderr}"
+            if not any(
+                line.strip() == GRADLE_NO_UPDATES_SIGNAL for line in output.splitlines()
+            ):
+                raise GradleError(
+                    f"versionCatalogUpdate produced no report at "
+                    f"{GRADLE_UPDATE_REPORT_RELPATH} — is version-catalog-update 1.1.1 "
+                    f"applied to {root}?"
+                )
+            proposals = []
+        else:
+            proposals = parse_update_report(report_path)
 
     if _digest(catalogue_path) != before:
         raise GradleError(
@@ -449,12 +458,12 @@ def build_update_findings(
 
 
 @contextmanager
-def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
-    """Yield a freshly generated, validated CycloneDX inventory.
+def owned_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
+    """Claim and yield the adapter-owned ``.mm-gradle-inventory`` directory.
 
-    The whole ``.mm-gradle-inventory`` tree is adapter-owned: marked leftovers
-    are reclaimed, caller paths are refused, and owned output is released.  Normal
-    Gradle build, problems-report and cache outputs are left alone.
+    Marked leftovers are reclaimed, caller paths are refused, and owned output
+    is released on exit.  Normal Gradle build, problems-report and cache
+    outputs are left alone.
     """
     root = Path(project.path)
     inventory_dir = root / GRADLE_INVENTORY_RELPATH
@@ -462,24 +471,34 @@ def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
     claim_owned_dir(inventory_dir, "Gradle inventory directory")
     try:
         inventory_dir.mkdir(parents=True)
-    except OSError as e:
-        raise GradleError(
-            f"Could not create Gradle inventory {inventory_dir}: {e}"
-        ) from e
+    except OSError as exc:
+        raise GradleError(f"Could not create Gradle inventory: {exc}") from exc
     try:
-        try:
-            (root / GRADLE_INVENTORY_MARKER_RELPATH).write_bytes(b"")
-            run_gradle(root, _BOM_ARGS, label="cyclonedxBom")
-            bom = root / GRADLE_INVENTORY_BOM_RELPATH
-            _validate_inventory(bom)
-        except OSError as e:
-            raise GradleError(
-                f"Could not generate Gradle inventory in {root}: {e}"
-            ) from e
-        yield bom
+        (inventory_dir / ".mm-owned").write_bytes(b"")
+    except OSError as exc:
+        _remove_owned_tree(inventory_dir)
+        raise GradleError(f"Could not create Gradle inventory: {exc}") from exc
+    try:
+        yield inventory_dir
     finally:
         _validate_owned_output_parents(root)
+        marker = inventory_dir / ".mm-owned"
+        if inventory_dir.is_symlink() or marker.is_symlink() or not marker.is_file():
+            raise GradleError("Gradle inventory ownership changed during operation")
         _remove_owned_tree(inventory_dir)
+
+
+@contextmanager
+def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
+    """Yield a freshly generated, validated CycloneDX inventory."""
+    with owned_gradle_inventory(project) as directory:
+        try:
+            run_gradle(Path(project.path), _BOM_ARGS, label="cyclonedxBom")
+            bom = directory / "bom.json"
+            _validate_inventory(bom)
+        except OSError as exc:
+            raise GradleError(f"Could not generate Gradle inventory: {exc}") from exc
+        yield bom
 
 
 def resolve_gradle_vulnerability_target(

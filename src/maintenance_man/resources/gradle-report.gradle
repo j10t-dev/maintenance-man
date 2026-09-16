@@ -1,0 +1,167 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import org.gradle.api.GradleException
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+import org.gradle.api.artifacts.result.UnresolvedDependencyResult
+
+def pluginRepositories = []
+def settingsRepositories = []
+def repositoryRows = { repositories, projectPath, domain ->
+    repositories.collect { repository ->
+        def safe = null
+        if (repository instanceof MavenArtifactRepository) {
+            def uri = repository.url
+            if (uri.userInfo == null && uri.query == null && uri.fragment == null) {
+                safe = uri.toString()
+            }
+        }
+        [project_path: projectPath, domain: domain, url: safe]
+    }
+}
+def atomicJson = { File directory, String name, Object value ->
+    if (Files.isSymbolicLink(directory.toPath()) ||
+        Files.isSymbolicLink(new File(directory, '.mm-owned').toPath()) ||
+        !new File(directory, '.mm-owned').isFile()) {
+        throw new GradleException('mm output ownership was lost')
+    }
+    def destination = new File(directory, name)
+    if (Files.isSymbolicLink(destination.toPath())) {
+        throw new GradleException('mm output is a symlink')
+    }
+    def temporary = Files.createTempFile(directory.toPath(), '.mm-report-', '.json')
+    try {
+        Files.writeString(temporary, JsonOutput.toJson(value))
+        Files.move(temporary, destination.toPath(),
+                   StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+    } finally {
+        Files.deleteIfExists(temporary)
+    }
+}
+gradle.settingsEvaluated { settings ->
+    pluginRepositories = repositoryRows(settings.pluginManagement.repositories, ':', 'plugin')
+    settingsRepositories = repositoryRows(settings.dependencyResolutionManagement.repositories, ':', 'library')
+}
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    ['mmGradleReport', 'mmGradleValidateCandidates'].each { name ->
+        if (root.tasks.findByName(name) != null) {
+            throw new GradleException("Reserved task name already exists: ${name}")
+        }
+    }
+    def directory = new File(root.projectDir, '.mm-gradle-inventory')
+    root.tasks.register('mmGradleReport') {
+        dependsOn(root.tasks.named('cyclonedxBom'))
+        doLast {
+            def scopes = []
+            def selected = []
+            def errors = []
+            def repositories = [] + pluginRepositories + settingsRepositories
+            def cdxVersions = [] as Set
+            root.allprojects.sort { it.path }.each { project ->
+                repositories.addAll(repositoryRows(project.repositories, project.path, 'library'))
+                def direct = project.tasks.findByName('cyclonedxDirectBom')
+                if (direct == null || !direct.enabled) {
+                    return
+                }
+                def original = direct.class
+                while (original.superclass != null &&
+                       original.name != 'org.cyclonedx.gradle.CyclonedxDirectTask') {
+                    original = original.superclass
+                }
+                def cdxVersion = original.package?.implementationVersion
+                if (cdxVersion == null) {
+                    def location = original.protectionDomain?.codeSource?.location?.toString() ?: ''
+                    def match = (location =~ /cyclonedx-gradle-plugin-([0-9][^\/]*?)\.jar$/)
+                    if (match.find()) { cdxVersion = match.group(1) }
+                }
+                if (cdxVersion == null) {
+                    errors.add("Cannot establish CycloneDX version for ${project.path}")
+                } else {
+                    cdxVersions.add(cdxVersion)
+                }
+                def includes
+                def skips
+                def buildEnvironment
+                try {
+                    includes = direct.includeConfigs.get()
+                    skips = direct.skipConfigs.get()
+                    buildEnvironment = direct.includeBuildEnvironment.get()
+                    includes.each { java.util.regex.Pattern.compile(it) }
+                    skips.each { java.util.regex.Pattern.compile(it) }
+                } catch (Exception failure) {
+                    errors.add("Cannot read CycloneDX selection for ${project.path}: ${failure.class.simpleName}")
+                    return
+                }
+                def domains = [[name: 'project', configurations: project.configurations]]
+                if (buildEnvironment) {
+                    domains.add([name: 'buildscript', configurations: project.buildscript.configurations])
+                }
+                domains.each { domain ->
+                    domain.configurations.findAll { configuration ->
+                        configuration.canBeResolved &&
+                        (includes.empty || includes.any { configuration.name.matches(it) }) &&
+                        !skips.any { configuration.name.matches(it) }
+                    }.sort { it.name }.each { configuration ->
+                        def identity = [project_path: project.path, domain: domain.name,
+                                        configuration: configuration.name]
+                        selected.add(identity)
+                        def components = []
+                        def edges = []
+                        def unresolved = []
+                        try {
+                            def result = configuration.incoming.resolutionResult
+                            def rootComponent = result.rootComponent.get()
+                            def all = result.allComponents.toList()
+                            def ids = [:]
+                            all.eachWithIndex { component, index -> ids[component.id] = "c${index}" }
+                            all.each { component ->
+                                def module = component.id instanceof ModuleComponentIdentifier ?
+                                    [group: component.id.group, artifact: component.id.module,
+                                     version: component.id.version] : null
+                                def kind = component.id == rootComponent.id ? 'root' :
+                                    (module == null ? 'project' : 'module')
+                                components.add([id: ids[component.id], kind: kind,
+                                                module: kind == 'module' ? module : null,
+                                                variants: component.variants.collect { it.displayName }.sort()])
+                                component.dependencies.each { dependency ->
+                                    if (dependency instanceof ResolvedDependencyResult) {
+                                        edges.add([source: ids[component.id],
+                                                   target: ids[dependency.selected.id],
+                                                   requested: dependency.requested.displayName,
+                                                   constraint: dependency.constraint])
+                                    } else if (dependency instanceof UnresolvedDependencyResult) {
+                                        unresolved.add("Unresolved ${dependency.attempted.displayName}")
+                                    }
+                                }
+                            }
+                        } catch (Exception failure) {
+                            components = [[id: 'root', kind: 'root', module: null, variants: []]]
+                            edges = []
+                            unresolved.add("Resolution failed: ${failure.class.simpleName}")
+                        }
+                        scopes.add([scope: identity, components: components,
+                                    edges: edges, unresolved: unresolved])
+                    }
+                }
+            }
+            if (cdxVersions.size() != 1) {
+                errors.add('Expected one loaded CycloneDX producer version')
+            }
+            if (!root.allprojects.any { it.tasks.findByName('cyclonedxDirectBom')?.enabled }) {
+                errors.add('No enabled CycloneDX direct tasks')
+            }
+            def catalogue = new File(root.projectDir, 'gradle/libs.versions.toml')
+            def digest = MessageDigest.getInstance('SHA-256').digest(catalogue.bytes).encodeHex().toString()
+            atomicJson(directory, 'report.json', [schema_version: 1, root_project: root.path,
+                producer_versions: [gradle: gradle.gradleVersion,
+                    cyclonedx: cdxVersions.size() == 1 ? cdxVersions.first() : 'unknown', report: '1'],
+                catalogue_digest: digest, repositories: repositories.unique(),
+                selected_scopes: selected, scopes: scopes, selection_errors: errors])
+        }
+    }
+}

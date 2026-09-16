@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import subprocess
@@ -9,7 +10,11 @@ from unittest.mock import patch
 
 import pytest
 
-from maintenance_man.gradle import GRADLE_INVENTORY_BOM_RELPATH, GradleError
+from maintenance_man.gradle import (
+    GRADLE_CATALOGUE_RELPATH,
+    GRADLE_INVENTORY_BOM_RELPATH,
+    GradleError,
+)
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
@@ -451,6 +456,60 @@ def test_gradle_finding_without_target_or_reason_is_blocked_not_eligible(
     assert "no catalogue target" in result[0].blocked_reason
 
 
+_GRADLE_BOM_MODULES = [
+    ("androidx.room", "room-runtime", "2.8.4"),
+    ("androidx.room", "room-compiler", "2.8.4"),
+    ("com.squareup.okhttp3", "okhttp", "4.12.0"),
+    ("com.google.code.gson", "gson", "2.11.0"),
+    ("androidx.compose.ui", "ui", "1.9.0"),
+    ("org.jetbrains", "annotations", "23.0.0"),
+]
+
+
+def _gradle_report_payload(catalogue_digest: str = "a" * 64) -> dict:
+    """A resolution report whose scope covers every ``bom.json`` component."""
+    components: list[dict[str, object]] = [
+        {"id": "root", "kind": "root", "module": None, "variants": []}
+    ]
+    for index, (group, artifact, version) in enumerate(_GRADLE_BOM_MODULES):
+        components.append(
+            {
+                "id": f"c{index}",
+                "kind": "module",
+                "module": {"group": group, "artifact": artifact, "version": version},
+                "variants": ["runtime"],
+            }
+        )
+    scope = {
+        "project_path": ":",
+        "domain": "project",
+        "configuration": "runtimeClasspath",
+    }
+    return {
+        "schema_version": 1,
+        "root_project": ":",
+        "producer_versions": {"gradle": "8.14.3", "cyclonedx": "3.4.1", "report": "1"},
+        "catalogue_digest": catalogue_digest,
+        "repositories": [],
+        "selected_scopes": [scope],
+        "scopes": [
+            {
+                "scope": scope,
+                "components": components,
+                "edges": [],
+                "unresolved": [],
+            }
+        ],
+        "selection_errors": [],
+    }
+
+
+def _gradle_resolution_fixture():
+    from maintenance_man.gradle_resolution import parse_resolution_report
+
+    return parse_resolution_report(json.dumps(_gradle_report_payload()))
+
+
 def _yield_fixture_bom(project):
     @contextmanager
     def _generate(_project):
@@ -460,7 +519,7 @@ def _yield_fixture_bom(project):
             (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"), encoding="utf-8"
         )
         try:
-            yield bom
+            yield bom, _gradle_resolution_fixture()
         finally:
             shutil.rmtree(bom.parent, ignore_errors=True)
 
@@ -484,10 +543,18 @@ def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
 def test_gradle_scan_maps_and_blocks_vulnerabilities(
     gradle_project, monkeypatch, mm_home
 ):
+    catalogue_digest = hashlib.sha256(
+        (Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH).read_bytes()
+    ).hexdigest()
+
     def _run(cmd, **kwargs):
-        bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
-        if cmd[1] == "cyclonedxBom":
+        owned = Path(gradle_project.path) / ".mm-gradle-inventory"
+        bom = owned / "bom.json"
+        if cmd[1] == "mmGradleReport":
             bom.write_bytes((GRADLE_FIXTURES / "bom.json").read_bytes())
+            (owned / "report.json").write_text(
+                json.dumps(_gradle_report_payload(catalogue_digest))
+            )
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         assert cmd == [
             "trivy",
@@ -525,11 +592,79 @@ def test_gradle_scan_maps_and_blocks_vulnerabilities(
     assert by_id["CVE-2026-4444"].gradle_block_kind == "mapping"
     assert by_id["CVE-2026-5555"].gradle_block_kind == "conflict"
     assert all(v.actionable for v in result.vulnerabilities)
+    assert by_id["CVE-2026-2222"].gradle_scopes == (":/project/runtimeClasspath",)
+    assert result.gradle_resolution is not None
     persisted = ScanResult.model_validate_json(
         (mm_home / "scan-results" / "android.json").read_bytes()
     )
     assert persisted.vulnerabilities == result.vulnerabilities
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
+
+
+def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
+    gradle_project, monkeypatch
+):
+    from maintenance_man.scanner import _run_gradle_scan
+
+    payload = _gradle_report_payload()
+    payload["scopes"][0]["components"] = [
+        component
+        for component in payload["scopes"][0]["components"]
+        if not (
+            component["module"] is not None
+            and component["module"]["artifact"] == "gson"
+        )
+    ]
+
+    @contextmanager
+    def _generate(_project):
+        from maintenance_man.gradle_resolution import parse_resolution_report
+
+        bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
+        bom.parent.mkdir(parents=True, exist_ok=True)
+        bom.write_text(
+            (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        resolution = parse_resolution_report(json.dumps(payload))
+        try:
+            yield bom, resolution
+        finally:
+            shutil.rmtree(bom.parent, ignore_errors=True)
+
+    monkeypatch.setattr("maintenance_man.scanner.generate_gradle_report", _generate)
+    _trivy_sbom(monkeypatch, stdout='{"Results": []}')
+
+    with pytest.raises(GradleError, match="no selected resolution identity"):
+        _run_gradle_scan(gradle_project)
+
+
+def test_gradle_scan_finding_without_resolution_scope_is_error(
+    gradle_project, monkeypatch
+):
+    from maintenance_man.scanner import _run_gradle_scan
+
+    monkeypatch.setattr(
+        "maintenance_man.scanner.generate_gradle_report",
+        _yield_fixture_bom(gradle_project),
+    )
+    unmapped_finding = {
+        "VulnerabilityID": "CVE-9999-0000",
+        "PkgName": "org.example:unmapped",
+        "InstalledVersion": "1.0.0",
+        "Severity": "HIGH",
+        "Title": "unmapped finding",
+        "Description": "not present in any selected resolution scope",
+        "Status": "affected",
+    }
+    _trivy_sbom(
+        monkeypatch,
+        stdout=json.dumps(
+            {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [unmapped_finding]}]}
+        ),
+    )
+
+    with pytest.raises(GradleError, match="no selected resolution scope"):
+        _run_gradle_scan(gradle_project)
 
 
 def test_gradle_scan_error_leaves_previous_results_intact(
@@ -540,11 +675,11 @@ def test_gradle_scan_error_leaves_previous_results_intact(
     results_file.write_text('{"previous": true}', encoding="utf-8")
 
     def _boom(project):
-        raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
+        raise GradleError("./gradlew mmGradleReport failed (exit 1): boom")
 
-    monkeypatch.setattr("maintenance_man.scanner.generate_gradle_inventory", _boom)
+    monkeypatch.setattr("maintenance_man.scanner.generate_gradle_report", _boom)
 
-    with pytest.raises(GradleError, match="cyclonedxBom failed"):
+    with pytest.raises(GradleError, match="mmGradleReport failed"):
         scan_project("android", gradle_project, 7)
 
     assert results_file.read_text(encoding="utf-8") == '{"previous": true}'
@@ -568,7 +703,7 @@ def test_gradle_inventory_failure_preserves_previous_result_bytes(
     results_file.write_bytes(previous)
 
     def _run(cmd, **kwargs):
-        assert cmd[1] == "cyclonedxBom"
+        assert cmd[1] == "mmGradleReport"
         if payload is not None:
             (Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH).write_text(
                 payload, encoding="utf-8"
@@ -586,7 +721,7 @@ def test_gradle_scan_runs_the_existing_secret_scan_when_enabled(
     gradle_project, monkeypatch, mm_home
 ):
     monkeypatch.setattr(
-        "maintenance_man.scanner.generate_gradle_inventory",
+        "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
     _trivy_sbom(monkeypatch, stdout='{"Results": []}')
@@ -610,10 +745,19 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
     previous = b'{"previous": true}\n'
     results_file.write_bytes(previous)
 
+    catalogue_digest = hashlib.sha256(
+        (Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH).read_bytes()
+    ).hexdigest()
+
     def _run(cmd, **kwargs):
-        if cmd[1] == "cyclonedxBom":
-            bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
-            bom.write_bytes((GRADLE_FIXTURES / "bom.json").read_bytes())
+        if cmd[1] == "mmGradleReport":
+            owned = Path(gradle_project.path) / ".mm-gradle-inventory"
+            (owned / "bom.json").write_bytes(
+                (GRADLE_FIXTURES / "bom.json").read_bytes()
+            )
+            (owned / "report.json").write_text(
+                json.dumps(_gradle_report_payload(catalogue_digest))
+            )
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout='{"Results": []}', stderr="")
 
@@ -648,7 +792,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
     from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
 
     monkeypatch.setattr(
-        "maintenance_man.scanner.generate_gradle_inventory",
+        "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
     _trivy_sbom(monkeypatch, stdout=json.dumps(payload))
@@ -671,7 +815,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
     from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
 
     monkeypatch.setattr(
-        "maintenance_man.scanner.generate_gradle_inventory",
+        "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
 
@@ -784,3 +928,32 @@ def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semanti
     assert findings[0].severity == Severity.UNKNOWN
     assert findings[0].published_date is None
     assert findings[0].fixed_version is None
+
+
+def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from maintenance_man import scanner
+    from maintenance_man.gradle import GradleError
+    from maintenance_man.gradle_resolution import parse_resolution_report
+    from maintenance_man.models.config import ProjectConfig
+
+    source = Path(__file__).parent / "fixtures/gradle/resolution/empty.json"
+    raw = json.loads(source.read_text())
+    raw["scopes"][0]["unresolved"] = ["g:missing:1.0"]
+    resolution = parse_resolution_report(json.dumps(raw))
+
+    @contextmanager
+    def capture(project):
+        yield tmp_path / "bom.json", resolution
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", capture)
+    monkeypatch.setattr(scanner._config, "MM_HOME", tmp_path / "mm")
+    saved = tmp_path / "mm/scan-results/demo.json"
+    saved.parent.mkdir(parents=True)
+    saved.write_text("previous findings")
+    with pytest.raises(GradleError, match="Incomplete"):
+        scanner.scan_project(
+            "demo", ProjectConfig(path=tmp_path, package_manager="gradle")
+        )
+    assert saved.read_text() == "previous findings"

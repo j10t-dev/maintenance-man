@@ -330,6 +330,73 @@ def test_all_scan_real_wrapper_launch_error_preserves_results_and_scans_next(
     assert not (root / GRADLE_INVENTORY_RELPATH).exists()
 
 
+_GRADLE_SCAN_CLI_MODULES = [
+    ("androidx.room", "room-runtime", "2.8.4"),
+    ("androidx.room", "room-compiler", "2.8.4"),
+    ("com.squareup.okhttp3", "okhttp", "4.12.0"),
+    ("com.google.code.gson", "gson", "2.11.0"),
+    ("androidx.compose.ui", "ui", "1.9.0"),
+    ("org.jetbrains", "annotations", "23.0.0"),
+]
+
+
+def _gradle_report_json_for_fixture_bom(root: Path) -> str:
+    """A resolution report covering every fixtures/gradle/bom.json component.
+
+    mmGradleReport now captures the resolution graph alongside the inventory
+    in one combined command, so any test that fakes a real ``bom.json`` must
+    also fake a matching ``report.json`` for the adapter's inventory-to-scope
+    cross-check to accept it.
+    """
+    import hashlib
+    import json
+
+    from maintenance_man.gradle import GRADLE_CATALOGUE_RELPATH
+
+    components: list[dict[str, object]] = [
+        {"id": "root", "kind": "root", "module": None, "variants": []}
+    ]
+    for index, (group, artifact, version) in enumerate(_GRADLE_SCAN_CLI_MODULES):
+        components.append(
+            {
+                "id": f"c{index}",
+                "kind": "module",
+                "module": {"group": group, "artifact": artifact, "version": version},
+                "variants": ["runtime"],
+            }
+        )
+    scope = {
+        "project_path": ":",
+        "domain": "project",
+        "configuration": "runtimeClasspath",
+    }
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "root_project": ":",
+            "producer_versions": {
+                "gradle": "8.14.3",
+                "cyclonedx": "3.4.1",
+                "report": "1",
+            },
+            "catalogue_digest": hashlib.sha256(
+                (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
+            ).hexdigest(),
+            "repositories": [],
+            "selected_scopes": [scope],
+            "scopes": [
+                {
+                    "scope": scope,
+                    "components": components,
+                    "edges": [],
+                    "unresolved": [],
+                }
+            ],
+            "selection_errors": [],
+        }
+    )
+
+
 @pytest.mark.parametrize(
     "phase",
     ["inventory-mkdir", "inventory-marker", "inventory-cleanup", "report-cleanup"],
@@ -395,8 +462,14 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
 
         monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
     else:
+        from maintenance_man.gradle_resolution import parse_resolution_report
+
+        resolution = parse_resolution_report(
+            (GRADLE_FIXTURES / "resolution/empty.json").read_text()
+        )
         monkeypatch.setattr(
-            "maintenance_man.scanner._run_gradle_vuln_scan", lambda *args: []
+            "maintenance_man.scanner._run_gradle_scan",
+            lambda *args: ([], resolution),
         )
         unlink = Path.unlink
 
@@ -413,10 +486,13 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
         if phase == "inventory-cleanup":
             from maintenance_man.gradle import GRADLE_INVENTORY_BOM_RELPATH
 
-            if cmd[1] == "cyclonedxBom":
+            if cmd[1] == "mmGradleReport":
                 (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
                     (GRADLE_FIXTURES / "bom.json").read_bytes()
                 )
+                (root / GRADLE_INVENTORY_BOM_RELPATH).parent.joinpath(
+                    "report.json"
+                ).write_text(_gradle_report_json_for_fixture_bom(root))
             else:
                 assert cmd[:2] == ["trivy", "sbom"]
                 return subprocess.CompletedProcess(
@@ -496,17 +572,26 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
         ),
     )
     if failure == "report-false":
+        from maintenance_man.gradle_resolution import parse_resolution_report
+
+        resolution = parse_resolution_report(
+            (GRADLE_FIXTURES / "resolution/empty.json").read_text()
+        )
         monkeypatch.setattr(
-            "maintenance_man.scanner._run_gradle_vuln_scan", lambda *args: []
+            "maintenance_man.scanner._run_gradle_scan",
+            lambda *args: ([], resolution),
         )
 
     def run(cmd, **kwargs):
-        if cmd[1] == "cyclonedxBom":
+        if cmd[1] == "mmGradleReport":
             if failure == "wrapper-decode":
                 raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
             (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
                 (GRADLE_FIXTURES / "bom.json").read_bytes()
             )
+            (root / GRADLE_INVENTORY_BOM_RELPATH).parent.joinpath(
+                "report.json"
+            ).write_text(_gradle_report_json_for_fixture_bom(root))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[1] == "versionCatalogUpdate":
             assert failure == "report-false"
