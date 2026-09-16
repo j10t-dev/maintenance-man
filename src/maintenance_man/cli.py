@@ -32,6 +32,7 @@ from maintenance_man.deployer import (
     run_build,
     run_deploy,
 )
+from maintenance_man.gradle import GradleError
 from maintenance_man.models.activity import (
     ActivityEvent,
     ProjectActivity,
@@ -204,14 +205,17 @@ def scan(
         proj_config = _resolve_proj(cfg, project)
         try:
             result = _scan_one(project, proj_config, cfg.defaults.min_version_age_days)
-        except TrivyScanError as e:
+        except (TrivyScanError, GradleError) as e:
             _fatal(str(e))
 
-        sys.exit(_scan_exit_code(result.has_actionable_vulns, result.has_updates))
+        sys.exit(
+            _scan_exit_code(_scan_has_vulns(result, proj_config), result.has_updates)
+        )
 
     # Scan all projects
     has_vulns = False
     has_updates = False
+    had_gradle_error = False
     for name, proj_config in cfg.projects.items():
         if not proj_config.path.exists():
             console.print(
@@ -221,14 +225,24 @@ def scan(
             continue
         try:
             result = _scan_one(name, proj_config, cfg.defaults.min_version_age_days)
-        except TrivyScanError as e:
+        except (TrivyScanError, GradleError) as e:
             console.print(f"[bold red]Error:[/] {name} — {e}")
+            had_gradle_error |= proj_config.package_manager == "gradle"
             continue
 
-        has_vulns |= result.has_actionable_vulns
+        has_vulns |= _scan_has_vulns(result, proj_config)
         has_updates |= result.has_updates
 
+    if had_gradle_error:
+        sys.exit(ExitCode.ERROR)
     sys.exit(_scan_exit_code(has_vulns, has_updates))
+
+
+def _scan_has_vulns(result: ScanResult, proj_config: ProjectConfig) -> bool:
+    return result.has_actionable_vulns or (
+        proj_config.package_manager == "gradle"
+        and any(v.blocked_reason for v in result.vulnerabilities)
+    )
 
 
 def _dedupe_preserve_order(names: list[str]) -> list[str]:

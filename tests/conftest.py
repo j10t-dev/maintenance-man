@@ -225,3 +225,16 @@ def gradle_project(tmp_path: Path) -> ProjectConfig:
     return ProjectConfig(
         path=root, package_manager="gradle", test_unit="./gradlew test"
     )
+
+
+@pytest.fixture()
+def mm_home_with_gradle(
+    mm_home_with_projects: Path, gradle_project: ProjectConfig
+) -> Path:
+    config_path = mm_home_with_projects / "config.toml"
+    config_path.write_text(
+        config_path.read_text()
+        + f'\n[projects.android]\npath = "{gradle_project.path}"\n'
+        f'package_manager = "gradle"\ntest_unit = "./gradlew testDebugUnitTest"\n'
+    )
+    return mm_home_with_projects

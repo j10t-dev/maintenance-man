@@ -1,0 +1,17 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:9f1f0c2e-9a4d-4b2e-9b71-2a3f0f7c5f10",
+  "version": 1,
+  "metadata": {
+    "component": {"type": "application", "name": "gradle-project", "version": "1.0"}
+  },
+  "components": [
+    {"type": "library", "group": "androidx.room", "name": "room-runtime", "version": "2.8.4", "purl": "pkg:maven/androidx.room/room-runtime@2.8.4"},
+    {"type": "library", "group": "androidx.room", "name": "room-compiler", "version": "2.8.4", "purl": "pkg:maven/androidx.room/room-compiler@2.8.4"},
+    {"type": "library", "group": "com.squareup.okhttp3", "name": "okhttp", "version": "4.12.0", "purl": "pkg:maven/com.squareup.okhttp3/okhttp@4.12.0"},
+    {"type": "library", "group": "com.google.code.gson", "name": "gson", "version": "2.11.0", "purl": "pkg:maven/com.google.code.gson/gson@2.11.0"},
+    {"type": "library", "group": "androidx.compose.ui", "name": "ui", "version": "1.9.0", "purl": "pkg:maven/androidx.compose.ui/ui@1.9.0"},
+    {"type": "library", "group": "org.jetbrains", "name": "annotations", "version": "23.0.0", "purl": "pkg:maven/org.jetbrains/annotations@23.0.0"}
+  ]
+}

@@ -1,10 +1,12 @@
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from maintenance_man.gradle import (
+    GRADLE_INVENTORY_BOM_RELPATH,
     GRADLE_INVENTORY_MARKER_RELPATH,
     GRADLE_INVENTORY_RELPATH,
     GRADLE_REPORT_MARKER_RELPATH,
@@ -12,13 +14,15 @@ from maintenance_man.gradle import (
     GradleError,
     claim_owned_dir,
     discover_gradle_updates,
+    generate_gradle_inventory,
     normalise_alias,
     parse_catalogue,
+    resolve_gradle_vulnerability_target,
     workspace_environment_reason,
 )
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import SemverTier
-from tests.conftest import GRADLE_FIXTURES
+from maintenance_man.models.scan import GradleBlock, GradleUpdateTarget, SemverTier
+from tests.conftest import GRADLE_FIXTURES, make_vuln
 
 
 def _digest(path: Path) -> str:
@@ -437,3 +441,311 @@ class TestDiscoverGradleUpdates:
         assert Path(kwargs["cwd"]) == Path(gradle_project.path)
         assert kwargs["timeout"] == 900
         assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+class TestGenerateGradleInventory:
+    def _wrapper_writing(self, fixture: str | None, *, returncode: int = 0):
+        def _run(cmd, **kwargs):
+            root = Path(kwargs["cwd"])
+            if fixture is not None:
+                bom = root / GRADLE_INVENTORY_BOM_RELPATH
+                bom.parent.mkdir(parents=True, exist_ok=True)
+                bom.write_text(
+                    (GRADLE_FIXTURES / fixture).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(
+                cmd, returncode, stdout="", stderr="boom"
+            )
+
+        return _run
+
+    def test_yields_a_validated_inventory_and_releases_it(
+        self, gradle_project, monkeypatch
+    ):
+        calls: list[list[str]] = []
+
+        def _record(cmd, **kwargs):
+            calls.append(cmd)
+            return self._wrapper_writing("bom.json")(cmd, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", _record)
+        root = Path(gradle_project.path)
+
+        with generate_gradle_inventory(gradle_project) as bom:
+            assert bom == root / GRADLE_INVENTORY_BOM_RELPATH
+            assert json.loads(bom.read_text())["specVersion"] == "1.6"
+
+        assert not (root / GRADLE_INVENTORY_RELPATH).exists()
+        assert calls[0][1:] == [
+            "cyclonedxBom",
+            "--no-daemon",
+            "--console=plain",
+            "--rerun-tasks",
+            "--no-build-cache",
+        ]
+
+    @pytest.mark.parametrize(
+        "fixture, returncode, expected",
+        [
+            (None, 0, "produced no inventory"),
+            ("bom-empty.json", 0, "no components"),
+            ("bom-non-maven.json", 0, "no Maven components"),
+            ("bom.json", 1, r"failed \(exit 1\)"),
+        ],
+    )
+    def test_unusable_inventory_is_an_error_not_a_clean_scan(
+        self, gradle_project, monkeypatch, fixture, returncode, expected
+    ):
+        monkeypatch.setattr(
+            subprocess, "run", self._wrapper_writing(fixture, returncode=returncode)
+        )
+
+        with pytest.raises(GradleError, match=expected):
+            with generate_gradle_inventory(gradle_project):
+                pytest.fail("unusable inventory must not be yielded")
+
+        assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
+
+    @pytest.mark.parametrize(
+        "spec, accepted",
+        [("1.5", True), ("1.6", True), ("1.7", True), ("1.4", False), ("junk", False)],
+    )
+    def test_spec_version_is_a_floor_not_an_equality(
+        self, gradle_project, monkeypatch, spec, accepted
+    ):
+        """A CycloneDX patch bump must not brick every Gradle scan."""
+        document = json.loads((GRADLE_FIXTURES / "bom.json").read_text())
+        document["specVersion"] = spec
+
+        def _run(cmd, **kwargs):
+            bom = Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH
+            bom.parent.mkdir(parents=True, exist_ok=True)
+            bom.write_text(json.dumps(document), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        if accepted:
+            with generate_gradle_inventory(gradle_project) as bom:
+                assert bom.is_file()
+        else:
+            with pytest.raises(GradleError, match="1.5 or later"):
+                with generate_gradle_inventory(gradle_project):
+                    pytest.fail("unsupported spec version must not be yielded")
+
+    def test_malformed_inventory_json_is_an_error(self, gradle_project, monkeypatch):
+        def _run(cmd, **kwargs):
+            bom = Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH
+            bom.parent.mkdir(parents=True, exist_ok=True)
+            bom.write_text("{not json", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
+            with generate_gradle_inventory(gradle_project):
+                pytest.fail("unreachable")
+
+    def test_existing_inventory_directory_is_a_collision(
+        self, gradle_project, monkeypatch
+    ):
+        owned = Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH
+        owned.mkdir()
+        (owned / "keep.txt").write_text("caller owned\n", encoding="utf-8")
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
+        )
+
+        with pytest.raises(GradleError, match="Refusing to overwrite"):
+            with generate_gradle_inventory(gradle_project):
+                pytest.fail("unreachable")
+
+        assert (owned / "keep.txt").read_text(encoding="utf-8") == "caller owned\n"
+
+    @pytest.mark.parametrize(
+        "document",
+        [
+            [],
+            None,
+            {"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [None]},
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.6",
+                "components": {"purl": "pkg:maven/g/a@1"},
+            },
+        ],
+    )
+    def test_malformed_inventory_structure_is_a_gradle_error(
+        self, gradle_project, monkeypatch, document
+    ):
+        def _run(cmd, **kwargs):
+            bom = Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH
+            bom.write_text(json.dumps(document), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
+            with generate_gradle_inventory(gradle_project):
+                pytest.fail("malformed inventory must not be yielded")
+        assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
+
+    @pytest.mark.parametrize("symlink_marker", [False, True])
+    def test_inventory_symlinks_preserve_caller_bytes(
+        self, gradle_project, monkeypatch, tmp_path, symlink_marker
+    ):
+        inventory = Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH
+        caller = tmp_path / "caller"
+        caller.mkdir()
+        keep = caller / "keep.txt"
+        keep.write_bytes(b"caller bytes\n")
+        if symlink_marker:
+            inventory.mkdir()
+            (inventory / "keep.txt").write_bytes(b"inventory caller bytes\n")
+            (inventory / ".mm-owned").symlink_to(keep)
+        else:
+            inventory.symlink_to(caller, target_is_directory=True)
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
+        )
+        with pytest.raises(GradleError, match="Refusing to overwrite"):
+            with generate_gradle_inventory(gradle_project):
+                pytest.fail("caller inventory must not be yielded")
+        assert keep.read_bytes() == b"caller bytes\n"
+        if symlink_marker:
+            assert (inventory / "keep.txt").read_bytes() == b"inventory caller bytes\n"
+        else:
+            assert inventory.is_symlink()
+
+    def test_body_exception_still_releases_the_inventory(
+        self, gradle_project, monkeypatch
+    ):
+        monkeypatch.setattr(subprocess, "run", self._wrapper_writing("bom.json"))
+
+        with pytest.raises(ValueError):
+            with generate_gradle_inventory(gradle_project):
+                raise ValueError("caller failed")
+
+        assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
+
+
+class TestResolveGradleVulnerabilityTarget:
+    @pytest.mark.parametrize(
+        "pkg_name, fixed, kind, reason_fragment",
+        [
+            ("com.squareup.okhttp3:okhttp", "4.12.1", "mapping", "rich version"),
+            (
+                "org.jetbrains:annotations",
+                "24.0.0",
+                "mapping",
+                "no catalogue library owns",
+            ),
+            ("androidx.compose.ui:ui", "1.9.1", "mapping", "platform/BOM managed"),
+            (
+                "androidx.room:room-runtime",
+                "2.8.5, 2.9.0",
+                "conflict",
+                "single exact fix version",
+            ),
+            (
+                "androidx.room:room-runtime",
+                ">=2.8.5",
+                "conflict",
+                "single exact fix version",
+            ),
+            (
+                "com.google.devtools.ksp",
+                "2.3.12",
+                "mapping",
+                "no catalogue library owns",
+            ),
+        ],
+    )
+    def test_unsafe_advisories_are_blocked(
+        self, gradle_project, pkg_name, fixed, kind, reason_fragment
+    ):
+        finding = make_vuln(pkg_name=pkg_name, fixed_version=fixed)
+
+        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
+
+        assert isinstance(outcome, GradleBlock)
+        assert outcome.kind == kind
+        assert reason_fragment in outcome.reason
+
+    def test_shared_reference_advisory_resolves_the_whole_group(self, gradle_project):
+        finding = make_vuln(
+            pkg_name="androidx.room:room-compiler",
+            installed_version="2.8.4",
+            fixed_version="2.8.5",
+        )
+
+        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
+
+        assert isinstance(outcome, GradleUpdateTarget)
+        assert outcome.version_ref == "room"
+        assert outcome.target_version == "2.8.5"
+        assert [m.alias for m in outcome.members] == [
+            "room-runtime",
+            "room-compiler",
+            "room-testing",
+        ]
+
+    def test_inline_advisory_resolves_one_member(self, gradle_project):
+        finding = make_vuln(
+            pkg_name="com.google.code.gson:gson",
+            installed_version="2.11.0",
+            fixed_version="2.12.0",
+        )
+
+        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
+
+        assert isinstance(outcome, GradleUpdateTarget)
+        assert outcome.version_ref is None
+        assert [m.alias for m in outcome.members] == ["gson"]
+
+
+@pytest.mark.parametrize(
+    "first_version, second_version, blocked",
+    [
+        ('version = "1.0"', 'version = "1.0"', True),
+        ('version = "1.0"', 'version = "1.1"', True),
+        ('version.ref = "shared-version"', 'version.ref = "shared_version"', False),
+        ('version.ref = "shared-version"', 'version.ref = "independent"', True),
+    ],
+)
+def test_advisory_mapping_distinguishes_independent_alias_identity(
+    gradle_project, first_version, second_version, blocked
+):
+    catalogue = Path(gradle_project.path) / "gradle/libs.versions.toml"
+    catalogue.write_text(
+        '[versions]\nshared-version = "1.0"\nindependent = "1.0"\n'
+        "[libraries]\n"
+        f'first = {{ module = "g:artifact", {first_version} }}\n'
+        f'second = {{ module = "g:artifact", {second_version} }}\n',
+        encoding="utf-8",
+    )
+    outcome = resolve_gradle_vulnerability_target(
+        gradle_project,
+        make_vuln(pkg_name="g:artifact", installed_version="1.0", fixed_version="2.0"),
+    )
+    if blocked:
+        assert isinstance(outcome, GradleBlock)
+        assert outcome.kind == "conflict"
+    else:
+        assert isinstance(outcome, GradleUpdateTarget)
+        assert [member.alias for member in outcome.members] == ["first", "second"]
+
+
+def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run", TestGenerateGradleInventory()._wrapper_writing("bom.json")
+    )
+
+    def _cannot_remove(*args, **kwargs):
+        if not kwargs.get("ignore_errors"):
+            raise PermissionError("cleanup denied")
+
+    monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
+    with pytest.raises(GradleError, match="cleanup denied"):
+        with generate_gradle_inventory(gradle_project) as bom:
+            assert bom.is_file()

@@ -1,0 +1,20 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": ".mm-gradle-inventory/bom.json",
+  "ArtifactType": "cyclonedx",
+  "Results": [
+    {
+      "Target": "Java",
+      "Class": "lang-pkgs",
+      "Type": "jar",
+      "Vulnerabilities": [
+        {"VulnerabilityID": "CVE-2026-1111", "PkgName": "com.squareup.okhttp3:okhttp", "InstalledVersion": "4.12.0", "FixedVersion": "4.12.1", "Severity": "HIGH", "Title": "okhttp flaw", "Description": "d", "Status": "fixed", "PrimaryURL": "https://example.invalid/CVE-2026-1111"},
+        {"VulnerabilityID": "CVE-2026-2222", "PkgName": "com.google.code.gson:gson", "InstalledVersion": "2.11.0", "FixedVersion": "2.12.0", "Severity": "MEDIUM", "Title": "gson flaw", "Description": "d", "Status": "fixed"},
+        {"VulnerabilityID": "CVE-2026-3333", "PkgName": "org.jetbrains:annotations", "InstalledVersion": "23.0.0", "FixedVersion": "24.0.0", "Severity": "LOW", "Title": "transitive flaw", "Description": "d", "Status": "fixed"},
+        {"VulnerabilityID": "CVE-2026-4444", "PkgName": "androidx.compose.ui:ui", "InstalledVersion": "1.9.0", "FixedVersion": "1.9.1", "Severity": "HIGH", "Title": "bom child flaw", "Description": "d", "Status": "fixed"},
+        {"VulnerabilityID": "CVE-2026-5555", "PkgName": "androidx.room:room-runtime", "InstalledVersion": "2.8.4", "FixedVersion": "2.8.5, 2.9.0", "Severity": "HIGH", "Title": "ambiguous fix", "Description": "d", "Status": "fixed"},
+        {"VulnerabilityID": "CVE-2026-6666", "PkgName": "androidx.room:room-compiler", "InstalledVersion": "2.8.4", "FixedVersion": "2.8.5", "Severity": "MEDIUM", "Title": "room flaw", "Description": "d", "Status": "fixed"}
+      ]
+    }
+  ]
+}

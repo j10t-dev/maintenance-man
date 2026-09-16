@@ -1,5 +1,7 @@
 import json
+import shutil
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -7,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from maintenance_man.gradle import GradleError
+from maintenance_man.gradle import GRADLE_INVENTORY_BOM_RELPATH, GradleError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
@@ -24,7 +26,7 @@ from maintenance_man.scanner import (
     check_trivy_available,
     scan_project,
 )
-from tests.conftest import make_gradle_target, make_update, make_vuln
+from tests.conftest import GRADLE_FIXTURES, make_gradle_target, make_update, make_vuln
 
 _OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
@@ -447,3 +449,338 @@ def test_gradle_finding_without_target_or_reason_is_blocked_not_eligible(
     assert result[0].blocked_reason is not None
     assert result[0].gradle_block_kind == "age"
     assert "no catalogue target" in result[0].blocked_reason
+
+
+def _yield_fixture_bom(project):
+    @contextmanager
+    def _generate(_project):
+        bom = Path(project.path) / GRADLE_INVENTORY_BOM_RELPATH
+        bom.parent.mkdir(parents=True, exist_ok=True)
+        bom.write_text(
+            (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        try:
+            yield bom
+        finally:
+            shutil.rmtree(bom.parent, ignore_errors=True)
+
+    return _generate
+
+
+def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
+    payload = (
+        stdout
+        if stdout is not None
+        else (GRADLE_FIXTURES / "trivy-sbom.json").read_text(encoding="utf-8")
+    )
+
+    def _run(cmd, **kwargs):
+        assert cmd[:5] == ["trivy", "sbom", "--format", "json", "--scanners"]
+        return subprocess.CompletedProcess(cmd, returncode, stdout=payload, stderr="")
+
+    monkeypatch.setattr("maintenance_man.scanner.subprocess.run", _run)
+
+
+def test_gradle_scan_maps_and_blocks_vulnerabilities(
+    gradle_project, monkeypatch, mm_home
+):
+    def _run(cmd, **kwargs):
+        bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
+        if cmd[1] == "cyclonedxBom":
+            bom.write_bytes((GRADLE_FIXTURES / "bom.json").read_bytes())
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        assert cmd == [
+            "trivy",
+            "sbom",
+            "--format",
+            "json",
+            "--scanners",
+            "vuln",
+            str(bom),
+        ]
+        assert bom.is_file()
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=(GRADLE_FIXTURES / "trivy-sbom.json").read_text(), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr(
+        "maintenance_man.dependency_age._get_maven_publish_date",
+        lambda pkg, version: _OLD,
+    )
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
+
+    result = scan_project("android", gradle_project, 7)
+    by_id = {v.vuln_id: v for v in result.vulnerabilities}
+
+    assert len(result.vulnerabilities) == 6
+    assert by_id["CVE-2026-2222"].blocked_reason is None
+    assert (gson_target := by_id["CVE-2026-2222"].gradle_target) is not None
+    assert gson_target.members[0].alias == "gson"
+    assert (room_target := by_id["CVE-2026-6666"].gradle_target) is not None
+    assert room_target.version_ref == "room"
+    assert by_id["CVE-2026-1111"].gradle_block_kind == "mapping"
+    assert by_id["CVE-2026-3333"].gradle_block_kind == "mapping"
+    assert by_id["CVE-2026-4444"].gradle_block_kind == "mapping"
+    assert by_id["CVE-2026-5555"].gradle_block_kind == "conflict"
+    assert all(v.actionable for v in result.vulnerabilities)
+    persisted = ScanResult.model_validate_json(
+        (mm_home / "scan-results" / "android.json").read_bytes()
+    )
+    assert persisted.vulnerabilities == result.vulnerabilities
+    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
+
+
+def test_gradle_scan_error_leaves_previous_results_intact(
+    gradle_project, monkeypatch, mm_home
+):
+    results_file = mm_home / "scan-results" / "android.json"
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+    results_file.write_text('{"previous": true}', encoding="utf-8")
+
+    def _boom(project):
+        raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
+
+    monkeypatch.setattr("maintenance_man.scanner.generate_gradle_inventory", _boom)
+
+    with pytest.raises(GradleError, match="cyclonedxBom failed"):
+        scan_project("android", gradle_project, 7)
+
+    assert results_file.read_text(encoding="utf-8") == '{"previous": true}'
+
+
+@pytest.mark.parametrize(
+    "payload, returncode",
+    [
+        (None, 0),
+        ("{bad json", 0),
+        ('{"bomFormat":"CycloneDX","specVersion":"1.6","components":[]}', 0),
+        ("{}", 1),
+    ],
+)
+def test_gradle_inventory_failure_preserves_previous_result_bytes(
+    gradle_project, monkeypatch, mm_home, payload, returncode
+):
+    results_file = mm_home / "scan-results" / "android.json"
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+    previous = b'{"previous": true}\n'
+    results_file.write_bytes(previous)
+
+    def _run(cmd, **kwargs):
+        assert cmd[1] == "cyclonedxBom"
+        if payload is not None:
+            (Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH).write_text(
+                payload, encoding="utf-8"
+            )
+        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr="boom")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    with pytest.raises(GradleError):
+        scan_project("android", gradle_project, 7)
+    assert results_file.read_bytes() == previous
+    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
+
+
+def test_gradle_scan_runs_the_existing_secret_scan_when_enabled(
+    gradle_project, monkeypatch, mm_home
+):
+    monkeypatch.setattr(
+        "maintenance_man.scanner.generate_gradle_inventory",
+        _yield_fixture_bom(gradle_project),
+    )
+    _trivy_sbom(monkeypatch, stdout='{"Results": []}')
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    secret_calls: list[Path] = []
+    monkeypatch.setattr(
+        "maintenance_man.scanner._run_trivy_secret_scan",
+        lambda path, skip_dirs: (secret_calls.append(path), [])[1],
+    )
+
+    scan_project("android", gradle_project, 7)
+
+    assert secret_calls == [Path(gradle_project.path)]
+
+
+def test_gradle_inventory_cleanup_failure_preserves_previous_results(
+    gradle_project, monkeypatch, mm_home
+):
+    results_file = mm_home / "scan-results" / "android.json"
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+    previous = b'{"previous": true}\n'
+    results_file.write_bytes(previous)
+
+    def _run(cmd, **kwargs):
+        if cmd[1] == "cyclonedxBom":
+            bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
+            bom.write_bytes((GRADLE_FIXTURES / "bom.json").read_bytes())
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"Results": []}', stderr="")
+
+    def _cannot_remove(*args, **kwargs):
+        if not kwargs.get("ignore_errors"):
+            raise PermissionError("cleanup denied")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
+    with pytest.raises(GradleError, match="cleanup denied"):
+        scan_project("android", gradle_project, 7)
+    assert results_file.read_bytes() == previous
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"Results": False},
+        {"Results": None},
+        {"Results": ""},
+        {"Results": 0},
+        {"Results": [None]},
+        {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": False}]},
+    ],
+)
+def test_gradle_trivy_malformed_shape_is_scan_error(
+    gradle_project, monkeypatch, payload
+):
+    from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
+
+    monkeypatch.setattr(
+        "maintenance_man.scanner.generate_gradle_inventory",
+        _yield_fixture_bom(gradle_project),
+    )
+    _trivy_sbom(monkeypatch, stdout=json.dumps(payload))
+    with pytest.raises(TrivyScanError, match="Trivy"):
+        _run_gradle_vuln_scan(gradle_project)
+    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("interpreter missing"),
+        PermissionError("launch denied"),
+        UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid"),
+    ],
+)
+def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
+    gradle_project, monkeypatch, failure
+):
+    from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
+
+    monkeypatch.setattr(
+        "maintenance_man.scanner.generate_gradle_inventory",
+        _yield_fixture_bom(gradle_project),
+    )
+
+    def run(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(TrivyScanError, match="Trivy"):
+        _run_gradle_vuln_scan(gradle_project)
+    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("VulnerabilityID", None),
+        ("VulnerabilityID", ""),
+        ("PkgName", 3),
+        ("InstalledVersion", False),
+        ("Severity", None),
+        ("Severity", False),
+        ("Severity", []),
+        ("PublishedDate", 0),
+        ("PublishedDate", {}),
+        ("Title", None),
+        ("Description", []),
+        ("Status", False),
+        ("FixedVersion", []),
+        ("PrimaryURL", {}),
+    ],
+)
+def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, value):
+    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+
+    row = {
+        "VulnerabilityID": "CVE-example",
+        "PkgName": "org.example:library",
+        "InstalledVersion": "1",
+    }
+    row[field] = value
+    with pytest.raises(TrivyScanError, match=field):
+        _parse_gradle_trivy_output(
+            json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
+        )
+
+
+@pytest.mark.parametrize("field", ["VulnerabilityID", "PkgName", "InstalledVersion"])
+def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
+    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+
+    row = {
+        "VulnerabilityID": "CVE-example",
+        "PkgName": "org.example:library",
+        "InstalledVersion": "1",
+    }
+    del row[field]
+    with pytest.raises(TrivyScanError, match=field):
+        _parse_gradle_trivy_output(
+            json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
+        )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"Class": False},
+        {"Class": "lang-pkgs", "Vulnerabilities": ""},
+        {"Class": "lang-pkgs", "Vulnerabilities": {}},
+        {"Class": "lang-pkgs", "Vulnerabilities": [None]},
+    ],
+)
+def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
+    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+
+    with pytest.raises(TrivyScanError):
+        _parse_gradle_trivy_output(json.dumps({"Results": [result]}))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"Results": []},
+        {"Results": [{"Class": "lang-pkgs"}]},
+        {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": None}]},
+    ],
+)
+def test_gradle_trivy_absent_optional_or_null_vulnerabilities_is_clean(payload):
+    from maintenance_man.scanner import _parse_gradle_trivy_output
+
+    assert _parse_gradle_trivy_output(json.dumps(payload)) == []
+
+
+def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semantics():
+    from maintenance_man.scanner import _parse_gradle_trivy_output
+
+    row = {
+        "VulnerabilityID": "CVE-example",
+        "PkgName": "org.example:library",
+        "InstalledVersion": "1",
+        "Severity": "new-severity",
+        "PublishedDate": "bad-date",
+        "FixedVersion": None,
+        "PrimaryURL": None,
+    }
+    findings = _parse_gradle_trivy_output(
+        json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
+    )
+    assert len(findings) == 1
+    assert findings[0].severity == Severity.UNKNOWN
+    assert findings[0].published_date is None
+    assert findings[0].fixed_version is None

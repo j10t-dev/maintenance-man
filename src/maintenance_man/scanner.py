@@ -6,12 +6,20 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypeGuard
+
+from pydantic import ValidationError
 
 from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
 from maintenance_man.dependency_age import evaluate_gradle_group_age, filter_by_age
+from maintenance_man.gradle import (
+    generate_gradle_inventory,
+    resolve_gradle_vulnerability_target,
+)
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    GradleBlock,
     ScanResult,
     SecretFinding,
     Severity,
@@ -48,6 +56,14 @@ def scan_project(
 
     if project.package_manager == "uv":
         vulns = _run_uv_audit(project_path)
+        secrets = (
+            _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
+            if project.scan_secrets
+            else []
+        )
+    elif project.package_manager == "gradle":
+        vulns = _run_gradle_vuln_scan(project)
+        _map_gradle_vulns(project, vulns, min_version_age_days)
         secrets = (
             _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
             if project.scan_secrets
@@ -149,6 +165,114 @@ def _check_gradle_outdated(
             finding.blocked_reason = block.reason
             finding.gradle_block_kind = block.kind
     return findings
+
+
+def _run_gradle_vuln_scan(project: ProjectConfig) -> list[VulnFinding]:
+    """Scan the project's own freshly generated CycloneDX inventory."""
+    with generate_gradle_inventory(project) as bom:
+        cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=project.path,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise TrivyScanError(f"Trivy timed out scanning {bom}") from e
+        except (OSError, UnicodeDecodeError) as e:
+            raise TrivyScanError(f"Could not run Trivy SBOM scan of {bom}: {e}") from e
+
+        if completed.returncode != 0:
+            raise TrivyScanError(
+                f"Trivy exited with code {completed.returncode}: "
+                f"{completed.stderr.strip()}"
+            )
+        return _parse_gradle_trivy_output(completed.stdout)
+
+
+def _is_trivy_object(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
+
+
+def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
+    """Validate consumed SBOM response fields before using the common parser."""
+    try:
+        output: object = json.loads(payload)
+    except json.JSONDecodeError as e:
+        raise TrivyScanError(f"Failed to parse Trivy SBOM output: {e}") from e
+    if not _is_trivy_object(output):
+        raise TrivyScanError("Malformed Trivy SBOM output: expected an object")
+    results = output.get("Results", [])
+    if not isinstance(results, list):
+        raise TrivyScanError("Malformed Trivy SBOM Results: expected an array")
+    validated_results: list[dict[str, object]] = []
+    for index, result in enumerate(results):
+        label = f"Trivy SBOM Results[{index}]"
+        if not _is_trivy_object(result):
+            raise TrivyScanError(f"Malformed {label}: expected an object")
+        validated_results.append(result)
+        if "Class" in result and not isinstance(result["Class"], str):
+            raise TrivyScanError(f"Malformed {label}.Class: expected a string")
+        vulnerabilities = result.get("Vulnerabilities")
+        if vulnerabilities is None:
+            continue
+        if not isinstance(vulnerabilities, list):
+            raise TrivyScanError(
+                f"Malformed {label}.Vulnerabilities: expected an array"
+            )
+        for row_index, row in enumerate(vulnerabilities):
+            row_label = f"{label}.Vulnerabilities[{row_index}]"
+            if not _is_trivy_object(row):
+                raise TrivyScanError(f"Malformed {row_label}: expected an object")
+            if result.get("Class") != "lang-pkgs":
+                continue
+            for field in ("VulnerabilityID", "PkgName", "InstalledVersion"):
+                if not isinstance(row.get(field), str) or not row[field]:
+                    raise TrivyScanError(
+                        f"Malformed {row_label}.{field}: expected a nonempty string"
+                    )
+            for field in ("Severity", "Title", "Description", "Status"):
+                if field in row and not isinstance(row[field], str):
+                    raise TrivyScanError(
+                        f"Malformed {row_label}.{field}: expected a string"
+                    )
+            for field in ("FixedVersion", "PrimaryURL", "PublishedDate"):
+                if (
+                    field in row
+                    and row[field] is not None
+                    and not isinstance(row[field], str)
+                ):
+                    raise TrivyScanError(
+                        f"Malformed {row_label}.{field}: expected a string or null"
+                    )
+    try:
+        return _parse_vulns(validated_results)
+    except ValidationError as e:
+        raise TrivyScanError(f"Malformed Trivy SBOM vulnerability fields: {e}") from e
+
+
+def _map_gradle_vulns(
+    project: ProjectConfig, vulns: list[VulnFinding], min_version_age_days: int
+) -> None:
+    """Attach a catalogue target or a blocking reason to each advisory in place.
+
+    Findings that cannot be mapped to a safe target are preserved and blocked,
+    never discarded.
+    """
+    for vuln in vulns:
+        outcome = resolve_gradle_vulnerability_target(project, vuln)
+        if isinstance(outcome, GradleBlock):
+            vuln.blocked_reason = outcome.reason
+            vuln.gradle_block_kind = outcome.kind
+            continue
+        vuln.gradle_target = outcome
+        block, published = evaluate_gradle_group_age(outcome, min_version_age_days)
+        vuln.published_date = vuln.published_date or published
+        if block is not None:
+            vuln.blocked_reason = block.reason
+            vuln.gradle_block_kind = block.kind
 
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:

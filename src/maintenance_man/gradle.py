@@ -10,6 +10,7 @@ owns no persistent cache.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -24,12 +25,14 @@ from typing import Any
 from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    GradleBlock,
     GradleBlockKind,
     GradleKind,
     GradleMember,
     GradleUpdateTarget,
     SemverTier,
     UpdateFinding,
+    VulnFinding,
     classify_semver,
 )
 
@@ -48,7 +51,15 @@ _DISCOVER_ARGS = [
     "--no-daemon",
     "--console=plain",
 ]
+_BOM_ARGS = [
+    "cyclonedxBom",
+    "--no-daemon",
+    "--console=plain",
+    "--rerun-tasks",
+    "--no-build-cache",
+]
 _UNSAFE_TEXT_RE = re.compile(r"[\x00-\x1f\x7f]")
+_EXACT_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 
 class GradleError(Exception):
@@ -305,6 +316,120 @@ def build_update_findings(
     return sorted(findings, key=lambda f: f.pkg_name)
 
 
+@contextmanager
+def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
+    """Yield a freshly generated, validated CycloneDX inventory.
+
+    The whole ``.mm-gradle-inventory`` tree is adapter-owned: marked leftovers
+    are reclaimed, caller paths are refused, and owned output is released.  Normal
+    Gradle build, problems-report and cache outputs are left alone.
+    """
+    root = Path(project.path)
+    inventory_dir = root / GRADLE_INVENTORY_RELPATH
+    claim_owned_dir(inventory_dir, "Gradle inventory directory")
+    inventory_dir.mkdir(parents=True)
+    (root / GRADLE_INVENTORY_MARKER_RELPATH).write_bytes(b"")
+    try:
+        run_gradle(root, _BOM_ARGS, label="cyclonedxBom")
+        bom = root / GRADLE_INVENTORY_BOM_RELPATH
+        _validate_inventory(bom)
+        yield bom
+    finally:
+        _remove_owned_tree(inventory_dir)
+
+
+def resolve_gradle_vulnerability_target(
+    project: ProjectConfig, finding: VulnFinding
+) -> GradleUpdateTarget | GradleBlock:
+    """Map an advisory to an editable catalogue target, or explain the block.
+
+    Only catalogue **libraries** can own an advisory: mm never infers that
+    upgrading a parent, platform or plugin resolves a transitive finding.
+    """
+    fixed = (finding.fixed_version or "").strip()
+    if not fixed:
+        return GradleBlock(
+            kind="mapping", reason=f"{finding.vuln_id} names no fix version"
+        )
+    if not _EXACT_VERSION_RE.fullmatch(fixed):
+        return GradleBlock(
+            kind="conflict",
+            reason=(
+                f"{finding.vuln_id} does not name a single exact fix version "
+                f"({finding.fixed_version!r}); resolve manually"
+            ),
+        )
+
+    catalogue = parse_catalogue(Path(project.path) / GRADLE_CATALOGUE_RELPATH)
+    matches = [
+        entry
+        for entry in catalogue.entries.values()
+        if entry.kind == "library" and entry.coordinate == finding.pkg_name
+    ]
+    if not matches:
+        return GradleBlock(
+            kind="mapping",
+            reason=(
+                f"no catalogue library owns {finding.pkg_name}; it is transitive, "
+                f"platform-owned or a plugin implementation dependency — resolve "
+                f"manually"
+            ),
+        )
+    identities = {
+        ("ref", normalise_alias(entry.version_ref))
+        if entry.version_ref is not None
+        else (entry.kind, entry.alias)
+        for entry in matches
+    }
+    if len(identities) > 1:
+        return GradleBlock(
+            kind="conflict",
+            reason=(
+                f"{finding.pkg_name} is declared by more than one independently "
+                f"versioned catalogue alias; resolve manually"
+            ),
+        )
+
+    entry = matches[0]
+    if entry.unsupported is not None:
+        return GradleBlock(kind="mapping", reason=entry.unsupported)
+
+    version = catalogue.version_of(entry)
+    if version is None:
+        return GradleBlock(
+            kind="mapping",
+            reason=(
+                f"'{entry.alias}' has no catalogue version (platform/BOM managed); "
+                f"mm does not give it one"
+            ),
+        )
+    if version.value is None:
+        return GradleBlock(
+            kind="mapping",
+            reason=version.unsupported
+            or f"version '{version.name}' is not a simple literal",
+        )
+
+    entries = (
+        catalogue.members_of_ref(entry.version_ref)
+        if entry.version_ref is not None
+        else [entry]
+    )
+    return GradleUpdateTarget(
+        version_ref=version.name if entry.version_ref is not None else None,
+        members=[
+            GradleMember(
+                kind=member.kind,
+                alias=assert_safe_text(member.alias, "catalogue alias"),
+                coordinate=assert_safe_text(member.coordinate, "catalogue coordinate"),
+                installed_version=version.value,
+            )
+            for member in entries
+        ],
+        target_version=assert_safe_text(fixed, "fix version"),
+    )
+
+
 def run_gradle(
     root: Path, args: list[str], *, label: str | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -361,7 +486,8 @@ def claim_owned_dir(path: Path, label: str) -> None:
         raise _collision(path, label)
     if not path.exists():
         return
-    if not (path / Path(GRADLE_INVENTORY_MARKER_RELPATH).name).is_file():
+    marker = path / Path(GRADLE_INVENTORY_MARKER_RELPATH).name
+    if marker.is_symlink() or not marker.is_file():
         raise _collision(path, label)
     shutil.rmtree(path)
 
@@ -583,3 +709,71 @@ def _table(raw: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_inventory(path: Path) -> None:
+    """A missing, empty, non-Maven or malformed inventory is never a clean scan."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as e:
+        raise GradleError(
+            f"cyclonedxBom produced no inventory at {path}; is org.cyclonedx.bom "
+            f"3.4.1 applied with the documented fixed output paths?"
+        ) from e
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        raise GradleError(f"malformed CycloneDX inventory {path}: {e}") from e
+
+    if not isinstance(document, dict):
+        raise GradleError(f"malformed CycloneDX inventory {path}: expected an object")
+    if document.get("bomFormat") != "CycloneDX":
+        raise GradleError(f"{path} is not a CycloneDX document")
+    if _spec_version(document.get("specVersion")) < (1, 5):
+        raise GradleError(
+            f"unsupported CycloneDX spec version "
+            f"{document.get('specVersion')!r} in {path}; mm requires 1.5 or later"
+        )
+    components = document.get("components", [])
+    if not isinstance(components, list) or any(
+        not isinstance(component, dict) for component in components
+    ):
+        raise GradleError(
+            f"malformed CycloneDX inventory {path}: "
+            "components must be an array of objects"
+        )
+    if not components:
+        raise GradleError(
+            f"CycloneDX inventory {path} has no components; an empty inventory is "
+            f"an unsupported scan, not a clean result"
+        )
+    if not any(
+        str(component.get("purl", "")).startswith("pkg:maven/")
+        for component in components
+    ):
+        raise GradleError(
+            f"CycloneDX inventory {path} has no Maven components; the scan scope is "
+            f"unsupported, not clean"
+        )
+
+
+def _spec_version(raw: object) -> tuple[int, ...]:
+    """Parse a CycloneDX specVersion as a numeric tuple. Unparsable sorts lowest.
+
+    A floor rather than an equality: a plugin patch bump that emits a newer
+    schema must not turn every Gradle scan into a hard error.
+    """
+    try:
+        return tuple(int(part) for part in str(raw).split("."))
+    except ValueError:
+        return (0,)
+
+
+def _remove_owned_tree(path: Path) -> None:
+    try:
+        if path.is_symlink():
+            path.unlink(missing_ok=True)
+            return
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise GradleError(f"failed to remove owned Gradle inventory {path}: {e}") from e
