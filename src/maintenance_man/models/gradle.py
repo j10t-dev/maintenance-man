@@ -1,6 +1,7 @@
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class GradleRecord(BaseModel):
@@ -111,3 +112,63 @@ class IncompleteResolution(GradleRecord):
 type ResolutionOutcome = Annotated[
     CompleteResolution | IncompleteResolution, Field(discriminator="kind")
 ]
+
+
+RepositoryId = Literal["central", "google", "portal"]
+
+
+class PublicationRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    module: ModuleId
+    repositories: tuple[RepositoryId, ...]
+    routing_supported: bool = False
+    marker_implementation: ModuleId | None = None
+
+
+class AgeBlock(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    kind: Literal["age"] = "age"
+    reason: str
+
+
+class PublicationFact(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    repository: RepositoryId
+    module: ModuleId
+    source_url: str
+    method: Literal["last_modified", "central_timestamp"]
+    artifact_digest: str
+    timestamp: datetime
+    checked_at: datetime
+    trust_policy_version: Literal[1] = 1
+    implementation: ModuleId | None = None
+
+    @field_validator("timestamp", "checked_at")
+    @classmethod
+    def utc_date(cls, value):
+        if value.tzinfo is None:
+            raise ValueError("publication dates require a timezone")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("artifact_digest")
+    @classmethod
+    def digest(cls, value):
+        if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError("expected SHA-256 digest")
+        return value
+
+
+class PublicationEvidence(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    facts: tuple[PublicationFact, ...]
+
+    @field_validator("facts")
+    @classmethod
+    def nonempty(cls, value):
+        if not value:
+            raise ValueError("publication evidence requires facts")
+        return value
+
+    @property
+    def timestamp(self):
+        return max(f.timestamp for f in self.facts)
