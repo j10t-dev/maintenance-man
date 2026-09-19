@@ -1142,3 +1142,44 @@ def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeyp
             assert started.wait(10), "eight requests did not start"
             raise KeyboardInterrupt
     assert len(calls) == 8, "queued publication requests ran after interruption"
+
+
+@pytest.mark.parametrize("failure", ["truncated-chunk", "bad-status-line"])
+def test_publication_malformed_http_withholds_candidate(tmp_path, monkeypatch, failure):
+    import http.client
+    import socket
+
+    from maintenance_man import dependency_age as age
+
+    receiver, sender = socket.socketpair()
+    if failure == "truncated-chunk":
+        wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n<project>"
+    else:
+        wire = b"not an HTTP status line\r\n\r\n"
+    sender.sendall(wire)
+    sender.shutdown(socket.SHUT_WR)
+
+    class Opener:
+        def open(self, request, timeout):
+            response = http.client.HTTPResponse(receiver)
+            response.begin()
+            return response
+
+    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *args: Opener())
+    try:
+        module = ModuleId(group="org.example", artifact="lib", version="2.0")
+        with PublicationLookupContext(tmp_path) as context:
+            result = lookup_gradle_publication(
+                PublicationRequest(
+                    module=module, repositories=("central",), routing_supported=True
+                ),
+                context,
+            )
+        assert isinstance(result, AgeBlock)
+        assert (
+            "IncompleteRead" if failure == "truncated-chunk" else "BadStatusLine"
+        ) in result.reason
+        assert not list(tmp_path.glob("*.json"))
+    finally:
+        receiver.close()
+        sender.close()

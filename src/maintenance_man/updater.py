@@ -1724,10 +1724,16 @@ def rebuild_gradle_run_evidence(
         context = initialize_comparison_context(
             base_project, resolution, _config.MM_HOME / "gradle-contexts"
         )
-        run_gradle_checks(base_project, run.project)
-        initial = capture_gradle_snapshot(base_project, context)
-        if isinstance(initial, IncompleteResolution):
-            raise GradleError("Recorded baseline snapshot incomplete")
+        try:
+            _, initial = capture_checked_gradle_snapshot(
+                base_project,
+                run.project,
+                context,
+                expected_tree=revision_tree_id(base_project.path, run.base_commit_id),
+            )
+        except BaseException:
+            discard_unpersisted_gradle_context(run.project, context)
+            raise
     rebuilt_attempts: dict[str, ReadyAttempt | CompletedAttempt] = {}
     baseline = initial
     try:
@@ -1735,10 +1741,15 @@ def rebuild_gradle_run_evidence(
             with _gradle_evidence_workspace(
                 project, old.receipt.accepted_commit_id
             ) as checked_project:
-                checks = run_gradle_checks(checked_project, run.project)
-                after = capture_gradle_snapshot(checked_project, context)
-                if isinstance(after, IncompleteResolution):
-                    raise GradleError("Recorded accepted revision snapshot incomplete")
+                checks, after = capture_checked_gradle_snapshot(
+                    checked_project,
+                    run.project,
+                    context,
+                    expected_tree=revision_tree_id(
+                        checked_project.path, old.receipt.accepted_commit_id
+                    ),
+                    target=old.candidate.target,
+                )
                 comparison = compare_gradle_snapshots(baseline, after, old.candidate)
                 if not isinstance(comparison, VerifiedComparison):
                     raise GradleError("Recorded accepted change fails fresh comparison")

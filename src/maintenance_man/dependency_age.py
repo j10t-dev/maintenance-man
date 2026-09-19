@@ -1,6 +1,7 @@
 import dbm
 import functools
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -651,6 +652,7 @@ class PublicationLookupContext:
                 pass
             return fact
         except (
+            http.client.HTTPException,
             OSError,
             ValueError,
             OverflowError,

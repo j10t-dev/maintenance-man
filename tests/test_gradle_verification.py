@@ -2050,3 +2050,306 @@ def test_batch_output_retains_verified_gradle_progress(driver, capsys):
     output = capsys.readouterr().out
     assert "Verified: 1" in output
     assert "No projects had actionable findings" not in output
+
+
+@pytest.fixture
+def rebuild_evidence(workflow, monkeypatch):
+    run = ready_workflow(workflow)
+    ledger = updater.gradle_run_path("sample")
+    before = ledger.read_bytes()
+    cache = workflow.context.private_cache_path.with_name("rebuilt-context")
+    shutil.copytree(workflow.context.private_cache_path, cache)
+    context = workflow.context.model_copy(update={"private_cache_path": cache})
+    monkeypatch.setattr(
+        updater,
+        "capture_gradle_snapshot",
+        lambda project, ctx: workflow.state["snapshot"].model_copy(
+            update={"context_identity": ctx.identity}
+        ),
+    )
+    observations = SimpleNamespace(mutated=None, visits=[], released=[])
+
+    @contextmanager
+    def proof(project, revision):
+        observations.visits.append(revision)
+        observed = workflow.initial if revision == "base" else workflow.after
+        if observations.mutated == revision:
+            observed = observed.model_copy(update={"tree_id": "uncommitted-tree"})
+        workflow.state.update(snapshot=observed, tree=observed.tree_id)
+        yield project
+
+    monkeypatch.setattr(updater, "_gradle_evidence_workspace", proof)
+    monkeypatch.setattr(updater, "parse_catalogue", lambda *args: object())
+    monkeypatch.setattr(
+        updater, "collect_gradle_resolution", lambda *args: workflow.initial.resolution
+    )
+    monkeypatch.setattr(updater, "initialize_comparison_context", lambda *args: context)
+    monkeypatch.setattr(
+        updater, "release_comparison_context", observations.released.append
+    )
+    monkeypatch.setattr(
+        updater,
+        "revision_tree_id",
+        lambda path, revision="@": {"base": "base-tree", "accepted": "after-tree"}.get(
+            revision, workflow.state["tree"]
+        ),
+    )
+    return SimpleNamespace(
+        run=run,
+        context=context,
+        ledger=ledger,
+        before=before,
+        observations=observations,
+        workflow=workflow,
+    )
+
+
+@pytest.mark.parametrize("revision", ["base", "accepted"])
+def test_rebuilt_evidence_refuses_a_tree_changed_by_checks(rebuild_evidence, revision):
+    state = rebuild_evidence
+    state.observations.mutated = revision
+    with pytest.raises(updater.GradleError, match="tree|baseline"):
+        updater.rebuild_gradle_run_evidence(
+            state.run, state.workflow.project, state.workflow.publication, 7
+        )
+    assert state.ledger.read_bytes() == state.before
+    assert state.observations.released == [state.context]
+
+
+def test_rebuilt_evidence_preserves_exact_revision_bindings(rebuild_evidence):
+    state = rebuild_evidence
+    rebuilt = updater.rebuild_gradle_run_evidence(
+        state.run, state.workflow.project, state.workflow.publication, 7
+    )
+    assert state.observations.visits == ["base", "accepted"]
+    assert rebuilt.initial_snapshot.tree_id == "base-tree"
+    accepted = rebuilt.attempts[0]
+    assert isinstance(accepted, ReadyAttempt)
+    assert accepted.after.tree_id == accepted.receipt.checked_tree_id == "after-tree"
+    assert accepted.receipt.accepted_commit_id == "accepted"
+    assert updater.load_gradle_run(state.ledger) == rebuilt
+    assert state.observations.released == [state.run.context]
+
+
+def test_rebuilt_baseline_check_failure_releases_new_context(
+    rebuild_evidence, monkeypatch
+):
+    state = rebuild_evidence
+
+    def fail_checks(*args):
+        raise updater.GradleError("baseline build failed")
+
+    monkeypatch.setattr(updater, "run_gradle_checks", fail_checks)
+    with pytest.raises(updater.GradleError, match="baseline build failed"):
+        updater.rebuild_gradle_run_evidence(
+            state.run, state.workflow.project, state.workflow.publication, 7
+        )
+    assert state.ledger.read_bytes() == state.before
+    assert state.observations.released == [state.context]
+
+
+@pytest.mark.parametrize("stage", ["checks", "snapshot"])
+def test_acceptance_rejects_source_changes_during_verification(
+    workflow, monkeypatch, stage
+):
+    run = begin_workflow(workflow)
+    if stage == "checks":
+        original = updater.run_gradle_checks
+
+        def mutate(*args):
+            workflow.state["tree"] = "unverified-tree"
+            workflow.state["snapshot"] = workflow.after.model_copy(
+                update={"tree_id": "unverified-tree"}
+            )
+            return original(*args)
+
+        monkeypatch.setattr(updater, "run_gradle_checks", mutate)
+    else:
+
+        def mutate(*args):
+            workflow.state["tree"] = "unverified-tree"
+            return workflow.after.model_copy(update={"tree_id": "unverified-tree"})
+
+        monkeypatch.setattr(updater, "capture_gradle_snapshot", mutate)
+    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    assert isinstance(result.attempts[0], FailedAttempt)
+    assert "tree" in result.attempts[0].reason.lower()
+    assert workflow.effects == ["apply", "discard"]
+    assert result.accepted_snapshot == workflow.initial
+
+
+def test_acceptance_requires_the_applied_catalogue_version(workflow, monkeypatch):
+    run = begin_workflow(workflow)
+    catalogue = workflow.project.path / "gradle/libs.versions.toml"
+    catalogue.parent.mkdir(exist_ok=True)
+    original = updater.apply_gradle_update
+
+    def undo_target(*args):
+        original(*args)
+        catalogue.write_text(catalogue.read_text().replace('lib = "2"', 'lib = "1"'))
+
+    monkeypatch.setattr(updater, "apply_gradle_update", undo_target)
+    # Simulate an apply hook that returns successfully but restores the old version.
+    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    assert isinstance(result.attempts[0], FailedAttempt)
+    assert workflow.effects == ["apply", "discard"]
+
+
+def test_snapshot_refuses_inventory_missing_a_resolved_module(
+    frozen_context, resolution, monkeypatch
+):
+    project, context, _ = frozen_context
+    benign = ModuleId(group="g", artifact="benign", version="1")
+    scope = resolution.report.scopes[0]
+    scope = scope.model_copy(
+        update={
+            "components": (
+                *scope.components,
+                ResolvedComponent(
+                    id="benign", kind="module", module=benign, variants=()
+                ),
+            )
+        }
+    )
+    resolution = resolution.model_copy(
+        update={"report": resolution.report.model_copy(update={"scopes": (scope,)})}
+    )
+
+    @contextmanager
+    def generate(_project):
+        bom = project.path / "fixture-bom.json"
+        bom.write_text(
+            json.dumps(
+                {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.6",
+                    "components": [{"type": "library", "purl": "pkg:maven/g/benign@1"}],
+                }
+            )
+        )
+        try:
+            yield bom, resolution
+        finally:
+            bom.unlink()
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", generate)
+    monkeypatch.setattr(scanner, "revision_tree_id", lambda *args: "tree")
+    scans = []
+
+    def scan(command, **kwargs):
+        scans.append(command)
+        return subprocess.CompletedProcess(command, 0, '{"Results": []}', "")
+
+    monkeypatch.setattr(scanner.subprocess, "run", scan)
+    result = scanner.capture_gradle_snapshot(project, context)
+    assert isinstance(result, IncompleteResolution)
+    assert any("inventory" in reason and "lib" in reason for reason in result.reasons)
+    assert scans == []
+
+
+def test_completed_run_releases_private_databases(driver):
+    cache = driver.workflow.context.private_cache_path
+    assert cache.is_dir()
+    assert invoke_driver(driver) == 0
+    saved = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert saved is not None and saved.refreshed
+    assert not cache.exists()
+
+
+@pytest.mark.parametrize("persist", [False, True])
+def test_rebuild_retires_only_superseded_durable_context(
+    rebuild_evidence, monkeypatch, tmp_path, persist
+):
+    state = rebuild_evidence
+    old = state.run.context
+    new_path = tmp_path / "replacement-cache"
+    shutil.copytree(old.private_cache_path, new_path)
+    new = old.model_copy(update={"private_cache_path": new_path})
+    monkeypatch.setattr(updater, "initialize_comparison_context", lambda *args: new)
+    monkeypatch.setattr(
+        updater, "release_comparison_context", verification.release_comparison_context
+    )
+    monkeypatch.setattr(
+        updater,
+        "capture_gradle_snapshot",
+        lambda *args: state.workflow.state["snapshot"].model_copy(
+            update={"context_identity": new.identity}
+        ),
+    )
+    rebuilt = updater.rebuild_gradle_run_evidence(
+        state.run,
+        state.workflow.project,
+        state.workflow.publication,
+        7,
+        persist=persist,
+    )
+    assert rebuilt.context == new
+    assert new_path.is_dir()
+    assert old.private_cache_path.exists() is (not persist)
+    durable = updater.load_gradle_run(state.ledger)
+    assert durable is not None
+    assert durable.context == (new if persist else old)
+
+
+def test_failed_rebuild_preserves_durable_context(
+    rebuild_evidence, monkeypatch, tmp_path
+):
+    state = rebuild_evidence
+    old = state.run.context
+    new_path = tmp_path / "replacement-cache"
+    shutil.copytree(old.private_cache_path, new_path)
+    new = old.model_copy(update={"private_cache_path": new_path})
+    monkeypatch.setattr(updater, "initialize_comparison_context", lambda *args: new)
+    monkeypatch.setattr(
+        updater, "release_comparison_context", verification.release_comparison_context
+    )
+    monkeypatch.setattr(
+        updater,
+        "capture_gradle_snapshot",
+        lambda *args: state.workflow.state["snapshot"].model_copy(
+            update={"context_identity": new.identity}
+        ),
+    )
+
+    def fail_save(*args):
+        raise updater.GradleError("ledger write failed")
+
+    monkeypatch.setattr(updater, "save_gradle_run", fail_save)
+    with pytest.raises(updater.GradleError, match="ledger write failed"):
+        updater.rebuild_gradle_run_evidence(
+            state.run, state.workflow.project, state.workflow.publication, 7
+        )
+    assert old.private_cache_path.is_dir()
+    assert not new_path.exists()
+    assert state.ledger.read_bytes() == state.before
+
+
+def test_failed_save_after_replace_keeps_new_context(rebuild_evidence, monkeypatch):
+    state = rebuild_evidence
+    original = updater.save_gradle_run
+
+    def replace_then_fail(path, run):
+        original(path, run)
+        raise updater.GradleError("directory fsync failed after replace")
+
+    monkeypatch.setattr(updater, "save_gradle_run", replace_then_fail)
+    with pytest.raises(updater.GradleError, match="fsync"):
+        updater.rebuild_gradle_run_evidence(
+            state.run, state.workflow.project, state.workflow.publication, 7
+        )
+    durable = updater.load_gradle_run(state.ledger)
+    assert durable is not None and durable.context == state.context
+    assert state.context.private_cache_path.is_dir()
+    assert state.observations.released == []
+
+
+def test_cleanup_retry_is_idempotent_and_keeps_foreign_cache(frozen_context):
+    project, context, _ = frozen_context
+    cache = context.private_cache_path
+    verification.release_comparison_context(context)
+    verification.release_comparison_context(context)
+    cache.mkdir()
+    (cache / ".mm-comparison-owner").write_text("someone-else")
+    with pytest.raises(verification.GradleError, match="ownership"):
+        verification.release_comparison_context(context)
+    assert cache.is_dir()
