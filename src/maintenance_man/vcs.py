@@ -719,3 +719,19 @@ def push_bookmark_and_create_pr(
             return True, f"PR already exists for {bookmark}"
         return False, pr.stderr.strip()
     return True, pr.stdout.strip()
+
+
+def reset_verified_gradle_bookmark(
+    path: Path, bookmark: str, *, expected_base: str, expected_tip: str
+) -> bool:
+    try:
+        guarded = _guarded_tip(bookmark, expected_base, expected_tip)
+        base = f"exactly({expected_base} & ::({guarded}), 1)"
+        result = _run(
+            ["jj", "bookmark", "set", bookmark, "--allow-backwards", "-r", base], path
+        )
+        return (
+            result.returncode == 0 and exact_commit_id(path, bookmark) == expected_base
+        )
+    except GradleError, OSError, subprocess.TimeoutExpired:
+        return False

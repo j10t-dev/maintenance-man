@@ -30,19 +30,26 @@ from maintenance_man.dependency_age import (
 from maintenance_man.deployer import BuildError, run_build
 from maintenance_man.env import project_env
 from maintenance_man.gradle import (
+    GRADLE_CATALOGUE_RELPATH,
     GradleError,
     apply_gradle_update,
     assert_safe_text,
     normalise_alias,
+    parse_catalogue,
+    reclaim_gradle_outputs,
     resolve_gradle_vulnerability_target,
     validate_gradle_recovery,
     validate_gradle_target,
     validate_gradle_target_shape,
 )
-from maintenance_man.gradle_resolution import gradle_routing_prerequisite
+from maintenance_man.gradle_resolution import (
+    collect_gradle_resolution,
+    gradle_routing_prerequisite,
+)
 from maintenance_man.gradle_verification import (
     compare_gradle_snapshots,
     context_inputs_valid,
+    initialize_comparison_context,
     release_comparison_context,
 )
 from maintenance_man.models.config import ProjectConfig
@@ -87,6 +94,7 @@ from maintenance_man.vcs import (
     discard_current_change,
     edit_new_change,
     exact_commit_id,
+    is_ancestor,
     revision_tree_id,
 )
 
@@ -1688,3 +1696,325 @@ def _gradle_evidence_workspace(
             and marker.read_text(encoding="utf-8") == token
         ):
             shutil.rmtree(container)
+
+
+def rebuild_gradle_run_evidence(
+    run: GradleRun,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+    *,
+    persist: bool = True,
+) -> GradleRun:
+    routing = gradle_routing_prerequisite(project)
+    if routing is not None:
+        raise GradleError(routing.reason)
+    if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
+        raise GradleError("Reconcile interrupted attempt before rebuilding context")
+    accepted = [
+        item
+        for item in run.attempts
+        if isinstance(item, (ReadyAttempt, CompletedAttempt))
+    ]
+    with _gradle_evidence_workspace(project, run.base_commit_id) as base_project:
+        catalogue = parse_catalogue(base_project.path / GRADLE_CATALOGUE_RELPATH)
+        resolution = collect_gradle_resolution(base_project, catalogue)
+        if isinstance(resolution, IncompleteResolution):
+            raise GradleError("Recorded baseline cannot produce complete coverage")
+        context = initialize_comparison_context(
+            base_project, resolution, _config.MM_HOME / "gradle-contexts"
+        )
+        run_gradle_checks(base_project, run.project)
+        initial = capture_gradle_snapshot(base_project, context)
+        if isinstance(initial, IncompleteResolution):
+            raise GradleError("Recorded baseline snapshot incomplete")
+    rebuilt_attempts: dict[str, ReadyAttempt | CompletedAttempt] = {}
+    baseline = initial
+    try:
+        for old in accepted:
+            with _gradle_evidence_workspace(
+                project, old.receipt.accepted_commit_id
+            ) as checked_project:
+                checks = run_gradle_checks(checked_project, run.project)
+                after = capture_gradle_snapshot(checked_project, context)
+                if isinstance(after, IncompleteResolution):
+                    raise GradleError("Recorded accepted revision snapshot incomplete")
+                comparison = compare_gradle_snapshots(baseline, after, old.candidate)
+                if not isinstance(comparison, VerifiedComparison):
+                    raise GradleError("Recorded accepted change fails fresh comparison")
+                block = evaluate_gradle_candidate_age(
+                    old.candidate,
+                    minimum_age_days,
+                    publication,
+                    datetime.now(timezone.utc),
+                )
+                if block is not None:
+                    raise GradleError(block.reason)
+                if not old.receipt.verified_fixes <= comparison.removed:
+                    raise GradleError(
+                        "Fresh context cannot prove every credited historical fix"
+                    )
+                receipt = VerificationReceipt(
+                    checked_tree_id=after.tree_id,
+                    accepted_commit_id=old.receipt.accepted_commit_id,
+                    baseline_snapshot_id=baseline.snapshot_id,
+                    after_snapshot_id=after.snapshot_id,
+                    context_identity=context.identity,
+                    checks=checks,
+                    publications=publication.evidence_for(old.candidate),
+                    verified_fixes=comparison.removed,
+                    residual_keys=comparison.residual,
+                )
+                updates = {"baseline": baseline, "after": after, "receipt": receipt}
+                rebuilt_attempts[old.candidate.target.group_key] = type(
+                    old
+                ).model_validate(old.model_copy(update=updates).model_dump(mode="json"))
+                baseline = after
+        attempts = tuple(
+            rebuilt_attempts.get(item.candidate.target.group_key, item)
+            for item in run.attempts
+        )
+        # A failed repair is compared against the newly proven accepted tip.
+        attempts = tuple(
+            item.model_copy(update={"baseline": baseline})
+            if isinstance(item, FailedAttempt)
+            else item
+            for item in attempts
+        )
+        rebuilt = GradleRun.model_validate(
+            run.model_copy(
+                update={
+                    "context": context,
+                    "initial_snapshot": initial,
+                    "accepted_snapshot": baseline,
+                    "attempts": attempts,
+                }
+            ).model_dump(mode="json")
+        )
+        if persist:
+            save_gradle_run(gradle_run_path(run.project), rebuilt)
+            if run.context.private_cache_path != context.private_cache_path:
+                retire_gradle_context(run.context)
+        return rebuilt
+    except BaseException:
+        discard_unpersisted_gradle_context(run.project, context)
+        raise
+
+
+def rollback_failed_gradle_update(run: GradleRun, project: ProjectConfig) -> None:
+    if run.flow != Workflow.UPDATE or any(
+        isinstance(item, ApplyingAttempt) for item in run.attempts
+    ):
+        raise GradleError("Rollback requires a failed update ledger")
+    if not any(isinstance(item, FailedAttempt) for item in run.attempts):
+        raise GradleError("Rollback requires a failed update ledger")
+    reclaim_gradle_outputs(project.path)
+    if (
+        exact_commit_id(project.path, run.managed_bookmark) != run.managed_tip_id
+        or exact_commit_id(project.path, "@-") != run.managed_tip_id
+        or revision_tree_id(project.path, run.managed_tip_id)
+        != run.accepted_snapshot.tree_id
+    ):
+        raise GradleError("Failed update is not a child of its recorded accepted tip")
+    changed = _run(["jj", "diff", "--name-only", "-r", "@"], project.path)
+    if changed.returncode != 0 or set(changed.stdout.splitlines()) - {
+        str(GRADLE_CATALOGUE_RELPATH)
+    }:
+        raise GradleError("Failed update contains changes outside the owned catalogue")
+    if current_change_has_changes(project.path) and not discard_current_change(
+        project.path
+    ):
+        raise GradleError("Could not restore the latest accepted Gradle baseline")
+    if (
+        current_change_has_changes(project.path)
+        or revision_tree_id(project.path) != run.accepted_snapshot.tree_id
+    ):
+        raise GradleError("Failed update rollback did not restore the accepted tree")
+
+
+def reconcile_gradle_applying(
+    run: GradleRun,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+) -> GradleRun:
+    routing = gradle_routing_prerequisite(project)
+    if routing is not None:
+        raise GradleError(routing.reason)
+    pending = [item for item in run.attempts if isinstance(item, ApplyingAttempt)]
+    if len(pending) != 1:
+        raise GradleError("Expected one interrupted Gradle attempt")
+    state = pending[0]
+    complete = (
+        state.after is not None
+        and state.checks is not None
+        and state.checked_tree_id is not None
+    )
+    commit = state.accepted_commit_id
+    parent = exact_commit_id(project.path, "@-")
+    if not complete or (commit is None and parent == run.managed_tip_id):
+        # Includes intent-only, mutation/check interruption and checked intent
+        # saved before commit. None is evidence of an accepted commit.
+        failed = FailedAttempt(
+            candidate=state.candidate,
+            baseline=state.baseline,
+            reason="Interrupted Gradle attempt requires rollback or committed repair",
+            after=state.after,
+        )
+        run = _replace_gradle_attempt(run, failed)
+        save_gradle_run(gradle_run_path(run.project), run)
+        if run.flow == Workflow.UPDATE:
+            rollback_failed_gradle_update(run, project)
+        return run
+    if commit is None:
+        if current_change_has_changes(project.path):
+            raise GradleError(
+                "Interrupted working copy is not an empty committed child"
+            )
+        commit = parent
+    ancestry = is_ancestor(project.path, run.managed_tip_id, commit)
+    if not ancestry.ok or not ancestry.value or commit == run.managed_tip_id:
+        raise GradleError("Interrupted checked commit has no trustworthy run ancestry")
+    if (
+        revision_tree_id(project.path, commit) != state.checked_tree_id
+        or state.after.tree_id != state.checked_tree_id
+    ):
+        raise GradleError("Interrupted commit differs from checked tree")
+    current_tip = exact_commit_id(project.path, run.managed_bookmark)
+    if current_tip not in {run.managed_tip_id, commit}:
+        raise GradleError("Managed bookmark moved outside interrupted attempt")
+    block = validate_gradle_recovery(project, state.candidate.target)
+    if block is not None:
+        raise GradleError(block.reason)
+    after, checks, checked_tree = state.after, state.checks, state.checked_tree_id
+    if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+        # Keep the on-disk intent until BOTH historical accepted work and the
+        # checked interrupted commit have been proven under one fresh context.
+        previous_context = run.context
+        prefix = run.model_copy(
+            update={
+                "attempts": tuple(item for item in run.attempts if item is not state)
+            }
+        )
+        prefix = rebuild_gradle_run_evidence(
+            prefix, project, publication, minimum_age_days, persist=False
+        )
+        try:
+            with _gradle_evidence_workspace(project, commit) as checked_project:
+                checks, after = capture_checked_gradle_snapshot(
+                    checked_project,
+                    run.project,
+                    prefix.context,
+                    expected_tree=state.checked_tree_id,
+                    target=state.candidate.target,
+                )
+                state = state.model_copy(
+                    update={
+                        "baseline": prefix.accepted_snapshot,
+                        "after": after,
+                        "checks": checks,
+                        "accepted_commit_id": commit,
+                    }
+                )
+                run = _replace_gradle_attempt(prefix, state)
+                save_gradle_run(gradle_run_path(run.project), run)
+                if (
+                    previous_context.private_cache_path
+                    != prefix.context.private_cache_path
+                ):
+                    retire_gradle_context(previous_context)
+        except BaseException:
+            discard_unpersisted_gradle_context(run.project, prefix.context)
+            raise
+    comparison = compare_gradle_snapshots(state.baseline, after, state.candidate)
+    if not isinstance(comparison, VerifiedComparison):
+        raise GradleError("Interrupted comparison does not prove acceptance")
+    block = evaluate_gradle_candidate_age(
+        state.candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+    )
+    if block is not None:
+        raise GradleError(block.reason)
+    if not create_or_reset_bookmark(run.managed_bookmark, project.path, commit):
+        raise GradleError("Cannot bind interrupted accepted bookmark")
+    receipt = VerificationReceipt(
+        checked_tree_id=checked_tree,
+        accepted_commit_id=commit,
+        baseline_snapshot_id=state.baseline.snapshot_id,
+        after_snapshot_id=after.snapshot_id,
+        context_identity=run.context.identity,
+        checks=checks,
+        publications=publication.evidence_for(state.candidate),
+        verified_fixes=comparison.removed,
+        residual_keys=comparison.residual,
+    )
+    accepted = ReadyAttempt(
+        candidate=state.candidate,
+        baseline=state.baseline,
+        after=after,
+        receipt=receipt,
+    )
+    run = _replace_gradle_attempt(run, accepted).model_copy(
+        update={"managed_tip_id": commit, "accepted_snapshot": after}
+    )
+    run = GradleRun.model_validate(run.model_dump(mode="json"))
+    save_gradle_run(gradle_run_path(run.project), run)
+    return run
+
+
+def continue_gradle_resolve(
+    run: GradleRun,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+) -> GradleRun:
+    routing = gradle_routing_prerequisite(project)
+    if routing is not None:
+        raise GradleError(routing.reason)
+    if run.flow != Workflow.RESOLVE:
+        raise GradleError("Continuation requires a resolve-owned Gradle run")
+    reclaim_gradle_outputs(project.path)
+    if current_change_has_changes(project.path):
+        raise GradleError("Commit or discard manual changes before --continue")
+    repaired_commit = exact_commit_id(project.path, "@-")
+    ancestry = is_ancestor(project.path, run.managed_tip_id, repaired_commit)
+    if not ancestry.ok or not ancestry.value or repaired_commit == run.managed_tip_id:
+        raise GradleError("Repair must be a committed descendant of the managed tip")
+    failures = [item for item in run.attempts if isinstance(item, FailedAttempt)]
+    if len(failures) != 1:
+        raise GradleError("Expected exactly one preserved resolve blocker")
+    candidate = failures[0].candidate
+    block = validate_gradle_recovery(project, candidate.target)
+    if block is not None:
+        raise GradleError(block.reason)
+    if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+        run = rebuild_gradle_run_evidence(run, project, publication, minimum_age_days)
+    try:
+        return verify_applied_gradle_attempt(
+            run,
+            candidate,
+            project,
+            publication,
+            minimum_age_days,
+            committed_revision=repaired_commit,
+        )
+    except (GradleError, TrivyScanError) as exc:
+        latest = load_gradle_run(gradle_run_path(run.project)) or run
+        state = next(
+            item
+            for item in latest.attempts
+            if item.candidate.target.group_key == candidate.target.group_key
+        )
+        if isinstance(state, ApplyingAttempt) and state.checked_tree_id is not None:
+            raise
+        failed = FailedAttempt(
+            candidate=candidate,
+            baseline=latest.accepted_snapshot,
+            reason=str(exc),
+            after=state.after
+            if isinstance(state, (ApplyingAttempt, FailedAttempt))
+            else None,
+        )
+        save_gradle_run(
+            gradle_run_path(run.project), _replace_gradle_attempt(latest, failed)
+        )
+        raise

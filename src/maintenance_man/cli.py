@@ -1,6 +1,8 @@
+import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum, StrEnum
@@ -132,6 +134,7 @@ from maintenance_man.vcs import (
     push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
+    reset_verified_gradle_bookmark,
     resolve_bookmark_contains_current_change,
     revision_file,
     revision_tree_id,
@@ -2125,74 +2128,6 @@ def _complete_gradle_attempts(run: GradleRun) -> GradleRun:
     )
 
 
-def _finish_verified_gradle_run(
-    run: GradleRun,
-    project: ProjectConfig,
-    results_dir: Path,
-    publication: PublicationLookupContext,
-    minimum_age_days: int,
-) -> GradleRun:
-    routing_block = gradle_routing_prerequisite(project)
-    if routing_block is not None:
-        raise GradleError(routing_block.reason)
-    # Verification reads the accepted revision, not the source workspace's old tree.
-    with gradle_updater._gradle_evidence_workspace(
-        project, run.managed_tip_id
-    ) as verified:
-        if not context_inputs_valid(run.context, verified, datetime.now(timezone.utc)):
-            raise GradleError("Verification expired; preserved for evidence recovery")
-        gradle_updater.gradle_run_finalization_check(
-            run, verified, publication, minimum_age_days
-        )
-    path = gradle_updater.gradle_run_path(run.project)
-    if run.flow == Workflow.RESOLVE:
-        if not run.submitted:
-            ok, output = push_bookmark_and_create_pr(
-                project.path,
-                run.managed_bookmark,
-                expected_base=run.base_commit_id,
-                expected_tip=run.managed_tip_id,
-            )
-            if output:
-                console.print(output)
-            if not ok:
-                raise GradleError(
-                    "Verified Gradle submission failed; retained for retry"
-                )
-            run = _complete_gradle_attempts(run.model_copy(update={"submitted": True}))
-            gradle_updater.save_gradle_run(path, run)
-        return run
-    main = exact_commit_id(project.path, "main")
-    if run.promoted_commit_id is None:
-        if main != run.managed_tip_id:
-            if not promote_bookmark_to_main(
-                project.path,
-                run.managed_bookmark,
-                expected_base=run.base_commit_id,
-                expected_tip=run.managed_tip_id,
-            ):
-                raise GradleError("Main or managed tip changed; promotion refused")
-        # main already equals verified tip also covers crash after promotion but
-        # before this durable record. Finalization above still checks exact tip.
-        run = run.model_copy(update={"promoted_commit_id": run.managed_tip_id})
-        gradle_updater.save_gradle_run(path, run)
-    elif run.promoted_commit_id != run.managed_tip_id or main != run.promoted_commit_id:
-        raise GradleError("Main moved after recorded Gradle promotion")
-    if not run.refreshed:
-        if not refresh_working_copy_from_main(project.path):
-            raise GradleError(
-                "Promotion recorded; working-copy refresh failed, retry update"
-            )
-        if exact_commit_id(project.path, "main") != run.managed_tip_id:
-            raise GradleError("Main moved during refresh")
-        _publish_verified_gradle_scan(
-            run, project, results_dir, publication, minimum_age_days
-        )
-        run = _complete_gradle_attempts(run.model_copy(update={"refreshed": True}))
-        gradle_updater.save_gradle_run(path, run)
-    return run
-
-
 def _publish_verified_gradle_scan(
     run: GradleRun,
     project: ProjectConfig,
@@ -2307,179 +2242,6 @@ def _require_gradle_accepted_workspace(run: GradleRun, project: ProjectConfig) -
         raise GradleError(
             "Working revision differs from the recorded accepted snapshot"
         )
-
-
-def _run_gradle_flow(
-    project_name: str,
-    project: ProjectConfig,
-    results_dir: Path,
-    flow: Workflow,
-    *,
-    interactive: bool,
-    minimum_age_days: int,
-    continue_: bool = False,
-) -> int:
-    try:
-        path = gradle_updater.gradle_run_path(project_name)
-        run = gradle_updater.load_gradle_run(path)
-        if run is not None and not (run.refreshed or run.submitted):
-            raise GradleError(
-                "An unfinished Gradle run requires recovery; preserved without effects"
-            )
-        if run is not None and (run.refreshed or run.submitted):
-            gradle_updater.retire_gradle_context(run.context)
-            if continue_:
-                return ExitCode.OK
-            run = None
-        if run is not None and (run.project != project_name or run.flow != flow):
-            raise GradleError("Another Gradle workflow owns the unfinished ledger")
-        if run is None:
-            if continue_:
-                raise GradleError("No preserved Gradle resolve attempt to continue")
-            try:
-                scan_result = load_scan_results(project_name, results_dir)
-            except NoScanResultsError:
-                scan_result = ScanResult(
-                    project=project_name,
-                    scanned_at=datetime.now(timezone.utc),
-                    trivy_target=str(project.path),
-                )
-            legacy = [
-                item
-                for item in (*scan_result.vulnerabilities, *scan_result.updates)
-                if item.update_status in {UpdateStatus.FAILED, UpdateStatus.READY}
-            ]
-            if legacy:
-                raise GradleError(
-                    "Legacy Gradle progress has no revision-bound ledger; "
-                    "manual review required"
-                )
-            if flow == Workflow.UPDATE:
-                _gradle_workspace_revision(project_name, project, "main")
-            if not prune_stale_bookmarks(project.path) or not ensure_main_bookmark(
-                project.path
-            ):
-                raise GradleError("Cannot prepare main")
-            base = exact_commit_id(project.path, "main")
-            bookmark = (
-                _UPDATE_BOOKMARK if flow == Workflow.UPDATE else _RESOLVE_BOOKMARK
-            )
-            if flow == Workflow.UPDATE:
-                _gradle_workspace_revision(project_name, project, base)
-                remove_workspace(project.path, project_name)
-                if not create_workspace(project.path, project_name, base):
-                    raise GradleError("Cannot prepare Gradle workspace")
-                work = project.model_copy(
-                    update={"path": workspace_path_for_project(project_name)}
-                )
-            else:
-                if current_change_has_changes(project.path):
-                    raise GradleError("Commit or discard source edits before resolve")
-                work = project
-            if not edit_new_change(work.path, base):
-                raise GradleError("Cannot prepare empty Gradle change")
-            if not create_or_reset_bookmark(bookmark, work.path, base):
-                raise GradleError("Cannot create managed Gradle bookmark")
-        else:
-            if flow == Workflow.UPDATE:
-                workspace = workspace_path_for_project(project_name)
-                if not workspace.exists():
-                    if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
-                        raise GradleError(
-                            "Interrupted workspace missing; manual review required"
-                        )
-                    if not create_workspace(
-                        project.path, project_name, run.managed_tip_id
-                    ):
-                        raise GradleError("Cannot resume verified workspace")
-                    if not edit_new_change(workspace, run.managed_tip_id):
-                        raise GradleError("Cannot create resumed empty change")
-                work = project.model_copy(update={"path": workspace})
-            else:
-                work = project
-            expected_main = run.promoted_commit_id or run.base_commit_id
-            main = exact_commit_id(project.path, "main")
-            if main not in {expected_main, run.managed_tip_id}:
-                raise GradleError("Main moved outside the recorded Gradle run")
-            if not any(isinstance(item, ApplyingAttempt) for item in run.attempts):
-                if (
-                    exact_commit_id(work.path, run.managed_bookmark)
-                    != run.managed_tip_id
-                ):
-                    raise GradleError("Managed Gradle bookmark changed")
-        with PublicationLookupContext(
-            _config.MM_HOME / "gradle-publications"
-        ) as publication:
-            if run is None:
-                proposals = discover_gradle_updates(work)
-                if not proposals and not scan_result.vulnerabilities:
-                    console.print("No catalogue updates available")
-                    if flow == Workflow.UPDATE:
-                        remove_workspace(project.path, project_name)
-                    return ExitCode.OK
-                gradle_updater.gradle_check_commands(work)
-                run = _prepare_gradle_run(
-                    project_name,
-                    work,
-                    flow,
-                    base,
-                    publication,
-                    minimum_age_days,
-                    interactive,
-                    discovered=proposals,
-                )
-            if continue_:
-                raise GradleError("Continuation requires the recovery increment")
-            elif any(isinstance(item, FailedAttempt) for item in run.attempts):
-                raise GradleError(
-                    "Preserved Gradle failure requires manual review "
-                    "or resolve --continue"
-                )
-            # Committed resolve repair is separately verified above and becomes
-            # the new accepted tip before automatic processing can resume.
-            _require_gradle_accepted_workspace(run, work)
-            if not context_inputs_valid(run.context, work, datetime.now(timezone.utc)):
-                raise GradleError(
-                    "Verification context expired; preserved for evidence recovery"
-                )
-            run = gradle_updater.process_gradle_run(
-                run, work, publication, minimum_age_days
-            )
-            for item in run.attempts:
-                console.print(f"{item.candidate.target.display_name}: {item.state}")
-                if isinstance(item, (WithheldAttempt, FailedAttempt)):
-                    console.print(item.reason)
-            if any(
-                isinstance(item, (ApplyingAttempt, FailedAttempt, PlannedAttempt))
-                for item in run.attempts
-            ):
-                return ExitCode.UPDATE_FAILED
-            if not any(
-                isinstance(item, (ReadyAttempt, CompletedAttempt))
-                for item in run.attempts
-            ):
-                console.print("No eligible Gradle changes")
-                # A clean/withheld-only run has no effects requiring recovery.
-                path.unlink(missing_ok=True)
-                release_comparison_context(run.context)
-                if flow == Workflow.UPDATE:
-                    remove_workspace(project.path, project_name)
-                return (
-                    ExitCode.UPDATE_FAILED
-                    if run.attempts
-                    or run.selection_blocks
-                    or run.initial_snapshot.findings
-                    else ExitCode.OK
-                )
-            run = _finish_verified_gradle_run(
-                run, project, results_dir, publication, minimum_age_days
-            )
-        if flow == Workflow.UPDATE and run.refreshed:
-            remove_workspace(project.path, project_name)
-        return ExitCode.OK
-    except (GradleError, TrivyScanError, _UpdateSetupError, OSError) as exc:
-        console.print(f"Cannot complete Gradle {flow}: {exc}")
-        return ExitCode.UPDATE_FAILED
 
 
 def _run_update_flow(
@@ -2776,3 +2538,310 @@ def _handle_resolve_continue(
         _ordered_resolve_candidates(scan_result, proj_config, minimum_age_days),
         minimum_age_days,
     )
+
+
+def _finish_verified_gradle_run(
+    run: GradleRun,
+    project: ProjectConfig,
+    results_dir: Path,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+) -> GradleRun:
+    routing_block = gradle_routing_prerequisite(project)
+    if routing_block is not None:
+        raise GradleError(routing_block.reason)
+    # Verification reads the accepted revision, not the source workspace's old tree.
+    with gradle_updater._gradle_evidence_workspace(
+        project, run.managed_tip_id
+    ) as verified:
+        if not context_inputs_valid(run.context, verified, datetime.now(timezone.utc)):
+            run = gradle_updater.rebuild_gradle_run_evidence(
+                run, verified, publication, minimum_age_days
+            )
+        gradle_updater.gradle_run_finalization_check(
+            run, verified, publication, minimum_age_days
+        )
+    path = gradle_updater.gradle_run_path(run.project)
+    if run.flow == Workflow.RESOLVE:
+        if not run.submitted:
+            ok, output = push_bookmark_and_create_pr(
+                project.path,
+                run.managed_bookmark,
+                expected_base=run.base_commit_id,
+                expected_tip=run.managed_tip_id,
+            )
+            if output:
+                console.print(output)
+            if not ok:
+                raise GradleError(
+                    "Verified Gradle submission failed; retained for retry"
+                )
+            run = _complete_gradle_attempts(run.model_copy(update={"submitted": True}))
+            gradle_updater.save_gradle_run(path, run)
+        return run
+    main = exact_commit_id(project.path, "main")
+    if run.promoted_commit_id is None:
+        if main != run.managed_tip_id:
+            if not promote_bookmark_to_main(
+                project.path,
+                run.managed_bookmark,
+                expected_base=run.base_commit_id,
+                expected_tip=run.managed_tip_id,
+            ):
+                raise GradleError("Main or managed tip changed; promotion refused")
+        # main already equals verified tip also covers crash after promotion but
+        # before this durable record. Finalization above still checks exact tip.
+        run = run.model_copy(update={"promoted_commit_id": run.managed_tip_id})
+        gradle_updater.save_gradle_run(path, run)
+    elif run.promoted_commit_id != run.managed_tip_id or main != run.promoted_commit_id:
+        raise GradleError("Main moved after recorded Gradle promotion")
+    if not run.refreshed:
+        if not refresh_working_copy_from_main(project.path):
+            raise GradleError(
+                "Promotion recorded; working-copy refresh failed, retry update"
+            )
+        if exact_commit_id(project.path, "main") != run.managed_tip_id:
+            raise GradleError("Main moved during refresh")
+        _publish_verified_gradle_scan(
+            run, project, results_dir, publication, minimum_age_days
+        )
+        run = _complete_gradle_attempts(run.model_copy(update={"refreshed": True}))
+        gradle_updater.save_gradle_run(path, run)
+    return run
+
+
+def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> None:
+    if (
+        run.flow != Workflow.UPDATE
+        or run.promoted_commit_id is not None
+        or any(isinstance(item, ApplyingAttempt) for item in run.attempts)
+        or not any(isinstance(item, FailedAttempt) for item in run.attempts)
+    ):
+        raise GradleError("Only rolled-back failed update runs can restart")
+    workspace = workspace_path_for_project(run.project)
+    if not workspace.exists() or current_change_has_changes(project.path):
+        raise GradleError(
+            "Uncommitted or missing failed workspace requires manual review"
+        )
+    # Repeat guarded rollback after a crash between saving Failed and restoring.
+    gradle_updater.rollback_failed_gradle_update(
+        run, project.model_copy(update={"path": workspace})
+    )
+    if current_change_has_changes(workspace):
+        raise GradleError(
+            "Uncommitted or missing failed workspace requires manual review"
+        )
+    if (
+        exact_commit_id(project.path, "main") != run.base_commit_id
+        or exact_commit_id(workspace, run.managed_bookmark) != run.managed_tip_id
+        or exact_commit_id(workspace, "@-") != run.managed_tip_id
+        or revision_tree_id(workspace) != run.accepted_snapshot.tree_id
+        or revision_tree_id(workspace, run.managed_tip_id)
+        != run.accepted_snapshot.tree_id
+    ):
+        raise GradleError(
+            "Failed update rollback cannot be proven; retained for manual review"
+        )
+    path = gradle_updater.gradle_run_path(run.project)
+    archive = path.parent / "history" / f"{path.stem}-{uuid.uuid4().hex}.json"
+    gradle_updater.save_gradle_run(archive, run)
+    if not reset_verified_gradle_bookmark(
+        project.path,
+        run.managed_bookmark,
+        expected_base=run.base_commit_id,
+        expected_tip=run.managed_tip_id,
+    ):
+        raise GradleError("Revisions changed during restart; original ledger retained")
+    path.unlink()
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    gradle_updater.retire_gradle_context(run.context)
+    console.print(
+        f"Archived failed Gradle run to {archive}; rebuilding candidates from main"
+    )
+
+
+def _run_gradle_flow(
+    project_name: str,
+    project: ProjectConfig,
+    results_dir: Path,
+    flow: Workflow,
+    *,
+    interactive: bool,
+    minimum_age_days: int,
+    continue_: bool = False,
+) -> int:
+    try:
+        path = gradle_updater.gradle_run_path(project_name)
+        run = gradle_updater.load_gradle_run(path)
+        if run is not None and (run.refreshed or run.submitted):
+            gradle_updater.retire_gradle_context(run.context)
+            if continue_:
+                return ExitCode.OK
+            run = None
+        if (
+            run is not None
+            and run.flow == Workflow.UPDATE
+            and not continue_
+            and any(isinstance(item, FailedAttempt) for item in run.attempts)
+        ):
+            _archive_rolled_back_gradle_run(run, project)
+            run = None
+        if run is not None and (run.project != project_name or run.flow != flow):
+            raise GradleError("Another Gradle workflow owns the unfinished ledger")
+        if run is None:
+            if continue_:
+                raise GradleError("No preserved Gradle resolve attempt to continue")
+            try:
+                scan_result = load_scan_results(project_name, results_dir)
+            except NoScanResultsError:
+                scan_result = ScanResult(
+                    project=project_name,
+                    scanned_at=datetime.now(timezone.utc),
+                    trivy_target=str(project.path),
+                )
+            legacy = [
+                item
+                for item in (*scan_result.vulnerabilities, *scan_result.updates)
+                if item.update_status in {UpdateStatus.FAILED, UpdateStatus.READY}
+            ]
+            if legacy:
+                raise GradleError(
+                    "Legacy Gradle progress has no revision-bound ledger; "
+                    "manual review required"
+                )
+            if flow == Workflow.UPDATE:
+                _gradle_workspace_revision(project_name, project, "main")
+            if not prune_stale_bookmarks(project.path) or not ensure_main_bookmark(
+                project.path
+            ):
+                raise GradleError("Cannot prepare main")
+            base = exact_commit_id(project.path, "main")
+            bookmark = (
+                _UPDATE_BOOKMARK if flow == Workflow.UPDATE else _RESOLVE_BOOKMARK
+            )
+            if flow == Workflow.UPDATE:
+                _gradle_workspace_revision(project_name, project, base)
+                remove_workspace(project.path, project_name)
+                if not create_workspace(project.path, project_name, base):
+                    raise GradleError("Cannot prepare Gradle workspace")
+                work = project.model_copy(
+                    update={"path": workspace_path_for_project(project_name)}
+                )
+            else:
+                if current_change_has_changes(project.path):
+                    raise GradleError("Commit or discard source edits before resolve")
+                work = project
+            if not edit_new_change(work.path, base):
+                raise GradleError("Cannot prepare empty Gradle change")
+            if not create_or_reset_bookmark(bookmark, work.path, base):
+                raise GradleError("Cannot create managed Gradle bookmark")
+        else:
+            if flow == Workflow.UPDATE:
+                workspace = workspace_path_for_project(project_name)
+                if not workspace.exists():
+                    if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
+                        raise GradleError(
+                            "Interrupted workspace missing; manual review required"
+                        )
+                    if not create_workspace(
+                        project.path, project_name, run.managed_tip_id
+                    ):
+                        raise GradleError("Cannot resume verified workspace")
+                    if not edit_new_change(workspace, run.managed_tip_id):
+                        raise GradleError("Cannot create resumed empty change")
+                work = project.model_copy(update={"path": workspace})
+            else:
+                work = project
+            expected_main = run.promoted_commit_id or run.base_commit_id
+            main = exact_commit_id(project.path, "main")
+            if main not in {expected_main, run.managed_tip_id}:
+                raise GradleError("Main moved outside the recorded Gradle run")
+            if not any(isinstance(item, ApplyingAttempt) for item in run.attempts):
+                if (
+                    exact_commit_id(work.path, run.managed_bookmark)
+                    != run.managed_tip_id
+                ):
+                    raise GradleError("Managed Gradle bookmark changed")
+        with PublicationLookupContext(
+            _config.MM_HOME / "gradle-publications"
+        ) as publication:
+            if run is None:
+                proposals = discover_gradle_updates(work)
+                if not proposals and not scan_result.vulnerabilities:
+                    console.print("No catalogue updates available")
+                    if flow == Workflow.UPDATE:
+                        remove_workspace(project.path, project_name)
+                    return ExitCode.OK
+                gradle_updater.gradle_check_commands(work)
+                run = _prepare_gradle_run(
+                    project_name,
+                    work,
+                    flow,
+                    base,
+                    publication,
+                    minimum_age_days,
+                    interactive,
+                    discovered=proposals,
+                )
+            if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
+                run = gradle_updater.reconcile_gradle_applying(
+                    run, work, publication, minimum_age_days
+                )
+            if continue_:
+                run = gradle_updater.continue_gradle_resolve(
+                    run, work, publication, minimum_age_days
+                )
+            elif any(isinstance(item, FailedAttempt) for item in run.attempts):
+                raise GradleError(
+                    "Preserved Gradle failure requires manual review "
+                    "or resolve --continue"
+                )
+            # Committed resolve repair is separately verified above and becomes
+            # the new accepted tip before automatic processing can resume.
+            _require_gradle_accepted_workspace(run, work)
+            if not context_inputs_valid(run.context, work, datetime.now(timezone.utc)):
+                run = gradle_updater.rebuild_gradle_run_evidence(
+                    run, work, publication, minimum_age_days
+                )
+            run = gradle_updater.process_gradle_run(
+                run, work, publication, minimum_age_days
+            )
+            for item in run.attempts:
+                console.print(f"{item.candidate.target.display_name}: {item.state}")
+                if isinstance(item, (WithheldAttempt, FailedAttempt)):
+                    console.print(item.reason)
+            if any(
+                isinstance(item, (ApplyingAttempt, FailedAttempt, PlannedAttempt))
+                for item in run.attempts
+            ):
+                return ExitCode.UPDATE_FAILED
+            if not any(
+                isinstance(item, (ReadyAttempt, CompletedAttempt))
+                for item in run.attempts
+            ):
+                console.print("No eligible Gradle changes")
+                # A clean/withheld-only run has no effects requiring recovery.
+                path.unlink(missing_ok=True)
+                release_comparison_context(run.context)
+                if flow == Workflow.UPDATE:
+                    remove_workspace(project.path, project_name)
+                return (
+                    ExitCode.UPDATE_FAILED
+                    if run.attempts
+                    or run.selection_blocks
+                    or run.initial_snapshot.findings
+                    else ExitCode.OK
+                )
+            run = _finish_verified_gradle_run(
+                run, project, results_dir, publication, minimum_age_days
+            )
+        if flow == Workflow.UPDATE and run.refreshed:
+            remove_workspace(project.path, project_name)
+        return ExitCode.OK
+    except (GradleError, TrivyScanError, _UpdateSetupError, OSError) as exc:
+        console.print(f"Cannot complete Gradle {flow}: {exc}")
+        return ExitCode.UPDATE_FAILED

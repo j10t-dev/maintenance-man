@@ -9,13 +9,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from maintenance_man import cli, scanner, updater
 from maintenance_man import gradle_verification as verification
-from maintenance_man import scanner, updater
 from maintenance_man.cli import _gradle_workspace_revision as _SDK_WORKSPACE_CHECK
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
+    ApplyingAttempt,
     CheckEvidence,
+    CompletedAttempt,
     CompleteResolution,
+    FailedAttempt,
     FindingEvidence,
     FindingKey,
     GradleCandidate,
@@ -41,6 +44,7 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.updater import run_gradle_checks as _RUN_GRADLE_CHECKS
+from maintenance_man.vcs import RevisionCheck
 
 
 @pytest.fixture
@@ -473,6 +477,7 @@ def workflow(frozen_context, resolution, candidate, scope, monkeypatch, tmp_path
 
     def apply(*args):
         stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+        assert stored is not None
         assert stored is not None
         assert stored.attempts[0].state == "applying"
         effects.append("apply")
@@ -1134,3 +1139,753 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
     assert effects == (["build"] if failure == "build" else ["build", "tests"])
     assert workflow.effects == []
     assert updater.load_gradle_run(updater.gradle_run_path("sample")) is None
+
+
+@pytest.mark.parametrize("minimum_age_days", [0, 7])
+def test_gradle_finalization_rechecks_routing(
+    workflow, monkeypatch, tmp_path, minimum_age_days
+):
+    run = ready_workflow(workflow)
+    undeclared = workflow.project.model_copy(update={"gradle_repository_routing": None})
+    before = updater.gradle_run_path(run.project).read_bytes()
+    monkeypatch.setattr(
+        cli,
+        "promote_bookmark_to_main",
+        lambda *args, **kwargs: pytest.fail("promotion without routing declaration"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "push_bookmark_and_create_pr",
+        lambda *args, **kwargs: pytest.fail("submission without routing declaration"),
+    )
+    with pytest.raises(
+        updater.GradleError, match="Public repository routing has not been declared"
+    ):
+        cli._finish_verified_gradle_run(
+            run, undeclared, tmp_path, workflow.publication, minimum_age_days
+        )
+    assert updater.gradle_run_path(run.project).read_bytes() == before
+
+
+@pytest.mark.parametrize("stage", ["intent", "mutated", "checked-before-commit"])
+@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
+def test_gradle_uncommitted_interruption_becomes_failed(
+    workflow, monkeypatch, stage, flow
+):
+    run = begin_workflow(workflow, flow)
+    checked = stage == "checked-before-commit"
+    state = ApplyingAttempt(
+        candidate=workflow.candidate,
+        baseline=workflow.initial,
+        after=workflow.after if checked else None,
+        checks=updater.run_gradle_checks(workflow.project, "sample")
+        if checked
+        else None,
+        checked_tree_id="after-tree" if checked else None,
+    )
+    run = updater._replace_gradle_attempt(run, state)
+    updater.save_gradle_run(updater.gradle_run_path("sample"), run)
+    dirty = stage != "intent"
+    workflow.state["tree"] = "after-tree" if dirty else "base-tree"
+    monkeypatch.setattr(updater, "exact_commit_id", lambda *args: "base")
+    monkeypatch.setattr(updater, "reclaim_gradle_outputs", lambda *args: None)
+    monkeypatch.setattr(
+        updater,
+        "current_change_has_changes",
+        lambda *args: workflow.state["tree"] != "base-tree",
+    )
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        updater,
+        "_run",
+        lambda *args: SimpleNamespace(
+            returncode=0,
+            stdout=str(updater.GRADLE_CATALOGUE_RELPATH) + "\n" if dirty else "",
+        ),
+    )
+    original_discard = updater.discard_current_change
+
+    def discard(path):
+        stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+        assert stored is not None
+        assert isinstance(stored.attempts[0], FailedAttempt)
+        return original_discard(path)
+
+    monkeypatch.setattr(updater, "discard_current_change", discard)
+    result = updater.reconcile_gradle_applying(
+        run, workflow.project, workflow.publication, 7
+    )
+    assert isinstance(result.attempts[0], FailedAttempt)
+    assert result.attempts[0].after == (workflow.after if checked else None)
+    assert result.managed_tip_id == "base"
+    assert workflow.effects == (
+        ["discard"] if flow == Workflow.UPDATE and dirty else []
+    )
+    assert workflow.state["tree"] == (
+        "after-tree" if flow == Workflow.RESOLVE and dirty else "base-tree"
+    )
+
+
+@pytest.mark.parametrize("unsafe", [None, "parent", "bookmark", "other-file"])
+def test_gradle_failed_save_before_rollback_is_recoverable(
+    workflow, monkeypatch, unsafe
+):
+    run = begin_workflow(workflow)
+    run = updater._replace_gradle_attempt(
+        run,
+        FailedAttempt(
+            candidate=workflow.candidate,
+            baseline=workflow.initial,
+            reason="Interrupted before rollback",
+        ),
+    )
+    updater.save_gradle_run(updater.gradle_run_path("sample"), run)
+    workflow.state["tree"] = "after-tree"
+    monkeypatch.setattr(updater, "reclaim_gradle_outputs", lambda *args: None)
+
+    def revision(path, rev):
+        return (
+            "unrelated"
+            if (unsafe == "parent" and rev == "@-")
+            or (unsafe == "bookmark" and rev == run.managed_bookmark)
+            else "base"
+        )
+
+    monkeypatch.setattr(updater, "exact_commit_id", revision)
+    monkeypatch.setattr(
+        updater,
+        "current_change_has_changes",
+        lambda *args: workflow.state["tree"] != "base-tree",
+    )
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        updater,
+        "_run",
+        lambda *args: SimpleNamespace(
+            returncode=0,
+            stdout="build.gradle.kts\n"
+            if unsafe == "other-file"
+            else str(updater.GRADLE_CATALOGUE_RELPATH) + "\n",
+        ),
+    )
+    before = updater.gradle_run_path("sample").read_bytes()
+    if unsafe:
+        with pytest.raises(updater.GradleError):
+            updater.rollback_failed_gradle_update(run, workflow.project)
+        assert workflow.effects == []
+        assert workflow.state["tree"] == "after-tree"
+    else:
+        original_discard = updater.discard_current_change
+
+        def interrupted_discard(path):
+            saved = updater.load_gradle_run(updater.gradle_run_path("sample"))
+            assert saved is not None
+            assert isinstance(saved.attempts[0], FailedAttempt)
+            raise updater.GradleError("simulated crash before restore")
+
+        monkeypatch.setattr(updater, "discard_current_change", interrupted_discard)
+        with pytest.raises(updater.GradleError, match="crash before restore"):
+            updater.rollback_failed_gradle_update(run, workflow.project)
+        assert workflow.state["tree"] == "after-tree"
+        monkeypatch.setattr(updater, "discard_current_change", original_discard)
+        stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+        assert stored is not None
+        updater.rollback_failed_gradle_update(stored, workflow.project)
+        updater.rollback_failed_gradle_update(stored, workflow.project)
+        assert workflow.effects == ["discard"]
+        assert workflow.state["tree"] == "base-tree"
+    assert updater.gradle_run_path("sample").read_bytes() == before
+
+
+def test_gradle_resolve_interrupted_before_checks_accepts_only_committed_repair(
+    workflow, monkeypatch
+):
+    run = begin_workflow(workflow, Workflow.RESOLVE)
+    run = updater._replace_gradle_attempt(
+        run, ApplyingAttempt(candidate=workflow.candidate, baseline=workflow.initial)
+    )
+    updater.save_gradle_run(updater.gradle_run_path("sample"), run)
+    workflow.state.update(snapshot=workflow.after, tree="after-tree")
+    monkeypatch.setattr(
+        updater,
+        "exact_commit_id",
+        lambda path, rev: "base" if rev == run.managed_bookmark else "repair",
+    )
+    monkeypatch.setattr(updater, "current_change_has_changes", lambda *args: False)
+    monkeypatch.setattr(updater, "reclaim_gradle_outputs", lambda *args: None)
+    monkeypatch.setattr(
+        updater, "is_ancestor", lambda *args: RevisionCheck(ok=True, value=True)
+    )
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: True)
+    failed = updater.reconcile_gradle_applying(
+        run, workflow.project, workflow.publication, 7
+    )
+    assert isinstance(failed.attempts[0], FailedAttempt)
+    assert workflow.effects == []
+    repaired = updater.continue_gradle_resolve(
+        failed, workflow.project, workflow.publication, 7
+    )
+    assert isinstance(repaired.attempts[0], ReadyAttempt)
+    assert repaired.managed_tip_id == "repair"
+    assert "apply" not in workflow.effects
+    assert "commit" not in workflow.effects
+    assert "discard" not in workflow.effects
+
+
+@contextmanager
+def same_proof_workspace(project, revision):
+    yield project
+
+
+def ready_workflow(workflow):
+    return updater.process_gradle_run(
+        begin_workflow(workflow), workflow.project, workflow.publication, 7
+    )
+
+
+def finalizer_effects(workflow, monkeypatch, run):
+    state = {
+        "main": run.base_commit_id,
+        "promotions": 0,
+        "refreshes": 0,
+        "published": 0,
+    }
+    monkeypatch.setattr(updater, "_gradle_evidence_workspace", same_proof_workspace)
+    monkeypatch.setattr(cli, "context_inputs_valid", lambda *args: True)
+    monkeypatch.setattr(
+        cli,
+        "exact_commit_id",
+        lambda path, rev: state["main"] if rev == "main" else run.managed_tip_id,
+    )
+
+    def promote(path, bookmark, *, expected_base, expected_tip):
+        assert (bookmark, expected_base, expected_tip) == (
+            run.managed_bookmark,
+            "base",
+            "accepted",
+        )
+        assert state["main"] == expected_base
+        state["main"] = expected_tip
+        state["promotions"] += 1
+        return True
+
+    def refresh(path):
+        saved = updater.load_gradle_run(updater.gradle_run_path(run.project))
+        assert saved is not None
+        assert saved.promoted_commit_id == "accepted"
+        state["refreshes"] += 1
+        return state["refreshes"] > 1
+
+    def publish(*args):
+        state["published"] += 1
+
+    monkeypatch.setattr(cli, "promote_bookmark_to_main", promote)
+    monkeypatch.setattr(cli, "refresh_working_copy_from_main", refresh)
+    monkeypatch.setattr(cli, "_publish_verified_gradle_scan", publish)
+    return state
+
+
+def test_gradle_retry_refresh_never_reapplies_or_repromotes(
+    workflow, monkeypatch, tmp_path
+):
+    run = ready_workflow(workflow)
+    state = finalizer_effects(workflow, monkeypatch, run)
+    with pytest.raises(updater.GradleError, match="refresh failed"):
+        cli._finish_verified_gradle_run(
+            run, workflow.project, tmp_path, workflow.publication, 7
+        )
+    saved = updater.load_gradle_run(updater.gradle_run_path(run.project))
+    assert saved is not None
+    assert saved.promoted_commit_id == "accepted"
+    assert not saved.refreshed
+    finished = cli._finish_verified_gradle_run(
+        saved, workflow.project, tmp_path, workflow.publication, 7
+    )
+    assert finished.refreshed
+    assert isinstance(finished.attempts[0], CompletedAttempt)
+    assert state == {
+        "main": "accepted",
+        "promotions": 1,
+        "refreshes": 2,
+        "published": 1,
+    }
+    assert workflow.effects.count("apply") == 1
+
+
+def test_gradle_crash_after_promotion_before_ledger_is_recognized(
+    workflow, monkeypatch, tmp_path
+):
+    run = ready_workflow(workflow)
+    state = finalizer_effects(workflow, monkeypatch, run)
+    original_save = updater.save_gradle_run
+    crashed = False
+
+    def crash_save(path, value):
+        nonlocal crashed
+        if value.promoted_commit_id and not crashed:
+            crashed = True
+            raise updater.GradleError("simulated durable-write crash")
+        original_save(path, value)
+
+    monkeypatch.setattr(updater, "save_gradle_run", crash_save)
+    with pytest.raises(updater.GradleError, match="durable-write"):
+        cli._finish_verified_gradle_run(
+            run, workflow.project, tmp_path, workflow.publication, 7
+        )
+    stored = updater.load_gradle_run(updater.gradle_run_path(run.project))
+    assert stored is not None
+    assert stored.promoted_commit_id is None
+    state["refreshes"] = 1
+    finished = cli._finish_verified_gradle_run(
+        stored, workflow.project, tmp_path, workflow.publication, 7
+    )
+    assert finished.refreshed
+    assert state["promotions"] == 1
+    assert workflow.effects.count("apply") == 1
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_gradle_checked_commit_recovery_does_not_apply_twice(
+    workflow, monkeypatch, stale
+):
+    run = begin_workflow(workflow)
+    original_save = updater.save_gradle_run
+    crashed = False
+
+    def crash_after_commit(path, value):
+        nonlocal crashed
+        item = value.attempts[0]
+        if (
+            isinstance(item, ApplyingAttempt)
+            and item.accepted_commit_id is not None
+            and not crashed
+        ):
+            crashed = True
+            raise updater.GradleError("simulated commit crash")
+        original_save(path, value)
+
+    monkeypatch.setattr(updater, "save_gradle_run", crash_after_commit)
+    with pytest.raises(updater.GradleError, match="commit crash"):
+        updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    interrupted = updater.load_gradle_run(updater.gradle_run_path(run.project))
+    assert interrupted is not None
+    assert isinstance(interrupted.attempts[0], ApplyingAttempt)
+    assert interrupted.attempts[0].checked_tree_id == "after-tree"
+    assert interrupted.attempts[0].accepted_commit_id is None
+    monkeypatch.setattr(updater, "current_change_has_changes", lambda *args: False)
+    monkeypatch.setattr(
+        updater,
+        "exact_commit_id",
+        lambda path, rev: "base" if rev == run.managed_bookmark else "accepted",
+    )
+    monkeypatch.setattr(
+        updater, "is_ancestor", lambda *args: RevisionCheck(ok=True, value=True)
+    )
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: not stale)
+    visited = []
+
+    @contextmanager
+    def proof(project, revision):
+        visited.append(revision)
+        workflow.state.update(
+            snapshot=workflow.initial if revision == "base" else workflow.after,
+            tree="base-tree" if revision == "base" else "after-tree",
+        )
+        yield project
+
+    monkeypatch.setattr(updater, "_gradle_evidence_workspace", proof)
+    monkeypatch.setattr(updater, "parse_catalogue", lambda *args: object())
+    monkeypatch.setattr(
+        updater, "collect_gradle_resolution", lambda *args: workflow.initial.resolution
+    )
+    monkeypatch.setattr(
+        updater, "initialize_comparison_context", lambda *args: workflow.context
+    )
+    recovered = updater.reconcile_gradle_applying(
+        interrupted, workflow.project, workflow.publication, 7
+    )
+    assert recovered.attempts[0].state == "ready"
+    assert recovered.managed_tip_id == "accepted"
+    assert workflow.effects.count("apply") == 1
+    assert workflow.effects.count("commit") == 1
+    assert visited == (["base", "accepted"] if stale else [])
+
+
+def test_gradle_rejected_snapshot_survives_resolve_retry(workflow, monkeypatch):
+    security = workflow.candidate.model_copy(
+        update={
+            "origins": frozenset({"security"}),
+            "requested_advisories": frozenset({"CVE-1"}),
+            "requested_coordinates": frozenset({"g:lib"}),
+        }
+    )
+    failed = updater.process_gradle_run(
+        begin_workflow(workflow, Workflow.RESOLVE, security),
+        workflow.project,
+        workflow.publication,
+        7,
+    )
+    assert isinstance(failed.attempts[0], FailedAttempt)
+    assert failed.attempts[0].after == workflow.after
+    monkeypatch.setattr(updater, "reclaim_gradle_outputs", lambda *args: None)
+    monkeypatch.setattr(updater, "current_change_has_changes", lambda *args: False)
+    monkeypatch.setattr(
+        updater, "is_ancestor", lambda *args: RevisionCheck(ok=True, value=True)
+    )
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    with pytest.raises(updater.GradleError, match="Security verification"):
+        updater.continue_gradle_resolve(
+            failed, workflow.project, workflow.publication, 7
+        )
+    stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert stored is not None
+    assert isinstance(stored.attempts[0], FailedAttempt)
+    assert stored.attempts[0].state == "failed"
+    assert stored.attempts[0].after == workflow.after
+    assert workflow.effects == ["apply"]
+
+
+def test_gradle_cli_uses_ledger_even_without_scan_results(
+    workflow, monkeypatch, tmp_path
+):
+    run = ready_workflow(workflow)
+    monkeypatch.setattr(
+        cli, "workspace_path_for_project", lambda *args: workflow.project.path
+    )
+    monkeypatch.setattr(
+        cli,
+        "exact_commit_id",
+        lambda path, revision: "base" if revision == "main" else "accepted",
+    )
+    monkeypatch.setattr(cli, "context_inputs_valid", lambda *args: True)
+    monkeypatch.setattr(
+        cli,
+        "PublicationLookupContext",
+        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+    )
+    monkeypatch.setattr(cli, "current_change_has_changes", lambda *args: False)
+    monkeypatch.setattr(
+        cli, "revision_tree_id", lambda *args: run.accepted_snapshot.tree_id
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_scan_results",
+        lambda *args: pytest.fail("legacy scan should not authorize retry"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_finish_verified_gradle_run",
+        lambda value, *args: value.model_copy(update={"refreshed": True}),
+    )
+    monkeypatch.setattr(cli, "remove_workspace", lambda *args: None)
+    assert (
+        cli._run_gradle_flow(
+            "sample",
+            workflow.project,
+            tmp_path,
+            Workflow.UPDATE,
+            interactive=False,
+            minimum_age_days=7,
+        )
+        == cli.ExitCode.OK
+    )
+    assert workflow.effects.count("apply") == 1
+
+
+def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
+    workflow, monkeypatch, tmp_path
+):
+    from maintenance_man.models.scan import ScanResult, UpdateStatus
+
+    row = (
+        workflow.initial.findings[0]
+        .rows[0]
+        .model_copy(update={"update_status": UpdateStatus.READY})
+    )
+    legacy = ScanResult(
+        project="sample",
+        scanned_at=workflow.context.created_at,
+        trivy_target=str(workflow.project.path),
+        vulnerabilities=[row],
+    )
+    monkeypatch.setattr(cli, "load_scan_results", lambda *args: legacy)
+    monkeypatch.setattr(
+        cli,
+        "create_workspace",
+        lambda *args: pytest.fail("workspace effect before legacy guard"),
+    )
+    assert (
+        cli._run_gradle_flow(
+            "sample",
+            workflow.project,
+            tmp_path,
+            Workflow.UPDATE,
+            interactive=False,
+            minimum_age_days=7,
+        )
+        == cli.ExitCode.UPDATE_FAILED
+    )
+    assert workflow.effects == []
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_gradle_failed_update_restart_retains_evidence(workflow, monkeypatch, unsafe):
+    security = workflow.candidate.model_copy(
+        update={
+            "origins": frozenset({"security"}),
+            "requested_advisories": frozenset({"CVE-1"}),
+            "requested_coordinates": frozenset({"g:lib"}),
+        }
+    )
+    failed = updater.process_gradle_run(
+        begin_workflow(workflow, candidate=security),
+        workflow.project,
+        workflow.publication,
+        7,
+    )
+    monkeypatch.setattr(
+        cli, "workspace_path_for_project", lambda *args: workflow.project.path
+    )
+    monkeypatch.setattr(cli, "current_change_has_changes", lambda *args: unsafe)
+    monkeypatch.setattr(updater, "rollback_failed_gradle_update", lambda *args: None)
+    monkeypatch.setattr(cli, "exact_commit_id", lambda *args: "base")
+    monkeypatch.setattr(cli, "revision_tree_id", lambda *args: "base-tree")
+    effects = []
+
+    def reset(*args, **kwargs):
+        archives = list(
+            (updater.gradle_run_path("sample").parent / "history").glob("*.json")
+        )
+        assert len(archives) == 1
+        assert updater.load_gradle_run(archives[0]) == failed
+        assert updater.gradle_run_path("sample").exists()
+        effects.append("reset")
+        return True
+
+    monkeypatch.setattr(cli, "reset_verified_gradle_bookmark", reset)
+    if unsafe:
+        with pytest.raises(updater.GradleError, match="Uncommitted"):
+            cli._archive_rolled_back_gradle_run(failed, workflow.project)
+        assert updater.load_gradle_run(updater.gradle_run_path("sample")) == failed
+        assert effects == []
+    else:
+        cli._archive_rolled_back_gradle_run(failed, workflow.project)
+        assert not updater.gradle_run_path("sample").exists()
+        assert effects == ["reset"]
+
+
+@pytest.mark.parametrize(
+    "mutation", ["none", "dirty", "unrelated-parent", "working-tree", "accepted-tree"]
+)
+def test_gradle_resume_requires_exact_empty_accepted_child(
+    workflow, monkeypatch, tmp_path, mutation
+):
+    run = ready_workflow(workflow)
+    before = updater.gradle_run_path("sample").read_bytes()
+    monkeypatch.setattr(
+        cli, "workspace_path_for_project", lambda *args: workflow.project.path
+    )
+    monkeypatch.setattr(
+        cli,
+        "PublicationLookupContext",
+        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+    )
+    monkeypatch.setattr(cli, "context_inputs_valid", lambda *args: True)
+    monkeypatch.setattr(
+        cli, "current_change_has_changes", lambda *args: mutation == "dirty"
+    )
+
+    def commit(path, revision):
+        if revision == "main":
+            return "base"
+        if revision == "@-" and mutation == "unrelated-parent":
+            return "manual-unverified-commit"
+        return "accepted"
+
+    def tree(path, revision="@"):
+        if (revision == "@" and mutation == "working-tree") or (
+            revision == "accepted" and mutation == "accepted-tree"
+        ):
+            return "unverified-tree"
+        return run.accepted_snapshot.tree_id
+
+    monkeypatch.setattr(cli, "exact_commit_id", commit)
+    monkeypatch.setattr(cli, "revision_tree_id", tree)
+    effects = []
+    monkeypatch.setattr(
+        updater,
+        "process_gradle_run",
+        lambda value, *args: effects.append("process") or value,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_finish_verified_gradle_run",
+        lambda value, *args: (
+            effects.append("finalize") or value.model_copy(update={"refreshed": True})
+        ),
+    )
+    monkeypatch.setattr(cli, "remove_workspace", lambda *args: effects.append("remove"))
+    result = cli._run_gradle_flow(
+        "sample",
+        workflow.project,
+        tmp_path,
+        Workflow.UPDATE,
+        interactive=False,
+        minimum_age_days=7,
+    )
+    assert result == (
+        cli.ExitCode.OK if mutation == "none" else cli.ExitCode.UPDATE_FAILED
+    )
+    assert effects == (["process", "finalize", "remove"] if mutation == "none" else [])
+    assert updater.gradle_run_path("sample").read_bytes() == before
+    assert workflow.effects.count("apply") == 1
+
+
+def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
+    workflow, monkeypatch, tmp_path
+):
+    updater.process_gradle_run(
+        begin_workflow(workflow, Workflow.RESOLVE),
+        workflow.project,
+        workflow.publication,
+        7,
+    )
+    monkeypatch.setattr(
+        cli,
+        "PublicationLookupContext",
+        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+    )
+    monkeypatch.setattr(cli, "context_inputs_valid", lambda *args: True)
+    monkeypatch.setattr(
+        cli,
+        "exact_commit_id",
+        lambda path, revision: "base" if revision == "main" else "accepted",
+    )
+    effects = []
+
+    def repair(value, *args):
+        effects.append("verify-committed-repair")
+        return value
+
+    def guard(value, project):
+        assert effects == ["verify-committed-repair"]
+        effects.append("accepted-workspace-guard")
+
+    monkeypatch.setattr(updater, "continue_gradle_resolve", repair)
+    monkeypatch.setattr(cli, "_require_gradle_accepted_workspace", guard)
+    monkeypatch.setattr(
+        updater,
+        "process_gradle_run",
+        lambda value, *args: effects.append("process") or value,
+    )
+    monkeypatch.setattr(cli, "_finish_verified_gradle_run", lambda value, *args: value)
+    assert (
+        cli._run_gradle_flow(
+            "sample",
+            workflow.project,
+            tmp_path,
+            Workflow.RESOLVE,
+            interactive=False,
+            minimum_age_days=7,
+            continue_=True,
+        )
+        == cli.ExitCode.OK
+    )
+    assert effects == ["verify-committed-repair", "accepted-workspace-guard", "process"]
+
+
+@pytest.mark.parametrize("repaired", [False, True])
+def test_gradle_resolve_checks_actual_catalogue_before_accepting_manual_repair(
+    driver, monkeypatch, repaired
+):
+    from maintenance_man.vcs import RevisionCheck
+
+    workflow = driver.workflow
+    run = begin_workflow(workflow, Workflow.RESOLVE)
+    failed = updater._replace_gradle_attempt(
+        run,
+        FailedAttempt(
+            candidate=workflow.candidate,
+            baseline=workflow.initial,
+            reason="manual repair required",
+        ),
+    )
+    ledger = updater.gradle_run_path("sample")
+    updater.save_gradle_run(ledger, failed)
+    before = ledger.read_bytes()
+    catalogue = driver.project.path / "gradle/libs.versions.toml"
+    if repaired:
+        catalogue.write_text(catalogue.read_text().replace('lib = "1"', 'lib = "2"'))
+    workflow.state.update(snapshot=workflow.after, tree="after-tree")
+    report = driver.project.path / "gradle/libs.versions.updates.toml"
+    marker = driver.project.path / "gradle/.mm-owned-report"
+    report.write_bytes(b"interrupted report")
+    marker.write_bytes(b"")
+
+    def clean(path):
+        assert not report.exists() and not marker.exists()
+        return False
+
+    monkeypatch.setattr(updater, "current_change_has_changes", clean)
+    monkeypatch.setattr(updater, "exact_commit_id", lambda *args: "repair")
+    monkeypatch.setattr(
+        updater, "is_ancestor", lambda *args: RevisionCheck(ok=True, value=True)
+    )
+    checks = updater.run_gradle_checks(driver.project, "sample")
+    calls = []
+    monkeypatch.setattr(
+        updater, "run_gradle_checks", lambda *args: calls.append("checks") or checks
+    )
+    if repaired:
+        result = updater.continue_gradle_resolve(
+            failed, driver.project, workflow.publication, 7
+        )
+        assert isinstance(result.attempts[0], ReadyAttempt)
+        assert result.managed_tip_id == "repair"
+        assert calls == ["checks"]
+        assert workflow.effects == ["bookmark"]
+    else:
+        with pytest.raises(updater.GradleError, match="expected 2"):
+            updater.continue_gradle_resolve(
+                failed, driver.project, workflow.publication, 7
+            )
+        assert calls == []
+        assert ledger.read_bytes() == before
+        assert workflow.effects == []
+
+
+def test_gradle_fresh_scan_does_not_clear_unfinished_ledger(driver, monkeypatch):
+    from maintenance_man import cli, scanner
+    from maintenance_man.models.config import MmConfig
+    from maintenance_man.models.scan import ScanResult
+
+    workflow = driver.workflow
+    run = begin_workflow(workflow)
+    interrupted = updater._replace_gradle_attempt(
+        run, ApplyingAttempt(candidate=workflow.candidate, baseline=workflow.initial)
+    )
+    ledger = updater.gradle_run_path("sample")
+    updater.save_gradle_run(ledger, interrupted)
+    before = ledger.read_bytes()
+    monkeypatch.setattr(
+        cli, "_load_cfg", lambda *args: MmConfig(projects={"sample": driver.project})
+    )
+    monkeypatch.setattr(cli, "check_trivy_available", lambda: None)
+    monkeypatch.setattr(
+        scanner, "_run_gradle_scan", lambda *args: ([], workflow.initial.resolution)
+    )
+    monkeypatch.setattr(scanner, "get_outdated", lambda *args: [])
+    result_path = updater._config.MM_HOME / "scan-results" / "sample.json"
+    result_path.parent.mkdir()
+    result_path.write_bytes(b"previous current-main scan")
+    with pytest.raises(SystemExit) as exc:
+        cli.app(["scan", "sample"])
+    assert exc.value.code == 0
+    result = ScanResult.model_validate_json(result_path.read_bytes())
+    assert result.project == "sample" and result.vulnerabilities == []
+    assert ledger.read_bytes() == before
+    assert workflow.effects == []

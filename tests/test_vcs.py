@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-import maintenance_man.vcs as vcs
+from maintenance_man import vcs
 from maintenance_man.vcs import (
     GitHubCLINotFoundError,
     JJCLINotFoundError,
@@ -1169,3 +1169,29 @@ def test_revision_file_malformed_listing_fails_closed(tmp_path, monkeypatch, lis
     assert not result.ok
     assert not result.value
     assert result.error
+
+
+def test_gradle_submission_binds_revision_in_push_operation(monkeypatch, tmp_path):
+    commands = []
+    base, tip = "a" * 40, "b" * 40
+
+    def execute(command, path, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "created", "")
+
+    monkeypatch.setattr(vcs, "_run", execute)
+    monkeypatch.setattr(
+        vcs,
+        "exact_commit_id",
+        lambda path, revision: base if revision == "main" else tip,
+    )
+    assert vcs.push_bookmark_and_create_pr(
+        tmp_path, "mm/resolve-dependencies", expected_base=base, expected_tip=tip
+    )[0]
+    assert "--named" in commands[0]
+    selector = commands[0][commands[0].index("--named") + 1]
+    assert selector.startswith("mm/resolve-dependencies=exactly(")
+    assert base in selector and tip in selector
+    assert "exactly(main, 1)" in selector
+    assert "exactly(mm/resolve-dependencies, 1)" in selector
+    assert commands[1][:3] == ["gh", "pr", "create"]
