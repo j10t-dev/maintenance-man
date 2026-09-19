@@ -3,6 +3,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from maintenance_man.models.scan import GradleKind, GradleUpdateTarget
+
 
 class GradleRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -172,3 +174,63 @@ class PublicationEvidence(BaseModel):
     @property
     def timestamp(self):
         return max(f.timestamp for f in self.facts)
+
+
+class GradleCandidate(GradleRecord):
+    target: GradleUpdateTarget
+    origins: frozenset[Literal["ordinary", "security"]] = Field(min_length=1)
+    requested_advisories: frozenset[str] = frozenset()
+    requested_coordinates: frozenset[str] = frozenset()
+    owner_keys: tuple[str, ...] = ()
+    scopes: tuple[ScopeId, ...] = ()
+    publication_requests: tuple[PublicationRequest, ...] = ()
+
+
+class KnownOwner(GradleRecord):
+    kind: Literal["direct", "parent", "platform", "plugin"]
+    group_key: str
+    scope: ScopeId
+
+
+class UnknownOwner(GradleRecord):
+    kind: Literal["unknown"] = "unknown"
+    reason: str
+    scope: ScopeId | None = None
+
+
+type OwnerResolution = Annotated[KnownOwner | UnknownOwner, Field(discriminator="kind")]
+
+
+class CandidateWithheld(GradleRecord):
+    group_key: str | None
+    coordinate: str
+    installed_version: str
+    reason: str
+    advisory_ids: frozenset[str] = frozenset()
+
+
+class GradleFixPlan(GradleRecord):
+    candidates: tuple[GradleCandidate, ...]
+    withheld: tuple[CandidateWithheld, ...]
+
+
+class CandidateValidation(GradleRecord):
+    request_id: str
+    project_path: str
+    group_key: str
+    alias: str
+    kind: GradleKind
+    selected_version: str | None
+    implementation: ModuleId | None
+    reason: str | None
+
+    @model_validator(mode="after")
+    def result_shape(self):
+        if (self.selected_version is None) == (self.reason is None):
+            raise ValueError("require success or unresolved reason")
+        return self
+
+
+class CandidateValidationBatch(GradleRecord):
+    schema_version: Literal[1]
+    results: tuple[CandidateValidation, ...]

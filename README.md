@@ -167,6 +167,23 @@ Artifacts published only to Google Maven or the Gradle Plugin Portal usually hav
 
 `mm resolve` follows the same safety rules. `--continue` validates the catalogue, relationships and current publication evidence before tests or READY promotion; passing tests cannot make a blocked group ready. An update with any remaining blocked group exits with code 4 and cannot finalise, promote or submit changes. Eligible groups in a mixed run can still be applied, with accepted changes left on the maintenance bookmark. A fully blocked run creates no workspace and runs no tests or commits.
 
+### Automatic publication eligibility requires a routing declaration
+
+Gradle automatic updates require an explicit project declaration:
+
+```toml
+[projects.example]
+path = "/path/to/project"
+package_manager = "gradle"
+gradle_repository_routing = "standard-public"
+```
+
+Set `gradle_repository_routing` only when the recognized public repository roots relevant to this project's library and plugin candidates use standard Maven routing without credentials, content filters or exclusive-content rules affecting those roots. This includes settings, subprojects and plugin-management repositories. Revisit the declaration when repository configuration changes. A credentialed public root, a content filter restricting that root, or an exclusive-content rule affecting it prevents this declaration. mm relies on the operator's assertion; it does not detect these settings.
+
+Omit the field for unsupported or unknown routing. Inventory, scanning and candidate reporting remain available, while automatic candidate groups are withheld with an age prerequisite. A zero minimum age does not bypass this prerequisite. The declaration does not make custom repository URLs trusted, expand configured project/domain scope, or replace native candidate and exact-artifact publication checks.
+
+Private Trivy database caches are released after a run completes or replacement evidence is durably saved. The ledger retains the recorded snapshots and receipts. Unfinished runs keep the cache needed for recovery.
+
 ### Inventory coverage
 
 The generated inventory must be CycloneDX JSON version 1.5 or later, with non-empty components and at least one Maven package URL. A missing, empty or malformed inventory is a scan error.

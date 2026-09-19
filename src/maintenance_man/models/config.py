@@ -24,6 +24,7 @@ class ProjectConfig(BaseModel):
     deployable: bool = True
     build_command: str | None = None
     deploy_command: str | None = None
+    gradle_repository_routing: Literal["standard-public"] | None = None
 
 
 class MmConfig(BaseModel):

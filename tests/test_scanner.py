@@ -26,12 +26,11 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.scanner import (
     TrivyNotFoundError,
-    _check_outdated,
     _parse_uv_audit_vulns,
     check_trivy_available,
     scan_project,
 )
-from tests.conftest import GRADLE_FIXTURES, make_gradle_target, make_update, make_vuln
+from tests.conftest import GRADLE_FIXTURES, make_update, make_vuln
 
 _OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
@@ -356,104 +355,295 @@ class TestRunTrivyScanSkipDirs:
         assert "--skip-dirs" not in cmd
 
 
-def _gradle_scan(monkeypatch, findings, dates):
-    monkeypatch.setattr(
-        "maintenance_man.scanner.get_outdated", lambda project: findings
-    )
-    monkeypatch.setattr(
-        "maintenance_man.dependency_age._get_maven_publish_date",
-        lambda pkg, version: dates.get(pkg),
+@pytest.fixture
+def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
+    from threading import Barrier, Lock
+    from types import SimpleNamespace
+
+    from maintenance_man import scanner
+    from maintenance_man.dependency_age import PublicationLookupContext
+    from maintenance_man.models.gradle import (
+        CompleteResolution,
+        ModuleId,
+        PublicationRequest,
+        RepositoryDeclaration,
+        ResolutionEdge,
+        ResolutionReport,
+        ResolvedComponent,
+        ScopeId,
+        ScopeResolution,
     )
 
-
-def test_gradle_outdated_retains_blocked_candidates(
-    gradle_project, monkeypatch, mm_home
-):
-    eligible = make_update(pkg_name="room", gradle_target=make_gradle_target())
-    withheld = make_update(
-        pkg_name="ksp",
-        installed_version="2.3.10",
-        latest_version="2.3.12",
-        gradle_target=GradleUpdateTarget(
-            version_ref="ksp",
+    catalogue_path = gradle_project.path / GRADLE_CATALOGUE_RELPATH
+    catalogue_path.write_text(
+        '[versions]\nlib0 = "1.0"\nlib1 = "1.0"\n[libraries]\n'
+        'lib0 = { module = "org.example:lib0", version.ref = "lib0" }\n'
+        'lib1 = { module = "org.example:lib1", version.ref = "lib1" }\n'
+    )
+    findings = []
+    modules = {}
+    for index in range(2):
+        module = ModuleId(group="org.example", artifact=f"lib{index}", version="2.0")
+        modules[module.artifact] = module
+        target = GradleUpdateTarget(
+            version_ref=f"lib{index}",
+            target_version="2.0",
             members=[
                 GradleMember(
-                    kind="plugin",
-                    alias="ksp",
-                    coordinate="com.google.devtools.ksp",
-                    installed_version="2.3.10",
+                    kind="library",
+                    alias=f"lib{index}",
+                    coordinate=module.coordinate,
+                    installed_version="1.0",
                 )
             ],
-            target_version="2.3.12",
+        )
+        findings.append(
+            make_update(
+                pkg_name=module.coordinate,
+                installed_version="1.0",
+                latest_version="2.0",
+                gradle_target=target,
+            )
+        )
+    scope = ScopeId(
+        project_path=":", domain="project", configuration="runtimeClasspath"
+    )
+    components = (
+        ResolvedComponent(id="root", kind="root", module=None, variants=()),
+    ) + tuple(
+        ResolvedComponent(
+            id=module.artifact,
+            kind="module",
+            module=ModuleId(
+                group=module.group, artifact=module.artifact, version="1.0"
+            ),
+            variants=("runtime",),
+        )
+        for module in modules.values()
+    )
+    edges = tuple(
+        ResolutionEdge(
+            source="root",
+            target=module.artifact,
+            requested=f"{module.coordinate}:1.0",
+            constraint=False,
+        )
+        for module in modules.values()
+    )
+    resolution = CompleteResolution(
+        report=ResolutionReport(
+            schema_version=1,
+            root_project=str(gradle_project.path),
+            producer_versions={"gradle": "9.0", "cyclonedx": "3.0.0", "report": "1"},
+            catalogue_digest=hashlib.sha256(catalogue_path.read_bytes()).hexdigest(),
+            repositories=(
+                RepositoryDeclaration(
+                    project_path=":",
+                    domain="library",
+                    url="https://dl.google.com/dl/android/maven2",
+                ),
+            ),
+            selected_scopes=(scope,),
+            scopes=(
+                ScopeResolution(
+                    scope=scope, components=components, edges=edges, unresolved=()
+                ),
+            ),
+        )
+    )
+    state = SimpleNamespace(
+        findings=findings,
+        vulns=[],
+        unknown=False,
+        failure=None,
+        overlap=False,
+        entered=set(),
+    )
+    barrier, lock = Barrier(2, timeout=10), Lock()
+
+    def transport(url, repository, suffix, count):
+        count()
+        artifact = suffix.split("/")[-3]
+        with lock:
+            state.entered.add(artifact)
+        if state.overlap:
+            barrier.wait()
+        if state.unknown and artifact == "lib1":
+            if state.failure:
+                raise state.failure
+            return None
+        module = modules[artifact]
+        body = (
+            f"<project><groupId>{module.group}</groupId>"
+            f"<artifactId>{module.artifact}</artifactId>"
+            f"<version>{module.version}</version></project>"
+        ).encode()
+        return body, {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"}, url
+
+    now = datetime(2026, 9, 18, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        scanner,
+        "PublicationLookupContext",
+        lambda path: PublicationLookupContext(
+            path, transport=transport, now=lambda: now
         ),
     )
-    _gradle_scan(
-        monkeypatch,
-        [eligible, withheld],
-        {
-            "androidx.room:room-runtime": _OLD,
-            "androidx.room:room-compiler": _OLD,
-            "androidx.room:room-testing": _OLD,
-        },
+    monkeypatch.setattr(
+        scanner, "_run_gradle_scan", lambda project: (state.vulns, resolution)
     )
-    result = _check_outdated("android", gradle_project, [], 7)
+    monkeypatch.setattr(scanner, "get_outdated", lambda project: state.findings)
+    monkeypatch.setattr(scanner, "validate_gradle_candidates", lambda *args: object())
 
-    names = {u.pkg_name: u for u in result}
-    assert names["room"].blocked_reason is None
-    assert names["room"].published_date == _OLD
-    assert names["ksp"].gradle_block_kind == "age"
-    assert names["ksp"].blocked_reason is not None
-    assert "no Maven Central publication date" in names["ksp"].blocked_reason
+    def attach(candidate, resolution, batch):
+        requests = tuple(
+            PublicationRequest(
+                module=modules[member.alias],
+                repositories=("google",),
+                routing_supported=True,
+            )
+            for member in candidate.target.members
+        )
+        return candidate.model_copy(update={"publication_requests": requests})
+
+    monkeypatch.setattr(scanner, "attach_gradle_publications", attach)
+    state.project = gradle_project.model_copy(
+        update={"scan_secrets": False, "gradle_repository_routing": "standard-public"}
+    )
+    return state
 
 
-def test_gradle_discovery_failure_is_not_swallowed(gradle_project, monkeypatch):
-    def _boom(project):
-        raise GradleError("versionCatalogUpdate failed (exit 1): boom")
+@pytest.mark.parametrize("failure", [None, TimeoutError("unavailable")])
+def test_gradle_scan_overlaps_groups_and_retains_unknown_publications(
+    scoped_publication_scan, failure
+):
+    state = scoped_publication_scan
+    state.unknown, state.overlap, state.failure = True, True, failure
+    result = scan_project("android", state.project, 7)
+    assert state.entered == {"lib0", "lib1"}
+    assert len(result.updates) == 2
+    assert result.updates[0].blocked_reason is None
+    assert result.updates[1].blocked_reason
+    assert result.updates[1].gradle_block_kind == "age"
 
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", _boom)
 
-    with pytest.raises(GradleError, match="versionCatalogUpdate failed"):
-        _check_outdated("android", gradle_project, [], 7)
+def test_gradle_discovery_failure_is_not_swallowed(
+    scoped_publication_scan, monkeypatch
+):
+    def fail(project):
+        raise GradleError("discovery failed")
+
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", fail)
+    with pytest.raises(GradleError, match="discovery failed"):
+        scan_project("android", scoped_publication_scan.project, 7)
 
 
 def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
-    gradle_project, monkeypatch
+    scoped_publication_scan,
 ):
-    finding = make_update(pkg_name="room", gradle_target=make_gradle_target())
-    _gradle_scan(
-        monkeypatch,
-        [finding],
-        {
-            "androidx.room:room-runtime": _OLD,
-            "androidx.room:room-compiler": _OLD,
-            "androidx.room:room-testing": _OLD,
-        },
-    )
-    vulns = [make_vuln(pkg_name="androidx.room:room-runtime")]
-
-    result = _check_outdated("android", gradle_project, vulns, 7)
-
-    assert [u.pkg_name for u in result] == ["room"]
+    state = scoped_publication_scan
+    state.vulns = [
+        make_vuln(
+            pkg_name=state.findings[0].pkg_name,
+            installed_version="1.0",
+            fixed_version="2.0",
+        )
+    ]
+    result = scan_project("android", state.project, 7)
+    assert result.updates == state.findings
+    assert result.vulnerabilities[0].gradle_target == result.updates[0].gradle_target
+    assert all(row.blocked_reason is None for row in result.updates)
 
 
 def test_gradle_finding_without_target_or_reason_is_blocked_not_eligible(
-    gradle_project, monkeypatch
+    scoped_publication_scan,
 ):
-    """A finding with neither a target nor a reason must not be presented as an
-    eligible update with zero publication evidence.  This combination should
-    not occur today, but the branch must fail closed if it ever does.
+    state = scoped_publication_scan
+    state.findings.append(make_update(pkg_name="unmapped", gradle_target=None))
+    result = scan_project("android", state.project, 7)
+    assert result.updates[-1].blocked_reason == "no supported catalogue target"
+    assert result.updates[-1].gradle_block_kind == "mapping"
+
+
+def test_gradle_block_kind_agrees_between_update_and_vuln_rows_for_withheld_group(
+    scoped_publication_scan, monkeypatch
+):
+    """A group withheld by attach_gradle_publications must report the same
+    gradle_block_kind on its update row and its advisory row.  Before the
+    fix, the update loop classified this as "mapping" (key not in
+    eligible) while the vulnerability loop unconditionally used "age"
+    whenever blocked_reason was set.
     """
-    finding = make_update(pkg_name="mystery", latest_version="9.9.9")
-    monkeypatch.setattr(
-        "maintenance_man.scanner.get_outdated", lambda project: [finding]
+    from maintenance_man.models.gradle import (
+        CandidateWithheld,
+        ModuleId,
+        PublicationRequest,
     )
 
-    result = _check_outdated("android", gradle_project, [], 7)
+    state = scoped_publication_scan
+    state.vulns = [
+        make_vuln(
+            vuln_id="CVE-2030-9999",
+            pkg_name="org.example:lib1",
+            installed_version="1.0",
+            fixed_version="2.0",
+        )
+    ]
 
-    assert len(result) == 1
-    assert result[0].blocked_reason is not None
-    assert result[0].gradle_block_kind == "age"
-    assert "no catalogue target" in result[0].blocked_reason
+    def attach(candidate, resolution, batch):
+        if candidate.target.group_key == "ref:lib1":
+            return CandidateWithheld(
+                group_key=candidate.target.group_key,
+                coordinate=candidate.target.members[0].coordinate,
+                installed_version=candidate.target.members[0].installed_version,
+                reason="native validation withheld ref:lib1",
+                advisory_ids=candidate.requested_advisories,
+            )
+        requests = tuple(
+            PublicationRequest(
+                module=ModuleId(
+                    group="org.example", artifact=member.alias, version="2.0"
+                ),
+                repositories=("google",),
+                routing_supported=True,
+            )
+            for member in candidate.target.members
+        )
+        return candidate.model_copy(update={"publication_requests": requests})
+
+    monkeypatch.setattr("maintenance_man.scanner.attach_gradle_publications", attach)
+
+    result = scan_project("android", state.project, 7)
+
+    def _for_group(rows):
+        return next(
+            row
+            for row in rows
+            if row.gradle_target and row.gradle_target.group_key == "ref:lib1"
+        )
+
+    update_row = _for_group(result.updates)
+    vuln_row = _for_group(result.vulnerabilities)
+    assert update_row.blocked_reason == "native validation withheld ref:lib1"
+    assert vuln_row.blocked_reason == "native validation withheld ref:lib1"
+    assert update_row.gradle_block_kind == vuln_row.gradle_block_kind == "mapping"
+
+
+def test_gradle_vuln_without_maven_coordinate_is_blocked_with_mapping_kind(
+    scoped_publication_scan,
+):
+    """select_gradle_candidates withholds a finding with no Maven coordinate
+    ("finding lacks Maven coordinate"); the scanner must surface it as a
+    mapping-kind block, mirroring the equivalent update-row case."""
+    state = scoped_publication_scan
+    state.vulns = [
+        make_vuln(pkg_name="unmapped", installed_version="1.0", fixed_version="2.0")
+    ]
+
+    result = scan_project("android", state.project, 7)
+
+    finding = next(v for v in result.vulnerabilities if v.pkg_name == "unmapped")
+    assert finding.blocked_reason == "finding lacks Maven coordinate"
+    assert finding.gradle_block_kind == "mapping"
 
 
 _GRADLE_BOM_MODULES = [
@@ -540,67 +730,6 @@ def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
     monkeypatch.setattr("maintenance_man.scanner.subprocess.run", _run)
 
 
-def test_gradle_scan_maps_and_blocks_vulnerabilities(
-    gradle_project, monkeypatch, mm_home
-):
-    catalogue_digest = hashlib.sha256(
-        (Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH).read_bytes()
-    ).hexdigest()
-
-    def _run(cmd, **kwargs):
-        owned = Path(gradle_project.path) / ".mm-gradle-inventory"
-        bom = owned / "bom.json"
-        if cmd[1] == "mmGradleReport":
-            bom.write_bytes((GRADLE_FIXTURES / "bom.json").read_bytes())
-            (owned / "report.json").write_text(
-                json.dumps(_gradle_report_payload(catalogue_digest))
-            )
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        assert cmd == [
-            "trivy",
-            "sbom",
-            "--format",
-            "json",
-            "--scanners",
-            "vuln",
-            str(bom),
-        ]
-        assert bom.is_file()
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=(GRADLE_FIXTURES / "trivy-sbom.json").read_text(), stderr=""
-        )
-
-    monkeypatch.setattr(subprocess, "run", _run)
-    monkeypatch.setattr(
-        "maintenance_man.dependency_age._get_maven_publish_date",
-        lambda pkg, version: _OLD,
-    )
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
-    gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
-
-    result = scan_project("android", gradle_project, 7)
-    by_id = {v.vuln_id: v for v in result.vulnerabilities}
-
-    assert len(result.vulnerabilities) == 6
-    assert by_id["CVE-2026-2222"].blocked_reason is None
-    assert (gson_target := by_id["CVE-2026-2222"].gradle_target) is not None
-    assert gson_target.members[0].alias == "gson"
-    assert (room_target := by_id["CVE-2026-6666"].gradle_target) is not None
-    assert room_target.version_ref == "room"
-    assert by_id["CVE-2026-1111"].gradle_block_kind == "mapping"
-    assert by_id["CVE-2026-3333"].gradle_block_kind == "mapping"
-    assert by_id["CVE-2026-4444"].gradle_block_kind == "mapping"
-    assert by_id["CVE-2026-5555"].gradle_block_kind == "conflict"
-    assert all(v.actionable for v in result.vulnerabilities)
-    assert by_id["CVE-2026-2222"].gradle_scopes == (":/project/runtimeClasspath",)
-    assert result.gradle_resolution is not None
-    persisted = ScanResult.model_validate_json(
-        (mm_home / "scan-results" / "android.json").read_bytes()
-    )
-    assert persisted.vulnerabilities == result.vulnerabilities
-    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
-
-
 def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
     gradle_project, monkeypatch
 ):
@@ -665,6 +794,31 @@ def test_gradle_scan_finding_without_resolution_scope_is_error(
 
     with pytest.raises(GradleError, match="no selected resolution scope"):
         _run_gradle_scan(gradle_project)
+
+
+def test_gradle_scan_records_selected_resolution_scopes(gradle_project, monkeypatch):
+    """Every finding's gradle_scopes is derived from the selected resolution
+    scope(s) that resolved its module — not left at the default empty tuple.
+
+    _gradle_report_payload puts every _GRADLE_BOM_MODULES component under a
+    single scope: project_path=":", domain="project",
+    configuration="runtimeClasspath". So the expected scope string, computed
+    independently of scanner.py, is ":/project/runtimeClasspath".
+    """
+    from maintenance_man.scanner import _run_gradle_scan
+
+    monkeypatch.setattr(
+        "maintenance_man.scanner.generate_gradle_report",
+        _yield_fixture_bom(gradle_project),
+    )
+    _trivy_sbom(monkeypatch)
+
+    findings, _ = _run_gradle_scan(gradle_project)
+
+    assert findings
+    assert all(
+        finding.gradle_scopes == (":/project/runtimeClasspath",) for finding in findings
+    )
 
 
 def test_gradle_scan_error_leaves_previous_results_intact(

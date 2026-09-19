@@ -14,7 +14,6 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from itertools import repeat
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -123,21 +122,6 @@ def evaluate_gradle_group_age(
             youngest,
         )
     return (None, youngest)
-
-
-def evaluate_gradle_group_ages(
-    targets: list[GradleUpdateTarget], minimum_age_days: int
-) -> list[tuple[GradleBlock | None, datetime | None]]:
-    """Evaluate independent groups concurrently, retaining their input order."""
-    if not targets:
-        return []
-    pool = ThreadPoolExecutor(max_workers=8)
-    try:
-        return list(
-            pool.map(evaluate_gradle_group_age, targets, repeat(minimum_age_days))
-        )
-    finally:
-        pool.shutdown(cancel_futures=True)
 
 
 def filter_by_age(

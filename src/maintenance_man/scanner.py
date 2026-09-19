@@ -13,20 +13,29 @@ from pydantic import ValidationError
 from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
 from maintenance_man.dependency_age import (
-    evaluate_gradle_group_age,
-    evaluate_gradle_group_ages,
+    PublicationLookupContext,
+    evaluate_gradle_candidate_age,
     filter_by_age,
 )
 from maintenance_man.gradle import (
+    GRADLE_CATALOGUE_RELPATH,
     GradleError,
-    resolve_gradle_vulnerability_target,
+    parse_catalogue,
 )
-from maintenance_man.gradle_resolution import generate_gradle_report
+from maintenance_man.gradle_resolution import (
+    attach_gradle_publications,
+    generate_gradle_report,
+    gradle_routing_prerequisite,
+    select_gradle_candidates,
+    validate_gradle_candidates,
+)
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.gradle import CompleteResolution, IncompleteResolution
+from maintenance_man.models.gradle import (
+    CandidateWithheld,
+    CompleteResolution,
+    IncompleteResolution,
+)
 from maintenance_man.models.scan import (
-    GradleBlock,
-    GradleUpdateTarget,
     ScanResult,
     SecretFinding,
     Severity,
@@ -45,9 +54,7 @@ class TrivyScanError(Exception):
 
 
 def scan_project(
-    name: str,
-    project: ProjectConfig,
-    min_version_age_days: int = 7,
+    name: str, project: ProjectConfig, min_version_age_days: int = 7
 ) -> ScanResult:
     """Run Trivy and outdated checks against a project and return parsed results.
 
@@ -60,8 +67,7 @@ def scan_project(
     project_path = Path(project.path)
     if not project_path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
-
-    gradle_resolution = None
+    resolution = None
     if project.package_manager == "uv":
         vulns = _run_uv_audit(project_path)
         secrets = (
@@ -69,9 +75,108 @@ def scan_project(
             if project.scan_secrets
             else []
         )
+        updates = _check_outdated(name, project, vulns, min_version_age_days)
     elif project.package_manager == "gradle":
-        vulns, gradle_resolution = _run_gradle_scan(project)
-        _map_gradle_vulns(project, vulns, min_version_age_days)
+        vulns, resolution = _run_gradle_scan(project)
+        updates = get_outdated(project)
+        catalogue = parse_catalogue(project_path / GRADLE_CATALOGUE_RELPATH)
+        plan = select_gradle_candidates(catalogue, resolution, vulns, updates)
+        routing_block = gradle_routing_prerequisite(project)
+        blocks = {
+            block.group_key: block.reason
+            for block in plan.withheld
+            if block.group_key is not None
+        }
+        eligible = {}
+        prepared_candidates = []
+        with PublicationLookupContext(_config.MM_HOME / "publication-cache") as context:
+            if routing_block is not None:
+                for candidate in plan.candidates:
+                    blocks[candidate.target.group_key] = routing_block.reason
+            else:
+                batch = validate_gradle_candidates(project, plan.candidates)
+                for candidate in plan.candidates:
+                    key = candidate.target.group_key
+                    prepared = attach_gradle_publications(candidate, resolution, batch)
+                    if isinstance(prepared, CandidateWithheld):
+                        blocks[key] = prepared.reason
+                        continue
+                    prepared_candidates.append(prepared)
+            context.prefetch(
+                request
+                for candidate in prepared_candidates
+                for request in candidate.publication_requests
+            )
+            for prepared in prepared_candidates:
+                key = prepared.target.group_key
+                block = evaluate_gradle_candidate_age(
+                    prepared, min_version_age_days, context, datetime.now(timezone.utc)
+                )
+                if block is not None:
+                    blocks[key] = block.reason
+                eligible[key] = prepared
+        for update in updates:
+            if update.gradle_target is None:
+                update.blocked_reason = (
+                    update.blocked_reason or "no supported catalogue target"
+                )
+                update.gradle_block_kind = "mapping"
+                continue
+            key = update.gradle_target.group_key
+            if key in blocks:
+                update.blocked_reason = blocks[key]
+                update.gradle_block_kind = (
+                    "age"
+                    if key in eligible
+                    or (
+                        routing_block is not None
+                        and any(
+                            candidate.target.group_key == key
+                            for candidate in plan.candidates
+                        )
+                    )
+                    else "mapping"
+                )
+            elif key in eligible:
+                update.blocked_reason = None
+                update.gradle_block_kind = None
+        for finding in vulns:
+            matches = [
+                candidate
+                for candidate in plan.candidates
+                if finding.vuln_id in candidate.requested_advisories
+                and finding.pkg_name in candidate.requested_coordinates
+            ]
+            if len(matches) == 1:
+                candidate = matches[0]
+                key = candidate.target.group_key
+                finding.gradle_target = candidate.target
+                finding.blocked_reason = blocks.get(key)
+                if finding.blocked_reason is None:
+                    finding.gradle_block_kind = None
+                else:
+                    finding.gradle_block_kind = (
+                        "age"
+                        if key in eligible
+                        or (
+                            routing_block is not None
+                            and any(
+                                other.target.group_key == key
+                                for other in plan.candidates
+                            )
+                        )
+                        else "mapping"
+                    )
+            else:
+                reasons = [
+                    block.reason
+                    for block in plan.withheld
+                    if finding.vuln_id in block.advisory_ids
+                    and finding.pkg_name == block.coordinate
+                ]
+                if reasons:
+                    finding.blocked_reason = "; ".join(dict.fromkeys(reasons))
+                    finding.gradle_block_kind = "mapping"
         secrets = (
             _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
             if project.scan_secrets
@@ -81,7 +186,7 @@ def scan_project(
         vulns, secrets = _run_trivy_scan(
             project_path, project.scan_secrets, project.scan_skip_dirs
         )
-    updates = _check_outdated(name, project, vulns, min_version_age_days)
+        updates = _check_outdated(name, project, vulns, min_version_age_days)
 
     scan_result = ScanResult(
         project=name,
@@ -91,20 +196,20 @@ def scan_project(
         secrets=secrets,
         updates=updates,
         gradle_resolution=(
-            gradle_resolution.report.model_dump(mode="json")
-            if gradle_resolution is not None
+            resolution.report.model_dump(mode="json")
+            if resolution is not None
             else None
         ),
     )
-
     results_dir = _config.MM_HOME / "scan-results"
     results_dir.mkdir(parents=True, exist_ok=True)
     safe_name = sanitise_project_name(name)
     results_file = results_dir / f"{safe_name}.json"
     if not results_file.resolve().is_relative_to(results_dir.resolve()):
         raise ValueError(f"Invalid project name for results file: {name!r}")
-    results_file.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
-
+    temporary = results_file.with_suffix(".json.tmp")
+    temporary.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
+    temporary.replace(results_file)
     return scan_result
 
 
@@ -122,10 +227,7 @@ def _check_outdated(
     vulns: list[VulnFinding],
     min_version_age_days: int,
 ) -> list[UpdateFinding]:
-    """Run outdated checks and return de-duplicated update findings."""
-    if project.package_manager == "gradle":
-        return _check_gradle_outdated(project, min_version_age_days)
-
+    """Run non-Gradle outdated checks and return de-duplicated findings."""
     try:
         raw_updates = get_outdated(project)
         aged_updates = filter_by_age(
@@ -143,48 +245,6 @@ def _check_outdated(
             exc_info=True,
         )
         return []
-
-
-def _check_gradle_outdated(
-    project: ProjectConfig, min_version_age_days: int
-) -> list[UpdateFinding]:
-    """Discover Gradle catalogue updates and record their age eligibility.
-
-    Blocked candidates are retained with their reason rather than filtered out,
-    and discovery failures propagate: for Gradle a broken check is an explicit
-    scan error, never a silently empty update list.  Package-name suppression
-    against vulnerability findings does not apply — Gradle targets are catalogue
-    groups, not packages.
-    """
-    findings = get_outdated(project)
-    eligible: list[UpdateFinding] = []
-    targets: list[GradleUpdateTarget] = []
-    for finding in findings:
-        if finding.blocked_reason is not None:
-            continue
-        if finding.gradle_target is None:
-            # No target attached and no reason set: this combination should
-            # not occur, but treat it as blocked rather than as eligible with
-            # zero publication evidence.
-            finding.blocked_reason = (
-                f"{finding.pkg_name} {finding.latest_version} has no catalogue "
-                f"target; rescan to refresh this finding"
-            )
-            finding.gradle_block_kind = "age"
-            continue
-        eligible.append(finding)
-        targets.append(finding.gradle_target)
-
-    if not eligible:
-        return findings
-
-    results = evaluate_gradle_group_ages(targets, min_version_age_days)
-    for finding, (block, published) in zip(eligible, results, strict=True):
-        finding.published_date = published
-        if block is not None:
-            finding.blocked_reason = block.reason
-            finding.gradle_block_kind = block.kind
-    return findings
 
 
 def _run_gradle_scan(
@@ -312,28 +372,6 @@ def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
         return _parse_vulns(validated_results)
     except ValidationError as e:
         raise TrivyScanError(f"Malformed Trivy SBOM vulnerability fields: {e}") from e
-
-
-def _map_gradle_vulns(
-    project: ProjectConfig, vulns: list[VulnFinding], min_version_age_days: int
-) -> None:
-    """Attach a catalogue target or a blocking reason to each advisory in place.
-
-    Findings that cannot be mapped to a safe target are preserved and blocked,
-    never discarded.
-    """
-    for vuln in vulns:
-        outcome = resolve_gradle_vulnerability_target(project, vuln)
-        if isinstance(outcome, GradleBlock):
-            vuln.blocked_reason = outcome.reason
-            vuln.gradle_block_kind = outcome.kind
-            continue
-        vuln.gradle_target = outcome
-        block, published = evaluate_gradle_group_age(outcome, min_version_age_days)
-        vuln.published_date = vuln.published_date or published
-        if block is not None:
-            vuln.blocked_reason = block.reason
-            vuln.gradle_block_kind = block.kind
 
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:

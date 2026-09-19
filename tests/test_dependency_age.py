@@ -5,7 +5,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.message import Message
-from threading import Barrier, Event, Lock
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,7 +19,6 @@ from maintenance_man.dependency_age import (
     check_gradle_update_age,
     evaluate_gradle_candidate_age,
     evaluate_gradle_group_age,
-    evaluate_gradle_group_ages,
     filter_by_age,
     gradle_lookup_coordinate,
     lookup_gradle_publication,
@@ -358,41 +357,7 @@ class TestGradleGroupAge:
         assert published is None
 
 
-@pytest.mark.parametrize("unverified", [None, TimeoutError("unavailable")])
-def test_gradle_group_ages_overlap_and_keep_unknown_releases_blocked(
-    monkeypatch, unverified
-):
-    rendezvous = Barrier(2, timeout=10)
-    targets = [
-        make_gradle_target(
-            version_ref=name,
-            members=[make_gradle_member(alias=name, coordinate=f"org.example:{name}")],
-        )
-        for name in ("first", "second")
-    ]
-
-    def lookup(pkg, version):
-        rendezvous.wait()
-        if pkg == "org.example:first":
-            return _OLD
-        if isinstance(unverified, Exception):
-            raise unverified
-        return unverified
-
-    monkeypatch.setattr(
-        "maintenance_man.dependency_age._get_maven_publish_date", lookup
-    )
-    result = evaluate_gradle_group_ages(targets, 7)
-    assert result[0] == (None, _OLD)
-    block, published = result[1]
-    assert block is not None
-    assert block.kind == "age"
-    assert "org.example:second" in block.reason
-    assert published is None
-
-
-@pytest.mark.parametrize("operation", ["filter", "gradle"])
-def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch, operation):
+def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch):
     from maintenance_man import dependency_age as age
 
     started = Event()
@@ -429,19 +394,7 @@ def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch, operation):
     monkeypatch.setattr(age, "_get_maven_publish_date", lookup)
     monkeypatch.setitem(age._REGISTRY_LOOKUPS, "mvn", lookup)
     with pytest.raises(KeyboardInterrupt):
-        if operation == "filter":
-            filter_by_age([_make_update(f"g:lib{i}") for i in range(40)], "mvn", 7)
-        else:
-            targets = [
-                make_gradle_target(
-                    version_ref=f"lib{i}",
-                    members=[
-                        make_gradle_member(alias=f"lib{i}", coordinate=f"g:lib{i}")
-                    ],
-                )
-                for i in range(40)
-            ]
-            evaluate_gradle_group_ages(targets, 7)
+        filter_by_age([_make_update(f"g:lib{i}") for i in range(40)], "mvn", 7)
     assert len(calls) == 8, "queued lookups ran after interruption"
 
 
