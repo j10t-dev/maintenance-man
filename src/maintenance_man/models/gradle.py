@@ -1,9 +1,19 @@
+import hashlib
+import json
 from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from maintenance_man.models.scan import GradleKind, GradleUpdateTarget
+from maintenance_man.models.scan import (
+    GradleKind,
+    GradleUpdateTarget,
+    Severity,
+    VulnFinding,
+    Workflow,
+)
 
 
 class GradleRecord(BaseModel):
@@ -234,3 +244,265 @@ class CandidateValidation(GradleRecord):
 class CandidateValidationBatch(GradleRecord):
     schema_version: Literal[1]
     results: tuple[CandidateValidation, ...]
+
+
+def content_identity(value: BaseModel) -> str:
+    def canonical(item):
+        if isinstance(item, BaseModel):
+            return {
+                name: canonical(getattr(item, name)) for name in type(item).model_fields
+            }
+        if isinstance(item, dict):
+            return {str(key): canonical(val) for key, val in item.items()}
+        if isinstance(item, (set, frozenset)):
+            return sorted(
+                (canonical(val) for val in item),
+                key=lambda val: json.dumps(val, sort_keys=True),
+            )
+        if isinstance(item, (tuple, list)):
+            return [canonical(val) for val in item]
+        if isinstance(item, (datetime, Path)):
+            return str(item)
+        if isinstance(item, Enum):
+            return item.value
+        return item
+
+    return hashlib.sha256(
+        json.dumps(canonical(value), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+class FindingKey(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    advisory_id: str
+    coordinate: str
+    scope: ScopeId
+
+
+class FindingEvidence(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    key: FindingKey
+    affected_versions: frozenset[str]
+    severity: Severity
+    has_unknown: bool
+    rows: tuple[VulnFinding, ...]
+
+    @model_validator(mode="after")
+    def nonempty(self):
+        if not self.affected_versions or not self.rows:
+            raise ValueError("finding evidence must retain versions and rows")
+        if self.affected_versions != frozenset(
+            row.installed_version for row in self.rows
+        ):
+            raise ValueError("affected versions disagree with retained rows")
+        if any(
+            row.vuln_id != self.key.advisory_id or row.pkg_name != self.key.coordinate
+            for row in self.rows
+        ):
+            raise ValueError("finding rows disagree with key")
+        return self
+
+
+class ComparisonContext(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    scanner_version: str
+    loaded_input_digests: dict[str, str]
+    selected_scopes: tuple[ScopeId, ...]
+    producer_versions: dict[str, str]
+    scanner_flags: tuple[str, ...]
+    created_at: datetime
+    private_cache_path: Path
+    owner_token: str
+
+    @property
+    def identity(self) -> str:
+        return content_identity(self)
+
+    @property
+    def context_identity(self) -> str:
+        return self.identity
+
+
+class GradleSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    tree_id: str
+    resolution: CompleteResolution
+    context_identity: str
+    findings: tuple[FindingEvidence, ...]
+    inventory_digest: str
+    inventory_modules: tuple[ModuleId, ...]
+
+    @model_validator(mode="after")
+    def unique_findings(self):
+        if len({finding.key for finding in self.findings}) != len(self.findings):
+            raise ValueError("duplicate snapshot finding key")
+        return self
+
+    @property
+    def snapshot_id(self) -> str:
+        return content_identity(self)
+
+
+class VerifiedComparison(BaseModel):
+    kind: Literal["verified"] = "verified"
+    removed: frozenset[FindingKey]
+    residual: frozenset[FindingKey]
+
+
+class RejectedComparison(BaseModel):
+    kind: Literal["rejected"] = "rejected"
+    reasons: tuple[str, ...]
+
+
+class IncomparableComparison(BaseModel):
+    kind: Literal["incomparable"] = "incomparable"
+    reasons: tuple[str, ...]
+
+
+type ComparisonResult = VerifiedComparison | RejectedComparison | IncomparableComparison
+
+
+class CheckEvidence(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    commands: tuple[str, ...]
+    command_digests: tuple[str, ...]
+    success: bool
+    checked_at: datetime
+
+    @model_validator(mode="after")
+    def hashes_match(self):
+        if self.command_digests != tuple(
+            hashlib.sha256(cmd.encode()).hexdigest() for cmd in self.commands
+        ):
+            raise ValueError("check command digests disagree")
+        if self.checked_at.tzinfo is None:
+            raise ValueError("check timestamp must be timezone aware")
+        return self
+
+
+class VerificationReceipt(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    checked_tree_id: str
+    accepted_commit_id: str
+    baseline_snapshot_id: str
+    after_snapshot_id: str
+    context_identity: str
+    checks: CheckEvidence
+    publications: tuple[PublicationEvidence, ...]
+    verified_fixes: frozenset[FindingKey]
+    residual_keys: frozenset[FindingKey] = frozenset()
+
+    @model_validator(mode="after")
+    def successful(self):
+        if not self.checks.success or not self.publications:
+            raise ValueError("receipt requires passing checks and publication evidence")
+        if self.verified_fixes & self.residual_keys:
+            raise ValueError("residual finding cannot be a verified fix")
+        return self
+
+
+class PlannedAttempt(GradleRecord):
+    state: Literal["planned"] = "planned"
+    candidate: GradleCandidate
+
+
+class WithheldAttempt(GradleRecord):
+    state: Literal["withheld"] = "withheld"
+    candidate: GradleCandidate
+    reason: str
+
+
+class ApplyingAttempt(GradleRecord):
+    state: Literal["applying"] = "applying"
+    candidate: GradleCandidate
+    baseline: GradleSnapshot
+    checks: CheckEvidence | None = None
+    after: GradleSnapshot | None = None
+    checked_tree_id: str | None = None
+    accepted_commit_id: str | None = None
+
+
+class FailedAttempt(GradleRecord):
+    state: Literal["failed"] = "failed"
+    candidate: GradleCandidate
+    baseline: GradleSnapshot
+    reason: str
+    after: GradleSnapshot | None = None
+
+
+class ReadyAttempt(GradleRecord):
+    state: Literal["ready"] = "ready"
+    candidate: GradleCandidate
+    baseline: GradleSnapshot
+    after: GradleSnapshot
+    receipt: VerificationReceipt
+
+    @model_validator(mode="after")
+    def binding(self):
+        if (
+            self.receipt.checked_tree_id != self.after.tree_id
+            or self.receipt.after_snapshot_id != self.after.snapshot_id
+            or self.receipt.baseline_snapshot_id != self.baseline.snapshot_id
+            or self.receipt.context_identity != self.after.context_identity
+            or self.baseline.context_identity != self.after.context_identity
+        ):
+            raise ValueError("receipt does not bind the accepted snapshots")
+        return self
+
+
+class CompletedAttempt(GradleRecord):
+    state: Literal["completed"] = "completed"
+    candidate: GradleCandidate
+    baseline: GradleSnapshot
+    after: GradleSnapshot
+    receipt: VerificationReceipt
+    promoted_commit_id: str
+
+
+type AttemptState = Annotated[
+    PlannedAttempt
+    | WithheldAttempt
+    | ApplyingAttempt
+    | FailedAttempt
+    | ReadyAttempt
+    | CompletedAttempt,
+    Field(discriminator="state"),
+]
+
+
+class GradleRun(GradleRecord):
+    schema_version: Literal[1] = 1
+    project: str
+    flow: Workflow
+    base_commit_id: str
+    managed_bookmark: str
+    managed_tip_id: str
+    context: ComparisonContext
+    initial_snapshot: GradleSnapshot
+    accepted_snapshot: GradleSnapshot
+    attempts: tuple[AttemptState, ...] = ()
+    selection_blocks: tuple[CandidateWithheld, ...] = ()
+    promoted_commit_id: str | None = None
+    refreshed: bool = False
+    submitted: bool = False
+
+    @model_validator(mode="after")
+    def unique_groups(self):
+        keys = [attempt.candidate.target.group_key for attempt in self.attempts]
+        if len(keys) != len(set(keys)):
+            raise ValueError("a run may attempt each group only once")
+        expected = (
+            "mm/update-dependencies"
+            if self.flow == Workflow.UPDATE
+            else "mm/resolve-dependencies"
+        )
+        if self.managed_bookmark != expected:
+            raise ValueError("run bookmark and flow disagree")
+        if (
+            self.initial_snapshot.context_identity != self.context.identity
+            or self.accepted_snapshot.context_identity != self.context.identity
+        ):
+            raise ValueError("run snapshots use a different context")
+        if self.refreshed and not self.promoted_commit_id:
+            raise ValueError("refresh requires a recorded promotion")
+        return self

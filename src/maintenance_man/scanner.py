@@ -1,12 +1,15 @@
+import hashlib
 import json
 import logging
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeGuard
+from urllib.parse import unquote
 
 from pydantic import ValidationError
 
@@ -29,11 +32,17 @@ from maintenance_man.gradle_resolution import (
     select_gradle_candidates,
     validate_gradle_candidates,
 )
+from maintenance_man.gradle_verification import context_inputs_valid
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     CandidateWithheld,
+    ComparisonContext,
     CompleteResolution,
+    FindingEvidence,
+    FindingKey,
+    GradleSnapshot,
     IncompleteResolution,
+    ModuleId,
 )
 from maintenance_man.models.scan import (
     ScanResult,
@@ -43,6 +52,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.outdated import get_outdated
+from maintenance_man.vcs import revision_tree_id
 
 
 class TrivyNotFoundError(Exception):
@@ -579,3 +589,176 @@ def _parse_secrets(results: list[dict]) -> list[SecretFinding]:
         if result.get("Class") == "secret"
         for s in result.get("Secrets") or []
     ]
+
+
+def _inventory_modules(payload: bytes) -> tuple[ModuleId, ...]:
+    try:
+        document = json.loads(payload)
+        if not isinstance(document, dict) or document.get("bomFormat") != "CycloneDX":
+            raise ValueError("expected CycloneDX object")
+        found: set[ModuleId] = set()
+
+        def visit(rows):
+            if not isinstance(rows, list):
+                raise ValueError("components must be an array")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("component must be an object")
+                purl = row.get("purl", "")
+                if not isinstance(purl, str):
+                    raise ValueError("component purl must be a string")
+                if purl.startswith("pkg:maven/"):
+                    identity = (
+                        purl.removeprefix("pkg:maven/")
+                        .split("?", 1)[0]
+                        .split("#", 1)[0]
+                    )
+                    coordinate, separator, version = identity.rpartition("@")
+                    group, slash, artifact = coordinate.partition("/")
+                    if (
+                        not separator
+                        or not slash
+                        or not group
+                        or not artifact
+                        or not version
+                    ):
+                        raise ValueError("malformed Maven purl")
+                    found.add(
+                        ModuleId(
+                            group=unquote(group),
+                            artifact=unquote(artifact),
+                            version=unquote(version),
+                        )
+                    )
+                elif row.get("type") == "library" and not purl:
+                    raise ValueError("library component has no package identity")
+                visit(row.get("components", []))
+
+        visit(document.get("components", []))
+        return tuple(
+            sorted(
+                found,
+                key=lambda module: (module.group, module.artifact, module.version),
+            )
+        )
+    except (ValueError, TypeError, ValidationError) as exc:
+        raise GradleError(f"Malformed CycloneDX inventory: {exc}") from exc
+
+
+def capture_gradle_snapshot(
+    project: ProjectConfig, context: ComparisonContext
+) -> GradleSnapshot | IncompleteResolution:
+    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
+        raise TrivyScanError(
+            "Comparison context expired or inputs changed; rebuild baseline and tip"
+        )
+    with generate_gradle_report(project) as (bom, resolution):
+        if isinstance(resolution, IncompleteResolution):
+            return resolution
+        report = resolution.report
+        if (
+            set(report.selected_scopes) != set(context.selected_scopes)
+            or report.producer_versions != context.producer_versions
+        ):
+            return IncompleteResolution(
+                report=report, reasons=("selected scopes or producer versions changed",)
+            )
+        inventory = bom.read_bytes()
+        modules = _inventory_modules(inventory)
+        scopes: dict[ModuleId, set] = {}
+        for result in report.scopes:
+            for component in result.components:
+                if component.module is not None:
+                    scopes.setdefault(component.module, set()).add(result.scope)
+        missing = [module for module in modules if module not in scopes]
+        omitted = [module for module in scopes if module not in modules]
+        if missing or omitted:
+            return IncompleteResolution(
+                report=report,
+                reasons=tuple(
+                    f"inventory module has no graph match: {module}"
+                    for module in missing
+                )
+                + tuple(
+                    f"resolved module missing from inventory: {module}"
+                    for module in omitted
+                ),
+            )
+        binary = next(
+            key.removeprefix("binary:")
+            for key in context.loaded_input_digests
+            if key.startswith("binary:")
+        )
+        trivy_started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                [binary, *context.scanner_flags, str(bom)],
+                cwd=project.path,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
+            raise TrivyScanError(f"Trivy snapshot failed: {exc}") from exc
+        if completed.returncode != 0:
+            raise TrivyScanError(f"Trivy snapshot failed: {completed.stderr.strip()}")
+        logging.getLogger(__name__).info(
+            "Gradle Trivy snapshot %.3fs", time.monotonic() - trivy_started
+        )
+        rows = _parse_gradle_trivy_output(completed.stdout)
+        grouped: dict[FindingKey, list[VulnFinding]] = {}
+        for row in rows:
+            group, separator, artifact = row.pkg_name.partition(":")
+            module = ModuleId(
+                group=group, artifact=artifact, version=row.installed_version
+            )
+            if not separator or module not in scopes or module not in modules:
+                return IncompleteResolution(
+                    report=report,
+                    reasons=(
+                        f"finding has no exact inventory/graph scope: "
+                        f"{row.pkg_name} {row.installed_version}",
+                    ),
+                )
+            for scope in scopes[module]:
+                key = FindingKey(
+                    advisory_id=row.vuln_id, coordinate=row.pkg_name, scope=scope
+                )
+                grouped.setdefault(key, []).append(row)
+        rank = {
+            Severity.UNKNOWN: 0,
+            Severity.LOW: 1,
+            Severity.MEDIUM: 2,
+            Severity.HIGH: 3,
+            Severity.CRITICAL: 4,
+        }
+        findings = tuple(
+            FindingEvidence(
+                key=key,
+                affected_versions=frozenset(row.installed_version for row in evidence),
+                severity=max((row.severity for row in evidence), key=rank.__getitem__),
+                has_unknown=any(row.severity == Severity.UNKNOWN for row in evidence),
+                rows=tuple(evidence),
+            )
+            for key, evidence in sorted(
+                grouped.items(),
+                key=lambda item: (
+                    item[0].advisory_id,
+                    item[0].coordinate,
+                    item[0].scope.project_path,
+                    item[0].scope.domain,
+                    item[0].scope.configuration,
+                ),
+            )
+        )
+    # Generated report/BOM cleanup must precede the jj source-tree snapshot.
+    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
+        raise TrivyScanError("Comparison inputs changed during capture")
+    return GradleSnapshot(
+        tree_id=revision_tree_id(Path(project.path)),
+        resolution=resolution,
+        context_identity=context.identity,
+        findings=findings,
+        inventory_digest=hashlib.sha256(inventory).hexdigest(),
+        inventory_modules=modules,
+    )

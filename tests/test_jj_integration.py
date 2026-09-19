@@ -12,6 +12,7 @@ from maintenance_man.vcs import (
     current_change_has_changes,
     delete_bookmark,
     edit_new_change,
+    exact_commit_id,
     is_ancestor,
     main_commit_id,
     promote_bookmark_to_main,
@@ -179,3 +180,48 @@ def test_refresh_rebases_reusable_empty_working_copy(tmp_path: Path):
 
     assert after == before
     assert "main" in parent_bookmarks
+
+
+@pytest.mark.parametrize("mutation", ["none", "main", "tip", "conflict"])
+def test_gradle_promotion_checks_exact_base_and_tip_in_operation(tmp_path, mutation):
+    repo = init_repo(tmp_path)
+    base = exact_commit_id(repo, "main")
+    (repo / "README.md").write_text("accepted update\n")
+    assert commit_current_change(repo, "accepted update")
+    tip = exact_commit_id(repo, "@-")
+    bookmark = "mm/update-dependencies"
+    assert create_or_reset_bookmark(bookmark, repo, tip)
+    if mutation == "main":
+        assert create_or_reset_bookmark("main", repo, tip)
+    elif mutation == "tip":
+        assert (
+            _jj(
+                repo, "bookmark", "set", bookmark, "-r", base, "--allow-backwards"
+            ).returncode
+            == 0
+        )
+    elif mutation == "conflict":
+        assert _jj(repo, "new", base).returncode == 0
+        (repo / "README.md").write_text("side\n")
+        assert commit_current_change(repo, "side")
+        side = exact_commit_id(repo, "@-")
+        op = _jj(
+            repo, "op", "log", "--limit", "1", "--no-graph", "-T", "id"
+        ).stdout.strip()
+        assert _jj(repo, "bookmark", "set", "main", "-r", tip).returncode == 0
+        assert (
+            _jj(repo, "--at-op", op, "bookmark", "set", "main", "-r", side).returncode
+            == 0
+        )
+        reconciled = _jj(repo, "bookmark", "list", "main")
+        assert reconciled.returncode == 0
+        assert "conflict" in reconciled.stdout
+    before = _jj(repo, "bookmark", "list", "main").stdout
+    promoted = promote_bookmark_to_main(
+        repo, bookmark, expected_base=base, expected_tip=tip
+    )
+    assert promoted is (mutation == "none")
+    if mutation == "none":
+        assert exact_commit_id(repo, "main") == tip
+    else:
+        assert _jj(repo, "bookmark", "list", "main").stdout == before

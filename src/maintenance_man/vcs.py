@@ -1,3 +1,4 @@
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from rich import print as rprint
 
 from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
+from maintenance_man.gradle import GradleError
 
 
 class GitHubCLINotFoundError(Exception):
@@ -205,10 +207,6 @@ def discard_current_change(path: Path) -> bool:
         rprint(f"  [bold yellow]Warning:[/] jj restore failed: {result.stderr.strip()}")
         return False
     return True
-
-
-def promote_bookmark_to_main(path: Path, source_bookmark: str) -> bool:
-    return create_or_reset_bookmark("main", path, source_bookmark)
 
 
 def _refresh_working_copy_from_main_result(path: Path) -> tuple[bool, str]:
@@ -440,33 +438,6 @@ def resolve_bookmark_contains_current_change(path: Path, bookmark: str) -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
-def push_bookmark_and_create_pr(project_path: Path, bookmark: str) -> tuple[bool, str]:
-    """Push a managed jj bookmark and create a GitHub PR.
-
-    ``jj git push --bookmark`` has force-with-lease-style safety: the remote
-    bookmark is updated only when it still matches the last fetched state.
-    """
-    push = _run(
-        ["jj", "git", "push", "--bookmark", bookmark, "--remote", "origin"],
-        project_path,
-        timeout=120,
-    )
-    if push.returncode != 0:
-        return False, push.stderr.strip()
-
-    pr = _run(
-        ["gh", "pr", "create", "--fill", "--head", bookmark, "--base", "main"],
-        project_path,
-        timeout=60,
-    )
-    if pr.returncode != 0:
-        if "already exists" in pr.stderr.lower():
-            return True, f"PR already exists for {bookmark}"
-        return False, pr.stderr.strip()
-
-    return True, pr.stdout.strip()
-
-
 def _gh_list_pr_bookmarks(
     state: str, prefixes: tuple[str, ...], project_path: Path
 ) -> set[str]:
@@ -635,3 +606,116 @@ def _run(
         text=True,
         env=env,
     )
+
+
+def revision_tree_id(path: Path, revision: str = "@") -> str:
+    resolved = _single_commit_id(path, revision)
+    if not resolved.ok:
+        raise GradleError(resolved.error)
+    result = _run(
+        ["jj", "log", "-r", resolved.commit_id, "--no-graph", "-T", 'tree_id ++ "\\n"'],
+        path,
+    )
+    values = result.stdout.splitlines()
+    if (
+        result.returncode != 0
+        or len(values) != 1
+        or not re.fullmatch(r"[0-9a-f]+", values[0])
+    ):
+        raise GradleError("Cannot identify the verified jj tree")
+    return values[0]
+
+
+def exact_commit_id(path: Path, revision: str) -> str:
+    result = _single_commit_id(path, revision)
+    if not result.ok:
+        raise GradleError(result.error)
+    return result.commit_id
+
+
+def _guarded_tip(source_bookmark: str, expected_base: str, expected_tip: str) -> str:
+    if source_bookmark not in _MANAGED_BOOKMARK_PREFIXES:
+        raise GradleError("Unexpected managed Gradle bookmark")
+    if not all(
+        re.fullmatch(r"[0-9a-f]{40,64}", value)
+        for value in (expected_base, expected_tip)
+    ):
+        raise GradleError("Invalid expected revision identity")
+    # Cardinality is tested before intersection so conflicted bookmarks cannot
+    # be reduced to the one expected arm and accidentally accepted.
+    base = f"exactly(exactly(main, 1) & {expected_base}, 1)"
+    tip = f"exactly(exactly({source_bookmark}, 1) & {expected_tip}, 1)"
+    return f"exactly(({base})::({tip}) & ({tip}), 1)"
+
+
+def promote_bookmark_to_main(
+    path: Path,
+    source_bookmark: str,
+    *,
+    expected_base: str | None = None,
+    expected_tip: str | None = None,
+) -> bool:
+    if expected_base is None and expected_tip is None:
+        return create_or_reset_bookmark("main", path, source_bookmark)
+    if expected_base is None or expected_tip is None:
+        return False
+    try:
+        guarded = _guarded_tip(source_bookmark, expected_base, expected_tip)
+        result = _run(["jj", "bookmark", "set", "main", "-r", guarded], path)
+        if result.returncode != 0:
+            return False
+        # Concurrent jj operations may merge into a conflicted bookmark. Never
+        # report finalization success unless the single result remains exact.
+        return (
+            exact_commit_id(path, "main") == expected_tip
+            and exact_commit_id(path, source_bookmark) == expected_tip
+        )
+    except GradleError, OSError, subprocess.TimeoutExpired:
+        return False
+
+
+def push_bookmark_and_create_pr(
+    project_path: Path,
+    bookmark: str,
+    *,
+    expected_base: str | None = None,
+    expected_tip: str | None = None,
+) -> tuple[bool, str]:
+    if expected_base is None and expected_tip is None:
+        selector = ["--bookmark", bookmark]
+    elif expected_base is None or expected_tip is None:
+        return False, "Both expected revision identities are required"
+    else:
+        try:
+            selector = [
+                "--named",
+                f"{bookmark}={_guarded_tip(bookmark, expected_base, expected_tip)}",
+            ]
+        except GradleError as exc:
+            return False, str(exc)
+    push = _run(
+        ["jj", "git", "push", *selector, "--remote", "origin"],
+        project_path,
+        timeout=120,
+    )
+    if push.returncode != 0:
+        return False, push.stderr.strip()
+    if expected_tip is not None:
+        try:
+            if (
+                exact_commit_id(project_path, bookmark) != expected_tip
+                or exact_commit_id(project_path, "main") != expected_base
+            ):
+                return False, "Local revisions changed during submission"
+        except GradleError as exc:
+            return False, str(exc)
+    pr = _run(
+        ["gh", "pr", "create", "--fill", "--head", bookmark, "--base", "main"],
+        project_path,
+        timeout=60,
+    )
+    if pr.returncode != 0:
+        if "already exists" in pr.stderr.lower():
+            return True, f"PR already exists for {bookmark}"
+        return False, pr.stderr.strip()
+    return True, pr.stdout.strip()

@@ -1,18 +1,33 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
 import shlex
+import shutil
 import subprocess
-from collections.abc import Sequence
+import tempfile
+import time
+import uuid
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
 
 from packaging.version import InvalidVersion, Version
 from rich import print as rprint
 
+from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
-from maintenance_man.dependency_age import check_gradle_update_age
+from maintenance_man.dependency_age import (
+    PublicationLookupContext,
+    check_gradle_update_age,
+    evaluate_gradle_candidate_age,
+)
+from maintenance_man.deployer import BuildError, run_build
 from maintenance_man.env import project_env
 from maintenance_man.gradle import (
     GradleError,
@@ -20,10 +35,34 @@ from maintenance_man.gradle import (
     assert_safe_text,
     normalise_alias,
     resolve_gradle_vulnerability_target,
+    validate_gradle_recovery,
     validate_gradle_target,
     validate_gradle_target_shape,
 )
+from maintenance_man.gradle_resolution import gradle_routing_prerequisite
+from maintenance_man.gradle_verification import (
+    compare_gradle_snapshots,
+    context_inputs_valid,
+    release_comparison_context,
+)
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.gradle import (
+    ApplyingAttempt,
+    AttemptState,
+    CheckEvidence,
+    ComparisonContext,
+    CompletedAttempt,
+    FailedAttempt,
+    GradleCandidate,
+    GradleRun,
+    GradleSnapshot,
+    IncompleteResolution,
+    PlannedAttempt,
+    ReadyAttempt,
+    VerificationReceipt,
+    VerifiedComparison,
+    WithheldAttempt,
+)
 from maintenance_man.models.scan import (
     GradleBlock,
     GradleUpdateTarget,
@@ -34,16 +73,21 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
+from maintenance_man.scanner import TrivyScanError, capture_gradle_snapshot
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     UvDependencyLocation,
     get_uv_dependency_locations,
 )
 from maintenance_man.vcs import (
+    _run,
     commit_current_change,
     create_or_reset_bookmark,
     current_change_has_changes,
     discard_current_change,
+    edit_new_change,
+    exact_commit_id,
+    revision_tree_id,
 )
 
 
@@ -1191,3 +1235,456 @@ def _apply_update(
             )
             return False
     return True
+
+
+def gradle_run_path(project: str) -> Path:
+    root = _config.MM_HOME / "gradle-runs"
+    target = root / f"{sanitise_project_name(project)}.json"
+    if target.parent.resolve() != root.resolve():
+        raise GradleError("Invalid Gradle run path")
+    return target
+
+
+def save_gradle_run(path: Path, run: GradleRun) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise GradleError("Refusing symlinked Gradle run ledger")
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".gradle-run-",
+            delete=False,
+        ) as stream:
+            temporary = stream.name
+            stream.write(run.model_dump_json(indent=2))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise GradleError(f"Cannot persist Gradle run: {exc}") from exc
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def load_gradle_run(path: Path) -> GradleRun | None:
+    if path.is_symlink():
+        raise GradleError("Refusing symlinked Gradle run ledger")
+    try:
+        return GradleRun.model_validate_json(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise GradleError(f"Invalid Gradle run ledger: {exc}") from exc
+
+
+def retire_gradle_context(context: ComparisonContext) -> None:
+    """Clean up retired evidence without invalidating an already saved transition."""
+    try:
+        release_comparison_context(context)
+    except (OSError, GradleError) as exc:
+        logging.getLogger(__name__).warning(
+            "Could not release retired Gradle cache %s: %s",
+            context.private_cache_path,
+            exc,
+        )
+
+
+def discard_unpersisted_gradle_context(
+    project_name: str, context: ComparisonContext
+) -> None:
+    # A failed fsync may follow a successful replace. Never delete the database
+    # that the durable ledger now references, even when its save raised.
+    try:
+        durable = load_gradle_run(gradle_run_path(project_name))
+    except GradleError:
+        return
+    if (
+        durable is None
+        or durable.context.private_cache_path != context.private_cache_path
+    ):
+        retire_gradle_context(context)
+
+
+def _replace_gradle_attempt(run: GradleRun, attempt: AttemptState) -> GradleRun:
+    attempts = tuple(
+        attempt
+        if old.candidate.target.group_key == attempt.candidate.target.group_key
+        else old
+        for old in run.attempts
+    )
+    if not any(
+        old.candidate.target.group_key == attempt.candidate.target.group_key
+        for old in run.attempts
+    ):
+        attempts += (attempt,)
+    return GradleRun.model_validate(
+        run.model_copy(update={"attempts": attempts}).model_dump(mode="json")
+    )
+
+
+def gradle_check_commands(project: ProjectConfig) -> tuple[str, ...]:
+    tests = tuple(
+        command
+        for command in (
+            project.test_unit,
+            project.test_integration,
+            project.test_component,
+        )
+        if command
+    )
+    if not project.build_command or not tests:
+        raise GradleError(
+            "Setup prerequisite: configure build_command and at least one test phase"
+        )
+    return (project.build_command, *tests)
+
+
+def run_gradle_checks(project: ProjectConfig, project_name: str) -> CheckEvidence:
+    commands = gradle_check_commands(project)
+    checks_started = time.monotonic()
+    try:
+        run_build(project_name, commands[0], project.path)
+    except BuildError as exc:
+        raise GradleError(
+            f"Build prerequisite/failure: {exc}; "
+            "SDK and wrapper repairs require manual preparation"
+        ) from exc
+    logging.getLogger(__name__).info(
+        "Gradle baseline/update build %.3fs", time.monotonic() - checks_started
+    )
+    tests_started = time.monotonic()
+    passed, phase = run_test_phases(project, project.path)
+    logging.getLogger(__name__).info(
+        "Gradle configured tests %.3fs", time.monotonic() - tests_started
+    )
+    if not passed:
+        raise GradleError(f"Gradle test phase failed: {phase}")
+    return CheckEvidence(
+        commands=commands,
+        command_digests=tuple(
+            hashlib.sha256(command.encode()).hexdigest() for command in commands
+        ),
+        success=True,
+        checked_at=datetime.now(timezone.utc),
+    )
+
+
+def capture_checked_gradle_snapshot(
+    project: ProjectConfig,
+    project_name: str,
+    context: ComparisonContext,
+    *,
+    expected_tree: str | None = None,
+    target: GradleUpdateTarget | None = None,
+) -> tuple[CheckEvidence, GradleSnapshot]:
+    """Bind build, tests and security evidence to one unchanged source tree."""
+    tree = expected_tree or revision_tree_id(project.path)
+    if revision_tree_id(project.path) != tree:
+        raise GradleError("Working tree differs from the verification revision")
+    if target is not None:
+        block = validate_gradle_recovery(project, target)
+        if block is not None:
+            raise GradleError(block.reason)
+    checks = run_gradle_checks(project, project_name)
+    if revision_tree_id(project.path) != tree:
+        raise GradleError("Source tree changed during build or tests")
+    snapshot = capture_gradle_snapshot(project, context)
+    if isinstance(snapshot, IncompleteResolution):
+        raise GradleError("Coverage incomplete: " + "; ".join(snapshot.reasons))
+    if snapshot.tree_id != tree or revision_tree_id(project.path) != tree:
+        raise GradleError("Source tree changed during security capture")
+    return checks, snapshot
+
+
+def start_gradle_run(
+    project_name: str,
+    project: ProjectConfig,
+    flow: Workflow,
+    base_commit_id: str,
+    context: ComparisonContext,
+    candidates: tuple[GradleCandidate, ...],
+) -> GradleRun:
+    _, baseline = capture_checked_gradle_snapshot(
+        project,
+        project_name,
+        context,
+        expected_tree=revision_tree_id(project.path, base_commit_id),
+    )
+    bookmark = _WORKFLOW_BOOKMARKS[flow]
+    run = GradleRun(
+        project=project_name,
+        flow=flow,
+        base_commit_id=base_commit_id,
+        managed_bookmark=bookmark,
+        managed_tip_id=base_commit_id,
+        context=context,
+        initial_snapshot=baseline,
+        accepted_snapshot=baseline,
+        attempts=tuple(PlannedAttempt(candidate=candidate) for candidate in candidates),
+    )
+    save_gradle_run(gradle_run_path(project_name), run)
+    return run
+
+
+def verify_applied_gradle_attempt(
+    run: GradleRun,
+    candidate: GradleCandidate,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+    *,
+    committed_revision: str | None = None,
+) -> GradleRun:
+    path = gradle_run_path(run.project)
+    routing = gradle_routing_prerequisite(project)
+    if routing is not None:
+        raise GradleError(routing.reason)
+    checks, after = capture_checked_gradle_snapshot(
+        project,
+        run.project,
+        run.context,
+        target=candidate.target,
+        expected_tree=(
+            revision_tree_id(project.path, committed_revision)
+            if committed_revision is not None
+            else None
+        ),
+    )
+    # Persist the rejected snapshot too: it is diagnostic evidence, not READY.
+    observed = ApplyingAttempt(
+        candidate=candidate, baseline=run.accepted_snapshot, checks=checks, after=after
+    )
+    run = _replace_gradle_attempt(run, observed)
+    save_gradle_run(path, run)
+    comparison = compare_gradle_snapshots(run.accepted_snapshot, after, candidate)
+    if not isinstance(comparison, VerifiedComparison):
+        raise GradleError(
+            "Security verification failed: " + "; ".join(comparison.reasons)
+        )
+    block = evaluate_gradle_candidate_age(
+        candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+    )
+    if block is not None:
+        raise GradleError(block.reason)
+    checked_tree = revision_tree_id(project.path)
+    if checked_tree != after.tree_id:
+        raise GradleError("Tree changed after security verification")
+    prepared = ApplyingAttempt(
+        candidate=candidate,
+        baseline=run.accepted_snapshot,
+        checks=checks,
+        after=after,
+        checked_tree_id=checked_tree,
+    )
+    run = _replace_gradle_attempt(run, prepared)
+    save_gradle_run(path, run)
+    if committed_revision is None:
+        if not current_change_has_changes(project.path):
+            raise GradleError("Candidate made no tracked source change")
+        target = candidate.target
+        if not commit_current_change(
+            project.path,
+            f"chore: bump {target.display_name} to {target.target_version}",
+        ):
+            raise GradleError("Could not commit verified Gradle update")
+        commit_id = exact_commit_id(project.path, "@-")
+    else:
+        commit_id = exact_commit_id(project.path, committed_revision)
+    if revision_tree_id(project.path, commit_id) != checked_tree:
+        raise GradleError("Accepted commit tree differs from checked tree")
+    prepared = prepared.model_copy(update={"accepted_commit_id": commit_id})
+    run = _replace_gradle_attempt(run, prepared)
+    save_gradle_run(path, run)
+    if not create_or_reset_bookmark(run.managed_bookmark, project.path, commit_id):
+        raise GradleError("Could not bind managed bookmark to accepted commit")
+    receipt = VerificationReceipt(
+        checked_tree_id=checked_tree,
+        accepted_commit_id=commit_id,
+        baseline_snapshot_id=run.accepted_snapshot.snapshot_id,
+        after_snapshot_id=after.snapshot_id,
+        context_identity=run.context.identity,
+        checks=checks,
+        publications=publication.evidence_for(candidate),
+        verified_fixes=comparison.removed,
+        residual_keys=comparison.residual,
+    )
+    accepted = ReadyAttempt(
+        candidate=candidate,
+        baseline=run.accepted_snapshot,
+        after=after,
+        receipt=receipt,
+    )
+    run = _replace_gradle_attempt(run, accepted).model_copy(
+        update={"managed_tip_id": commit_id, "accepted_snapshot": after}
+    )
+    run = GradleRun.model_validate(run.model_dump(mode="json"))
+    save_gradle_run(path, run)
+    return run
+
+
+def process_gradle_run(
+    run: GradleRun,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+) -> GradleRun:
+    for planned in tuple(run.attempts):
+        if not isinstance(planned, PlannedAttempt):
+            continue
+        candidate = planned.candidate
+        block = validate_gradle_target(project, candidate.target)
+        age = gradle_routing_prerequisite(project) or evaluate_gradle_candidate_age(
+            candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+        )
+        reason = block.reason if block else age.reason if age else None
+        if reason:
+            run = _replace_gradle_attempt(
+                run, WithheldAttempt(candidate=candidate, reason=reason)
+            )
+            save_gradle_run(gradle_run_path(run.project), run)
+            continue
+        if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+            raise GradleError(
+                "Comparison context expired or changed; "
+                "rebuild evidence before continuing"
+            )
+        run = _replace_gradle_attempt(
+            run, ApplyingAttempt(candidate=candidate, baseline=run.accepted_snapshot)
+        )
+        save_gradle_run(gradle_run_path(run.project), run)
+        try:
+            block = apply_gradle_update(project, candidate.target)
+            if block is not None:
+                raise GradleError(block.reason)
+            run = verify_applied_gradle_attempt(
+                run, candidate, project, publication, minimum_age_days
+            )
+        except (GradleError, TrivyScanError) as exc:
+            # Read latest pre-effect intent to retain commit-crash evidence.
+            latest = load_gradle_run(gradle_run_path(run.project))
+            if latest is not None:
+                run = latest
+            state = next(
+                item
+                for item in run.attempts
+                if item.candidate.target.group_key == candidate.target.group_key
+            )
+            if isinstance(state, ApplyingAttempt) and state.checked_tree_id is not None:
+                # A checked commit may already exist. Recovery must reconcile it;
+                # never discard or synthesize a failure after that irreversible effect.
+                raise
+            failed = FailedAttempt(
+                candidate=candidate,
+                baseline=run.accepted_snapshot,
+                reason=str(exc),
+                after=state.after if isinstance(state, ApplyingAttempt) else None,
+            )
+            run = _replace_gradle_attempt(run, failed)
+            save_gradle_run(gradle_run_path(run.project), run)
+            if run.flow == Workflow.UPDATE:
+                if (
+                    not discard_current_change(project.path)
+                    or revision_tree_id(project.path) != run.accepted_snapshot.tree_id
+                ):
+                    raise GradleError(
+                        "Could not restore the latest accepted Gradle baseline"
+                    ) from exc
+            else:
+                return run
+    return run
+
+
+def gradle_run_finalization_check(
+    run: GradleRun,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+) -> None:
+    routing = gradle_routing_prerequisite(project)
+    if routing is not None:
+        raise GradleError(routing.reason)
+    if any(
+        isinstance(attempt, (ApplyingAttempt, FailedAttempt, PlannedAttempt))
+        for attempt in run.attempts
+    ):
+        raise GradleError("Unfinished or failed Gradle attempt prevents finalization")
+    accepted = [
+        attempt
+        for attempt in run.attempts
+        if isinstance(attempt, (ReadyAttempt, CompletedAttempt))
+    ]
+    if not accepted:
+        raise GradleError("No verified Gradle update to finalize")
+    if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+        raise GradleError("Final comparison context is stale")
+    if (
+        exact_commit_id(project.path, run.managed_bookmark) != run.managed_tip_id
+        or revision_tree_id(project.path, run.managed_tip_id)
+        != run.accepted_snapshot.tree_id
+    ):
+        raise GradleError("Managed tip differs from the verified snapshot")
+    if tuple(gradle_check_commands(project)) != accepted[-1].receipt.checks.commands:
+        raise GradleError("Configured verification commands changed")
+    probe = accepted[-1].candidate.model_copy(
+        update={"origins": frozenset({"ordinary"})}
+    )
+    comparison = compare_gradle_snapshots(
+        run.initial_snapshot, run.accepted_snapshot, probe
+    )
+    if not isinstance(comparison, VerifiedComparison):
+        raise GradleError("Final snapshot regressed against original run baseline")
+    credited = frozenset(
+        key for attempt in accepted for key in attempt.receipt.verified_fixes
+    )
+    if credited & frozenset(item.key for item in run.accepted_snapshot.findings):
+        raise GradleError("An earlier credited fix was reintroduced")
+    for attempt in accepted:
+        block = evaluate_gradle_candidate_age(
+            attempt.candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+        )
+        if block is not None:
+            raise GradleError(block.reason)
+
+
+@contextmanager
+def _gradle_evidence_workspace(
+    project: ProjectConfig, revision: str
+) -> Iterator[ProjectConfig]:
+    resolved = exact_commit_id(project.path, revision)
+    container = Path(tempfile.mkdtemp(prefix="mm-gradle-proof-"))
+    token = uuid.uuid4().hex
+    marker = container / ".mm-proof-owner"
+    marker.write_text(token, encoding="utf-8")
+    name = f"mm-proof-{token}"
+    root = container / "workspace"
+    registered = False
+    try:
+        result = _run(
+            ["jj", "workspace", "add", "--name", name, "-r", resolved, str(root)],
+            project.path,
+        )
+        if result.returncode != 0:
+            raise GradleError("Cannot create recorded-baseline proof workspace")
+        registered = True
+        if not edit_new_change(root, resolved):
+            raise GradleError("Cannot create empty proof change")
+        yield project.model_copy(update={"path": root})
+    finally:
+        if registered:
+            _run(["jj", "workspace", "forget", name], project.path)
+        if (
+            not container.is_symlink()
+            and marker.is_file()
+            and marker.read_text(encoding="utf-8") == token
+        ):
+            shutil.rmtree(container)
