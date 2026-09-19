@@ -1111,3 +1111,86 @@ def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch
             "demo", ProjectConfig(path=tmp_path, package_manager="gradle")
         )
     assert saved.read_text() == "previous findings"
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "local",
+        "unknown-path",
+        "wrong-coordinate",
+        "unqualified",
+        "duplicate-path",
+        "external-mismatch",
+        "local-finding",
+    ],
+)
+def test_gradle_scan_checks_local_project_provenance(
+    gradle_project, monkeypatch, variant
+):
+    from maintenance_man import scanner
+    from maintenance_man.gradle_resolution import parse_resolution_report
+
+    payload = _gradle_report_payload()
+    payload["local_projects"] = [
+        {
+            "project_path": ":",
+            "module": {"group": "fixture", "artifact": "app", "version": "unspecified"},
+        }
+    ]
+    purl = "pkg:maven/fixture/app@unspecified?project_path=%3A"
+    if variant == "unknown-path":
+        purl = "pkg:maven/fixture/app@unspecified?project_path=%3Aunknown"
+    elif variant == "wrong-coordinate":
+        purl = "pkg:maven/other/app@unspecified?project_path=%3A"
+    elif variant == "unqualified":
+        purl = "pkg:maven/fixture/app@unspecified"
+    elif variant == "duplicate-path":
+        purl += "&project_path=%3A"
+    inventory = json.loads((GRADLE_FIXTURES / "bom.json").read_text())
+    inventory["components"].append({"type": "library", "purl": purl})
+    if variant == "external-mismatch":
+        inventory["components"].append(
+            {"type": "library", "purl": "pkg:maven/g/missing@1"}
+        )
+
+    @contextmanager
+    def generate(project):
+        bom = Path(project.path) / "fixture-bom.json"
+        bom.write_text(json.dumps(inventory))
+        try:
+            yield bom, parse_resolution_report(json.dumps(payload))
+        finally:
+            bom.unlink()
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", generate)
+    if variant == "local-finding":
+        _trivy_sbom(
+            monkeypatch,
+            stdout=json.dumps(
+                {
+                    "Results": [
+                        {
+                            "Class": "lang-pkgs",
+                            "Vulnerabilities": [
+                                {
+                                    "VulnerabilityID": "CVE-local",
+                                    "PkgName": "fixture:app",
+                                    "InstalledVersion": "unspecified",
+                                    "Severity": "HIGH",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+    else:
+        _trivy_sbom(monkeypatch)
+    if variant == "local":
+        findings, _ = scanner._run_gradle_scan(gradle_project)
+        assert findings
+        assert all(f.gradle_scopes == (":/project/runtimeClasspath",) for f in findings)
+    else:
+        with pytest.raises(GradleError):
+            scanner._run_gradle_scan(gradle_project)

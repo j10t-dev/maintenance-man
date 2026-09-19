@@ -225,3 +225,19 @@ def test_gradle_promotion_checks_exact_base_and_tip_in_operation(tmp_path, mutat
         assert exact_commit_id(repo, "main") == tip
     else:
         assert _jj(repo, "bookmark", "list", "main").stdout == before
+
+
+def test_gradle_revision_tree_identity_tracks_content_not_commit_metadata(tmp_path):
+    from maintenance_man.vcs import revision_tree_id
+
+    repo = init_repo(tmp_path)
+    original = revision_tree_id(repo, "main")
+    assert original == revision_tree_id(repo)
+    assert _jj(repo, "describe", "-m", "metadata only").returncode == 0
+    assert original == revision_tree_id(repo)
+    (repo / "README.md").write_text("different content\n")
+    changed = revision_tree_id(repo)
+    assert changed != original
+    assert original == revision_tree_id(repo, "main")
+    (repo / "README.md").write_text("initial\n")
+    assert revision_tree_id(repo) == original

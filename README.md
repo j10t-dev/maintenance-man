@@ -133,6 +133,8 @@ Configure the test commands as for any other project, for example `test_unit = "
 
 Standard generated build and cache outputs must already be ignored by the repository; mm verifies that its dependency commits contain no generated reports.
 
+Builds, tests and inventory generation must leave tracked source files unchanged. mm binds their evidence to one source tree and refuses acceptance if these commands change it.
+
 Export the Android SDK location before running `mm update`. `mm update` applies changes inside a throwaway jj workspace under `~/.mm/workspaces/`, and a jj workspace checks out tracked files only. `local.properties` is conventionally untracked, so `sdk.dir` is not available there and an Android build cannot find the SDK. Export `ANDROID_HOME` or `ANDROID_SDK_ROOT` in the environment you run `mm` from. mm refuses to create the workspace and tells you so if neither is set and the project relies on `local.properties`. `mm scan` and `mm resolve` run in the project directory, where `local.properties` is present.
 
 Because the workspace is created fresh and deleted after every run, each `mm update` is a cold Gradle build with no reusable daemon or build cache. Allow for that when choosing test tasks. Gradle commands are given 900 seconds, and each configured test phase 600 seconds.
@@ -152,35 +154,23 @@ Each Gradle command runs from the project root with a 900-second timeout, closed
 
 ### What mm changes
 
-mm edits catalogue versions only, through the update plugin:
+mm edits catalogue library and plugin versions through the update plugin. Every alias sharing a `version.ref` changes as one group, including mixed library/plugin groups. Independently versioned aliases remain separate targets. Each group gets one chosen candidate and one application per invocation; a failure does not try another version.
 
-- Every alias sharing a `version.ref`, including libraries and plugins together, is upgraded in one attempt, tested once and produces at most one dependency-update commit across vulnerability and ordinary-update findings. Mixed groups use vulnerability priority and a vulnerability-labelled commit. Independently versioned aliases remain separate targets even when their coordinates match.
-- Supported declarations are simple literal versions and simple `version.ref` declarations. Rich versions, constraints and ambiguous mappings are reported as blocked, never flattened.
-- A library with no catalogue version stays under platform or BOM control and never acquires a version.
-- Vulnerability fixes are applied automatically only when a catalogue library owns the coordinate and the advisory names a single exact fix version. Transitive-only findings, BOM-owned children, plugin implementation dependencies, ranges and multiple alternative fixes are reported for manual resolution; mm never assumes that upgrading a parent or plugin fixes a transitive advisory.
+Simple literal versions and simple `version.ref` declarations are supported. Rich or ambiguous declarations remain blocked. A library without a catalogue version stays under platform or BOM control and never acquires a version. SDK, compileSdk/targetSdk, Gradle-wrapper, dependency-override and hard-coded declaration changes require manual preparation.
 
-### Release-age policy is stricter for Gradle
+A direct security fix requires an exact advisory fix version, or one unambiguous version on the installed major/minor branch, followed by native Gradle validation. Transitive parent, BOM and plugin updates require an independently discovered catalogue proposal and unambiguous ownership in the covered resolution graph. Unsupported ownership remains visible as a prerequisite. Updating a parent or plugin does not by itself mark its child advisories fixed.
 
-mm checks Maven Central for the publication timestamp of every artifact a change touches. It uses the real coordinate for libraries and the `<id>:<id>.gradle.plugin` marker for plugins. If any one of them has no verifiable timestamp, the whole group is blocked, including vulnerability fixes. Setting `min_version_age_days = 0` removes the waiting period; it does not accept unknown publication dates.
+### Release-age and verification policy
 
-Artifacts published only to Google Maven or the Gradle Plugin Portal usually have no Maven Central timestamp, so mm will report those updates and refuse to apply them automatically. Apply those by hand. Network and lookup failures also block changes. HTTP `Last-Modified` headers and first-observation times are not publication dates. mm rechecks the catalogue target, catalogue state and publication evidence before every automatic change, including findings loaded from older scan files.
+Automatic Gradle publication eligibility requires the project declaration `gradle_repository_routing = "standard-public"`. Set it only when relevant public repositories have no credentials or custom content/exclusive routing. mm relies on this operator declaration and does not infer it from a URL or successful resolution. Existing configurations without the declaration remain valid for scanning and reporting, with automatic candidates withheld.
 
-`mm resolve` follows the same safety rules. `--continue` validates the catalogue, relationships and current publication evidence before tests or READY promotion; passing tests cannot make a blocked group ready. An update with any remaining blocked group exits with code 4 and cannot finalise, promote or submit changes. Eligible groups in a mixed run can still be applied, with accepted changes left on the maintenance bookmark. A fully blocked run creates no workspace and runs no tests or commits.
+Every changed member needs reliable publication evidence from its exact POM on a relevant configured trusted repository. Supported repositories are Maven Central, Google Maven and Plugin Portal. A reliable Last-Modified header is accepted as repository availability evidence; an exact matching Central timestamp is also supported. Missing, invalid or conflicting evidence blocks the group. When identical artifacts have different valid dates, mm uses the youngest. Setting `min_version_age_days = 0` removes the waiting period and still requires evidence. Custom URLs and unsupported redirects remain blocked. Plugin updates require evidence for both the standard marker and its exact implementation artifact.
 
-### Automatic publication eligibility requires a routing declaration
+Configure `build_command` and at least one test phase for automatic acceptance. For Android, use debug assembly plus unit tests and lint. Complete before/after scans use one frozen Trivy database and policy context. Failed checks, incomplete or incomparable coverage, and new or worsened findings block acceptance. An ordinary catalogue update may complete with unchanged residual advisories. A candidate proposed solely as a security fix must remove every requested scoped finding. Saved scan results retain residual CVEs without marking them completed.
 
-Gradle automatic updates require an explicit project declaration:
+Verified changes can be promoted or submitted while unrelated advisories or withheld candidates remain. An actual failed or interrupted attempt prevents final promotion in that run. mm rechecks publication facts, checked trees, comparison inputs and the expected main/bookmark revisions before finalization. Update failure restores the last accepted workspace tree; resolve failure preserves the repair workspace.
 
-```toml
-[projects.example]
-path = "/path/to/project"
-package_manager = "gradle"
-gradle_repository_routing = "standard-public"
-```
-
-Set `gradle_repository_routing` only when the recognized public repository roots relevant to this project's library and plugin candidates use standard Maven routing without credentials, content filters or exclusive-content rules affecting those roots. This includes settings, subprojects and plugin-management repositories. Revisit the declaration when repository configuration changes. A credentialed public root, a content filter restricting that root, or an exclusive-content rule affecting it prevents this declaration. mm relies on the operator's assertion; it does not detect these settings.
-
-Omit the field for unsupported or unknown routing. Inventory, scanning and candidate reporting remain available, while automatic candidate groups are withheld with an age prerequisite. A zero minimum age does not bypass this prerequisite. The declaration does not make custom repository URLs trusted, expand configured project/domain scope, or replace native candidate and exact-artifact publication checks.
+Interrupted work is tracked separately from scans in `~/.mm/gradle-runs`. Update recovery rolls back an unverified attempt before a later fresh invocation. `mm resolve PROJECT --continue` verifies a committed repair, including intended catalogue versions, age, build/tests and a comparable scan, without applying the update again. READY recovery reuses valid evidence or rebuilds it without reapplying. A failed refresh after promotion retries the refresh. Do not delete the ledger to bypass unsafe work; a fresh scan cannot erase it.
 
 Private Trivy database caches are released after a run completes or replacement evidence is durably saved. The ledger retains the recorded snapshots and receipts. Unfinished runs keep the cache needed for recovery.
 

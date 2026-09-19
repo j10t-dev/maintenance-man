@@ -77,6 +77,11 @@ class ScopeResolution(GradleRecord):
         return self
 
 
+class LocalProjectIdentity(GradleRecord):
+    project_path: str
+    module: ModuleId
+
+
 class ResolutionReport(GradleRecord):
     schema_version: Literal[1]
     root_project: str
@@ -85,6 +90,7 @@ class ResolutionReport(GradleRecord):
     repositories: tuple[RepositoryDeclaration, ...]
     selected_scopes: tuple[ScopeId, ...]
     scopes: tuple[ScopeResolution, ...]
+    local_projects: tuple[LocalProjectIdentity, ...] = ()
     selection_errors: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -97,6 +103,11 @@ class ResolutionReport(GradleRecord):
             raise ValueError("unselected scope result")
         if set(self.producer_versions) != {"gradle", "cyclonedx", "report"}:
             raise ValueError("producer versions missing")
+        paths = [project.project_path for project in self.local_projects]
+        if len(set(paths)) != len(paths) or not set(paths) <= {
+            scope.project_path for scope in self.selected_scopes
+        }:
+            raise ValueError("duplicate or unselected local project identity")
         return self
 
 

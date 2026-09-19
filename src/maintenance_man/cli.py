@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum, StrEnum
@@ -30,7 +31,6 @@ from maintenance_man.config import (
 )
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
-    check_gradle_update_age,
     evaluate_gradle_candidate_age,
 )
 from maintenance_man.deployer import (
@@ -45,7 +45,6 @@ from maintenance_man.gradle import (
     GradleError,
     discover_gradle_updates,
     parse_catalogue,
-    validate_gradle_recovery,
     validate_gradle_target,
     workspace_environment_reason,
 )
@@ -82,6 +81,7 @@ from maintenance_man.models.gradle import (
 )
 from maintenance_man.models.scan import (
     ScanResult,
+    Severity,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
@@ -97,7 +97,6 @@ from maintenance_man.scanner import (
 )
 from maintenance_man.updater import (
     Finding,
-    GradleFinding,
     NoScanResultsError,
     UpdateResult,
     consolidate_vulns,
@@ -105,7 +104,6 @@ from maintenance_man.updater import (
     has_test_config,
     highest_fix_version,
     load_scan_results,
-    prepare_gradle_findings,
     process_findings,
     process_updates,
     process_vulns,
@@ -441,6 +439,7 @@ def _update_batch_targets(
     results_dir = _config.MM_HOME / "scan-results"
     all_project_results: list[tuple[str, list[UpdateResult]]] = []
     had_errors = False
+    gradle_reported = False
 
     for name in target_names:
         proj_config = cfg.projects[name]
@@ -463,12 +462,15 @@ def _update_batch_targets(
             had_errors = True
             continue
         results, promotion_failed = outcome
+        if proj_config.package_manager == "gradle":
+            gradle_reported = True
         if promotion_failed:
             had_errors = True
         if results:
             all_project_results.append((name, results))
 
-    _print_mass_update_summary(all_project_results)
+    if all_project_results or not gradle_reported:
+        _print_mass_update_summary(all_project_results)
 
     any_failed = had_errors or any(
         not r.passed for _, results in all_project_results for r in results
@@ -545,60 +547,6 @@ def _enter_update_workspace(
         remove_workspace(proj_config.path, project)
         raise _UpdateSetupError("could not create update change")
     return workspace_path
-
-
-def _finish_gradle_update_without_application(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    results_dir: Path,
-) -> int:
-    if scan_result.blocked_findings or _has_update_failures(scan_result):
-        return ExitCode.UPDATE_FAILED
-    if not _has_update_progress(scan_result):
-        return ExitCode.OK
-    if not bookmark_exists(_UPDATE_BOOKMARK, proj_config.path):
-        console.print(
-            f"[bold red]Cannot update {project}:[/] update bookmark is missing"
-        )
-        return ExitCode.UPDATE_FAILED
-    if not _finalise_local_update(proj_config.path, scan_result, project, results_dir):
-        return ExitCode.UPDATE_FAILED
-    delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
-    return ExitCode.OK
-
-
-def _prepare_gradle_update_groups(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    results_dir: Path,
-    minimum_age_days: int,
-) -> list[GradleFinding]:
-    groups = prepare_gradle_findings(scan_result, proj_config, minimum_age_days)
-    save_scan_results(project, results_dir, scan_result)
-    _print_blocked_findings(scan_result)
-    return groups
-
-
-def _process_gradle_update_groups(
-    groups: list[GradleFinding],
-    work_config: ProjectConfig,
-    scan_result: ScanResult,
-    project: str,
-    results_dir: Path,
-    minimum_age_days: int,
-) -> list[UpdateResult]:
-    console.print(f"\n[bold]Processing {len(groups)} Gradle group(s)...[/]")
-    return process_findings(
-        groups,
-        work_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan_result,
-        project_name=project,
-        results_dir=results_dir,
-        minimum_age_days=minimum_age_days,
-    )
 
 
 def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
@@ -680,37 +628,6 @@ def _process_selected_updates(
         project_name=project,
         results_dir=results_dir,
     )
-
-
-def _prompt_gradle_selection(groups: list[GradleFinding]) -> list[GradleFinding]:
-    """Select whole catalogue groups; every affected alias is shown first."""
-    console.print()
-    for idx, group in enumerate(groups, 1):
-        label = "[bold red]VULN[/]" if group.kind == "vuln" else "[bold cyan]UPDATE[/]"
-        console.print(
-            f"  [dim]{idx:>3}.[/] {label} {group.pkg_name} "
-            f"{group.installed_version} -> {group.target_version} ({group.detail})"
-        )
-        aliases = ", ".join(m.alias for m in group.target.members)
-        console.print(f"       [dim]affects: {aliases}[/]")
-
-    while True:
-        selection = Prompt.ask("\n  Select updates [all/1,2,.../none]", default="all")
-        if selection == "none":
-            return []
-        if selection == "all":
-            return groups
-        try:
-            indices = [int(s.strip()) for s in selection.split(",")]
-        except ValueError:
-            console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
-            continue
-        chosen = [
-            groups[i - 1] for i in dict.fromkeys(indices) if 1 <= i <= len(groups)
-        ]
-        if chosen:
-            return chosen
-        console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
 
 
 def _print_update_summary(all_results: list[UpdateResult]) -> None:
@@ -887,19 +804,6 @@ def _ordered_resolve_candidates(
     minimum_age_days: int,
 ) -> list[Finding]:
     """Return fresh + resolve-owned failed findings, ordered for processing."""
-    if proj_config.package_manager == "gradle":
-        return [
-            group
-            for group in prepare_gradle_findings(
-                scan_result, proj_config, minimum_age_days
-            )
-            if (group.flow is None and group.update_status is None)
-            or (
-                group.flow == Workflow.RESOLVE
-                and group.update_status == UpdateStatus.FAILED
-            )
-            or _is_resolve_claimable_failure(group, Workflow.RESOLVE)
-        ]
     candidate_vulns = [
         v
         for v in scan_result.vulnerabilities
@@ -929,10 +833,6 @@ def _ordered_failed_findings(
     minimum_age_days: int,
 ) -> list[Finding]:
     """Return resolve-owned FAILED findings in processing order."""
-    if proj_config.package_manager == "gradle":
-        return _recorded_gradle_progress(
-            scan_result, UpdateStatus.FAILED, Workflow.RESOLVE
-        )
     failed_vulns = [
         v
         for v in scan_result.vulnerabilities
@@ -956,8 +856,6 @@ def _ordered_ready_findings(
     proj_config: ProjectConfig,
 ) -> list[Finding]:
     """Return READY findings owned by *flow*, ordered for submission."""
-    if proj_config.package_manager == "gradle":
-        return _recorded_gradle_progress(scan_result, UpdateStatus.READY, flow)
     ready_vulns = [
         v
         for v in scan_result.vulnerabilities
@@ -972,25 +870,6 @@ def _ordered_ready_findings(
         *consolidate_vulns(ready_vulns),
         *sort_updates_by_risk(ready_updates),
     ]
-
-
-def _recorded_gradle_progress(
-    scan_result: ScanResult, status: UpdateStatus, flow: Workflow
-) -> list[Finding]:
-    originals = [f for f in (*scan_result.vulnerabilities, *scan_result.updates)]
-    groups = gradle_groups_from_targets(originals)
-    grouped_ids = {id(original) for group in groups for original in group._originals}
-    selected: list[Finding] = [
-        group
-        for group in groups
-        if group.update_status == status and group.flow == flow
-    ]
-    selected.extend(
-        f
-        for f in originals
-        if id(f) not in grouped_ids and f.update_status == status and f.flow == flow
-    )
-    return selected
 
 
 def _has_ready_resolve_progress(scan_result: ScanResult) -> bool:
@@ -1102,45 +981,6 @@ def _submit_resolve_bookmark(
     remove_completed_findings(scan_result)
     save_scan_results(project, results_dir, scan_result)
     return ExitCode.OK
-
-
-def _gradle_recovery_verified(
-    proj_config: ProjectConfig,
-    failed: list[Finding],
-    scan_result: ScanResult,
-    project: str,
-    results_dir: Path,
-    minimum_age_days: int,
-) -> bool:
-    """Verify the complete intended manual repair before tests or promotion."""
-    if proj_config.package_manager != "gradle":
-        return True
-    ready = _ordered_ready_findings(
-        scan_result, flow=Workflow.RESOLVE, proj_config=proj_config
-    )
-    if any(not isinstance(finding, GradleFinding) for finding in ready):
-        _print_blocked_findings(scan_result)
-        save_scan_results(project, results_dir, scan_result)
-        return False
-    blocked = False
-    for blocker in failed:
-        if not isinstance(blocker, GradleFinding):
-            blocked = True
-            continue
-        block = validate_gradle_recovery(
-            proj_config, blocker.target
-        ) or check_gradle_update_age(blocker.target, minimum_age_days)
-        if block is not None:
-            blocker.set_block(block)
-            blocked = True
-        else:
-            for original in blocker._originals:
-                original.blocked_reason = None
-                original.gradle_block_kind = None
-    if blocked:
-        _print_blocked_findings(scan_result)
-        save_scan_results(project, results_dir, scan_result)
-    return not blocked
 
 
 def _print_mass_update_summary(
@@ -1788,136 +1628,10 @@ def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanR
     t0 = time.monotonic()
     result = scan_project(name, proj_config, min_age_days)
     elapsed = time.monotonic() - t0
-    _print_scan_result(result, elapsed_s=elapsed)
+    _print_scan_result(
+        result, elapsed_s=elapsed, gradle=proj_config.package_manager == "gradle"
+    )
     return result
-
-
-def _print_blocked_findings(scan_result: ScanResult) -> None:
-    """Show current policy blocks with their count. These are not failures."""
-    blocked = scan_result.blocked_findings
-    if not blocked:
-        return
-    console.print(
-        f"\n[bold yellow]{len(blocked)} blocked[/] — not applied automatically:"
-    )
-    for f in blocked:
-        assert f.blocked_reason is not None
-        console.print(f"  [yellow]BLOCKED[/] {f.pkg_name} — {escape(f.blocked_reason)}")
-
-
-def _print_scan_result(
-    result: ScanResult, elapsed_s: float | None = None, *, show_blocked: bool = True
-) -> None:
-    """Print a Rich-formatted summary of scan results for one project."""
-    actionable = sort_vulns_by_severity(
-        [v for v in result.vulnerabilities if v.actionable]
-    )
-    advisories = sort_vulns_by_severity(
-        [v for v in result.vulnerabilities if not v.actionable]
-    )
-    secrets = result.secrets
-    updates = result.updates
-
-    total = len(actionable) + len(advisories) + len(secrets) + len(updates)
-    timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
-
-    if total == 0:
-        console.print(f"[bold green]{result.project}[/] — clean{timing}")
-        return
-
-    categories = [
-        (actionable, "vulnerability", "vulnerabilities"),
-        (advisories, "advisory", "advisories"),
-        (secrets, "secret", "secrets"),
-        (updates, "update", "updates"),
-    ]
-    parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
-
-    console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
-
-    if actionable:
-        # Determine the winning fix version per package for the marker.
-        win_versions: dict[str, str] = {}
-        pkg_counts: dict[str, int] = {}
-        for v in actionable:
-            pkg_counts[v.pkg_name] = pkg_counts.get(v.pkg_name, 0) + 1
-        for pkg in pkg_counts:
-            if pkg_counts[pkg] > 1:
-                group = [v for v in actionable if v.pkg_name == pkg]
-                win_versions[pkg] = highest_fix_version(group)
-
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold red", width=4)
-        table.add_column("Package")
-        table.add_column("Installed")
-        table.add_column("Fix")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in actionable:
-            fix_col = v.fixed_version or ""
-            if (
-                v.pkg_name in win_versions
-                and v.fixed_version == win_versions[v.pkg_name]
-            ):
-                fix_col += " ← fix"
-            table.add_row(
-                "VULN",
-                v.pkg_name,
-                v.installed_version,
-                fix_col,
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
-
-    if advisories:
-        table = Table(show_header=False, **_TABLE_STYLE)
-        table.add_column("", style="bold yellow", width=4)
-        table.add_column("Package")
-        table.add_column("Installed")
-        table.add_column("Status")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in advisories:
-            table.add_row(
-                "ADV",
-                v.pkg_name,
-                v.installed_version,
-                v.status,
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
-
-    if secrets:
-        for s in secrets:
-            console.print(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
-
-    if updates:
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold cyan", width=4)
-        table.add_column("Package")
-        table.add_column("Installed")
-        table.add_column("Latest")
-        table.add_column("Tier")
-        table.add_column("Age")
-        for u in updates:
-            age = ""
-            if u.published_date:
-                days = (datetime.now(timezone.utc) - u.published_date).days
-                age = f"({days} days old)"
-            table.add_row(
-                "UPDATE",
-                u.pkg_name,
-                u.installed_version,
-                u.latest_version,
-                u.semver_tier.value,
-                age,
-            )
-        console.print(table)
-
-    if show_blocked:
-        _print_blocked_findings(result)
 
 
 def _print_numbered_findings(
@@ -2810,19 +2524,17 @@ def _run_gradle_flow(
             run = gradle_updater.process_gradle_run(
                 run, work, publication, minimum_age_days
             )
-            for item in run.attempts:
-                console.print(f"{item.candidate.target.display_name}: {item.state}")
-                if isinstance(item, (WithheldAttempt, FailedAttempt)):
-                    console.print(item.reason)
             if any(
                 isinstance(item, (ApplyingAttempt, FailedAttempt, PlannedAttempt))
                 for item in run.attempts
             ):
+                _print_gradle_run_result(run, project, results_dir)
                 return ExitCode.UPDATE_FAILED
             if not any(
                 isinstance(item, (ReadyAttempt, CompletedAttempt))
                 for item in run.attempts
             ):
+                _print_gradle_run_result(run, project, results_dir)
                 console.print("No eligible Gradle changes")
                 # A clean/withheld-only run has no effects requiring recovery.
                 path.unlink(missing_ok=True)
@@ -2839,9 +2551,275 @@ def _run_gradle_flow(
             run = _finish_verified_gradle_run(
                 run, project, results_dir, publication, minimum_age_days
             )
+            gradle_updater.retire_gradle_context(run.context)
+            _print_gradle_run_result(run, project, results_dir)
         if flow == Workflow.UPDATE and run.refreshed:
             remove_workspace(project.path, project_name)
         return ExitCode.OK
     except (GradleError, TrivyScanError, _UpdateSetupError, OSError) as exc:
         console.print(f"Cannot complete Gradle {flow}: {exc}")
         return ExitCode.UPDATE_FAILED
+
+
+def _print_gradle_advisories(result: ScanResult) -> None:
+    grouped: dict[tuple[str, str], list[VulnFinding]] = defaultdict(list)
+    for finding in result.vulnerabilities:
+        grouped[(finding.pkg_name, finding.installed_version)].append(finding)
+    if not grouped:
+        return
+    rank = {
+        Severity.CRITICAL: 0,
+        Severity.HIGH: 1,
+        Severity.MEDIUM: 2,
+        Severity.LOW: 3,
+        Severity.UNKNOWN: 4,
+    }
+    table = Table(show_header=True, **_TABLE_STYLE)
+    for title in ("Package", "Installed", "CVEs", "Worst severity", "Scopes"):
+        table.add_column(title)
+    ordered = sorted(
+        grouped.items(),
+        key=lambda item: (min(rank[row.severity] for row in item[1]), item[0]),
+    )
+    for (package, version), rows in ordered:
+        scopes = sorted({scope for row in rows for scope in row.gradle_scopes})
+        table.add_row(
+            escape(package),
+            escape(version),
+            str(len({row.vuln_id for row in rows})),
+            min((row.severity for row in rows), key=rank.__getitem__).value,
+            escape(", ".join(scopes) or "scope unavailable"),
+        )
+    console.print(table)
+
+
+def _print_gradle_run_summary(run: GradleRun) -> None:
+    counts = {
+        state: sum(attempt.state == state for attempt in run.attempts)
+        for state in ("ready", "completed", "failed", "applying")
+    }
+    withheld: dict[tuple[str, str, str, str], str] = {}
+    for block in run.selection_blocks:
+        if block.group_key is not None:
+            key = ("target", block.group_key, "", block.reason)
+            label = block.group_key
+        else:
+            key = ("package", block.coordinate, block.installed_version, block.reason)
+            label = f"{block.coordinate}@{block.installed_version}"
+        withheld[key] = label
+    for attempt in run.attempts:
+        if isinstance(attempt, WithheldAttempt):
+            target = attempt.candidate.target
+            key = ("target", target.group_key, "", attempt.reason)
+            withheld[key] = f"{target.display_name} -> {target.target_version}"
+    console.print(
+        f"Verified: {counts['ready'] + counts['completed']}; "
+        f"withheld: {len(withheld)}; "
+        f"failed: {counts['failed'] + counts['applying']}; "
+        f"residual advisories: {len(run.accepted_snapshot.findings)}"
+    )
+    for (kind, identity, version, reason), label in sorted(withheld.items()):
+        prefix = "WITHHELD TARGET" if kind == "target" else "RESIDUAL PACKAGE"
+        console.print(f"  {prefix} {escape(label)} — {escape(reason)}")
+    for attempt in run.attempts:
+        if isinstance(attempt, FailedAttempt):
+            target = attempt.candidate.target
+            console.print(
+                f"  FAILED {escape(target.display_name)} -> "
+                f"{escape(target.target_version)} "
+                f"— {escape(attempt.reason)}"
+            )
+
+
+def _print_scan_result(
+    result: ScanResult,
+    elapsed_s: float | None = None,
+    *,
+    show_blocked: bool = True,
+    gradle: bool = False,
+) -> None:
+    """Print a Rich-formatted summary of scan results for one project."""
+    actionable = sort_vulns_by_severity(
+        [v for v in result.vulnerabilities if v.actionable]
+    )
+    advisories = sort_vulns_by_severity(
+        [v for v in result.vulnerabilities if not v.actionable]
+    )
+    secrets = result.secrets
+    updates = result.updates
+
+    total = len(actionable) + len(advisories) + len(secrets) + len(updates)
+    timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
+
+    if total == 0:
+        console.print(f"[bold green]{result.project}[/] — clean{timing}")
+        return
+
+    categories = [
+        (actionable, "vulnerability", "vulnerabilities"),
+        (advisories, "advisory", "advisories"),
+        (secrets, "secret", "secrets"),
+        (updates, "update", "updates"),
+    ]
+    parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
+
+    console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
+
+    if gradle:
+        _print_gradle_advisories(result)
+
+    if actionable and not gradle:
+        # Determine the winning fix version per package for the marker.
+        win_versions: dict[str, str] = {}
+        pkg_counts: dict[str, int] = {}
+        for v in actionable:
+            pkg_counts[v.pkg_name] = pkg_counts.get(v.pkg_name, 0) + 1
+        for pkg in pkg_counts:
+            if pkg_counts[pkg] > 1:
+                group = [v for v in actionable if v.pkg_name == pkg]
+                win_versions[pkg] = highest_fix_version(group)
+
+        table = Table(show_header=True, **_TABLE_STYLE)
+        table.add_column("", style="bold red", width=4)
+        table.add_column("Package")
+        table.add_column("Installed")
+        table.add_column("Fix")
+        table.add_column("Severity")
+        table.add_column("CVE")
+        for v in actionable:
+            fix_col = v.fixed_version or ""
+            if (
+                v.pkg_name in win_versions
+                and v.fixed_version == win_versions[v.pkg_name]
+            ):
+                fix_col += " ← fix"
+            table.add_row(
+                "VULN",
+                v.pkg_name,
+                v.installed_version,
+                fix_col,
+                v.severity.value,
+                v.vuln_id,
+            )
+        console.print(table)
+
+    if advisories and not gradle:
+        table = Table(show_header=False, **_TABLE_STYLE)
+        table.add_column("", style="bold yellow", width=4)
+        table.add_column("Package")
+        table.add_column("Installed")
+        table.add_column("Status")
+        table.add_column("Severity")
+        table.add_column("CVE")
+        for v in advisories:
+            table.add_row(
+                "ADV",
+                v.pkg_name,
+                v.installed_version,
+                v.status,
+                v.severity.value,
+                v.vuln_id,
+            )
+        console.print(table)
+
+    if secrets:
+        for s in secrets:
+            console.print(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
+
+    if updates:
+        table = Table(show_header=True, **_TABLE_STYLE)
+        table.add_column("", style="bold cyan", width=4)
+        table.add_column("Package")
+        table.add_column("Installed")
+        table.add_column("Latest")
+        table.add_column("Tier")
+        table.add_column("Age")
+        for u in updates:
+            age = ""
+            if u.published_date:
+                days = (datetime.now(timezone.utc) - u.published_date).days
+                age = f"({days} days old)"
+            table.add_row(
+                "UPDATE",
+                u.pkg_name,
+                u.installed_version,
+                u.latest_version,
+                u.semver_tier.value,
+                age,
+            )
+        console.print(table)
+
+    if show_blocked:
+        _print_blocked_findings(result)
+
+
+def _print_blocked_findings(scan_result: ScanResult) -> None:
+    groups: dict[tuple[str, str], list[VulnFinding | UpdateFinding]] = defaultdict(list)
+    for finding in scan_result.blocked_findings:
+        identity = (
+            finding.gradle_target.group_key
+            if finding.gradle_target
+            else f"{finding.pkg_name}@{finding.installed_version}"
+        )
+        groups[(identity, finding.blocked_reason or "")].append(finding)
+    if not groups:
+        return
+    console.print(
+        f"\n[bold yellow]{len(groups)} blocked target/package group(s)[/] "
+        "— not applied automatically:"
+    )
+    for (identity, reason), rows in sorted(groups.items()):
+        target = rows[0].gradle_target
+        label = (
+            f"{target.display_name} -> {target.target_version}" if target else identity
+        )
+        prefix = "BLOCKED TARGET" if target else "RESIDUAL PACKAGE"
+        console.print(f"  [yellow]{prefix}[/] {escape(label)} — {escape(reason)}")
+
+
+def _print_gradle_run_result(
+    run: GradleRun, project: ProjectConfig, results_dir: Path
+) -> None:
+    result = None
+    if run.refreshed:
+        try:
+            result = load_scan_results(run.project, results_dir)
+        except NoScanResultsError:
+            # A removed results file must not hide durable residual evidence.
+            pass
+    if result is None:
+        rows = {}
+        for finding in run.accepted_snapshot.findings:
+            scope = finding.key.scope
+            label = f"{scope.project_path}/{scope.domain}/{scope.configuration}"
+            for row in finding.rows:
+                identity = row.model_dump_json(
+                    exclude={"gradle_scopes", "update_status", "flow", "failed_phase"}
+                )
+                if identity not in rows:
+                    rows[identity] = row.model_copy(
+                        update={
+                            "gradle_scopes": (),
+                            "update_status": None,
+                            "flow": None,
+                            "failed_phase": None,
+                        }
+                    )
+                rows[identity] = rows[identity].model_copy(
+                    update={
+                        "gradle_scopes": tuple(
+                            sorted(set(rows[identity].gradle_scopes) | {label})
+                        )
+                    }
+                )
+        result = ScanResult(
+            project=run.project,
+            scanned_at=run.context.created_at,
+            trivy_target=str(project.path),
+            vulnerabilities=list(rows.values()),
+            gradle_resolution=run.accepted_snapshot.resolution.report.model_dump(
+                mode="json"
+            ),
+        )
+    _print_scan_result(result, gradle=True)
+    _print_gradle_run_summary(run)

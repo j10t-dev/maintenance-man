@@ -1571,16 +1571,19 @@ def test_gradle_cli_uses_ledger_even_without_scan_results(
     monkeypatch.setattr(
         cli, "revision_tree_id", lambda *args: run.accepted_snapshot.tree_id
     )
-    monkeypatch.setattr(
-        cli,
-        "load_scan_results",
-        lambda *args: pytest.fail("legacy scan should not authorize retry"),
-    )
-    monkeypatch.setattr(
-        cli,
-        "_finish_verified_gradle_run",
-        lambda value, *args: value.model_copy(update={"refreshed": True}),
-    )
+    finalized = False
+
+    def read_published(*args):
+        assert finalized, "scan JSON must not authorize ledger recovery"
+        raise cli.NoScanResultsError("no published results")
+
+    def finish(value, *args):
+        nonlocal finalized
+        finalized = True
+        return value.model_copy(update={"refreshed": True})
+
+    monkeypatch.setattr(cli, "load_scan_results", read_published)
+    monkeypatch.setattr(cli, "_finish_verified_gradle_run", finish)
     monkeypatch.setattr(cli, "remove_workspace", lambda *args: None)
     assert (
         cli._run_gradle_flow(
@@ -1889,3 +1892,161 @@ def test_gradle_fresh_scan_does_not_clear_unfinished_ledger(driver, monkeypatch)
     assert result.project == "sample" and result.vulnerabilities == []
     assert ledger.read_bytes() == before
     assert workflow.effects == []
+
+
+@pytest.mark.parametrize(
+    "refreshed,published_exists", [(False, False), (True, False), (True, True)]
+)
+def test_gradle_result_render_uses_durable_or_published_evidence(
+    workflow, monkeypatch, tmp_path, refreshed, published_exists
+):
+    from maintenance_man.models.scan import ScanResult
+
+    run = ready_workflow(workflow)
+    if refreshed:
+        run = run.model_copy(
+            update={"promoted_commit_id": run.managed_tip_id, "refreshed": True}
+        )
+    published = ScanResult(
+        project="sample",
+        scanned_at=workflow.context.created_at,
+        trivy_target=str(workflow.project.path),
+        vulnerabilities=[],
+    )
+    reads = []
+
+    def load(*args):
+        reads.append("load")
+        if published_exists:
+            return published
+        raise cli.NoScanResultsError("no saved results")
+
+    rendered = []
+    monkeypatch.setattr(cli, "load_scan_results", load)
+    monkeypatch.setattr(
+        cli,
+        "_print_scan_result",
+        lambda value, **kwargs: rendered.append((value, kwargs)),
+    )
+    summaries = []
+    monkeypatch.setattr(cli, "_print_gradle_run_summary", summaries.append)
+    before = run.model_dump_json()
+    cli._print_gradle_run_result(run, workflow.project, tmp_path)
+    assert len(rendered) == 1
+    result, options = rendered[0]
+    assert options == {"gradle": True}
+    assert summaries == [run]
+    assert reads == (["load"] if refreshed else [])
+    if refreshed and published_exists:
+        assert result is published
+    else:
+        assert len(result.vulnerabilities) == 1
+        assert result.vulnerabilities[0].installed_version == "2"
+        assert result.vulnerabilities[0].update_status is None
+        scope = run.accepted_snapshot.findings[0].key.scope
+        assert result.vulnerabilities[0].gradle_scopes == (
+            f"{scope.project_path}/{scope.domain}/{scope.configuration}",
+        )
+    assert run.model_dump_json() == before
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "local",
+        "unknown-path",
+        "wrong-coordinate",
+        "undeclared",
+        "external-mismatch",
+        "local-finding",
+    ],
+)
+def test_snapshot_checks_local_project_provenance(
+    frozen_context, resolution, monkeypatch, variant
+):
+    project, context, _ = frozen_context
+    payload = resolution.model_dump(mode="json")
+    if variant != "undeclared":
+        payload["report"]["local_projects"] = [
+            {
+                "project_path": ":app",
+                "module": {
+                    "group": "fixture",
+                    "artifact": "app",
+                    "version": "unspecified",
+                },
+            }
+        ]
+    resolution = CompleteResolution.model_validate(payload)
+    purl = "pkg:maven/fixture/app@unspecified?project_path=%3Aapp"
+    if variant == "unknown-path":
+        purl = "pkg:maven/fixture/app@unspecified?project_path=%3Aother"
+    elif variant == "wrong-coordinate":
+        purl = "pkg:maven/other/app@unspecified?project_path=%3Aapp"
+    components = [
+        {"type": "library", "purl": purl},
+        {"type": "library", "purl": "pkg:maven/g/lib@1"},
+    ]
+    if variant == "external-mismatch":
+        components.append({"type": "library", "purl": "pkg:maven/g/lib@2"})
+
+    @contextmanager
+    def generate(_project):
+        bom = project.path / "fixture-bom.json"
+        bom.write_text(json.dumps({"bomFormat": "CycloneDX", "components": components}))
+        try:
+            yield bom, resolution
+        finally:
+            bom.unlink()
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", generate)
+    monkeypatch.setattr(scanner, "revision_tree_id", lambda *args: "checked-tree")
+    rows = (
+        [
+            {
+                "VulnerabilityID": "CVE-local",
+                "PkgName": "fixture:app",
+                "InstalledVersion": "unspecified",
+                "Severity": "HIGH",
+            }
+        ]
+        if variant == "local-finding"
+        else []
+    )
+    monkeypatch.setattr(
+        scanner.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": rows}]}),
+            "",
+        ),
+    )
+    if variant in {"unknown-path", "wrong-coordinate", "undeclared"}:
+        with pytest.raises(scanner.GradleError, match="local project"):
+            scanner.capture_gradle_snapshot(project, context)
+    else:
+        result = scanner.capture_gradle_snapshot(project, context)
+        if variant == "local":
+            assert isinstance(result, GradleSnapshot)
+            assert result.inventory_modules == (
+                ModuleId(group="g", artifact="lib", version="1"),
+            )
+        else:
+            assert isinstance(result, IncompleteResolution)
+
+
+def test_batch_output_retains_verified_gradle_progress(driver, capsys):
+    from maintenance_man.models.config import MmConfig
+
+    cfg = MmConfig(projects={"sample": driver.project})
+    with pytest.raises(SystemExit) as exit_info:
+        cli._update_batch_targets(cfg, target_names=["sample"])
+    assert exit_info.value.code == 0
+    run = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert run is not None and run.refreshed
+    assert any(isinstance(attempt, CompletedAttempt) for attempt in run.attempts)
+    output = capsys.readouterr().out
+    assert "Verified: 1" in output
+    assert "No projects had actionable findings" not in output

@@ -1,11 +1,26 @@
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
+from maintenance_man import cli
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
 from maintenance_man.gradle import GradleError
+from maintenance_man.models.gradle import (
+    CandidateWithheld,
+    CompleteResolution,
+    FailedAttempt,
+    GradleCandidate,
+    GradleSnapshot,
+    ResolutionReport,
+    WithheldAttempt,
+)
 from maintenance_man.models.scan import (
+    GradleMember,
+    GradleUpdateTarget,
     ScanResult,
     SemverTier,
     Severity,
@@ -620,3 +635,212 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
     assert not (root / GRADLE_INVENTORY_RELPATH).exists()
     assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()
     assert not (root / GRADLE_REPORT_MARKER_RELPATH).exists()
+
+
+def test_gradle_advisories_collapse_without_losing_saved_cves(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=180, color_system=None)
+    )
+    scope = ":app/project/debugRuntimeClasspath"
+    findings = [
+        VulnFinding(
+            vuln_id=advisory,
+            pkg_name="org.example:shared",
+            installed_version="1.0",
+            severity=severity,
+            title=advisory,
+            description="",
+            status="affected",
+            gradle_scopes=(scope,),
+        )
+        for advisory, severity in (("CVE-A", Severity.LOW), ("CVE-B", Severity.HIGH))
+    ]
+    result = ScanResult(
+        project="android",
+        scanned_at=datetime.now(timezone.utc),
+        trivy_target="/fixture",
+        vulnerabilities=findings,
+    )
+    cli._print_gradle_advisories(result)
+    rendered = output.getvalue()
+    assert rendered.count("org.example:shared") == 1
+    assert "HIGH" in rendered
+    assert "2" in rendered
+    assert "debugRuntimeClasspath" in rendered
+    assert [
+        row["vuln_id"] for row in result.model_dump(mode="json")["vulnerabilities"]
+    ] == ["CVE-A", "CVE-B"]
+
+
+def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=180, color_system=None)
+    )
+    result = ScanResult(
+        project="android",
+        scanned_at=datetime.now(timezone.utc),
+        trivy_target="/fixture",
+        vulnerabilities=[
+            VulnFinding(
+                vuln_id="CVE-A",
+                pkg_name="org.example:shared",
+                installed_version=version,
+                severity=Severity.UNKNOWN,
+                title="",
+                description="",
+                status="affected",
+            )
+            for version in ("1.0", "2.0")
+        ],
+    )
+    cli._print_gradle_advisories(result)
+    assert output.getvalue().count("org.example:shared") == 2
+
+
+def _summary_run(blocks=(), attempts=(), residuals=()):
+    return SimpleNamespace(
+        selection_blocks=tuple(blocks),
+        attempts=tuple(attempts),
+        accepted_snapshot=SimpleNamespace(findings=tuple(residuals)),
+    )
+
+
+def _summary_attempt(state, reference="shared", reason="too young"):
+    target = GradleUpdateTarget(
+        version_ref=reference,
+        target_version="2.0",
+        members=[
+            GradleMember(
+                kind="library",
+                alias="shared",
+                coordinate="g:shared",
+                installed_version="1.0",
+            )
+        ],
+    )
+    candidate = GradleCandidate(target=target, origins=frozenset({"ordinary"}))
+    if state == "withheld":
+        return WithheldAttempt(candidate=candidate, reason=reason)
+    if state == "failed":
+        baseline = GradleSnapshot(
+            tree_id="tree",
+            context_identity="context",
+            inventory_digest="bom",
+            inventory_modules=(),
+            findings=(),
+            resolution=CompleteResolution(
+                report=ResolutionReport(
+                    schema_version=1,
+                    root_project=":",
+                    producer_versions={
+                        "gradle": "9.6.1",
+                        "cyclonedx": "3.4.1",
+                        "report": "1",
+                    },
+                    catalogue_digest="catalogue",
+                    repositories=(),
+                    selected_scopes=(),
+                    scopes=(),
+                )
+            ),
+        )
+        return FailedAttempt(candidate=candidate, reason=reason, baseline=baseline)
+    return SimpleNamespace(
+        state=state, reason=reason, candidate=SimpleNamespace(target=target)
+    )
+
+
+def test_gradle_retry_summary_renders_persisted_selection_blocks(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=180, color_system=None)
+    )
+    blocks = [
+        CandidateWithheld(
+            group_key=group,
+            coordinate="g:shared",
+            installed_version="1.0",
+            reason=reason,
+            advisory_ids=frozenset({advisory}),
+        )
+        for group, reason, advisory in (
+            ("ref:first", "too young", "CVE-A"),
+            ("ref:first", "too young", "CVE-B"),
+            ("ref:second", "too young", "CVE-C"),
+            ("ref:first", "unsupported routing", "CVE-D"),
+        )
+    ]
+    # Round-trip selection records to demonstrate the retry needs no preparation output.
+    loaded = [
+        CandidateWithheld.model_validate_json(block.model_dump_json())
+        for block in blocks
+    ]
+    run = _summary_run(loaded, (_summary_attempt("completed"),), (object(),))
+    cli._print_gradle_run_summary(run)
+    text = output.getvalue()
+    assert "Verified: 1; withheld: 3; failed: 0; residual advisories: 1" in text
+    assert text.count("WITHHELD TARGET") == 3
+    assert text.count("ref:first") == 2
+    assert text.count("ref:second") == 1
+    assert text.count("too young") == 2
+    assert text.count("unsupported routing") == 1
+
+
+def test_gradle_summary_keeps_unknown_versions_and_collapses_duplicate_reasons(
+    monkeypatch,
+):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=180, color_system=None)
+    )
+    blocks = [
+        CandidateWithheld(
+            group_key=None,
+            coordinate="g:unowned",
+            installed_version=version,
+            reason="ambiguous owner",
+            advisory_ids=frozenset({advisory}),
+        )
+        for version, advisory in (("1.0", "CVE-A"), ("1.0", "CVE-B"), ("2.0", "CVE-C"))
+    ]
+    cli._print_gradle_run_summary(_summary_run(blocks))
+    text = output.getvalue()
+    assert "withheld: 2" in text
+    assert text.count("RESIDUAL PACKAGE") == 2
+    assert text.count("g:unowned@1.0") == 1
+    assert text.count("g:unowned@2.0") == 1
+    assert text.count("ambiguous owner") == 2
+
+
+def test_gradle_summary_deduplicates_selection_and_attempt_but_retains_failures(
+    monkeypatch,
+):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=180, color_system=None)
+    )
+    block = CandidateWithheld(
+        group_key="ref:shared",
+        coordinate="g:shared",
+        installed_version="1.0",
+        reason="too young",
+    )
+    run = _summary_run(
+        (block,),
+        (
+            _summary_attempt("withheld"),
+            _summary_attempt("failed", "broken", "unit tests failed"),
+            _summary_attempt("applying", "interrupted"),
+            _summary_attempt("ready", "accepted"),
+        ),
+    )
+    cli._print_gradle_run_summary(run)
+    text = output.getvalue()
+    assert "Verified: 1; withheld: 1; failed: 2; residual advisories: 0" in text
+    assert text.count("WITHHELD TARGET") == 1
+    assert text.count("too young") == 1
+    assert "shared -> 2.0" in text
+    assert "FAILED broken -> 2.0" in text
+    assert "unit tests failed" in text

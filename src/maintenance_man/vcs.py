@@ -613,17 +613,19 @@ def revision_tree_id(path: Path, revision: str = "@") -> str:
     if not resolved.ok:
         raise GradleError(resolved.error)
     result = _run(
-        ["jj", "log", "-r", resolved.commit_id, "--no-graph", "-T", 'tree_id ++ "\\n"'],
+        ["jj", "debug", "object", "commit", resolved.commit_id],
         path,
     )
-    values = result.stdout.splitlines()
-    if (
-        result.returncode != 0
-        or len(values) != 1
-        or not re.fullmatch(r"[0-9a-f]+", values[0])
-    ):
+    # jj exposes the stored tree through its object inspector, not a template
+    # keyword. Refuse conflicted trees and unfamiliar inspector output.
+    trees = re.findall(
+        r'^    root_tree: Resolved\(\s*TreeId\(\s*"([0-9a-f]{40,64})",?\s*\),?\s*\),$',
+        result.stdout,
+        re.MULTILINE,
+    )
+    if result.returncode != 0 or len(trees) != 1:
         raise GradleError("Cannot identify the verified jj tree")
-    return values[0]
+    return trees[0]
 
 
 def exact_commit_id(path: Path, revision: str) -> str:

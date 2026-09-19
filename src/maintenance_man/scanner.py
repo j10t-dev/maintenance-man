@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeGuard
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
 
@@ -43,6 +43,7 @@ from maintenance_man.models.gradle import (
     GradleSnapshot,
     IncompleteResolution,
     ModuleId,
+    ResolutionReport,
 )
 from maintenance_man.models.scan import (
     ScanResult,
@@ -295,14 +296,8 @@ def _run_gradle_scan(
                         f"{scope.scope.project_path}/{scope.scope.domain}/"
                         f"{scope.scope.configuration}"
                     )
-        inventory = json.loads(bom.read_text())
-        for component in inventory["components"]:
-            if not str(component.get("purl", "")).startswith("pkg:maven/"):
-                continue
-            key = (
-                f"{component.get('group', '')}:{component.get('name', '')}",
-                component.get("version"),
-            )
+        for module in _inventory_modules(bom.read_bytes(), outcome.report):
+            key = (module.coordinate, module.version)
             if key not in scoped:
                 raise GradleError(
                     f"Inventory module has no selected resolution identity: {key}"
@@ -591,12 +586,17 @@ def _parse_secrets(results: list[dict]) -> list[SecretFinding]:
     ]
 
 
-def _inventory_modules(payload: bytes) -> tuple[ModuleId, ...]:
+def _inventory_modules(
+    payload: bytes, report: ResolutionReport
+) -> tuple[ModuleId, ...]:
     try:
         document = json.loads(payload)
         if not isinstance(document, dict) or document.get("bomFormat") != "CycloneDX":
             raise ValueError("expected CycloneDX object")
         found: set[ModuleId] = set()
+        local_projects = {
+            project.project_path: project.module for project in report.local_projects
+        }
 
         def visit(rows):
             if not isinstance(rows, list):
@@ -623,13 +623,18 @@ def _inventory_modules(payload: bytes) -> tuple[ModuleId, ...]:
                         or not version
                     ):
                         raise ValueError("malformed Maven purl")
-                    found.add(
-                        ModuleId(
-                            group=unquote(group),
-                            artifact=unquote(artifact),
-                            version=unquote(version),
-                        )
+                    module = ModuleId(
+                        group=unquote(group),
+                        artifact=unquote(artifact),
+                        version=unquote(version),
                     )
+                    qualifiers = parse_qs(urlsplit(purl).query, keep_blank_values=True)
+                    if "project_path" in qualifiers:
+                        paths = qualifiers["project_path"]
+                        if len(paths) != 1 or local_projects.get(paths[0]) != module:
+                            raise ValueError("unverified local project identity")
+                    else:
+                        found.add(module)
                 elif row.get("type") == "library" and not purl:
                     raise ValueError("library component has no package identity")
                 visit(row.get("components", []))
@@ -664,7 +669,7 @@ def capture_gradle_snapshot(
                 report=report, reasons=("selected scopes or producer versions changed",)
             )
         inventory = bom.read_bytes()
-        modules = _inventory_modules(inventory)
+        modules = _inventory_modules(inventory, report)
         scopes: dict[ModuleId, set] = {}
         for result in report.scopes:
             for component in result.components:

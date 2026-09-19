@@ -61,116 +61,147 @@ gradle.projectsEvaluated {
         }
     }
     def directory = new File(root.projectDir, '.mm-gradle-inventory')
-    root.tasks.register('mmGradleValidateCandidates') {
-        doLast {
-            def inputFile = new File(directory, 'candidate-requests.json')
-            if (Files.isSymbolicLink(inputFile.toPath())) {
-                throw new GradleException('Candidate request is a symlink')
-            }
-            def input = new JsonSlurper().parse(inputFile)
-            if (input.schema_version != 1 || !(input.requests instanceof List)) {
-                throw new GradleException('Unsupported candidate request schema')
-            }
-            def exact = { String value -> value ==~ /[A-Za-z0-9][A-Za-z0-9._+-]*/ }
-            def results = []
-            input.requests.each { request ->
-                def row = [request_id: request.request_id, group_key: request.group_key,
-                           alias: request.alias, project_path: request.project_path,
-                           selected_version: null, implementation: null, reason: null]
-                try {
-                    if (!(request.kind in ['library', 'plugin']) ||
-                        !exact(request.installed_version) || !exact(request.candidate_version) ||
-                        request.installed_version == request.candidate_version) {
-                        throw new GradleException('Candidate is not an exact changed version')
-                    }
-                    def project = root.project(request.project_path)
-                    def handler = project.dependencies
-                    def configurations = project.configurations
-                    def coordinate = request.coordinate
-                    if (request.kind == 'plugin') {
-                        handler = root.buildscript.dependencies
-                        configurations = root.buildscript.configurations
-                        pluginRepositoryObjects.each { repository ->
-                            if (!root.buildscript.repositories.contains(repository)) {
-                                root.buildscript.repositories.add(repository)
-                            }
-                        }
-                        coordinate = "${request.coordinate}:${request.coordinate}.gradle.plugin"
-                    }
-                    def resolveOne = { String notation ->
-                        def dependency = handler.create(notation)
-                        def detached = configurations.detachedConfiguration(dependency)
-                        detached.transitive = false
-                        def dependencies = detached.incoming.resolutionResult.rootComponent.get().dependencies
-                        if (dependencies.size() != 1 || !(dependencies.first() instanceof ResolvedDependencyResult)) {
-                            throw new GradleException('Exact metadata request unresolved')
-                        }
-                        def selected = dependencies.first().selected.id
-                        if (!(selected instanceof ModuleComponentIdentifier)) {
-                            throw new GradleException('Metadata request selected a project substitution')
-                        }
-                        def parts = coordinate.split(':')
-                        if (notation.startsWith(coordinate + ':') &&
-                            (selected.group != parts[0] || selected.module != parts[1])) {
-                            throw new GradleException('Metadata request changed module identity')
-                        }
-                        selected
-                    }
-                    def selected = resolveOne("${coordinate}:[${request.installed_version},${request.candidate_version}]")
-                    if (selected.version != request.candidate_version) {
-                        throw new GradleException('Native interval did not select the exact candidate')
-                    }
-                    if (request.kind == 'plugin') {
-                        def query = handler.createArtifactResolutionQuery()
-                            .forModule(selected.group, selected.module, selected.version)
-                            .withArtifacts(MavenModule, MavenPomArtifact).execute()
-                        def components = query.resolvedComponents
-                        if (components.size() != 1) {
-                            throw new GradleException('Standard plugin marker POM unavailable')
-                        }
-                        def artifacts = components.first().getArtifacts(MavenPomArtifact)
-                        if (artifacts.size() != 1 || !(artifacts.first() instanceof ResolvedArtifactResult)) {
-                            throw new GradleException('Standard plugin marker POM unresolved')
-                        }
-                        def parser = new XmlParser(false, false)
-                        parser.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
-                        parser.setFeature('http://xml.org/sax/features/external-general-entities', false)
-                        parser.setFeature('http://xml.org/sax/features/external-parameter-entities', false)
-                        def pom = parser.parse(artifacts.first().file)
-                        if (pom.groupId.text() != selected.group || pom.artifactId.text() != selected.module ||
-                            pom.version.text() != selected.version) {
-                            throw new GradleException('Marker POM identity is not exact')
-                        }
-                        def dependencies = pom.dependencies.dependency
-                        if (dependencies.size() != 1) {
-                            throw new GradleException('Marker must have one exact implementation dependency')
-                        }
-                        def implementation = dependencies.first()
-                        def group = implementation.groupId.text()
-                        def artifact = implementation.artifactId.text()
-                        def version = implementation.version.text()
-                        if (!exact(group) || !exact(artifact) || !exact(version) ||
-                            !(implementation.scope.text() in ['', 'compile', 'runtime']) ||
-                            !(implementation.type.text() in ['', 'jar']) || implementation.classifier.text()) {
-                            throw new GradleException('Unsupported marker implementation declaration')
-                        }
-                        def resolved = resolveOne("${group}:${artifact}:${version}")
-                        if (resolved.group != group || resolved.module != artifact || resolved.version != version) {
-                            throw new GradleException('Marker implementation did not resolve exactly')
-                        }
-                        row.implementation = [group: group, artifact: artifact, version: version]
-                    }
-                    row.selected_version = selected.version
-                } catch (Exception failure) {
-                    // Never serialize resolver exception messages: private repository
-                    // credentials can occur in their rendered URLs.
-                    row.reason = "Native metadata validation failed (${failure.class.simpleName})"
-                    row.selected_version = null
-                    row.implementation = null
+    def readCandidateRequests = {
+        def inputFile = new File(directory, 'candidate-requests.json')
+        if (Files.isSymbolicLink(inputFile.toPath())) {
+            throw new GradleException('Candidate request is a symlink')
+        }
+        def input = new JsonSlurper().parse(inputFile)
+        if (input.schema_version != 1 || !(input.requests instanceof List)) {
+            throw new GradleException('Unsupported candidate request schema')
+        }
+        input.requests
+    }
+    def validateProjectRequests = { project ->
+        def exact = { String value -> value ==~ /[A-Za-z0-9][A-Za-z0-9._+-]*/ }
+        def results = []
+        readCandidateRequests().findAll { it.project_path == project.path }.each { request ->
+            def row = [request_id: request.request_id, group_key: request.group_key,
+                       alias: request.alias, project_path: request.project_path, kind: request.kind,
+                       selected_version: null, implementation: null, reason: null]
+            try {
+                if (!(request.kind in ['library', 'plugin']) ||
+                    !exact(request.installed_version) || !exact(request.candidate_version) ||
+                    request.installed_version == request.candidate_version) {
+                    throw new GradleException('Candidate is not an exact changed version')
                 }
-                results.add(row)
+                def handler = project.dependencies
+                def configurations = project.configurations
+                def coordinate = request.coordinate
+                if (request.kind == 'plugin') {
+                    if (project != root) {
+                        throw new GradleException('Plugin candidates require the root project')
+                    }
+                    handler = root.buildscript.dependencies
+                    configurations = root.buildscript.configurations
+                    pluginRepositoryObjects.each { repository ->
+                        if (!root.buildscript.repositories.contains(repository)) {
+                            root.buildscript.repositories.add(repository)
+                        }
+                    }
+                    coordinate = "${request.coordinate}:${request.coordinate}.gradle.plugin"
+                }
+                def resolveOne = { String notation ->
+                    def dependency = handler.create(notation)
+                    def detached = configurations.detachedConfiguration(dependency)
+                    detached.transitive = false
+                    def dependencies = detached.incoming.resolutionResult.rootComponent.get().dependencies
+                    if (dependencies.size() != 1 || !(dependencies.first() instanceof ResolvedDependencyResult)) {
+                        throw new GradleException('Exact metadata request unresolved')
+                    }
+                    def selected = dependencies.first().selected.id
+                    if (!(selected instanceof ModuleComponentIdentifier)) {
+                        throw new GradleException('Metadata request selected a project substitution')
+                    }
+                    def parts = coordinate.split(':')
+                    if (notation.startsWith(coordinate + ':') &&
+                        (selected.group != parts[0] || selected.module != parts[1])) {
+                        throw new GradleException('Metadata request changed module identity')
+                    }
+                    selected
+                }
+                def selected = resolveOne("${coordinate}:[${request.installed_version},${request.candidate_version}]")
+                if (selected.version != request.candidate_version) {
+                    throw new GradleException('Native interval did not select the exact candidate')
+                }
+                if (request.kind == 'plugin') {
+                    def query = handler.createArtifactResolutionQuery()
+                        .forModule(selected.group, selected.module, selected.version)
+                        .withArtifacts(MavenModule, MavenPomArtifact).execute()
+                    def components = query.resolvedComponents
+                    if (components.size() != 1) {
+                        throw new GradleException('Standard plugin marker POM unavailable')
+                    }
+                    def artifacts = components.first().getArtifacts(MavenPomArtifact)
+                    if (artifacts.size() != 1 || !(artifacts.first() instanceof ResolvedArtifactResult)) {
+                        throw new GradleException('Standard plugin marker POM unresolved')
+                    }
+                    def parser = new XmlParser(false, false)
+                    parser.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
+                    parser.setFeature('http://xml.org/sax/features/external-general-entities', false)
+                    parser.setFeature('http://xml.org/sax/features/external-parameter-entities', false)
+                    def pom = parser.parse(artifacts.first().file)
+                    if (pom.groupId.text() != selected.group || pom.artifactId.text() != selected.module ||
+                        pom.version.text() != selected.version) {
+                        throw new GradleException('Marker POM identity is not exact')
+                    }
+                    def dependencies = pom.dependencies.dependency
+                    if (dependencies.size() != 1) {
+                        throw new GradleException('Marker must have one exact implementation dependency')
+                    }
+                    def implementation = dependencies.first()
+                    def group = implementation.groupId.text()
+                    def artifact = implementation.artifactId.text()
+                    def version = implementation.version.text()
+                    if (!exact(group) || !exact(artifact) || !exact(version) ||
+                        !(implementation.scope.text() in ['', 'compile', 'runtime']) ||
+                        !(implementation.type.text() in ['', 'jar']) || implementation.classifier.text()) {
+                        throw new GradleException('Unsupported marker implementation declaration')
+                    }
+                    def resolved = resolveOne("${group}:${artifact}:${version}")
+                    if (resolved.group != group || resolved.module != artifact || resolved.version != version) {
+                        throw new GradleException('Marker implementation did not resolve exactly')
+                    }
+                    row.implementation = [group: group, artifact: artifact, version: version]
+                }
+                row.selected_version = selected.version
+            } catch (Exception failure) {
+                // Never serialize resolver exception messages: private repository
+                // credentials can occur in their rendered URLs.
+                row.reason = "Native metadata validation failed (${failure.class.simpleName})"
+                row.selected_version = null
+                row.implementation = null
             }
-            atomicJson(directory, 'candidate-validation.json', [schema_version: 1, results: results])
+            results.add(row)
+        }
+        results
+    }
+    // A task may resolve only its own project's configurations when parallel
+    // execution is enabled. Dependencies give the aggregator a complete batch.
+    def projectResults = new java.util.concurrent.ConcurrentHashMap()
+    def validators = root.allprojects.sort { it.path }.collect { project ->
+        def name = 'mmGradleValidateProjectCandidates'
+        if (project.tasks.findByName(name) != null) {
+            throw new GradleException("Reserved task name already exists: ${project.path}:${name}")
+        }
+        project.tasks.register(name) {
+            doLast {
+                projectResults.put(project.path, validateProjectRequests(project))
+            }
+        }
+    }
+    root.tasks.register('mmGradleValidateCandidates') {
+        dependsOn(validators)
+        doLast {
+            def results = projectResults.values().collectMany { it }
+            readCandidateRequests().findAll { !projectResults.containsKey(it.project_path) }.each { request ->
+                results.add([request_id: request.request_id, group_key: request.group_key,
+                             alias: request.alias, project_path: request.project_path, kind: request.kind,
+                             selected_version: null, implementation: null,
+                             reason: 'Native metadata validation failed (unknown project)'])
+            }
+            atomicJson(directory, 'candidate-validation.json',
+                [schema_version: 1, results: results.sort { it.request_id }])
         }
     }
     root.tasks.register('mmGradleReport') {
@@ -276,11 +307,19 @@ gradle.projectsEvaluated {
             }
             def catalogue = new File(root.projectDir, 'gradle/libs.versions.toml')
             def digest = MessageDigest.getInstance('SHA-256').digest(catalogue.bytes).encodeHex().toString()
+            def localProjects = root.allprojects.findAll { project ->
+                selected.any { it.project_path == project.path }
+            }.sort { it.path }.collect { project ->
+                [project_path: project.path,
+                 module: [group: project.group.toString(), artifact: project.name,
+                          version: project.version.toString()]]
+            }
             atomicJson(directory, 'report.json', [schema_version: 1, root_project: root.path,
                 producer_versions: [gradle: gradle.gradleVersion,
-                    cyclonedx: cdxVersions.size() == 1 ? cdxVersions.first() : 'unknown', report: '1'],
+                    cyclonedx: cdxVersions.size() == 1 ? cdxVersions.first() : 'unknown', report: '2'],
                 catalogue_digest: digest, repositories: repositories.unique(),
-                selected_scopes: selected, scopes: scopes, selection_errors: errors])
+                selected_scopes: selected, scopes: scopes, local_projects: localProjects,
+                selection_errors: errors])
         }
     }
 }
