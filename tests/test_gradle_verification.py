@@ -752,7 +752,7 @@ def driver(workflow, resolution, monkeypatch, tmp_path):
         lambda *args: state.proposals if workflow.state["tree"] == "base-tree" else [],
     )
 
-    def native(_project, candidates):
+    def native(_project, candidates, _resolution):
         return CandidateValidationBatch(
             schema_version=1,
             results=tuple(

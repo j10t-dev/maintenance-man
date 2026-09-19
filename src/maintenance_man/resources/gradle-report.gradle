@@ -49,6 +49,11 @@ def atomicJson = { File directory, String name, Object value ->
     }
 }
 gradle.settingsEvaluated { settings ->
+    // Gradle adds this default to an internal handler, not to the settings
+    // declarations. Make the same default explicit for reporting and validation.
+    if (settings.pluginManagement.repositories.empty) {
+        settings.pluginManagement.repositories.gradlePluginPortal()
+    }
     pluginRepositories = repositoryRows(settings.pluginManagement.repositories, ':', 'plugin')
     pluginRepositoryObjects = settings.pluginManagement.repositories.toList()
     settingsRepositories = repositoryRows(settings.dependencyResolutionManagement.repositories, ':', 'library')

@@ -9,6 +9,62 @@ import pytest
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("repositories", ["implicit", "explicit", "custom"])
+def test_real_gradle_reports_effective_plugin_repositories(tmp_path, repositories):
+    executable = os.environ.get("MM_GRADLE_EXECUTABLE") or shutil.which("gradle")
+    if not executable:
+        pytest.skip("Set MM_GRADLE_EXECUTABLE to an installed Gradle executable")
+    declaration = {
+        "implicit": "",
+        "explicit": "pluginManagement { repositories { gradlePluginPortal() } }",
+        "custom": (
+            "pluginManagement { repositories { maven { "
+            "url = uri('https://example.invalid/maven') } } }"
+        ),
+    }[repositories]
+    (tmp_path / "settings.gradle").write_text(declaration)
+    # Only repository reporting is exercised; no plugins or artifacts are fetched.
+    (tmp_path / "build.gradle").write_text("tasks.register('cyclonedxBom')\n")
+    (tmp_path / "gradle").mkdir()
+    (tmp_path / "gradle/libs.versions.toml").write_text("[versions]\n")
+    owned = tmp_path / ".mm-gradle-inventory"
+    owned.mkdir()
+    (owned / ".mm-owned").write_text("")
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "src/maintenance_man/resources/gradle-report.gradle"
+    )
+    subprocess.run(
+        [
+            executable,
+            "mmGradleReport",
+            "--init-script",
+            str(script),
+            "--offline",
+            "--no-daemon",
+            "--console=plain",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    report = json.loads((owned / "report.json").read_text())
+    assert [row for row in report["repositories"] if row["domain"] == "plugin"] == [
+        {
+            "project_path": ":",
+            "domain": "plugin",
+            "url": (
+                "https://example.invalid/maven"
+                if repositories == "custom"
+                else "https://plugins.gradle.org/m2"
+            ),
+        },
+    ]
+
+
+@pytest.mark.integration
 def test_wheel_installs_gradle_report_resource(tmp_path):
     root = Path(__file__).resolve().parents[1]
     wheel_dir = tmp_path / "dist"

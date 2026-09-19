@@ -1784,7 +1784,7 @@ def _prepare_gradle_run(
                 for candidate in candidates
             )
         else:
-            batch = validate_gradle_candidates(project, candidates)
+            batch = validate_gradle_candidates(project, candidates, resolution)
             for candidate in candidates:
                 bound = attach_gradle_publications(candidate, resolution, batch)
                 if isinstance(bound, CandidateWithheld):

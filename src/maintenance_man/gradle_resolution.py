@@ -518,11 +518,22 @@ class ValidationRequest(TypedDict):
 
 def _validation_requests(
     candidates: Sequence[GradleCandidate],
+    resolution: CompleteResolution,
 ) -> list[ValidationRequest]:
+    # A shared catalogue version can span projects with different repositories.
+    # Candidate scopes also include advisory ownership; resolve each member's
+    # actual consumers independently from that candidate-wide union.
+    projects: dict[str, set[str]] = {}
+    for scope in resolution.report.scopes:
+        for component in scope.components:
+            if component.module is not None:
+                projects.setdefault(component.module.coordinate, set()).add(
+                    scope.scope.project_path
+                )
     requests: list[ValidationRequest] = []
     for candidate in candidates:
         for member in candidate.target.members:
-            paths = sorted({scope.project_path for scope in candidate.scopes}) or [":"]
+            paths = sorted(projects.get(member.coordinate, ())) or [":"]
             if member.kind == "plugin":
                 paths = [":"]
             for project_path in paths:
@@ -542,9 +553,11 @@ def _validation_requests(
 
 
 def validate_gradle_candidates(
-    project: ProjectConfig, candidates: Sequence[GradleCandidate]
+    project: ProjectConfig,
+    candidates: Sequence[GradleCandidate],
+    resolution: CompleteResolution,
 ) -> CandidateValidationBatch:
-    requests = _validation_requests(candidates)
+    requests = _validation_requests(candidates, resolution)
     if not requests:
         return CandidateValidationBatch(schema_version=1, results=())
     root = Path(project.path)

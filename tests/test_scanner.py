@@ -796,6 +796,34 @@ def test_gradle_scan_finding_without_resolution_scope_is_error(
         _run_gradle_scan(gradle_project)
 
 
+def test_gradle_scan_rejects_omitted_resolved_modules(
+    gradle_project, monkeypatch, mm_home
+):
+    previous = mm_home / "scan-results/android.json"
+    previous.parent.mkdir(parents=True)
+    previous.write_bytes(b'{"previous": true}\n')
+
+    @contextmanager
+    def incomplete_inventory(project):
+        with _yield_fixture_bom(project)(project) as (bom, resolution):
+            document = json.loads(bom.read_text())
+            document["components"] = [
+                row for row in document["components"] if row["name"] == "gson"
+            ]
+            bom.write_text(json.dumps(document))
+            yield bom, resolution
+
+    monkeypatch.setattr(
+        "maintenance_man.scanner.generate_gradle_report", incomplete_inventory
+    )
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
+    _trivy_sbom(monkeypatch, stdout='{"Results": []}')
+    with pytest.raises(GradleError, match="resolved module missing from inventory"):
+        scan_project("android", gradle_project, 7)
+    assert previous.read_bytes() == b'{"previous": true}\n'
+
+
 def test_gradle_scan_records_selected_resolution_scopes(gradle_project, monkeypatch):
     """Every finding's gradle_scopes is derived from the selected resolution
     scope(s) that resolved its module — not left at the default empty tuple.

@@ -44,6 +44,7 @@ from maintenance_man.models.gradle import (
     IncompleteResolution,
     ModuleId,
     ResolutionReport,
+    ScopeId,
 )
 from maintenance_man.models.scan import (
     ScanResult,
@@ -105,7 +106,7 @@ def scan_project(
                 for candidate in plan.candidates:
                     blocks[candidate.target.group_key] = routing_block.reason
             else:
-                batch = validate_gradle_candidates(project, plan.candidates)
+                batch = validate_gradle_candidates(project, plan.candidates, resolution)
                 for candidate in plan.candidates:
                     key = candidate.target.group_key
                     prepared = attach_gradle_publications(candidate, resolution, batch)
@@ -267,6 +268,13 @@ def _run_gradle_scan(
             raise GradleError(
                 "Incomplete Gradle resolution: " + "; ".join(outcome.reasons)
             )
+        modules = _inventory_modules(bom.read_bytes(), outcome.report)
+        module_scopes = _resolution_module_scopes(outcome.report)
+        coverage_errors = _inventory_coverage_errors(modules, module_scopes)
+        if coverage_errors:
+            raise GradleError(
+                "Incomplete Gradle inventory: " + "; ".join(coverage_errors)
+            )
         cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
         try:
             completed = subprocess.run(
@@ -287,21 +295,13 @@ def _run_gradle_scan(
                 f"{completed.stderr.strip()}"
             )
         findings = _parse_gradle_trivy_output(completed.stdout)
-        scoped: dict[tuple[str, str], set[str]] = {}
-        for scope in outcome.report.scopes:
-            for component in scope.components:
-                if component.module is not None:
-                    module = component.module
-                    scoped.setdefault((module.coordinate, module.version), set()).add(
-                        f"{scope.scope.project_path}/{scope.scope.domain}/"
-                        f"{scope.scope.configuration}"
-                    )
-        for module in _inventory_modules(bom.read_bytes(), outcome.report):
-            key = (module.coordinate, module.version)
-            if key not in scoped:
-                raise GradleError(
-                    f"Inventory module has no selected resolution identity: {key}"
-                )
+        scoped = {
+            (module.coordinate, module.version): {
+                f"{scope.project_path}/{scope.domain}/{scope.configuration}"
+                for scope in scopes
+            }
+            for module, scopes in module_scopes.items()
+        }
         for finding in findings:
             scopes = scoped.get((finding.pkg_name, finding.installed_version))
             if not scopes:
@@ -650,6 +650,30 @@ def _inventory_modules(
         raise GradleError(f"Malformed CycloneDX inventory: {exc}") from exc
 
 
+def _resolution_module_scopes(report: ResolutionReport) -> dict[ModuleId, set[ScopeId]]:
+    scopes: dict[ModuleId, set[ScopeId]] = {}
+    for result in report.scopes:
+        for component in result.components:
+            if component.module is not None:
+                scopes.setdefault(component.module, set()).add(result.scope)
+    return scopes
+
+
+def _inventory_coverage_errors(
+    modules: tuple[ModuleId, ...], scopes: dict[ModuleId, set[ScopeId]]
+) -> tuple[str, ...]:
+    inventory = set(modules)
+    return tuple(
+        f"Inventory module has no selected resolution identity: {module}"
+        for module in modules
+        if module not in scopes
+    ) + tuple(
+        f"resolved module missing from inventory: {module}"
+        for module in scopes
+        if module not in inventory
+    )
+
+
 def capture_gradle_snapshot(
     project: ProjectConfig, context: ComparisonContext
 ) -> GradleSnapshot | IncompleteResolution:
@@ -670,24 +694,12 @@ def capture_gradle_snapshot(
             )
         inventory = bom.read_bytes()
         modules = _inventory_modules(inventory, report)
-        scopes: dict[ModuleId, set] = {}
-        for result in report.scopes:
-            for component in result.components:
-                if component.module is not None:
-                    scopes.setdefault(component.module, set()).add(result.scope)
-        missing = [module for module in modules if module not in scopes]
-        omitted = [module for module in scopes if module not in modules]
-        if missing or omitted:
+        scopes = _resolution_module_scopes(report)
+        coverage_errors = _inventory_coverage_errors(modules, scopes)
+        if coverage_errors:
             return IncompleteResolution(
                 report=report,
-                reasons=tuple(
-                    f"inventory module has no graph match: {module}"
-                    for module in missing
-                )
-                + tuple(
-                    f"resolved module missing from inventory: {module}"
-                    for module in omitted
-                ),
+                reasons=coverage_errors,
             )
         binary = next(
             key.removeprefix("binary:")

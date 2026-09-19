@@ -375,9 +375,13 @@ def test_metadata_batch_is_complete_and_does_not_mutate(tmp_path, response_kind)
     with patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner):
         if response_kind == "missing":
             with pytest.raises(GradleError, match="coverage"):
-                validate_gradle_candidates(project, [candidate()])
+                validate_gradle_candidates(
+                    project, [candidate()], _resolution_with_repositories(())
+                )
         else:
-            result = validate_gradle_candidates(project, [candidate()])
+            result = validate_gradle_candidates(
+                project, [candidate()], _resolution_with_repositories(())
+            )
             assert (result.results[0].reason is None) == (response_kind == "success")
     assert len(calls) == 1
     assert (tmp_path / "gradle/libs.versions.toml").read_bytes() == before
@@ -431,7 +435,9 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
     assert selected.publication_requests == ()
 
 
-def test_native_batch_requests_each_member_in_each_distinct_project(tmp_path):
+def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_root(
+    tmp_path,
+):
     project = make_project(tmp_path)
     selected = two_member_candidate().model_copy(
         update={
@@ -453,6 +459,26 @@ def test_native_batch_requests_each_member_in_each_distinct_project(tmp_path):
                 ),
             )
         }
+    )
+    root = ResolvedComponent(id="root", kind="root", module=None, variants=())
+    library = ResolvedComponent(
+        id="a",
+        kind="module",
+        variants=(),
+        module=ModuleId(group="g", artifact="a", version="1.0.0"),
+    )
+    resolution = CompleteResolution(
+        report=_resolution_with_repositories(()).report.model_copy(
+            update={
+                "selected_scopes": selected.scopes,
+                "scopes": tuple(
+                    ScopeResolution(
+                        scope=scope, components=(root, library), edges=(), unresolved=()
+                    )
+                    for scope in selected.scopes
+                ),
+            }
+        )
     )
     calls = []
     before = (tmp_path / "gradle/libs.versions.toml").read_bytes()
@@ -478,7 +504,7 @@ def test_native_batch_requests_each_member_in_each_distinct_project(tmp_path):
         "maintenance_man.gradle_resolution.run_gradle",
         side_effect=_validation_runner(respond),
     ):
-        result = validate_gradle_candidates(project, [selected])
+        result = validate_gradle_candidates(project, [selected], resolution)
 
     assert len(calls) == 1
     assert [
@@ -804,6 +830,124 @@ def _validation_runner(build_response):
     return runner
 
 
+@pytest.mark.parametrize("security_only", [False, True])
+def test_shared_members_validate_only_in_projects_that_resolve_them(
+    tmp_path, security_only
+):
+    from maintenance_man.gradle import ReportProposal, build_update_findings
+    from maintenance_man.models.gradle import ResolutionEdge
+
+    project = make_project(tmp_path)
+    catalogue_path = tmp_path / "gradle/libs.versions.toml"
+    catalogue_path.write_text(
+        '[versions]\ngrp = "1.0.0"\n[libraries]\n'
+        'a = { module = "g:a", version.ref = "grp" }\n'
+        'b = { module = "g:b", version.ref = "grp" }\n'
+    )
+    catalogue = parse_catalogue(catalogue_path)
+    scopes = []
+    repositories = []
+    for alias, path, url in (
+        ("a", ":app", "https://dl.google.com/dl/android/maven2"),
+        ("b", ":lib", "https://repo.maven.apache.org/maven2"),
+    ):
+        scope = ScopeId(
+            project_path=path, domain="project", configuration="runtimeClasspath"
+        )
+        scopes.append(
+            ScopeResolution(
+                scope=scope,
+                components=(
+                    ResolvedComponent(id="root", kind="root", module=None, variants=()),
+                    ResolvedComponent(
+                        id=alias,
+                        kind="module",
+                        variants=(),
+                        module=ModuleId(group="g", artifact=alias, version="1.0.0"),
+                    ),
+                ),
+                edges=(
+                    ResolutionEdge(
+                        source="root",
+                        target=alias,
+                        requested=f"g:{alias}:1.0.0",
+                        constraint=False,
+                    ),
+                ),
+                unresolved=(),
+            )
+        )
+        repositories.append(
+            RepositoryDeclaration(project_path=path, domain="library", url=url)
+        )
+    resolution = CompleteResolution(
+        report=_resolution_with_repositories(tuple(repositories)).report.model_copy(
+            update={
+                "selected_scopes": tuple(row.scope for row in scopes),
+                "scopes": tuple(scopes),
+            }
+        )
+    )
+    discovered = build_update_findings(
+        catalogue,
+        [
+            ReportProposal(
+                kind="library", alias=alias, coordinate=f"g:{alias}", version="2.0.0"
+            )
+            for alias in ("a", "b")
+        ],
+    )
+    vulnerability = VulnFinding(
+        vuln_id="CVE-2030-1",
+        pkg_name="g:a",
+        installed_version="1.0.0",
+        fixed_version="2.0.0",
+        severity=Severity.HIGH,
+        title="",
+        description="",
+        status="affected",
+    )
+    plan = select_gradle_candidates(
+        catalogue,
+        resolution,
+        [vulnerability] if security_only else [],
+        [] if security_only else discovered,
+    )
+    assert len(plan.candidates) == 1
+
+    def respond(root, directory, requests):
+        rows = []
+        for request in requests:
+            row = _success_row(request)
+            if (request["alias"], request["project_path"]) not in {
+                ("a", ":app"),
+                ("b", ":lib"),
+            }:
+                row.update(selected_version=None, reason="unavailable in this project")
+            rows.append(row)
+        (directory / "candidate-validation.json").write_text(
+            json.dumps({"schema_version": 1, "results": rows})
+        )
+
+    with patch(
+        "maintenance_man.gradle_resolution.run_gradle",
+        side_effect=_validation_runner(respond),
+    ):
+        batch = validate_gradle_candidates(project, plan.candidates, resolution)
+    bound = attach_gradle_publications(plan.candidates[0], resolution, batch)
+    assert isinstance(bound, GradleCandidate), bound
+    assert [(row.alias, row.project_path) for row in batch.results] == [
+        ("a", ":app"),
+        ("b", ":lib"),
+    ]
+    assert [
+        (r.module.coordinate, r.repositories) for r in bound.publication_requests
+    ] == [
+        ("g:a", ("google",)),
+        ("g:b", ("central",)),
+    ]
+
+
 def test_validate_gradle_candidates_refuses_duplicate_request_id(tmp_path):
     """Both requests are covered by id, but a request_id repeats: the
     duplicate collapses in the response dict, so its row count no longer
@@ -828,7 +972,9 @@ def test_validate_gradle_candidates_refuses_duplicate_request_id(tmp_path):
         side_effect=_validation_runner(build_response),
     ):
         with pytest.raises(GradleError, match="coverage"):
-            validate_gradle_candidates(project, [two_member_candidate()])
+            validate_gradle_candidates(
+                project, [two_member_candidate()], _resolution_with_repositories(())
+            )
 
 
 def test_validate_gradle_candidates_refuses_extra_row(tmp_path):
@@ -848,7 +994,9 @@ def test_validate_gradle_candidates_refuses_extra_row(tmp_path):
         side_effect=_validation_runner(build_response),
     ):
         with pytest.raises(GradleError, match="coverage"):
-            validate_gradle_candidates(project, [candidate()])
+            validate_gradle_candidates(
+                project, [candidate()], _resolution_with_repositories(())
+            )
 
 
 @pytest.mark.parametrize("identity", [{"alias": "wrong-alias"}, {"kind": "plugin"}])
@@ -866,7 +1014,9 @@ def test_validate_gradle_candidates_refuses_identity_mismatch(tmp_path, identity
         side_effect=_validation_runner(build_response),
     ):
         with pytest.raises(GradleError, match="identity mismatch"):
-            validate_gradle_candidates(project, [candidate()])
+            validate_gradle_candidates(
+                project, [candidate()], _resolution_with_repositories(())
+            )
 
 
 def test_validate_gradle_candidates_refuses_success_with_different_version(tmp_path):
@@ -883,7 +1033,9 @@ def test_validate_gradle_candidates_refuses_success_with_different_version(tmp_p
         side_effect=_validation_runner(build_response),
     ):
         with pytest.raises(GradleError, match="selected a different version"):
-            validate_gradle_candidates(project, [candidate()])
+            validate_gradle_candidates(
+                project, [candidate()], _resolution_with_repositories(())
+            )
 
 
 def test_validate_gradle_candidates_refuses_plugin_success_without_implementation(
@@ -905,7 +1057,9 @@ def test_validate_gradle_candidates_refuses_plugin_success_without_implementatio
         side_effect=_validation_runner(build_response),
     ):
         with pytest.raises(GradleError, match="marker success lacks implementation"):
-            validate_gradle_candidates(project, [two_member_candidate()])
+            validate_gradle_candidates(
+                project, [two_member_candidate()], _resolution_with_repositories(())
+            )
 
 
 def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
@@ -925,7 +1079,9 @@ def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
 
     with patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner):
         with pytest.raises(GradleError, match="symlink"):
-            validate_gradle_candidates(project, [candidate()])
+            validate_gradle_candidates(
+                project, [candidate()], _resolution_with_repositories(())
+            )
 
 
 def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
@@ -943,7 +1099,9 @@ def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
         side_effect=_validation_runner(build_response),
     ):
         with pytest.raises(GradleError, match="modified the catalogue"):
-            validate_gradle_candidates(project, [candidate()])
+            validate_gradle_candidates(
+                project, [candidate()], _resolution_with_repositories(())
+            )
 
 
 def test_mixed_library_plugin_alias_keeps_member_validation_separate():
@@ -986,7 +1144,9 @@ def test_mixed_library_plugin_alias_keeps_member_validation_separate():
                 implementation=implementation if request["kind"] == "plugin" else None,
                 reason=None,
             )
-            for request in _validation_requests((candidate,))
+            for request in _validation_requests(
+                (candidate,), _resolution_with_repositories(())
+            )
         ),
     )
     result = attach_gradle_publications(
