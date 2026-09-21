@@ -203,6 +203,12 @@ class TestLoadScanResults:
 # -- get_update_commands --
 
 
+def test_bun_update_refuses_a_workspace_without_a_manifest(tmp_path: Path):
+    with pytest.raises(ValueError, match="package.json"):
+        get_update_commands("bun", "zod", "4.6.5", tmp_path)
+    assert not (tmp_path / "package.json").exists()
+
+
 class TestGetUpdateCommands:
     def test_uv_runtime_dependency(self, tmp_path: Path):
         (tmp_path / "pyproject.toml").write_text(
@@ -300,6 +306,8 @@ class TestGetUpdateCommands:
     def test_non_uv_managers_unchanged(
         self, tmp_path: Path, manager, pkg, version, expected
     ):
+        if manager == "bun":
+            (tmp_path / "package.json").write_text('{"dependencies":{"axios":"1.6.0"}}')
         assert get_update_commands(manager, pkg, version, tmp_path) == expected
 
     def test_uv_group_command_requires_group_name(self):

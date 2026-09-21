@@ -1635,8 +1635,19 @@ def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
     assert workflow.effects == []
 
 
-@pytest.mark.parametrize("unsafe", [False, True])
-def test_gradle_failed_update_restart_retains_evidence(workflow, monkeypatch, unsafe):
+@pytest.mark.parametrize(
+    ("default_dirty", "unsafe", "workspace_exists"),
+    [
+        (False, False, True),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+        (True, False, False),
+    ],
+)
+def test_gradle_failed_update_restart_retains_evidence(
+    workflow, monkeypatch, tmp_path, unsafe, default_dirty, workspace_exists
+):
     security = workflow.candidate.model_copy(
         update={
             "origins": frozenset({"security"}),
@@ -1650,10 +1661,17 @@ def test_gradle_failed_update_restart_retains_evidence(workflow, monkeypatch, un
         workflow.publication,
         7,
     )
+    workspace = tmp_path / "managed-workspace"
+    if workspace_exists:
+        workspace.mkdir()
+    user_file = workflow.project.path / "user-notes.txt"
+    user_file.write_text("preserve these notes")
+    monkeypatch.setattr(cli, "workspace_path_for_project", lambda *args: workspace)
     monkeypatch.setattr(
-        cli, "workspace_path_for_project", lambda *args: workflow.project.path
+        cli,
+        "current_change_has_changes",
+        lambda path: default_dirty if path == workflow.project.path else unsafe,
     )
-    monkeypatch.setattr(cli, "current_change_has_changes", lambda *args: unsafe)
     monkeypatch.setattr(updater, "rollback_failed_gradle_update", lambda *args: None)
     monkeypatch.setattr(cli, "exact_commit_id", lambda *args: "base")
     monkeypatch.setattr(cli, "revision_tree_id", lambda *args: "base-tree")
@@ -1670,7 +1688,7 @@ def test_gradle_failed_update_restart_retains_evidence(workflow, monkeypatch, un
         return True
 
     monkeypatch.setattr(cli, "reset_verified_gradle_bookmark", reset)
-    if unsafe:
+    if unsafe or not workspace_exists:
         with pytest.raises(updater.GradleError, match="Uncommitted"):
             cli._archive_rolled_back_gradle_run(failed, workflow.project)
         assert updater.load_gradle_run(updater.gradle_run_path("sample")) == failed
@@ -1679,6 +1697,7 @@ def test_gradle_failed_update_restart_retains_evidence(workflow, monkeypatch, un
         cli._archive_rolled_back_gradle_run(failed, workflow.project)
         assert not updater.gradle_run_path("sample").exists()
         assert effects == ["reset"]
+    assert user_file.read_text() == "preserve these notes"
 
 
 @pytest.mark.parametrize(

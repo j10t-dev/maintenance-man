@@ -423,6 +423,11 @@ def get_update_commands(
     """Return the shell command or commands to update a package."""
     match package_manager:
         case "bun":
+            if not (project_path / "package.json").is_file():
+                raise ValueError(
+                    "package.json is missing from the update workspace; "
+                    "check that the project exists on main and rescan"
+                )
             return [["bun", "add", f"{pkg_name}@{version}"]]
         case "uv":
             locations = get_uv_dependency_locations(project_path, pkg_name)

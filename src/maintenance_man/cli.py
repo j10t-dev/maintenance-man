@@ -113,6 +113,7 @@ from maintenance_man.updater import (
     sort_updates_by_risk,
 )
 from maintenance_man.vcs import (
+    BookmarkLookupError,
     GitHubCLINotFoundError,
     JJCLINotFoundError,
     bookmark_exists,
@@ -1981,7 +1982,7 @@ def _run_update_flow(
         )
     try:
         wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except _UpdateSetupError as e:
+    except (_UpdateSetupError, BookmarkLookupError) as e:
         _fatal(str(e))
     work_config = proj_config.model_copy(update={"path": wt_path})
     finalised = False
@@ -2056,7 +2057,7 @@ def _update_batch(
     _warn_missing_test_config(project, proj_config)
     try:
         wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except _UpdateSetupError as e:
+    except (_UpdateSetupError, BookmarkLookupError) as e:
         console.print(f"  [bold red]Error:[/] {project} — {e}")
         return None
     work_config = proj_config.model_copy(update={"path": wt_path})
@@ -2178,12 +2179,17 @@ def resolve(
     candidates = _ordered_resolve_candidates(scan_result, proj_config, minimum_age_days)
     if not prune_stale_bookmarks(proj_config.path):
         _fatal("failed to sync trunk")
-    if not ensure_main_bookmark(proj_config.path):
-        _fatal("main bookmark not found")
-    if _ordered_failed_findings(scan_result, proj_config, minimum_age_days):
-        _fatal(f"resolve already paused for [bold]{project}[/] — rerun with --continue")
-    if not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
-        _fatal(f"aborted resolve for [bold]{project}[/]")
+    try:
+        if not ensure_main_bookmark(proj_config.path):
+            _fatal("main bookmark not found")
+        if _ordered_failed_findings(scan_result, proj_config, minimum_age_days):
+            _fatal(
+                f"resolve already paused for [bold]{project}[/] — rerun with --continue"
+            )
+        if not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
+            _fatal(f"aborted resolve for [bold]{project}[/]")
+    except BookmarkLookupError as exc:
+        _fatal(str(exc))
     sys.exit(
         _run_resolve_findings(
             project, proj_config, scan_result, results_dir, candidates, minimum_age_days
@@ -2333,7 +2339,7 @@ def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> N
     ):
         raise GradleError("Only rolled-back failed update runs can restart")
     workspace = workspace_path_for_project(run.project)
-    if not workspace.exists() or current_change_has_changes(project.path):
+    if not workspace.exists():
         raise GradleError(
             "Uncommitted or missing failed workspace requires manual review"
         )
@@ -2556,7 +2562,13 @@ def _run_gradle_flow(
         if flow == Workflow.UPDATE and run.refreshed:
             remove_workspace(project.path, project_name)
         return ExitCode.OK
-    except (GradleError, TrivyScanError, _UpdateSetupError, OSError) as exc:
+    except (
+        GradleError,
+        TrivyScanError,
+        _UpdateSetupError,
+        BookmarkLookupError,
+        OSError,
+    ) as exc:
         console.print(f"Cannot complete Gradle {flow}: {exc}")
         return ExitCode.UPDATE_FAILED
 

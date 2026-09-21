@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,6 +18,29 @@ from tests.conftest import (
     make_scan_result,
     make_update,
 )
+
+
+def test_batch_reports_bookmark_access_error_without_requesting_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    from maintenance_man import cli
+    from maintenance_man.models.config import ProjectConfig
+
+    scan = make_scan_result(
+        vulns=[],
+        updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.UPDATE)],
+    )
+    monkeypatch.setattr(cli, "load_scan_results", lambda *args: scan)
+    monkeypatch.setattr(cli, "remove_workspace", lambda *args: None)
+    monkeypatch.setattr(
+        "maintenance_man.vcs._run",
+        lambda *args: subprocess.CompletedProcess([], 1, "", "permission denied"),
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
+    assert cli._update_batch("example", project, tmp_path, 7) is None
+    output = " ".join(capsys.readouterr().out.split())
+    assert "permission denied" in output
+    assert "rescan required" not in output
 
 
 class TestUpdatePreChecks:
