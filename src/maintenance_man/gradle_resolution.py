@@ -10,6 +10,8 @@ import time
 from collections import deque
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 from typing import TypedDict
@@ -17,7 +19,11 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from maintenance_man.dependency_age import publication_request
+from maintenance_man.dependency_age import (
+    PublicationLookupContext,
+    evaluate_gradle_candidate_age,
+    publication_request,
+)
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     Catalogue,
@@ -32,7 +38,6 @@ from maintenance_man.gradle import (
 )
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
-    AgeBlock,
     CandidateValidationBatch,
     CandidateWithheld,
     CompleteResolution,
@@ -49,6 +54,7 @@ from maintenance_man.models.gradle import (
     UnknownOwner,
 )
 from maintenance_man.models.scan import (
+    GradleBlock,
     GradleKind,
     GradleUpdateTarget,
     UpdateFinding,
@@ -411,7 +417,7 @@ def select_gradle_candidates(
                     group_key=None,
                     coordinate=finding.pkg_name,
                     installed_version=finding.installed_version,
-                    reason="unknown or ambiguous catalogue ownership",
+                    reason="cannot identify an unambiguous catalogue entry",
                     advisory_ids=frozenset({finding.vuln_id}),
                 )
             )
@@ -629,18 +635,6 @@ def validate_gradle_candidates(
             raise GradleError(f"Invalid candidate validation output: {exc}") from exc
 
 
-def gradle_routing_prerequisite(project: ProjectConfig) -> AgeBlock | None:
-    if project.gradle_repository_routing == "standard-public":
-        return None
-    return AgeBlock(
-        reason=(
-            "Public repository routing has not been declared; automatic "
-            "publication eligibility requires "
-            "gradle_repository_routing = 'standard-public'"
-        )
-    )
-
-
 def attach_gradle_publications(
     candidate: GradleCandidate,
     resolution: CompleteResolution,
@@ -703,3 +697,55 @@ def attach_gradle_publications(
                 )
             )
     return candidate.model_copy(update={"publication_requests": tuple(requests)})
+
+
+@dataclass(frozen=True)
+class PreparedCandidate:
+    candidate: GradleCandidate
+    block: GradleBlock | None = None
+
+
+def prepare_gradle_candidates(
+    project: ProjectConfig,
+    candidates: Sequence[GradleCandidate],
+    resolution: CompleteResolution,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+) -> tuple[PreparedCandidate, ...]:
+    """Validate proposed catalogue changes and apply the release-age policy."""
+    batch = validate_gradle_candidates(project, candidates, resolution)
+    prepared = []
+    for candidate in candidates:
+        bound = attach_gradle_publications(candidate, resolution, batch)
+        if isinstance(bound, CandidateWithheld):
+            prepared.append(
+                PreparedCandidate(
+                    candidate, GradleBlock(kind="mapping", reason=bound.reason)
+                )
+            )
+        else:
+            if project.gradle_repository_routing != "standard-public":
+                bound = bound.model_copy(update={"publication_requests": ()})
+            prepared.append(PreparedCandidate(bound))
+    if minimum_age_days > 0:
+        publication.prefetch(
+            request
+            for item in prepared
+            if item.block is None
+            for request in item.candidate.publication_requests
+        )
+    result = []
+    for item in prepared:
+        if item.block is not None:
+            result.append(item)
+            continue
+        age = evaluate_gradle_candidate_age(
+            item.candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+        )
+        result.append(
+            PreparedCandidate(
+                item.candidate,
+                GradleBlock(kind="age", reason=age.reason) if age else None,
+            )
+        )
+    return tuple(result)

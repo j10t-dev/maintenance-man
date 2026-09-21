@@ -520,26 +520,6 @@ def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_r
     assert not (tmp_path / ".mm-gradle-inventory").exists()
 
 
-@pytest.mark.parametrize("declaration", [None, "standard-public"])
-def test_gradle_publication_requires_operator_declaration(tmp_path, declaration):
-    from maintenance_man.gradle_resolution import gradle_routing_prerequisite
-
-    project = ProjectConfig(
-        path=tmp_path, package_manager="gradle", gradle_repository_routing=declaration
-    )
-    block = gradle_routing_prerequisite(project)
-    if declaration is None:
-        assert block is not None
-        assert block.kind == "age"
-        assert block.reason == (
-            "Public repository routing has not been declared; automatic "
-            "publication eligibility requires "
-            "gradle_repository_routing = 'standard-public'"
-        )
-    else:
-        assert block is None
-
-
 def _resolution_with_repositories(repositories):
     scope = ScopeId(
         project_path=":", domain="project", configuration="runtimeClasspath"

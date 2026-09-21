@@ -1,10 +1,7 @@
 """Gradle adapter: wrapper invocation and version-catalogue target safety.
 
-Owns every Gradle-specific concern behind catalogue *targets*: the project's
-``./gradlew``, the supported catalogue declarations, grouping by shared version
-reference, plugin marker coordinates, plugin report validation and the two
-adapter-owned temporary outputs.  It performs subprocess and local-file I/O and
-owns no persistent cache.
+Runs the project's wrapper, parses catalogue declarations and update reports,
+groups shared versions, and manages adapter-owned temporary outputs.
 """
 
 from __future__ import annotations
@@ -32,7 +29,6 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     SemverTier,
     UpdateFinding,
-    VulnFinding,
     classify_semver,
 )
 
@@ -60,7 +56,6 @@ _BOM_ARGS = [
     "--no-build-cache",
 ]
 _UNSAFE_TEXT_RE = re.compile(r"[\x00-\x1f\x7f]")
-_EXACT_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 
 class GradleError(Exception):
@@ -499,98 +494,6 @@ def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
         except OSError as exc:
             raise GradleError(f"Could not generate Gradle inventory: {exc}") from exc
         yield bom
-
-
-def resolve_gradle_vulnerability_target(
-    project: ProjectConfig, finding: VulnFinding
-) -> GradleUpdateTarget | GradleBlock:
-    """Map an advisory to an editable catalogue target, or explain the block.
-
-    Only catalogue **libraries** can own an advisory: mm never infers that
-    upgrading a parent, platform or plugin resolves a transitive finding.
-    """
-    fixed = (finding.fixed_version or "").strip()
-    if not fixed:
-        return GradleBlock(
-            kind="mapping", reason=f"{finding.vuln_id} names no fix version"
-        )
-    if not _EXACT_VERSION_RE.fullmatch(fixed):
-        return GradleBlock(
-            kind="conflict",
-            reason=(
-                f"{finding.vuln_id} does not name a single exact fix version "
-                f"({finding.fixed_version!r}); resolve manually"
-            ),
-        )
-
-    catalogue = parse_catalogue(Path(project.path) / GRADLE_CATALOGUE_RELPATH)
-    matches = [
-        entry
-        for entry in catalogue.entries.values()
-        if entry.kind == "library" and entry.coordinate == finding.pkg_name
-    ]
-    if not matches:
-        return GradleBlock(
-            kind="mapping",
-            reason=(
-                f"no catalogue library owns {finding.pkg_name}; it is transitive, "
-                f"platform-owned or a plugin implementation dependency — resolve "
-                f"manually"
-            ),
-        )
-    identities = {
-        ("ref", normalise_alias(entry.version_ref))
-        if entry.version_ref is not None
-        else (entry.kind, entry.alias)
-        for entry in matches
-    }
-    if len(identities) > 1:
-        return GradleBlock(
-            kind="conflict",
-            reason=(
-                f"{finding.pkg_name} is declared by more than one independently "
-                f"versioned catalogue alias; resolve manually"
-            ),
-        )
-
-    entry = matches[0]
-    if entry.unsupported is not None:
-        return GradleBlock(kind="mapping", reason=entry.unsupported)
-
-    version = catalogue.version_of(entry)
-    if version is None:
-        return GradleBlock(
-            kind="mapping",
-            reason=(
-                f"'{entry.alias}' has no catalogue version (platform/BOM managed); "
-                f"mm does not give it one"
-            ),
-        )
-    if version.value is None:
-        return GradleBlock(
-            kind="mapping",
-            reason=version.unsupported
-            or f"version '{version.name}' is not a simple literal",
-        )
-
-    entries = (
-        catalogue.members_of_ref(entry.version_ref)
-        if entry.version_ref is not None
-        else [entry]
-    )
-    return GradleUpdateTarget(
-        version_ref=version.name if entry.version_ref is not None else None,
-        members=[
-            GradleMember(
-                kind=member.kind,
-                alias=assert_safe_text(member.alias, "catalogue alias"),
-                coordinate=assert_safe_text(member.coordinate, "catalogue coordinate"),
-                installed_version=version.value,
-            )
-            for member in entries
-        ],
-        target_version=assert_safe_text(fixed, "fix version"),
-    )
 
 
 def run_gradle(

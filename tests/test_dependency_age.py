@@ -16,11 +16,8 @@ from maintenance_man.dependency_age import (
     PublicationLookupContext,
     _public_url,
     _publication_http,
-    check_gradle_update_age,
     evaluate_gradle_candidate_age,
-    evaluate_gradle_group_age,
     filter_by_age,
-    gradle_lookup_coordinate,
     lookup_gradle_publication,
     publication_request,
     trusted_repository,
@@ -32,12 +29,9 @@ from maintenance_man.models.gradle import (
     RepositoryDeclaration,
 )
 from maintenance_man.models.scan import (
-    GradleMember,
-    GradleUpdateTarget,
     SemverTier,
     UpdateFinding,
 )
-from tests.conftest import make_gradle_member, make_gradle_target
 
 _PATCH_FETCH = "maintenance_man.dependency_age._fetch_json"
 _PATCH_SUBRUN = "maintenance_man.dependency_age.subprocess.run"
@@ -178,183 +172,6 @@ class TestFilterByAge:
 
 
 _OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
-
-
-def _dates(mapping, monkeypatch):
-    """Substitute Maven Central lookup with a coordinate -> date|None|raise map."""
-
-    def _lookup(pkg: str, version: str):
-        outcome = mapping[pkg]
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
-
-    monkeypatch.setattr(
-        "maintenance_man.dependency_age._get_maven_publish_date", _lookup
-    )
-
-
-@pytest.mark.parametrize(
-    "kind, coordinate, expected",
-    [
-        ("library", "androidx.room:room-runtime", "androidx.room:room-runtime"),
-        (
-            "plugin",
-            "com.google.devtools.ksp",
-            "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin",
-        ),
-    ],
-)
-def test_lookup_coordinate_uses_plugin_markers(kind, coordinate, expected):
-    member = make_gradle_member(kind=kind, coordinate=coordinate)
-
-    assert gradle_lookup_coordinate(member) == expected
-
-
-class TestGradleGroupAge:
-    def test_all_members_old_enough_is_eligible(self, monkeypatch):
-        target = make_gradle_target()
-        _dates(
-            {
-                "androidx.room:room-runtime": _OLD,
-                "androidx.room:room-compiler": _OLD,
-                "androidx.room:room-testing": _OLD + timedelta(days=1),
-            },
-            monkeypatch,
-        )
-
-        block, published = evaluate_gradle_group_age(target, 7)
-
-        assert block is None
-        assert published == _OLD + timedelta(days=1)
-
-    @pytest.mark.parametrize(
-        "third_outcome, reason_fragment",
-        [
-            (None, "no Maven Central publication date"),
-            (RuntimeError("network down"), "publication lookup failed"),
-        ],
-    )
-    def test_one_member_without_evidence_blocks_the_group(
-        self, monkeypatch, third_outcome, reason_fragment
-    ):
-        target = make_gradle_target()
-        _dates(
-            {
-                "androidx.room:room-runtime": _OLD,
-                "androidx.room:room-compiler": _OLD,
-                "androidx.room:room-testing": third_outcome,
-            },
-            monkeypatch,
-        )
-
-        block = check_gradle_update_age(target, 7)
-
-        assert block is not None
-        assert block.kind == "age"
-        assert reason_fragment in block.reason
-        assert "androidx.room:room-testing" in block.reason
-
-    def test_too_recent_member_blocks_the_group(self, monkeypatch):
-        now = datetime.now(timezone.utc)
-        target = make_gradle_target()
-        _dates(
-            {
-                "androidx.room:room-runtime": _OLD,
-                "androidx.room:room-compiler": _OLD,
-                "androidx.room:room-testing": now - timedelta(days=2),
-            },
-            monkeypatch,
-        )
-
-        block = check_gradle_update_age(target, 7)
-
-        assert block is not None
-        assert block.kind == "age"
-        assert "2 day(s) ago" in block.reason
-        assert "minimum is 7" in block.reason
-
-    def test_member_published_exactly_at_cutoff_blocks_the_group(self, monkeypatch):
-        """A publication exactly ``minimum_age_days`` old is not yet old enough.
-
-        Matches ``filter_by_age``'s existing ``>=`` semantics: pinned so a
-        future refactor to ``>`` fails the suite instead of passing silently.
-        """
-        fixed_now = datetime(2024, 2, 1, tzinfo=timezone.utc)
-        monkeypatch.setattr("maintenance_man.dependency_age._utcnow", lambda: fixed_now)
-        target = make_gradle_target()
-        exactly_at_cutoff = fixed_now - timedelta(days=7)
-        _dates(
-            {
-                "androidx.room:room-runtime": _OLD,
-                "androidx.room:room-compiler": _OLD,
-                "androidx.room:room-testing": exactly_at_cutoff,
-            },
-            monkeypatch,
-        )
-
-        block = check_gradle_update_age(target, 7)
-
-        assert block is not None
-        assert block.kind == "age"
-        assert "androidx.room:room-testing" in block.reason
-        assert "7 day(s) ago" in block.reason
-        assert "minimum is 7" in block.reason
-
-    def test_zero_waiting_period_allows_recent_but_not_unknown(self, monkeypatch):
-        now = datetime.now(timezone.utc)
-        target = make_gradle_target(
-            members=[make_gradle_member(alias="room-runtime")], version_ref=None
-        )
-        _dates({"androidx.room:room-runtime": now - timedelta(hours=1)}, monkeypatch)
-
-        assert check_gradle_update_age(target, 0) is None
-
-        _dates({"androidx.room:room-runtime": None}, monkeypatch)
-        block = check_gradle_update_age(target, 0)
-
-        assert block is not None and block.kind == "age"
-
-    def test_plugin_member_is_looked_up_by_marker_coordinate(self, monkeypatch):
-        seen: list[str] = []
-
-        def _lookup(pkg: str, version: str):
-            seen.append(pkg)
-            return _OLD
-
-        monkeypatch.setattr(
-            "maintenance_man.dependency_age._get_maven_publish_date", _lookup
-        )
-        target = GradleUpdateTarget(
-            version_ref="ksp",
-            members=[
-                GradleMember(
-                    kind="plugin",
-                    alias="ksp",
-                    coordinate="com.google.devtools.ksp",
-                    installed_version="2.3.10",
-                )
-            ],
-            target_version="2.3.12",
-        )
-
-        assert check_gradle_update_age(target, 7) is None
-        assert seen == ["com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin"]
-
-    def test_empty_member_list_blocks_instead_of_raising(self):
-        """A target with no members (e.g. malformed historical scan JSON) must
-        block for a rescan, not raise out of ``max()`` on an empty sequence.
-        """
-        target = GradleUpdateTarget(
-            version_ref="room", members=[], target_version="2.8.5"
-        )
-
-        block, published = evaluate_gradle_group_age(target, 7)
-
-        assert block is not None
-        assert block.kind == "age"
-        assert "no members" in block.reason
-        assert published is None
 
 
 def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch):
@@ -562,18 +379,17 @@ def test_publication_routing_withheld_before_any_transport_call(
     [(False, ("central",)), (True, ())],
     ids=["routing_unsupported", "no_repositories"],
 )
-def test_publication_candidate_age_propagates_routing_withholding(
+def test_publication_candidate_age_allows_unknown_routing(
     tmp_path, routing_supported, repositories
 ):
-    """The routing guard's block must reach the policy decision as an
-    ``AgeBlock``, not be silently treated as a passing ``None``."""
+    """Unsupported routing leaves age unknown and does not veto updates."""
     _, request, calls, context = _publication_fixture(
         tmp_path, repositories=repositories, routing_supported=routing_supported
     )
     candidate = SimpleNamespace(publication_requests=(request,))
     with context:
         result = evaluate_gradle_candidate_age(candidate, 0, context, _PUB_NOW)
-    assert isinstance(result, AgeBlock)
+    assert result is None
     assert calls == []
 
 
@@ -581,11 +397,11 @@ def test_publication_candidate_age_propagates_routing_withholding(
     "date,days,blocked",
     [
         ("Tue, 01 Sep 2026 00:00:00 GMT", 7, False),
-        ("Fri, 11 Sep 2026 00:00:00 GMT", 7, False),
+        ("Fri, 11 Sep 2026 00:00:00 GMT", 7, True),
         ("Thu, 17 Sep 2026 00:00:00 GMT", 0, False),
-        ("Sat, 19 Sep 2026 00:00:00 GMT", 0, True),
-        ("broken", 0, True),
-        (None, 0, True),
+        ("Sat, 19 Sep 2026 00:00:00 GMT", 0, False),
+        ("broken", 0, False),
+        (None, 0, False),
     ],
 )
 def test_publication_policy(tmp_path, date, days, blocked):
@@ -601,7 +417,7 @@ def test_publication_policy(tmp_path, date, days, blocked):
             SimpleNamespace(publication_requests=(request,)), days, context, _PUB_NOW
         )
     assert isinstance(result, AgeBlock) == blocked
-    assert len(calls) == 1
+    assert len(calls) == (1 if days else 0)
 
 
 @pytest.mark.parametrize(
@@ -665,6 +481,22 @@ def test_publication_negative_results_retry_next_command(tmp_path):
             assert isinstance(lookup_gradle_publication(request, context), AgeBlock)
             assert len(calls) == 1
     assert not list(tmp_path.glob("*.json"))
+
+
+def test_publication_failure_has_readable_reason_and_debug_details(tmp_path, caplog):
+    def transport(url, repository, suffix, count):
+        raise PublicationFailure("publication lookup timed out")
+
+    _, request, _, context = _publication_fixture(tmp_path)
+    context.transport = transport
+    with caplog.at_level("DEBUG", logger="maintenance_man.dependency_age"), context:
+        result = lookup_gradle_publication(request, context)
+
+    assert isinstance(result, AgeBlock)
+    assert "org.example:lib:2.0" in result.reason
+    assert "publication lookup timed out" in result.reason
+    assert "PublicationFailure" not in result.reason
+    assert "PublicationFailure" in caplog.text
 
 
 def test_publication_youngest_and_content_conflict(tmp_path):
@@ -1097,7 +929,7 @@ def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown):
             for candidate in candidates
         ]
     assert blocks[0] is None
-    assert isinstance(blocks[1], AgeBlock)
+    assert blocks[1] is None
 
 
 def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeypatch):
@@ -1145,7 +977,9 @@ def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("failure", ["truncated-chunk", "bad-status-line"])
-def test_publication_malformed_http_withholds_candidate(tmp_path, monkeypatch, failure):
+def test_publication_malformed_http_withholds_candidate(
+    tmp_path, monkeypatch, caplog, failure
+):
     import http.client
     import socket
 
@@ -1166,6 +1000,7 @@ def test_publication_malformed_http_withholds_candidate(tmp_path, monkeypatch, f
             return response
 
     monkeypatch.setattr(age.urllib.request, "build_opener", lambda *args: Opener())
+    caplog.set_level("DEBUG", logger="maintenance_man.dependency_age")
     try:
         module = ModuleId(group="org.example", artifact="lib", version="2.0")
         with PublicationLookupContext(tmp_path) as context:
@@ -1176,10 +1011,273 @@ def test_publication_malformed_http_withholds_candidate(tmp_path, monkeypatch, f
                 context,
             )
         assert isinstance(result, AgeBlock)
+        assert "publication lookup failed" in result.reason
         assert (
             "IncompleteRead" if failure == "truncated-chunk" else "BadStatusLine"
-        ) in result.reason
+        ) in caplog.text
         assert not list(tmp_path.glob("*.json"))
     finally:
         receiver.close()
         sender.close()
+
+
+@pytest.mark.parametrize(
+    "explicit", ["", "<groupId>org.example</groupId>", "<version>2.0</version>"]
+)
+def test_publication_accepts_literal_parent_identity(tmp_path, explicit):
+    from maintenance_man.models.gradle import PublicationEvidence
+
+    pom = (
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        "<modelVersion>4.0.0</modelVersion><parent><groupId>org.example</groupId>"
+        "<artifactId>parent</artifactId><version>2.0</version></parent>"
+        f"<artifactId>lib</artifactId>{explicit}</project>"
+    ).encode()
+    _, request, _, context = _publication_fixture(
+        tmp_path,
+        responses={
+            "central": (pom, {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"})
+        },
+    )
+    with context:
+        result = lookup_gradle_publication(request, context)
+    assert isinstance(result, PublicationEvidence)
+    assert result.facts[0].module == ModuleId(
+        group="org.example", artifact="lib", version="2.0"
+    )
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "<groupId>wrong.group</groupId>",
+        "<version>${revision}</version>",
+        "<version></version>",
+        "<version>2.0</version><version>2.0</version>",
+    ],
+)
+def test_publication_never_replaces_invalid_explicit_identity_with_parent(
+    tmp_path, identity
+):
+    pom = (
+        "<project><parent><groupId>org.example</groupId><artifactId>parent</artifactId>"
+        "<version>2.0</version></parent><artifactId>lib</artifactId>"
+        f"{identity}</project>"
+    ).encode()
+    _, request, _, context = _publication_fixture(
+        tmp_path,
+        responses={
+            "central": (pom, {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"})
+        },
+    )
+    with context:
+        assert isinstance(lookup_gradle_publication(request, context), AgeBlock)
+
+
+@pytest.mark.parametrize("minimum_age", [0, 7])
+def test_unknown_gradle_publication_does_not_veto_update(tmp_path, minimum_age):
+    _, request, calls, context = _publication_fixture(
+        tmp_path, responses={"central": TimeoutError("unavailable")}
+    )
+    with context:
+        assert (
+            evaluate_gradle_candidate_age(
+                SimpleNamespace(publication_requests=(request,)),
+                minimum_age,
+                context,
+                _PUB_NOW,
+            )
+            is None
+        )
+    if minimum_age == 0:
+        assert calls == []
+
+
+def test_gradle_age_without_requests_is_unknown(tmp_path):
+    with PublicationLookupContext(tmp_path) as context:
+        assert (
+            evaluate_gradle_candidate_age(
+                SimpleNamespace(publication_requests=()), 7, context, _PUB_NOW
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize("kind", ["library", "plugin"])
+@pytest.mark.parametrize(
+    "date,kept",
+    [
+        ("Tue, 01 Sep 2026 00:00:00 GMT", True),
+        ("Thu, 17 Sep 2026 00:00:00 GMT", False),
+        (None, True),
+    ],
+)
+def test_gradle_scan_age_filter_keeps_unknown_and_filters_known_young(
+    tmp_path, kind, date, kept
+):
+    from maintenance_man import dependency_age as age
+    from maintenance_man.models.scan import GradleMember, GradleUpdateTarget
+
+    coordinate = "org.example:lib" if kind == "library" else "org.example.plugin"
+    target = GradleUpdateTarget(
+        version_ref="lib",
+        target_version="2.0",
+        members=[
+            GradleMember(
+                kind=kind, alias="lib", coordinate=coordinate, installed_version="1.0"
+            )
+        ],
+    )
+    row = _make_update("lib", "2.0").model_copy(update={"gradle_target": target})
+    module = (
+        ModuleId(group="org.example", artifact="lib", version="2.0")
+        if kind == "library"
+        else ModuleId(
+            group=coordinate, artifact=coordinate + ".gradle.plugin", version="2.0"
+        )
+    )
+
+    def transport(url, repository, suffix, count):
+        if date is None:
+            raise TimeoutError("unavailable")
+        body = _pom(module)
+        if kind == "plugin":
+            body = body.replace(
+                b"</project>",
+                b"<dependencies><dependency><groupId>g</groupId><artifactId>impl</artifactId><version>2</version></dependency></dependencies></project>",
+            )
+        return body, {"Last-Modified": date}, url
+
+    from maintenance_man.models.config import ProjectConfig
+    from maintenance_man.models.gradle import (
+        CompleteResolution,
+        RepositoryDeclaration,
+        ResolutionReport,
+    )
+
+    project = ProjectConfig(
+        path=tmp_path,
+        package_manager="gradle",
+        gradle_repository_routing="standard-public",
+    )
+    resolution = CompleteResolution(
+        report=ResolutionReport(
+            schema_version=1,
+            root_project=":",
+            producer_versions={"gradle": "9", "cyclonedx": "3", "report": "1"},
+            catalogue_digest="catalogue",
+            repositories=(
+                RepositoryDeclaration(
+                    domain=kind,
+                    project_path=":",
+                    url="https://repo.maven.apache.org/maven2",
+                ),
+            ),
+            selected_scopes=(),
+            scopes=(),
+        )
+    )
+    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+        result = age.filter_gradle_updates_by_age(
+            [row], project, resolution, 7, context
+        )
+    assert bool(result) is kept
+    if kept:
+        assert result[0].blocked_reason is None
+        assert (result[0].published_date is not None) is (date is not None)
+
+
+@pytest.mark.parametrize(
+    "case,kept,dated",
+    [
+        ("member-timeout", True, False),
+        ("member-routing", True, False),
+        ("young-member", False, False),
+        ("repository-timeout", True, False),
+        ("young-repository", False, False),
+        ("all-old", True, True),
+    ],
+)
+def test_gradle_group_age_requires_every_member_date(tmp_path, case, kept, dated):
+    from maintenance_man.dependency_age import filter_gradle_updates_by_age
+    from maintenance_man.models.config import ProjectConfig
+    from maintenance_man.models.gradle import (
+        CompleteResolution,
+        RepositoryDeclaration,
+        ResolutionReport,
+    )
+    from maintenance_man.models.scan import GradleMember, GradleUpdateTarget
+
+    members = [
+        GradleMember(
+            kind="library", alias="one", coordinate="g:one", installed_version="1"
+        )
+    ]
+    repositories = [
+        RepositoryDeclaration(
+            project_path=":",
+            domain="library",
+            url="https://repo.maven.apache.org/maven2",
+        )
+    ]
+    if "repository" in case:
+        repositories.append(
+            RepositoryDeclaration(
+                project_path=":",
+                domain="library",
+                url="https://dl.google.com/dl/android/maven2",
+            )
+        )
+    else:
+        members.append(
+            GradleMember(
+                kind="plugin" if case == "member-routing" else "library",
+                alias="two",
+                coordinate="g.two" if case == "member-routing" else "g:two",
+                installed_version="1",
+            )
+        )
+    row = _make_update("shared", "2").model_copy(
+        update={
+            "gradle_target": GradleUpdateTarget(
+                version_ref="shared", target_version="2", members=members
+            )
+        }
+    )
+    project = ProjectConfig(
+        path=tmp_path,
+        package_manager="gradle",
+        gradle_repository_routing="standard-public",
+    )
+    resolution = CompleteResolution(
+        report=ResolutionReport(
+            schema_version=1,
+            root_project=":",
+            producer_versions={"gradle": "9", "cyclonedx": "3", "report": "1"},
+            catalogue_digest="catalogue",
+            repositories=tuple(repositories),
+            selected_scopes=(),
+            scopes=(),
+        )
+    )
+
+    def transport(url, repository, suffix, count):
+        artifact = "two" if "/two/" in url else "one"
+        if repository == "google" or (artifact == "two" and case != "all-old"):
+            raise TimeoutError("unavailable")
+        date = (
+            "Thu, 17 Sep 2026 00:00:00 GMT"
+            if case.startswith("young")
+            else "Tue, 01 Sep 2026 00:00:00 GMT"
+        )
+        return (
+            _pom(ModuleId(group="g", artifact=artifact, version="2")),
+            {"Last-Modified": date},
+            url,
+        )
+
+    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+        result = filter_gradle_updates_by_age([row], project, resolution, 7, context)
+    assert bool(result) is kept
+    if kept:
+        assert (result[0].published_date is not None) is dated

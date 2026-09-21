@@ -17,25 +17,18 @@ from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
-    evaluate_gradle_candidate_age,
     filter_by_age,
+    filter_gradle_updates_by_age,
 )
 from maintenance_man.gradle import (
-    GRADLE_CATALOGUE_RELPATH,
     GradleError,
-    parse_catalogue,
 )
 from maintenance_man.gradle_resolution import (
-    attach_gradle_publications,
     generate_gradle_report,
-    gradle_routing_prerequisite,
-    select_gradle_candidates,
-    validate_gradle_candidates,
 )
 from maintenance_man.gradle_verification import context_inputs_valid
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
-    CandidateWithheld,
     ComparisonContext,
     CompleteResolution,
     FindingEvidence,
@@ -91,104 +84,12 @@ def scan_project(
     elif project.package_manager == "gradle":
         vulns, resolution = _run_gradle_scan(project)
         updates = get_outdated(project)
-        catalogue = parse_catalogue(project_path / GRADLE_CATALOGUE_RELPATH)
-        plan = select_gradle_candidates(catalogue, resolution, vulns, updates)
-        routing_block = gradle_routing_prerequisite(project)
-        blocks = {
-            block.group_key: block.reason
-            for block in plan.withheld
-            if block.group_key is not None
-        }
-        eligible = {}
-        prepared_candidates = []
-        with PublicationLookupContext(_config.MM_HOME / "publication-cache") as context:
-            if routing_block is not None:
-                for candidate in plan.candidates:
-                    blocks[candidate.target.group_key] = routing_block.reason
-            else:
-                batch = validate_gradle_candidates(project, plan.candidates, resolution)
-                for candidate in plan.candidates:
-                    key = candidate.target.group_key
-                    prepared = attach_gradle_publications(candidate, resolution, batch)
-                    if isinstance(prepared, CandidateWithheld):
-                        blocks[key] = prepared.reason
-                        continue
-                    prepared_candidates.append(prepared)
-            context.prefetch(
-                request
-                for candidate in prepared_candidates
-                for request in candidate.publication_requests
+        with PublicationLookupContext(
+            _config.MM_HOME / "gradle-publications"
+        ) as context:
+            updates = filter_gradle_updates_by_age(
+                updates, project, resolution, min_version_age_days, context
             )
-            for prepared in prepared_candidates:
-                key = prepared.target.group_key
-                block = evaluate_gradle_candidate_age(
-                    prepared, min_version_age_days, context, datetime.now(timezone.utc)
-                )
-                if block is not None:
-                    blocks[key] = block.reason
-                eligible[key] = prepared
-        for update in updates:
-            if update.gradle_target is None:
-                update.blocked_reason = (
-                    update.blocked_reason or "no supported catalogue target"
-                )
-                update.gradle_block_kind = "mapping"
-                continue
-            key = update.gradle_target.group_key
-            if key in blocks:
-                update.blocked_reason = blocks[key]
-                update.gradle_block_kind = (
-                    "age"
-                    if key in eligible
-                    or (
-                        routing_block is not None
-                        and any(
-                            candidate.target.group_key == key
-                            for candidate in plan.candidates
-                        )
-                    )
-                    else "mapping"
-                )
-            elif key in eligible:
-                update.blocked_reason = None
-                update.gradle_block_kind = None
-        for finding in vulns:
-            matches = [
-                candidate
-                for candidate in plan.candidates
-                if finding.vuln_id in candidate.requested_advisories
-                and finding.pkg_name in candidate.requested_coordinates
-            ]
-            if len(matches) == 1:
-                candidate = matches[0]
-                key = candidate.target.group_key
-                finding.gradle_target = candidate.target
-                finding.blocked_reason = blocks.get(key)
-                if finding.blocked_reason is None:
-                    finding.gradle_block_kind = None
-                else:
-                    finding.gradle_block_kind = (
-                        "age"
-                        if key in eligible
-                        or (
-                            routing_block is not None
-                            and any(
-                                other.target.group_key == key
-                                for other in plan.candidates
-                            )
-                        )
-                        else "mapping"
-                    )
-            else:
-                reasons = [
-                    block.reason
-                    for block in plan.withheld
-                    if finding.vuln_id in block.advisory_ids
-                    and finding.pkg_name == block.coordinate
-                ]
-                if reasons:
-                    finding.blocked_reason = "; ".join(dict.fromkeys(reasons))
-                    finding.gradle_block_kind = "mapping"
         secrets = (
             _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
             if project.scan_secrets

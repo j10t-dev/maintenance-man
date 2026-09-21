@@ -9,6 +9,7 @@ from rich.console import Console
 from maintenance_man import cli
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
 from maintenance_man.gradle import GradleError
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     CandidateWithheld,
     CompleteResolution,
@@ -200,8 +201,9 @@ def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
 
     assert "clean" not in out
     assert "ksp" in out
-    assert "1 blocked" in out
-    assert "no Maven Central publication date" in out
+    assert "UPDATE" in out
+    assert "Blocked" not in out
+    assert "publication date" not in out
 
 
 def test_blocked_update_candidates_still_exit_updates_found():
@@ -227,6 +229,75 @@ def test_blocked_update_candidates_still_exit_updates_found():
     assert _scan_exit_code(result.has_actionable_vulns, result.has_updates) == (
         ExitCode.UPDATES_FOUND
     )
+
+
+def test_scan_keeps_update_planning_diagnostics_out_of_standard_rows(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=220, color_system=None)
+    )
+    result = _make_vulnerable_result()
+    result.vulnerabilities[0].blocked_reason = "Cannot identify catalogue entry"
+    result.vulnerabilities.append(
+        result.vulnerabilities[0].model_copy(
+            update={
+                "pkg_name": "unfixed-pkg",
+                "vuln_id": "CVE-2024-0002",
+                "fixed_version": None,
+                "blocked_reason": "No published fix",
+            }
+        )
+    )
+    result.updates = [
+        make_update(pkg_name="agp", blocked_reason="Publication lookup timed out"),
+        make_update(pkg_name="available"),
+    ]
+
+    cli._print_scan_result(result)
+    lines = output.getvalue().splitlines()
+    for label, package, reason in (
+        ("VULN", "some-pkg", "Cannot identify catalogue entry"),
+        ("ADV", "unfixed-pkg", "No published fix"),
+        ("UPDATE", "agp", "Publication lookup timed out"),
+    ):
+        rows = [line for line in lines if package in line]
+        assert len(rows) == 1
+        assert label in rows[0]
+        assert reason not in output.getvalue()
+    available = next(line for line in lines if "available" in line)
+    assert "UPDATE" in available
+    assert "timed out" not in available
+
+
+def test_scan_wraps_long_package_names_without_crowding_out_cves(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=80, color_system=None)
+    )
+    result = _make_vulnerable_result()
+    result.vulnerabilities[0].pkg_name = "org.apache.commons:commons-lang3"
+    result.vulnerabilities[
+        0
+    ].blocked_reason = "cannot identify an unambiguous catalogue entry"
+
+    cli._print_scan_result(result)
+
+    assert "VULN" in output.getvalue()
+    assert "CVE-2024-0001" in output.getvalue()
+    assert "…" not in output.getvalue()
+
+
+def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
+    result = make_scan_result(
+        vulns=[],
+        updates=[make_update(pkg_name="example", blocked_reason="apply failed")],
+    )
+
+    cli._print_blocked_findings(result)
+
+    out = capsys.readouterr().out
+    assert "BLOCKED example" in out
+    assert "apply failed" in out
 
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
@@ -637,7 +708,8 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
     assert not (root / GRADLE_REPORT_MARKER_RELPATH).exists()
 
 
-def test_gradle_advisories_collapse_without_losing_saved_cves(monkeypatch):
+@pytest.mark.parametrize("manager", ["gradle", "uv", "bun", "mvn"])
+def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager):
     output = StringIO()
     monkeypatch.setattr(
         cli, "console", Console(file=output, width=180, color_system=None)
@@ -648,6 +720,7 @@ def test_gradle_advisories_collapse_without_losing_saved_cves(monkeypatch):
             vuln_id=advisory,
             pkg_name="org.example:shared",
             installed_version="1.0",
+            fixed_version="1.1" if advisory == "CVE-B" else None,
             severity=severity,
             title=advisory,
             description="",
@@ -662,12 +735,19 @@ def test_gradle_advisories_collapse_without_losing_saved_cves(monkeypatch):
         trivy_target="/fixture",
         vulnerabilities=findings,
     )
-    cli._print_gradle_advisories(result)
+    monkeypatch.setattr(cli, "scan_project", lambda *args: result)
+    cli._scan_one(
+        "android", ProjectConfig(path=Path("/fixture"), package_manager=manager), 7
+    )
     rendered = output.getvalue()
-    assert rendered.count("org.example:shared") == 1
+    assert rendered.count("org.example:shared") == 2
+    assert "VULN" in rendered
+    assert "ADV" in rendered
+    assert "Fix" in rendered
+    assert "1.1" in rendered
+    assert "CVE-A" in rendered
+    assert "CVE-B" in rendered
     assert "HIGH" in rendered
-    assert "2" in rendered
-    assert "debugRuntimeClasspath" in rendered
     assert [
         row["vuln_id"] for row in result.model_dump(mode="json")["vulnerabilities"]
     ] == ["CVE-A", "CVE-B"]
@@ -695,7 +775,7 @@ def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
             for version in ("1.0", "2.0")
         ],
     )
-    cli._print_gradle_advisories(result)
+    cli._print_scan_result(result)
     assert output.getvalue().count("org.example:shared") == 2
 
 

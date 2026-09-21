@@ -405,8 +405,8 @@ class VerificationReceipt(BaseModel):
 
     @model_validator(mode="after")
     def successful(self):
-        if not self.checks.success or not self.publications:
-            raise ValueError("receipt requires passing checks and publication evidence")
+        if not self.checks.success:
+            raise ValueError("receipt requires passing checks")
         if self.verified_fixes & self.residual_keys:
             raise ValueError("residual finding cannot be a verified fix")
         return self

@@ -1,12 +1,9 @@
-import os
 import subprocess
 import sys
 import time
-import uuid
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import IntEnum, StrEnum
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
@@ -18,9 +15,8 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from maintenance_man import __version__
+from maintenance_man import __version__, gradle_workflow
 from maintenance_man import config as _config
-from maintenance_man import updater as gradle_updater
 from maintenance_man.config import (
     MM_HOME,
     ConfigError,
@@ -29,10 +25,6 @@ from maintenance_man.config import (
     load_config,
     resolve_project,
 )
-from maintenance_man.dependency_age import (
-    PublicationLookupContext,
-    evaluate_gradle_candidate_age,
-)
 from maintenance_man.deployer import (
     BuildError,
     DeployError,
@@ -40,26 +32,13 @@ from maintenance_man.deployer import (
     run_build,
     run_deploy,
 )
+from maintenance_man.exit_codes import ExitCode
+from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
 from maintenance_man.gradle import (
-    GRADLE_CATALOGUE_RELPATH,
     GradleError,
-    discover_gradle_updates,
-    parse_catalogue,
-    validate_gradle_target,
     workspace_environment_reason,
 )
-from maintenance_man.gradle_resolution import (
-    attach_gradle_publications,
-    collect_gradle_resolution,
-    gradle_routing_prerequisite,
-    select_gradle_candidates,
-    validate_gradle_candidates,
-)
-from maintenance_man.gradle_verification import (
-    context_inputs_valid,
-    initialize_comparison_context,
-    release_comparison_context,
-)
+from maintenance_man.gradle_verification import snapshot_vulnerabilities
 from maintenance_man.models.activity import (
     ActivityEvent,
     ProjectActivity,
@@ -68,20 +47,13 @@ from maintenance_man.models.activity import (
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.gradle import (
-    ApplyingAttempt,
-    CandidateWithheld,
-    CompletedAttempt,
     FailedAttempt,
     GradleCandidate,
     GradleRun,
-    IncompleteResolution,
-    PlannedAttempt,
-    ReadyAttempt,
     WithheldAttempt,
 )
 from maintenance_man.models.scan import (
     ScanResult,
-    Severity,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
@@ -91,7 +63,6 @@ from maintenance_man.models.scan import (
 from maintenance_man.scanner import (
     TrivyNotFoundError,
     TrivyScanError,
-    _run_trivy_secret_scan,
     check_trivy_available,
     scan_project,
 )
@@ -100,7 +71,6 @@ from maintenance_man.updater import (
     NoScanResultsError,
     UpdateResult,
     consolidate_vulns,
-    gradle_groups_from_targets,
     has_test_config,
     highest_fix_version,
     load_scan_results,
@@ -113,6 +83,7 @@ from maintenance_man.updater import (
     sort_updates_by_risk,
 )
 from maintenance_man.vcs import (
+    BookmarkLookupError,
     GitHubCLINotFoundError,
     JJCLINotFoundError,
     bookmark_exists,
@@ -125,32 +96,17 @@ from maintenance_man.vcs import (
     delete_bookmark,
     edit_new_change,
     ensure_main_bookmark,
-    exact_commit_id,
     main_commit_id,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
-    reset_verified_gradle_bookmark,
     resolve_bookmark_contains_current_change,
     revision_file,
-    revision_tree_id,
     sync_main,
     workspace_path_for_project,
 )
-
-
-class ExitCode(IntEnum):
-    OK = 0
-    ERROR = 1
-    VULNS_FOUND = 2
-    UPDATES_FOUND = 3
-    UPDATE_FAILED = 4
-    TEST_FAILED = 5
-    BUILD_FAILED = 6
-    DEPLOY_FAILED = 7
-    SYNC_FAILED = 8
 
 
 class GateDecision(StrEnum):
@@ -478,10 +434,6 @@ def _update_batch_targets(
     sys.exit(ExitCode.UPDATE_FAILED if any_failed else ExitCode.OK)
 
 
-class _UpdateSetupError(Exception):
-    pass
-
-
 def _gradle_workspace_revision(
     project: str, proj_config: ProjectConfig, revision: str
 ) -> str:
@@ -775,20 +727,14 @@ def _load_validated_scan(
     except NoScanResultsError:
         console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
         sys.exit(ExitCode.OK)
-    if proj_config.package_manager == "gradle" and workflow == Workflow.RESOLVE:
-        gradle_groups_from_targets([*scan_result.vulnerabilities, *scan_result.updates])
     try:
         _assert_supported_in_progress_state(scan_result, project)
         _assert_no_conflicting_flow(scan_result, workflow, project)
     except _FlowConflictError as e:
-        if proj_config.package_manager == "gradle" and scan_result.blocked_findings:
-            _print_blocked_findings(scan_result)
-            save_scan_results(project, results_dir, scan_result)
-            sys.exit(ExitCode.UPDATE_FAILED)
         _fatal(str(e))
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
-    if proj_config.package_manager != "gradle" and not actionable_vulns and not updates:
+    if not actionable_vulns and not updates:
         console.print(f"[bold green]{project}[/] — nothing to {workflow}.")
         sys.exit(ExitCode.OK)
     _warn_missing_test_config(project, proj_config)
@@ -1628,9 +1574,7 @@ def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanR
     t0 = time.monotonic()
     result = scan_project(name, proj_config, min_age_days)
     elapsed = time.monotonic() - t0
-    _print_scan_result(
-        result, elapsed_s=elapsed, gradle=proj_config.package_manager == "gradle"
-    )
+    _print_scan_result(result, elapsed_s=elapsed)
     return result
 
 
@@ -1735,229 +1679,6 @@ def _choose_gradle_candidates(
         console.print("Invalid selection")
 
 
-def _prepare_gradle_run(
-    project_name: str,
-    project: ProjectConfig,
-    flow: Workflow,
-    base: str,
-    publication: PublicationLookupContext,
-    minimum_age_days: int,
-    interactive: bool,
-    discovered: list[UpdateFinding] | None = None,
-) -> GradleRun:
-    catalogue = parse_catalogue(project.path / GRADLE_CATALOGUE_RELPATH)
-    resolution = collect_gradle_resolution(project, catalogue)
-    if isinstance(resolution, IncompleteResolution):
-        raise GradleError(
-            "Incomplete baseline resolution: " + "; ".join(resolution.reasons)
-        )
-    context = initialize_comparison_context(
-        project, resolution, _config.MM_HOME / "gradle-contexts"
-    )
-    try:
-        # start_gradle_run persists a checked baseline before any candidate effect.
-        run = gradle_updater.start_gradle_run(
-            project_name, project, flow, base, context, ()
-        )
-        vulnerabilities = tuple(
-            row for item in run.initial_snapshot.findings for row in item.rows
-        )
-        plan = select_gradle_candidates(
-            catalogue,
-            resolution,
-            vulnerabilities,
-            discovered if discovered is not None else discover_gradle_updates(project),
-        )
-        for withheld in plan.withheld:
-            console.print(f"Withheld {withheld.coordinate}: {withheld.reason}")
-        candidates = (
-            _choose_gradle_candidates(plan.candidates)
-            if interactive
-            else plan.candidates
-        )
-        routing_block = gradle_routing_prerequisite(project)
-        attempts = []
-        prepared = {}
-        if routing_block is not None:
-            attempts.extend(
-                WithheldAttempt(candidate=candidate, reason=routing_block.reason)
-                for candidate in candidates
-            )
-        else:
-            batch = validate_gradle_candidates(project, candidates, resolution)
-            for candidate in candidates:
-                bound = attach_gradle_publications(candidate, resolution, batch)
-                if isinstance(bound, CandidateWithheld):
-                    attempts.append(
-                        WithheldAttempt(candidate=candidate, reason=bound.reason)
-                    )
-                    continue
-                prepared[candidate.target.group_key] = bound
-        publication.prefetch(
-            request
-            for bound in prepared.values()
-            for request in bound.publication_requests
-        )
-        for candidate in candidates:
-            bound = prepared.get(candidate.target.group_key)
-            if bound is None:
-                continue
-            block = evaluate_gradle_candidate_age(
-                bound, minimum_age_days, publication, datetime.now(timezone.utc)
-            )
-            attempts.append(
-                WithheldAttempt(candidate=bound, reason=block.reason)
-                if block
-                else PlannedAttempt(candidate=bound)
-            )
-        run = GradleRun.model_validate(
-            run.model_copy(
-                update={"attempts": tuple(attempts), "selection_blocks": plan.withheld}
-            ).model_dump(mode="json")
-        )
-        gradle_updater.save_gradle_run(
-            gradle_updater.gradle_run_path(project_name), run
-        )
-        return run
-    except BaseException:
-        gradle_updater.discard_unpersisted_gradle_context(project_name, context)
-        raise
-
-
-def _complete_gradle_attempts(run: GradleRun) -> GradleRun:
-    attempts = tuple(
-        CompletedAttempt(
-            candidate=item.candidate,
-            baseline=item.baseline,
-            after=item.after,
-            receipt=item.receipt,
-            promoted_commit_id=run.managed_tip_id,
-        )
-        if isinstance(item, ReadyAttempt)
-        else item
-        for item in run.attempts
-    )
-    return GradleRun.model_validate(
-        run.model_copy(update={"attempts": attempts}).model_dump(mode="json")
-    )
-
-
-def _publish_verified_gradle_scan(
-    run: GradleRun,
-    project: ProjectConfig,
-    results_dir: Path,
-    publication: PublicationLookupContext,
-    minimum_age_days: int,
-) -> None:
-    if revision_tree_id(project.path) != run.accepted_snapshot.tree_id:
-        raise GradleError("Refreshed working tree differs from verified tree")
-    discovered = discover_gradle_updates(project)
-    catalogue = parse_catalogue(project.path / GRADLE_CATALOGUE_RELPATH)
-    plan = select_gradle_candidates(
-        catalogue, run.accepted_snapshot.resolution, (), discovered
-    )
-    proven = {item.candidate.target.group_key: item.candidate for item in run.attempts}
-    blocks = {
-        item.group_key: item.reason
-        for item in plan.withheld
-        if item.group_key is not None
-    }
-    routing_block = gradle_routing_prerequisite(project)
-    for candidate in plan.candidates:
-        if routing_block is not None:
-            blocks[candidate.target.group_key] = routing_block.reason
-            continue
-        previous = proven.get(candidate.target.group_key)
-        if (
-            previous is None
-            or previous.target != candidate.target
-            or not previous.publication_requests
-        ):
-            blocks[candidate.target.group_key] = (
-                "Fresh native metadata validation required on next invocation"
-            )
-            continue
-        shape_block = validate_gradle_target(project, previous.target)
-        age_block = evaluate_gradle_candidate_age(
-            previous, minimum_age_days, publication, datetime.now(timezone.utc)
-        )
-        block = shape_block or age_block
-        if block is not None:
-            blocks[candidate.target.group_key] = block.reason
-    for update in discovered:
-        if (
-            update.gradle_target is not None
-            and update.gradle_target.group_key in blocks
-        ):
-            update.blocked_reason = blocks[update.gradle_target.group_key]
-    # Scope expansion must not duplicate original CVE/version rows in scan JSON.
-    raw = {}
-    for finding in run.accepted_snapshot.findings:
-        scope = finding.key.scope
-        scope_text = f"{scope.project_path}/{scope.domain}/{scope.configuration}"
-        for row in finding.rows:
-            key = row.model_dump_json(
-                exclude={"gradle_scopes", "update_status", "flow", "failed_phase"}
-            )
-            if key not in raw:
-                raw[key] = row.model_copy(
-                    update={
-                        "update_status": None,
-                        "flow": None,
-                        "failed_phase": None,
-                        "gradle_scopes": (),
-                    }
-                )
-            raw[key] = raw[key].model_copy(
-                update={
-                    "gradle_scopes": tuple(
-                        sorted(set(raw[key].gradle_scopes) | {scope_text})
-                    )
-                }
-            )
-    rows = list(raw.values())
-    secrets = (
-        _run_trivy_secret_scan(project.path, project.scan_skip_dirs)
-        if project.scan_secrets
-        else []
-    )
-    fresh = ScanResult(
-        project=run.project,
-        scanned_at=datetime.now(timezone.utc),
-        trivy_target=str(project.path),
-        vulnerabilities=rows,
-        secrets=secrets,
-        updates=discovered,
-        gradle_resolution=run.accepted_snapshot.resolution.report.model_dump(
-            mode="json"
-        ),
-    )
-    if revision_tree_id(project.path) != run.accepted_snapshot.tree_id:
-        raise GradleError("Source changed while publishing verified findings")
-    results_dir.mkdir(parents=True, exist_ok=True)
-    save_scan_results(run.project, results_dir, fresh)
-
-
-def _require_gradle_accepted_workspace(run: GradleRun, project: ProjectConfig) -> None:
-    if current_change_has_changes(project.path):
-        raise GradleError(
-            "Automatic Gradle processing requires an empty working change"
-        )
-    if exact_commit_id(project.path, "@-") != run.managed_tip_id:
-        raise GradleError(
-            "Working change is not an empty child of the recorded accepted tip"
-        )
-    if (
-        exact_commit_id(project.path, run.managed_bookmark) != run.managed_tip_id
-        or revision_tree_id(project.path, run.managed_tip_id)
-        != run.accepted_snapshot.tree_id
-        or revision_tree_id(project.path) != run.accepted_snapshot.tree_id
-    ):
-        raise GradleError(
-            "Working revision differs from the recorded accepted snapshot"
-        )
-
-
 def _run_update_flow(
     project: str,
     proj_config: ProjectConfig,
@@ -1981,7 +1702,7 @@ def _run_update_flow(
         )
     try:
         wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except _UpdateSetupError as e:
+    except (_UpdateSetupError, BookmarkLookupError) as e:
         _fatal(str(e))
     work_config = proj_config.model_copy(update={"path": wt_path})
     finalised = False
@@ -2056,7 +1777,7 @@ def _update_batch(
     _warn_missing_test_config(project, proj_config)
     try:
         wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except _UpdateSetupError as e:
+    except (_UpdateSetupError, BookmarkLookupError) as e:
         console.print(f"  [bold red]Error:[/] {project} — {e}")
         return None
     work_config = proj_config.model_copy(update={"path": wt_path})
@@ -2178,12 +1899,17 @@ def resolve(
     candidates = _ordered_resolve_candidates(scan_result, proj_config, minimum_age_days)
     if not prune_stale_bookmarks(proj_config.path):
         _fatal("failed to sync trunk")
-    if not ensure_main_bookmark(proj_config.path):
-        _fatal("main bookmark not found")
-    if _ordered_failed_findings(scan_result, proj_config, minimum_age_days):
-        _fatal(f"resolve already paused for [bold]{project}[/] — rerun with --continue")
-    if not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
-        _fatal(f"aborted resolve for [bold]{project}[/]")
+    try:
+        if not ensure_main_bookmark(proj_config.path):
+            _fatal("main bookmark not found")
+        if _ordered_failed_findings(scan_result, proj_config, minimum_age_days):
+            _fatal(
+                f"resolve already paused for [bold]{project}[/] — rerun with --continue"
+            )
+        if not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
+            _fatal(f"aborted resolve for [bold]{project}[/]")
+    except BookmarkLookupError as exc:
+        _fatal(str(exc))
     sys.exit(
         _run_resolve_findings(
             project, proj_config, scan_result, results_dir, candidates, minimum_age_days
@@ -2254,345 +1980,6 @@ def _handle_resolve_continue(
     )
 
 
-def _finish_verified_gradle_run(
-    run: GradleRun,
-    project: ProjectConfig,
-    results_dir: Path,
-    publication: PublicationLookupContext,
-    minimum_age_days: int,
-) -> GradleRun:
-    routing_block = gradle_routing_prerequisite(project)
-    if routing_block is not None:
-        raise GradleError(routing_block.reason)
-    # Verification reads the accepted revision, not the source workspace's old tree.
-    with gradle_updater._gradle_evidence_workspace(
-        project, run.managed_tip_id
-    ) as verified:
-        if not context_inputs_valid(run.context, verified, datetime.now(timezone.utc)):
-            run = gradle_updater.rebuild_gradle_run_evidence(
-                run, verified, publication, minimum_age_days
-            )
-        gradle_updater.gradle_run_finalization_check(
-            run, verified, publication, minimum_age_days
-        )
-    path = gradle_updater.gradle_run_path(run.project)
-    if run.flow == Workflow.RESOLVE:
-        if not run.submitted:
-            ok, output = push_bookmark_and_create_pr(
-                project.path,
-                run.managed_bookmark,
-                expected_base=run.base_commit_id,
-                expected_tip=run.managed_tip_id,
-            )
-            if output:
-                console.print(output)
-            if not ok:
-                raise GradleError(
-                    "Verified Gradle submission failed; retained for retry"
-                )
-            run = _complete_gradle_attempts(run.model_copy(update={"submitted": True}))
-            gradle_updater.save_gradle_run(path, run)
-        return run
-    main = exact_commit_id(project.path, "main")
-    if run.promoted_commit_id is None:
-        if main != run.managed_tip_id:
-            if not promote_bookmark_to_main(
-                project.path,
-                run.managed_bookmark,
-                expected_base=run.base_commit_id,
-                expected_tip=run.managed_tip_id,
-            ):
-                raise GradleError("Main or managed tip changed; promotion refused")
-        # main already equals verified tip also covers crash after promotion but
-        # before this durable record. Finalization above still checks exact tip.
-        run = run.model_copy(update={"promoted_commit_id": run.managed_tip_id})
-        gradle_updater.save_gradle_run(path, run)
-    elif run.promoted_commit_id != run.managed_tip_id or main != run.promoted_commit_id:
-        raise GradleError("Main moved after recorded Gradle promotion")
-    if not run.refreshed:
-        if not refresh_working_copy_from_main(project.path):
-            raise GradleError(
-                "Promotion recorded; working-copy refresh failed, retry update"
-            )
-        if exact_commit_id(project.path, "main") != run.managed_tip_id:
-            raise GradleError("Main moved during refresh")
-        _publish_verified_gradle_scan(
-            run, project, results_dir, publication, minimum_age_days
-        )
-        run = _complete_gradle_attempts(run.model_copy(update={"refreshed": True}))
-        gradle_updater.save_gradle_run(path, run)
-    return run
-
-
-def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> None:
-    if (
-        run.flow != Workflow.UPDATE
-        or run.promoted_commit_id is not None
-        or any(isinstance(item, ApplyingAttempt) for item in run.attempts)
-        or not any(isinstance(item, FailedAttempt) for item in run.attempts)
-    ):
-        raise GradleError("Only rolled-back failed update runs can restart")
-    workspace = workspace_path_for_project(run.project)
-    if not workspace.exists() or current_change_has_changes(project.path):
-        raise GradleError(
-            "Uncommitted or missing failed workspace requires manual review"
-        )
-    # Repeat guarded rollback after a crash between saving Failed and restoring.
-    gradle_updater.rollback_failed_gradle_update(
-        run, project.model_copy(update={"path": workspace})
-    )
-    if current_change_has_changes(workspace):
-        raise GradleError(
-            "Uncommitted or missing failed workspace requires manual review"
-        )
-    if (
-        exact_commit_id(project.path, "main") != run.base_commit_id
-        or exact_commit_id(workspace, run.managed_bookmark) != run.managed_tip_id
-        or exact_commit_id(workspace, "@-") != run.managed_tip_id
-        or revision_tree_id(workspace) != run.accepted_snapshot.tree_id
-        or revision_tree_id(workspace, run.managed_tip_id)
-        != run.accepted_snapshot.tree_id
-    ):
-        raise GradleError(
-            "Failed update rollback cannot be proven; retained for manual review"
-        )
-    path = gradle_updater.gradle_run_path(run.project)
-    archive = path.parent / "history" / f"{path.stem}-{uuid.uuid4().hex}.json"
-    gradle_updater.save_gradle_run(archive, run)
-    if not reset_verified_gradle_bookmark(
-        project.path,
-        run.managed_bookmark,
-        expected_base=run.base_commit_id,
-        expected_tip=run.managed_tip_id,
-    ):
-        raise GradleError("Revisions changed during restart; original ledger retained")
-    path.unlink()
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    gradle_updater.retire_gradle_context(run.context)
-    console.print(
-        f"Archived failed Gradle run to {archive}; rebuilding candidates from main"
-    )
-
-
-def _run_gradle_flow(
-    project_name: str,
-    project: ProjectConfig,
-    results_dir: Path,
-    flow: Workflow,
-    *,
-    interactive: bool,
-    minimum_age_days: int,
-    continue_: bool = False,
-) -> int:
-    try:
-        path = gradle_updater.gradle_run_path(project_name)
-        run = gradle_updater.load_gradle_run(path)
-        if run is not None and (run.refreshed or run.submitted):
-            gradle_updater.retire_gradle_context(run.context)
-            if continue_:
-                return ExitCode.OK
-            run = None
-        if (
-            run is not None
-            and run.flow == Workflow.UPDATE
-            and not continue_
-            and any(isinstance(item, FailedAttempt) for item in run.attempts)
-        ):
-            _archive_rolled_back_gradle_run(run, project)
-            run = None
-        if run is not None and (run.project != project_name or run.flow != flow):
-            raise GradleError("Another Gradle workflow owns the unfinished ledger")
-        if run is None:
-            if continue_:
-                raise GradleError("No preserved Gradle resolve attempt to continue")
-            try:
-                scan_result = load_scan_results(project_name, results_dir)
-            except NoScanResultsError:
-                scan_result = ScanResult(
-                    project=project_name,
-                    scanned_at=datetime.now(timezone.utc),
-                    trivy_target=str(project.path),
-                )
-            legacy = [
-                item
-                for item in (*scan_result.vulnerabilities, *scan_result.updates)
-                if item.update_status in {UpdateStatus.FAILED, UpdateStatus.READY}
-            ]
-            if legacy:
-                raise GradleError(
-                    "Legacy Gradle progress has no revision-bound ledger; "
-                    "manual review required"
-                )
-            if flow == Workflow.UPDATE:
-                _gradle_workspace_revision(project_name, project, "main")
-            if not prune_stale_bookmarks(project.path) or not ensure_main_bookmark(
-                project.path
-            ):
-                raise GradleError("Cannot prepare main")
-            base = exact_commit_id(project.path, "main")
-            bookmark = (
-                _UPDATE_BOOKMARK if flow == Workflow.UPDATE else _RESOLVE_BOOKMARK
-            )
-            if flow == Workflow.UPDATE:
-                _gradle_workspace_revision(project_name, project, base)
-                remove_workspace(project.path, project_name)
-                if not create_workspace(project.path, project_name, base):
-                    raise GradleError("Cannot prepare Gradle workspace")
-                work = project.model_copy(
-                    update={"path": workspace_path_for_project(project_name)}
-                )
-            else:
-                if current_change_has_changes(project.path):
-                    raise GradleError("Commit or discard source edits before resolve")
-                work = project
-            if not edit_new_change(work.path, base):
-                raise GradleError("Cannot prepare empty Gradle change")
-            if not create_or_reset_bookmark(bookmark, work.path, base):
-                raise GradleError("Cannot create managed Gradle bookmark")
-        else:
-            if flow == Workflow.UPDATE:
-                workspace = workspace_path_for_project(project_name)
-                if not workspace.exists():
-                    if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
-                        raise GradleError(
-                            "Interrupted workspace missing; manual review required"
-                        )
-                    if not create_workspace(
-                        project.path, project_name, run.managed_tip_id
-                    ):
-                        raise GradleError("Cannot resume verified workspace")
-                    if not edit_new_change(workspace, run.managed_tip_id):
-                        raise GradleError("Cannot create resumed empty change")
-                work = project.model_copy(update={"path": workspace})
-            else:
-                work = project
-            expected_main = run.promoted_commit_id or run.base_commit_id
-            main = exact_commit_id(project.path, "main")
-            if main not in {expected_main, run.managed_tip_id}:
-                raise GradleError("Main moved outside the recorded Gradle run")
-            if not any(isinstance(item, ApplyingAttempt) for item in run.attempts):
-                if (
-                    exact_commit_id(work.path, run.managed_bookmark)
-                    != run.managed_tip_id
-                ):
-                    raise GradleError("Managed Gradle bookmark changed")
-        with PublicationLookupContext(
-            _config.MM_HOME / "gradle-publications"
-        ) as publication:
-            if run is None:
-                proposals = discover_gradle_updates(work)
-                if not proposals and not scan_result.vulnerabilities:
-                    console.print("No catalogue updates available")
-                    if flow == Workflow.UPDATE:
-                        remove_workspace(project.path, project_name)
-                    return ExitCode.OK
-                gradle_updater.gradle_check_commands(work)
-                run = _prepare_gradle_run(
-                    project_name,
-                    work,
-                    flow,
-                    base,
-                    publication,
-                    minimum_age_days,
-                    interactive,
-                    discovered=proposals,
-                )
-            if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
-                run = gradle_updater.reconcile_gradle_applying(
-                    run, work, publication, minimum_age_days
-                )
-            if continue_:
-                run = gradle_updater.continue_gradle_resolve(
-                    run, work, publication, minimum_age_days
-                )
-            elif any(isinstance(item, FailedAttempt) for item in run.attempts):
-                raise GradleError(
-                    "Preserved Gradle failure requires manual review "
-                    "or resolve --continue"
-                )
-            # Committed resolve repair is separately verified above and becomes
-            # the new accepted tip before automatic processing can resume.
-            _require_gradle_accepted_workspace(run, work)
-            if not context_inputs_valid(run.context, work, datetime.now(timezone.utc)):
-                run = gradle_updater.rebuild_gradle_run_evidence(
-                    run, work, publication, minimum_age_days
-                )
-            run = gradle_updater.process_gradle_run(
-                run, work, publication, minimum_age_days
-            )
-            if any(
-                isinstance(item, (ApplyingAttempt, FailedAttempt, PlannedAttempt))
-                for item in run.attempts
-            ):
-                _print_gradle_run_result(run, project, results_dir)
-                return ExitCode.UPDATE_FAILED
-            if not any(
-                isinstance(item, (ReadyAttempt, CompletedAttempt))
-                for item in run.attempts
-            ):
-                _print_gradle_run_result(run, project, results_dir)
-                console.print("No eligible Gradle changes")
-                # A clean/withheld-only run has no effects requiring recovery.
-                path.unlink(missing_ok=True)
-                release_comparison_context(run.context)
-                if flow == Workflow.UPDATE:
-                    remove_workspace(project.path, project_name)
-                return (
-                    ExitCode.UPDATE_FAILED
-                    if run.attempts
-                    or run.selection_blocks
-                    or run.initial_snapshot.findings
-                    else ExitCode.OK
-                )
-            run = _finish_verified_gradle_run(
-                run, project, results_dir, publication, minimum_age_days
-            )
-            gradle_updater.retire_gradle_context(run.context)
-            _print_gradle_run_result(run, project, results_dir)
-        if flow == Workflow.UPDATE and run.refreshed:
-            remove_workspace(project.path, project_name)
-        return ExitCode.OK
-    except (GradleError, TrivyScanError, _UpdateSetupError, OSError) as exc:
-        console.print(f"Cannot complete Gradle {flow}: {exc}")
-        return ExitCode.UPDATE_FAILED
-
-
-def _print_gradle_advisories(result: ScanResult) -> None:
-    grouped: dict[tuple[str, str], list[VulnFinding]] = defaultdict(list)
-    for finding in result.vulnerabilities:
-        grouped[(finding.pkg_name, finding.installed_version)].append(finding)
-    if not grouped:
-        return
-    rank = {
-        Severity.CRITICAL: 0,
-        Severity.HIGH: 1,
-        Severity.MEDIUM: 2,
-        Severity.LOW: 3,
-        Severity.UNKNOWN: 4,
-    }
-    table = Table(show_header=True, **_TABLE_STYLE)
-    for title in ("Package", "Installed", "CVEs", "Worst severity", "Scopes"):
-        table.add_column(title)
-    ordered = sorted(
-        grouped.items(),
-        key=lambda item: (min(rank[row.severity] for row in item[1]), item[0]),
-    )
-    for (package, version), rows in ordered:
-        scopes = sorted({scope for row in rows for scope in row.gradle_scopes})
-        table.add_row(
-            escape(package),
-            escape(version),
-            str(len({row.vuln_id for row in rows})),
-            min((row.severity for row in rows), key=rank.__getitem__).value,
-            escape(", ".join(scopes) or "scope unavailable"),
-        )
-    console.print(table)
-
-
 def _print_gradle_run_summary(run: GradleRun) -> None:
     counts = {
         state: sum(attempt.state == state for attempt in run.attempts)
@@ -2634,9 +2021,6 @@ def _print_gradle_run_summary(run: GradleRun) -> None:
 def _print_scan_result(
     result: ScanResult,
     elapsed_s: float | None = None,
-    *,
-    show_blocked: bool = True,
-    gradle: bool = False,
 ) -> None:
     """Print a Rich-formatted summary of scan results for one project."""
     actionable = sort_vulns_by_severity(
@@ -2665,10 +2049,7 @@ def _print_scan_result(
 
     console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
 
-    if gradle:
-        _print_gradle_advisories(result)
-
-    if actionable and not gradle:
+    if actionable:
         # Determine the winning fix version per package for the marker.
         win_versions: dict[str, str] = {}
         pkg_counts: dict[str, int] = {}
@@ -2681,7 +2062,7 @@ def _print_scan_result(
 
         table = Table(show_header=True, **_TABLE_STYLE)
         table.add_column("", style="bold red", width=4)
-        table.add_column("Package")
+        table.add_column("Package", overflow="fold")
         table.add_column("Installed")
         table.add_column("Fix")
         table.add_column("Severity")
@@ -2703,10 +2084,10 @@ def _print_scan_result(
             )
         console.print(table)
 
-    if advisories and not gradle:
+    if advisories:
         table = Table(show_header=False, **_TABLE_STYLE)
         table.add_column("", style="bold yellow", width=4)
-        table.add_column("Package")
+        table.add_column("Package", overflow="fold")
         table.add_column("Installed")
         table.add_column("Status")
         table.add_column("Severity")
@@ -2728,8 +2109,8 @@ def _print_scan_result(
 
     if updates:
         table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold cyan", width=4)
-        table.add_column("Package")
+        table.add_column("", style="bold cyan", width=6, no_wrap=True)
+        table.add_column("Package", overflow="fold")
         table.add_column("Installed")
         table.add_column("Latest")
         table.add_column("Tier")
@@ -2749,32 +2130,14 @@ def _print_scan_result(
             )
         console.print(table)
 
-    if show_blocked:
-        _print_blocked_findings(result)
-
 
 def _print_blocked_findings(scan_result: ScanResult) -> None:
-    groups: dict[tuple[str, str], list[VulnFinding | UpdateFinding]] = defaultdict(list)
+    """Explain why an explicit update or resolve operation cannot proceed."""
     for finding in scan_result.blocked_findings:
-        identity = (
-            finding.gradle_target.group_key
-            if finding.gradle_target
-            else f"{finding.pkg_name}@{finding.installed_version}"
+        console.print(
+            f"  [yellow]BLOCKED[/] {escape(finding.pkg_name)} — "
+            f"{escape(finding.blocked_reason or '')}"
         )
-        groups[(identity, finding.blocked_reason or "")].append(finding)
-    if not groups:
-        return
-    console.print(
-        f"\n[bold yellow]{len(groups)} blocked target/package group(s)[/] "
-        "— not applied automatically:"
-    )
-    for (identity, reason), rows in sorted(groups.items()):
-        target = rows[0].gradle_target
-        label = (
-            f"{target.display_name} -> {target.target_version}" if target else identity
-        )
-        prefix = "BLOCKED TARGET" if target else "RESIDUAL PACKAGE"
-        console.print(f"  [yellow]{prefix}[/] {escape(label)} — {escape(reason)}")
 
 
 def _print_gradle_run_result(
@@ -2788,38 +2151,41 @@ def _print_gradle_run_result(
             # A removed results file must not hide durable residual evidence.
             pass
     if result is None:
-        rows = {}
-        for finding in run.accepted_snapshot.findings:
-            scope = finding.key.scope
-            label = f"{scope.project_path}/{scope.domain}/{scope.configuration}"
-            for row in finding.rows:
-                identity = row.model_dump_json(
-                    exclude={"gradle_scopes", "update_status", "flow", "failed_phase"}
-                )
-                if identity not in rows:
-                    rows[identity] = row.model_copy(
-                        update={
-                            "gradle_scopes": (),
-                            "update_status": None,
-                            "flow": None,
-                            "failed_phase": None,
-                        }
-                    )
-                rows[identity] = rows[identity].model_copy(
-                    update={
-                        "gradle_scopes": tuple(
-                            sorted(set(rows[identity].gradle_scopes) | {label})
-                        )
-                    }
-                )
         result = ScanResult(
             project=run.project,
             scanned_at=run.context.created_at,
             trivy_target=str(project.path),
-            vulnerabilities=list(rows.values()),
+            vulnerabilities=snapshot_vulnerabilities(run.accepted_snapshot),
             gradle_resolution=run.accepted_snapshot.resolution.report.model_dump(
                 mode="json"
             ),
         )
-    _print_scan_result(result, gradle=True)
+    _print_scan_result(result)
     _print_gradle_run_summary(run)
+
+
+def _run_gradle_flow(
+    project_name: str,
+    project: ProjectConfig,
+    results_dir: Path,
+    flow: Workflow,
+    *,
+    interactive: bool,
+    minimum_age_days: int,
+    continue_: bool = False,
+) -> int:
+    return gradle_workflow.run_gradle_flow(
+        project_name,
+        project,
+        results_dir,
+        flow,
+        interactive=interactive,
+        minimum_age_days=minimum_age_days,
+        continue_=continue_,
+        interaction=gradle_workflow.GradleInteraction(
+            choose=_choose_gradle_candidates,
+            report=_print_gradle_run_result,
+            report_scan=_print_scan_result,
+            workspace_revision=_gradle_workspace_revision,
+        ),
+    )

@@ -19,7 +19,7 @@ from maintenance_man.models.gradle import (
     RejectedComparison,
     VerifiedComparison,
 )
-from maintenance_man.models.scan import Severity
+from maintenance_man.models.scan import Severity, VulnFinding
 
 _MARKER = ".mm-comparison-owner"
 _POLICY_FILES = ("trivy.yaml", "trivy.yml", ".trivyignore.yaml", ".trivyignore.yml")
@@ -240,3 +240,26 @@ def compare_gradle_snapshots(
                 reasons=("security-only candidate did not fix all requested findings",)
             )
     return VerifiedComparison(removed=removed, residual=frozenset(new))
+
+
+def snapshot_vulnerabilities(snapshot: GradleSnapshot) -> list[VulnFinding]:
+    """Project scoped evidence into unique advisory rows without update status."""
+    rows: dict[str, VulnFinding] = {}
+    for finding in snapshot.findings:
+        scope = finding.key.scope
+        label = f"{scope.project_path}/{scope.domain}/{scope.configuration}"
+        for row in finding.rows:
+            key = row.model_dump_json(
+                exclude={"gradle_scopes", "update_status", "flow", "failed_phase"}
+            )
+            previous = rows.get(key)
+            scopes = set(previous.gradle_scopes) if previous else set()
+            rows[key] = row.model_copy(
+                update={
+                    "gradle_scopes": tuple(sorted(scopes | {label})),
+                    "update_status": None,
+                    "flow": None,
+                    "failed_phase": None,
+                }
+            )
+    return list(rows.values())

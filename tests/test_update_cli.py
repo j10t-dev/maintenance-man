@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,6 +18,29 @@ from tests.conftest import (
     make_scan_result,
     make_update,
 )
+
+
+def test_batch_reports_bookmark_access_error_without_requesting_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    from maintenance_man import cli
+    from maintenance_man.models.config import ProjectConfig
+
+    scan = make_scan_result(
+        vulns=[],
+        updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.UPDATE)],
+    )
+    monkeypatch.setattr(cli, "load_scan_results", lambda *args: scan)
+    monkeypatch.setattr(cli, "remove_workspace", lambda *args: None)
+    monkeypatch.setattr(
+        "maintenance_man.vcs._run",
+        lambda *args: subprocess.CompletedProcess([], 1, "", "permission denied"),
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
+    assert cli._update_batch("example", project, tmp_path, 7) is None
+    output = " ".join(capsys.readouterr().out.split())
+    assert "permission denied" in output
+    assert "rescan required" not in output
 
 
 class TestUpdatePreChecks:
@@ -1264,6 +1288,10 @@ def gradle_update_cli(
     mock_update_cli_deps, mm_home_with_gradle, gradle_project, monkeypatch
 ):
     """Update-CLI boundaries plus Gradle spies. Returns a mutable spy record."""
+    monkeypatch.setattr(
+        "maintenance_man.gradle_workflow.load_scan_results",
+        lambda *args: mock_update_cli_deps["scan_result"],
+    )
     from maintenance_man.vcs import RevisionFileCheck
 
     monkeypatch.setattr(
@@ -1289,11 +1317,12 @@ def gradle_update_cli(
         lambda cfg, path: (spies["tests"].append(1), (True, None))[1],
     )
     monkeypatch.setattr(
-        "maintenance_man.updater.apply_gradle_update",
+        "maintenance_man.gradle_updates.apply_gradle_update",
         lambda project, target: spies["applies"].append(target) or None,
     )
     monkeypatch.setattr(
-        "maintenance_man.updater.validate_gradle_target", lambda project, target: None
+        "maintenance_man.gradle_updates.validate_gradle_target",
+        lambda project, target: None,
     )
     monkeypatch.setattr(
         "maintenance_man.updater.current_change_has_changes", lambda path: True

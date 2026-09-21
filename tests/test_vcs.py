@@ -155,7 +155,8 @@ class TestBookmarkHelpers:
         mock_run.return_value = _completed(stdout="main")
         assert bookmark_exists("main", tmp_path) is True
         mock_run.assert_called_once_with(
-            ["jj", "bookmark", "list", "-T", "name", "main"], tmp_path
+            ["jj", "--ignore-working-copy", "bookmark", "list", "-T", "name", "main"],
+            tmp_path,
         )
 
     @patch("maintenance_man.vcs._run")
@@ -166,11 +167,23 @@ class TestBookmarkHelpers:
         assert bookmark_exists("main", tmp_path) is False
 
     @patch("maintenance_man.vcs._run")
-    def test_bookmark_exists_false_on_command_failure(
+    def test_bookmark_inspection_failure_is_not_absence(
         self, mock_run: MagicMock, tmp_path: Path
     ):
         mock_run.return_value = _completed(returncode=1, stderr="template error")
-        assert bookmark_exists("main", tmp_path) is False
+        with pytest.raises(RuntimeError, match="template error"):
+            bookmark_exists("main", tmp_path)
+
+    @pytest.mark.parametrize(
+        "error", [OSError("read-only filesystem"), subprocess.TimeoutExpired("jj", 30)]
+    )
+    @patch("maintenance_man.vcs._run")
+    def test_bookmark_inspection_wraps_execution_errors(
+        self, mock_run: MagicMock, error: Exception, tmp_path: Path
+    ):
+        mock_run.side_effect = error
+        with pytest.raises(RuntimeError, match="Cannot inspect bookmark"):
+            bookmark_exists("main", tmp_path)
 
     @patch("maintenance_man.vcs._run")
     def test_create_or_reset_bookmark_sets_revision(
@@ -599,6 +612,18 @@ class TestPushBookmarkAndCreatePr:
 
 
 class TestEnsureMainBookmark:
+    @patch("maintenance_man.vcs._run")
+    def test_sync_reports_bookmark_inspection_failure(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        mock_run.side_effect = [
+            _completed(),
+            _completed(returncode=1, stderr="permission denied"),
+        ]
+        ok, message = sync_main(tmp_path)
+        assert not ok
+        assert "permission denied" in message
+
     @patch("maintenance_man.vcs.bookmark_exists", side_effect=[True])
     @patch("maintenance_man.vcs._run")
     def test_existing_main_is_ok(

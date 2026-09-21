@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
+from maintenance_man import gradle_resolution as candidates
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GRADLE_INVENTORY_BOM_RELPATH,
@@ -365,7 +366,6 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
     from maintenance_man.models.gradle import (
         CompleteResolution,
         ModuleId,
-        PublicationRequest,
         RepositoryDeclaration,
         ResolutionEdge,
         ResolutionReport,
@@ -455,6 +455,7 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         findings=findings,
         vulns=[],
         unknown=False,
+        young=False,
         failure=None,
         overlap=False,
         entered=set(),
@@ -478,7 +479,12 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
             f"<artifactId>{module.artifact}</artifactId>"
             f"<version>{module.version}</version></project>"
         ).encode()
-        return body, {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"}, url
+        published = (
+            "Thu, 17 Sep 2026 00:00:00 GMT"
+            if state.young and artifact == "lib0"
+            else "Tue, 01 Sep 2026 00:00:00 GMT"
+        )
+        return body, {"Last-Modified": published}, url
 
     now = datetime(2026, 9, 18, tzinfo=timezone.utc)
     monkeypatch.setattr(
@@ -492,20 +498,6 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         scanner, "_run_gradle_scan", lambda project: (state.vulns, resolution)
     )
     monkeypatch.setattr(scanner, "get_outdated", lambda project: state.findings)
-    monkeypatch.setattr(scanner, "validate_gradle_candidates", lambda *args: object())
-
-    def attach(candidate, resolution, batch):
-        requests = tuple(
-            PublicationRequest(
-                module=modules[member.alias],
-                repositories=("google",),
-                routing_supported=True,
-            )
-            for member in candidate.target.members
-        )
-        return candidate.model_copy(update={"publication_requests": requests})
-
-    monkeypatch.setattr(scanner, "attach_gradle_publications", attach)
     state.project = gradle_project.model_copy(
         update={"scan_secrets": False, "gradle_repository_routing": "standard-public"}
     )
@@ -522,8 +514,9 @@ def test_gradle_scan_overlaps_groups_and_retains_unknown_publications(
     assert state.entered == {"lib0", "lib1"}
     assert len(result.updates) == 2
     assert result.updates[0].blocked_reason is None
-    assert result.updates[1].blocked_reason
-    assert result.updates[1].gradle_block_kind == "age"
+    assert result.updates[1].blocked_reason is None
+    assert result.updates[1].published_date is None
+    assert result.updates[0].published_date is not None
 
 
 def test_gradle_discovery_failure_is_not_swallowed(
@@ -549,101 +542,67 @@ def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
         )
     ]
     result = scan_project("android", state.project, 7)
-    assert result.updates == state.findings
-    assert result.vulnerabilities[0].gradle_target == result.updates[0].gradle_target
+    assert [row.pkg_name for row in result.updates] == [
+        "org.example:lib0",
+        "org.example:lib1",
+    ]
+    assert result.vulnerabilities[0].gradle_target is None
     assert all(row.blocked_reason is None for row in result.updates)
 
 
-def test_gradle_finding_without_target_or_reason_is_blocked_not_eligible(
+def test_gradle_scan_reports_unmapped_update_without_planning_diagnostics(
     scoped_publication_scan,
 ):
     state = scoped_publication_scan
     state.findings.append(make_update(pkg_name="unmapped", gradle_target=None))
     result = scan_project("android", state.project, 7)
-    assert result.updates[-1].blocked_reason == "no supported catalogue target"
-    assert result.updates[-1].gradle_block_kind == "mapping"
+    assert result.updates[-1].blocked_reason is None
+    assert result.updates[-1].gradle_block_kind is None
 
 
-def test_gradle_block_kind_agrees_between_update_and_vuln_rows_for_withheld_group(
-    scoped_publication_scan, monkeypatch
-):
-    """A group withheld by attach_gradle_publications must report the same
-    gradle_block_kind on its update row and its advisory row.  Before the
-    fix, the update loop classified this as "mapping" (key not in
-    eligible) while the vulnerability loop unconditionally used "age"
-    whenever blocked_reason was set.
-    """
-    from maintenance_man.models.gradle import (
-        CandidateWithheld,
-        ModuleId,
-        PublicationRequest,
-    )
-
-    state = scoped_publication_scan
-    state.vulns = [
-        make_vuln(
-            vuln_id="CVE-2030-9999",
-            pkg_name="org.example:lib1",
-            installed_version="1.0",
-            fixed_version="2.0",
-        )
-    ]
-
-    def attach(candidate, resolution, batch):
-        if candidate.target.group_key == "ref:lib1":
-            return CandidateWithheld(
-                group_key=candidate.target.group_key,
-                coordinate=candidate.target.members[0].coordinate,
-                installed_version=candidate.target.members[0].installed_version,
-                reason="native validation withheld ref:lib1",
-                advisory_ids=candidate.requested_advisories,
-            )
-        requests = tuple(
-            PublicationRequest(
-                module=ModuleId(
-                    group="org.example", artifact=member.alias, version="2.0"
-                ),
-                repositories=("google",),
-                routing_supported=True,
-            )
-            for member in candidate.target.members
-        )
-        return candidate.model_copy(update={"publication_requests": requests})
-
-    monkeypatch.setattr("maintenance_man.scanner.attach_gradle_publications", attach)
-
-    result = scan_project("android", state.project, 7)
-
-    def _for_group(rows):
-        return next(
-            row
-            for row in rows
-            if row.gradle_target and row.gradle_target.group_key == "ref:lib1"
-        )
-
-    update_row = _for_group(result.updates)
-    vuln_row = _for_group(result.vulnerabilities)
-    assert update_row.blocked_reason == "native validation withheld ref:lib1"
-    assert vuln_row.blocked_reason == "native validation withheld ref:lib1"
-    assert update_row.gradle_block_kind == vuln_row.gradle_block_kind == "mapping"
-
-
-def test_gradle_vuln_without_maven_coordinate_is_blocked_with_mapping_kind(
-    scoped_publication_scan,
-):
-    """select_gradle_candidates withholds a finding with no Maven coordinate
-    ("finding lacks Maven coordinate"); the scanner must surface it as a
-    mapping-kind block, mirroring the equivalent update-row case."""
+def test_gradle_scan_does_not_run_update_planning(scoped_publication_scan, monkeypatch):
     state = scoped_publication_scan
     state.vulns = [
         make_vuln(pkg_name="unmapped", installed_version="1.0", fixed_version="2.0")
     ]
+    monkeypatch.setattr(
+        candidates,
+        "validate_gradle_candidates",
+        lambda *args: pytest.fail("scan must not run native update validation"),
+    )
 
     result = scan_project("android", state.project, 7)
 
-    finding = next(v for v in result.vulnerabilities if v.pkg_name == "unmapped")
-    assert finding.blocked_reason == "finding lacks Maven coordinate"
-    assert finding.gradle_block_kind == "mapping"
+    assert len(result.updates) == 2
+    assert len(result.vulnerabilities) == 1
+    assert result.vulnerabilities[0].pkg_name == "unmapped"
+    assert result.vulnerabilities[0].blocked_reason is None
+
+
+def test_gradle_scan_filters_young_updates_without_hiding_vulnerabilities(
+    scoped_publication_scan,
+):
+    state = scoped_publication_scan
+    state.young = True
+    state.vulns = [make_vuln(pkg_name="org.example:lib0")]
+
+    result = scan_project("android", state.project, 7)
+
+    assert [row.pkg_name for row in result.updates] == ["org.example:lib1"]
+    assert [row.pkg_name for row in result.vulnerabilities] == ["org.example:lib0"]
+    assert not result.blocked_findings
+
+
+def test_gradle_scan_disabled_age_policy_skips_publication_lookups(
+    scoped_publication_scan,
+):
+    state = scoped_publication_scan
+
+    result = scan_project("android", state.project, 0)
+
+    assert len(result.updates) == 2
+    assert not state.entered
+    assert not result.blocked_findings
 
 
 _GRADLE_BOM_MODULES = [

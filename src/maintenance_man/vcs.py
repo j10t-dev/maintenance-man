@@ -19,6 +19,10 @@ class JJCLINotFoundError(Exception):
     pass
 
 
+class BookmarkLookupError(RuntimeError):
+    """A bookmark could not be inspected; its existence is unknown."""
+
+
 @dataclass(frozen=True)
 class RevisionCheck:
     ok: bool
@@ -134,8 +138,20 @@ def current_label(path: Path) -> str:
 
 
 def bookmark_exists(bookmark: str, path: Path) -> bool:
-    result = _run(["jj", "bookmark", "list", "-T", "name", bookmark], path)
-    return result.returncode == 0 and bool(result.stdout.strip())
+    try:
+        result = _run(
+            ["jj", "--ignore-working-copy", "bookmark", "list", "-T", "name", bookmark],
+            path,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BookmarkLookupError(
+            f"Cannot inspect bookmark '{bookmark}': {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise BookmarkLookupError(
+            f"Cannot inspect bookmark '{bookmark}': {result.stderr.strip()}"
+        )
+    return bool(result.stdout.strip())
 
 
 def create_or_reset_bookmark(bookmark: str, path: Path, revision: str) -> bool:
@@ -522,8 +538,11 @@ def sync_main(project_path: Path) -> tuple[bool, str]:
     if fetch.returncode != 0:
         return False, fetch.stderr.strip()
 
-    if not ensure_main_bookmark(project_path):
-        return False, "main bookmark not found"
+    try:
+        if not ensure_main_bookmark(project_path):
+            return False, "main bookmark not found"
+    except BookmarkLookupError as exc:
+        return False, str(exc)
 
     if _main_bookmark_is_conflicted(project_path):
         return (

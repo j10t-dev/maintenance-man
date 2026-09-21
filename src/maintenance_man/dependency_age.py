@@ -19,110 +19,18 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     AgeBlock,
+    CompleteResolution,
     ModuleId,
     PublicationEvidence,
     PublicationFact,
     PublicationRequest,
 )
 from maintenance_man.models.scan import (
-    GradleBlock,
-    GradleMember,
-    GradleUpdateTarget,
     UpdateFinding,
 )
-
-
-def gradle_lookup_coordinate(member: GradleMember) -> str:
-    """Return the Maven coordinate that carries *member*'s publication timestamp.
-
-    Plugins are published as marker artifacts, not under their plugin id.
-    """
-    if member.kind == "plugin":
-        return f"{member.coordinate}:{member.coordinate}.gradle.plugin"
-    return member.coordinate
-
-
-def check_gradle_update_age(
-    target: GradleUpdateTarget, minimum_age_days: int
-) -> GradleBlock | None:
-    """Return an age block, or None when every member has sufficient evidence."""
-    return evaluate_gradle_group_age(target, minimum_age_days)[0]
-
-
-def evaluate_gradle_group_age(
-    target: GradleUpdateTarget, minimum_age_days: int
-) -> tuple[GradleBlock | None, datetime | None]:
-    """Resolve publication evidence for every member changed by *target*.
-
-    Returns ``(block, youngest_verified_date)``.  One missing, failed or
-    too-recent lookup blocks the whole group: for Gradle, unknown release age is
-    never treated as eligible, and ``minimum_age_days == 0`` removes only the
-    waiting period, not the evidence requirement.
-    """
-    if not target.members:
-        # target.display_name indexes members[0] when version_ref is unset, so
-        # it cannot be used here without risking the same empty-list failure.
-        name = target.version_ref or "inline target"
-        return (
-            GradleBlock(
-                kind="age",
-                reason=(
-                    f"{name} {target.target_version} has no members to verify; "
-                    f"rescan to refresh this target"
-                ),
-            ),
-            None,
-        )
-
-    dated: list[tuple[str, datetime]] = []
-    for member in target.members:
-        coordinate = gradle_lookup_coordinate(member)
-        try:
-            published = _get_maven_publish_date(coordinate, target.target_version)
-        except Exception as e:
-            return (
-                GradleBlock(
-                    kind="age",
-                    reason=(
-                        f"publication lookup failed for {coordinate} "
-                        f"{target.target_version}: {type(e).__name__}; "
-                        f"release age cannot be verified"
-                    ),
-                ),
-                None,
-            )
-        if published is None:
-            return (
-                GradleBlock(
-                    kind="age",
-                    reason=(
-                        f"no Maven Central publication date for {coordinate} "
-                        f"{target.target_version}; mm does not update on unknown "
-                        f"release age"
-                    ),
-                ),
-                None,
-            )
-        dated.append((coordinate, published))
-
-    coordinate, youngest = max(dated, key=lambda item: item[1])
-    now = _utcnow()
-    cutoff = now - timedelta(days=minimum_age_days)
-    if minimum_age_days > 0 and youngest >= cutoff:
-        age_days = (now - youngest).days
-        return (
-            GradleBlock(
-                kind="age",
-                reason=(
-                    f"{coordinate} {target.target_version} was published "
-                    f"{age_days} day(s) ago; minimum is {minimum_age_days}"
-                ),
-            ),
-            youngest,
-        )
-    return (None, youngest)
 
 
 def filter_by_age(
@@ -386,7 +294,7 @@ def _publication_http(url, repository, suffix, count):
             raise PublicationFailure("untrusted Central timestamp endpoint")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise PublicationFailure("publication timeout")
+            raise PublicationFailure("publication lookup timed out")
         count()
         try:
             response = opener.open(urllib.request.Request(url), timeout=remaining)
@@ -416,7 +324,7 @@ def _publication_http(url, repository, suffix, count):
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise PublicationFailure("publication timeout")
+                    raise PublicationFailure("publication lookup timed out")
                 # HTTPResponse.read1 performs at most one underlying read.
                 # Bound that read by the remaining operation deadline.
                 response.fp.raw._sock.settimeout(remaining)
@@ -433,9 +341,10 @@ def _publication_http(url, repository, suffix, count):
 
 
 def _pom_identity(body, module):
-    """Validate that *body* is an exact, self-contained POM for *module*.
+    """Validate literal POM coordinates, including group/version from a parent.
 
-    Returns the plugin marker's implementation ``ModuleId`` when present.
+    Property expansion remains unsupported. Returns the plugin marker's exact
+    implementation ``ModuleId`` when present.
     """
     # UTF-16/32 could hide the lexical declaration guard: unsupported encodings
     # fail closed before parsing. UTF-8 POMs are the supported trust-v1 format.
@@ -447,17 +356,25 @@ def _pom_identity(body, module):
         raise PublicationFailure("invalid POM root")
     ns = "{http://maven.apache.org/POM/4.0.0}" if root.tag.startswith("{") else ""
 
-    def identity(node):
+    def identity(node, *, inherit=False):
         values = []
         for field in ("groupId", "artifactId", "version"):
             matches = node.findall(ns + field)
+            if not matches and inherit and field in {"groupId", "version"}:
+                parents = node.findall(ns + "parent")
+                if len(parents) == 1:
+                    parent = identity(parents[0])
+                    values.append(
+                        parent.group if field == "groupId" else parent.version
+                    )
+                    continue
             value = (matches[0].text or "").strip() if len(matches) == 1 else ""
             if not value or "${" in value:
-                raise PublicationFailure("unresolved or inherited POM identity")
+                raise PublicationFailure("unresolved or ambiguous POM identity")
             values.append(value)
         return ModuleId(group=values[0], artifact=values[1], version=values[2])
 
-    if identity(root) != module:
+    if identity(root, inherit=True) != module:
         raise PublicationFailure("POM identity mismatch")
     implementation = None
     if module.artifact.endswith(".gradle.plugin"):
@@ -662,12 +579,18 @@ class PublicationLookupContext:
             urllib.error.URLError,
             PublicationFailure,
         ) as error:
-            return AgeBlock(
-                reason=(
-                    f"{module.coordinate}:{module.version}: "
-                    f"{type(error).__name__}: {error}"
-                )
+            logging.getLogger(__name__).debug(
+                "Publication lookup failed for %s:%s",
+                module.coordinate,
+                module.version,
+                exc_info=True,
             )
+            reason = (
+                str(error)
+                if isinstance(error, PublicationFailure)
+                else "publication lookup failed"
+            )
+            return AgeBlock(reason=f"{module.coordinate}:{module.version}: {reason}")
         finally:
             with self.lock:
                 self.seconds += time.monotonic() - started
@@ -748,27 +671,94 @@ def lookup_gradle_publication(request, context):
 
 
 def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
-    """Return an ``AgeBlock`` unless every publication request is proven old enough.
-
-    Reliable exact-artifact evidence is required even when ``minimum_age_days``
-    is zero: an unresolved lookup withholds the candidate rather than passing it.
-    """
+    """Withhold only releases with a known date inside the waiting period."""
     if now.tzinfo is None or minimum_age_days < 0:
         raise ValueError("current UTC date and nonnegative minimum age required")
+    if minimum_age_days == 0:
+        return None
     requests = candidate.publication_requests
-    if not requests:
-        return AgeBlock(reason="candidate has no publication requests")
     context.prefetch(requests)
     for request in requests:
         result = lookup_gradle_publication(request, context)
         if isinstance(result, AgeBlock):
-            return result
-        if result.timestamp > now:
-            return AgeBlock(reason="publication evidence is in the future")
-        if minimum_age_days and result.timestamp > now - timedelta(
-            days=minimum_age_days
-        ):
+            continue
+        if result.timestamp >= now - timedelta(days=minimum_age_days):
             return AgeBlock(
-                reason=f"publication younger than required {minimum_age_days} days"
+                reason=f"release younger than required {minimum_age_days} days"
             )
     return None
+
+
+def filter_gradle_updates_by_age(
+    updates: list[UpdateFinding],
+    project: ProjectConfig,
+    resolution: CompleteResolution,
+    min_age_days: int,
+    context: PublicationLookupContext,
+) -> list[UpdateFinding]:
+    """Filter known young catalogue proposals; unknown dates remain eligible.
+
+    Scan-time lookups use catalogue coordinates and declared repositories only.
+    Native candidate validation remains part of the update workflow.
+    """
+    if (
+        not updates
+        or min_age_days == 0
+        or project.gradle_repository_routing != "standard-public"
+    ):
+        return list(updates)
+    cutoff = context.now() - timedelta(days=min_age_days)
+    pending = []
+    for update in updates:
+        requests = []
+        if update.gradle_target is not None:
+            for member in update.gradle_target.members:
+                if member.kind == "plugin":
+                    module = ModuleId(
+                        group=member.coordinate,
+                        artifact=member.coordinate + ".gradle.plugin",
+                        version=update.latest_version,
+                    )
+                else:
+                    parts = member.coordinate.split(":")
+                    if len(parts) != 2:
+                        continue
+                    module = ModuleId(
+                        group=parts[0], artifact=parts[1], version=update.latest_version
+                    )
+                repositories = tuple(
+                    repository
+                    for repository in resolution.report.repositories
+                    if repository.domain == member.kind
+                )
+                request = publication_request(module, repositories)
+                if request.routing_supported:
+                    requests.append(
+                        tuple(
+                            context.submit(repository, module)
+                            for repository in request.repositories
+                        )
+                    )
+        pending.append((update, requests))
+    result = []
+    for update, requests in pending:
+        dates = []
+        complete = (
+            bool(requests)
+            and update.gradle_target is not None
+            and len(requests) == len(update.gradle_target.members)
+        )
+        for futures in requests:
+            facts = [future.result() for future in futures]
+            known = [fact for fact in facts if isinstance(fact, PublicationFact)]
+            dates.extend(fact.timestamp for fact in known)
+            if (
+                any(isinstance(fact, AgeBlock) for fact in facts)
+                or len({fact.artifact_digest for fact in known}) != 1
+            ):
+                complete = False
+        if dates and max(dates) >= cutoff:
+            continue
+        published = max(dates) if complete else None
+        result.append(update.model_copy(update={"published_date": published}))
+    return result

@@ -20,19 +20,17 @@ from maintenance_man.gradle import (
     normalise_alias,
     parse_catalogue,
     render_selected_report,
-    resolve_gradle_vulnerability_target,
     validate_gradle_recovery,
     validate_gradle_target,
     workspace_environment_reason,
 )
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
-    GradleBlock,
     GradleMember,
     GradleUpdateTarget,
     SemverTier,
 )
-from tests.conftest import GRADLE_FIXTURES, make_gradle_target, make_vuln
+from tests.conftest import GRADLE_FIXTURES, make_gradle_target
 
 
 def _digest(path: Path) -> str:
@@ -696,113 +694,6 @@ class TestGenerateGradleInventory:
                 raise ValueError("caller failed")
 
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
-
-
-class TestResolveGradleVulnerabilityTarget:
-    @pytest.mark.parametrize(
-        "pkg_name, fixed, kind, reason_fragment",
-        [
-            ("com.squareup.okhttp3:okhttp", "4.12.1", "mapping", "rich version"),
-            (
-                "org.jetbrains:annotations",
-                "24.0.0",
-                "mapping",
-                "no catalogue library owns",
-            ),
-            ("androidx.compose.ui:ui", "1.9.1", "mapping", "platform/BOM managed"),
-            (
-                "androidx.room:room-runtime",
-                "2.8.5, 2.9.0",
-                "conflict",
-                "single exact fix version",
-            ),
-            (
-                "androidx.room:room-runtime",
-                ">=2.8.5",
-                "conflict",
-                "single exact fix version",
-            ),
-            (
-                "com.google.devtools.ksp",
-                "2.3.12",
-                "mapping",
-                "no catalogue library owns",
-            ),
-        ],
-    )
-    def test_unsafe_advisories_are_blocked(
-        self, gradle_project, pkg_name, fixed, kind, reason_fragment
-    ):
-        finding = make_vuln(pkg_name=pkg_name, fixed_version=fixed)
-
-        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
-
-        assert isinstance(outcome, GradleBlock)
-        assert outcome.kind == kind
-        assert reason_fragment in outcome.reason
-
-    def test_shared_reference_advisory_resolves_the_whole_group(self, gradle_project):
-        finding = make_vuln(
-            pkg_name="androidx.room:room-compiler",
-            installed_version="2.8.4",
-            fixed_version="2.8.5",
-        )
-
-        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
-
-        assert isinstance(outcome, GradleUpdateTarget)
-        assert outcome.version_ref == "room"
-        assert outcome.target_version == "2.8.5"
-        assert [m.alias for m in outcome.members] == [
-            "room-runtime",
-            "room-compiler",
-            "room-testing",
-        ]
-
-    def test_inline_advisory_resolves_one_member(self, gradle_project):
-        finding = make_vuln(
-            pkg_name="com.google.code.gson:gson",
-            installed_version="2.11.0",
-            fixed_version="2.12.0",
-        )
-
-        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
-
-        assert isinstance(outcome, GradleUpdateTarget)
-        assert outcome.version_ref is None
-        assert [m.alias for m in outcome.members] == ["gson"]
-
-
-@pytest.mark.parametrize(
-    "first_version, second_version, blocked",
-    [
-        ('version = "1.0"', 'version = "1.0"', True),
-        ('version = "1.0"', 'version = "1.1"', True),
-        ('version.ref = "shared-version"', 'version.ref = "shared_version"', False),
-        ('version.ref = "shared-version"', 'version.ref = "independent"', True),
-    ],
-)
-def test_advisory_mapping_distinguishes_independent_alias_identity(
-    gradle_project, first_version, second_version, blocked
-):
-    catalogue = Path(gradle_project.path) / "gradle/libs.versions.toml"
-    catalogue.write_text(
-        '[versions]\nshared-version = "1.0"\nindependent = "1.0"\n'
-        "[libraries]\n"
-        f'first = {{ module = "g:artifact", {first_version} }}\n'
-        f'second = {{ module = "g:artifact", {second_version} }}\n',
-        encoding="utf-8",
-    )
-    outcome = resolve_gradle_vulnerability_target(
-        gradle_project,
-        make_vuln(pkg_name="g:artifact", installed_version="1.0", fixed_version="2.0"),
-    )
-    if blocked:
-        assert isinstance(outcome, GradleBlock)
-        assert outcome.kind == "conflict"
-    else:
-        assert isinstance(outcome, GradleUpdateTarget)
-        assert [member.alias for member in outcome.members] == ["first", "second"]
 
 
 def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
@@ -1515,11 +1406,24 @@ def test_library_plugin_shared_history_validates_before_manual_recovery(
         'version.ref = "shared" }\n'
         '[plugins]\nbuild = { id = "org.example.plugin", version.ref = "shared" }\n'
     )
-    vuln = make_vuln(
-        pkg_name="org.example:library", installed_version="1.0.0", fixed_version="1.0.1"
+    target = GradleUpdateTarget(
+        version_ref="shared",
+        target_version="1.0.1",
+        members=[
+            GradleMember(
+                kind="library",
+                alias="runtime",
+                coordinate="org.example:library",
+                installed_version="1.0.0",
+            ),
+            GradleMember(
+                kind="plugin",
+                alias="build",
+                coordinate="org.example.plugin",
+                installed_version="1.0.0",
+            ),
+        ],
     )
-    target = resolve_gradle_vulnerability_target(gradle_project, vuln)
-    assert isinstance(target, GradleUpdateTarget)
     if not consistent:
         target.members[1].installed_version = "9.9.9"
     if reverse:
