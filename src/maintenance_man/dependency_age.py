@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -36,9 +37,8 @@ from maintenance_man.storage import atomic_write_text
 
 def filter_by_age(
     updates: list[UpdateFinding],
-    manager: str,
+    lookup: Callable[[str, str], datetime | None],
     min_age_days: int,
-    project_path: str | Path | None = None,
 ) -> list[UpdateFinding]:
     """Filter out updates where the target version is younger than min_age_days.
 
@@ -48,19 +48,11 @@ def filter_by_age(
     if min_age_days == 0 or not updates:
         return list(updates)
 
-    lookup_fn = _REGISTRY_LOOKUPS.get(manager)
-    if lookup_fn is None:
-        return list(updates)
-
-    # bun info needs a cwd with a package.json
-    if manager == "bun" and project_path:
-        lookup_fn = functools.partial(lookup_fn, cwd=project_path)  # type: ignore
-
     cutoff = _utcnow() - timedelta(days=min_age_days)
 
     def _lookup_one(update: UpdateFinding) -> tuple[UpdateFinding, datetime | None]:
         try:
-            return update, lookup_fn(update.pkg_name, update.latest_version)
+            return update, lookup(update.pkg_name, update.latest_version)
         except Exception:
             return update, None
 
@@ -81,17 +73,16 @@ def filter_by_age(
     return result
 
 
-def _get_npm_publish_date(
+def get_npm_publish_date(
     pkg: str,
     version: str,
-    *,
-    cwd: str | Path | None = None,
+    project_path: Path,
 ) -> datetime | None:
     """Fetch publish date via ``bun info``."""
     try:
         completed = run_captured(
             ["bun", "info", f"{pkg}@{version}"],
-            cwd,
+            project_path,
             timeout=30,
             label="bun info",
             ok_codes=None,
@@ -110,7 +101,7 @@ def _get_npm_publish_date(
     return datetime.fromisoformat(ts) if ts else None
 
 
-def _get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
+def get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
     """Look up publish date, checking a local dbm cache before hitting PyPI."""
     key = f"{pkg}:{version}"
     cache_file = str(_pypi_cache_dir() / "pypi-publish-dates")
@@ -151,7 +142,7 @@ def _get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
     return dt
 
 
-def _get_maven_publish_date(pkg: str, version: str) -> datetime | None:
+def get_maven_publish_date(pkg: str, version: str) -> datetime | None:
     """Fetch publish date from Maven Central.
 
     pkg is in the format "groupId:artifactId".
@@ -169,13 +160,6 @@ def _get_maven_publish_date(pkg: str, version: str) -> datetime | None:
     ):
         return datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
     return None
-
-
-_REGISTRY_LOOKUPS = {
-    "bun": _get_npm_publish_date,
-    "uv": _get_pypi_publish_date,
-    "mvn": _get_maven_publish_date,
-}
 
 
 def _utcnow() -> datetime:

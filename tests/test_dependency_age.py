@@ -15,11 +15,13 @@ import pytest
 from maintenance_man.dependency_age import (
     PublicationError,
     PublicationLookupContext,
-    _get_npm_publish_date,
     _public_url,
     _publication_http,
     evaluate_gradle_candidate_age,
     filter_by_age,
+    get_maven_publish_date,
+    get_npm_publish_date,
+    get_pypi_publish_date,
     lookup_gradle_publication,
     publication_request,
     trusted_repository,
@@ -41,16 +43,6 @@ _PATCH_NOW = "maintenance_man.dependency_age._utcnow"
 _PATCH_CACHE_DIR = "maintenance_man.dependency_age._pypi_cache_dir"
 
 
-def _bun_info_result(published_iso: str) -> subprocess.CompletedProcess[str]:
-    """Build a fake ``bun info`` CompletedProcess with a Published line."""
-    return subprocess.CompletedProcess(
-        args=["bun", "info", "pkg@version"],
-        returncode=0,
-        stdout=f"pkg@version | MIT\nPublished: {published_iso}\n",
-        stderr="",
-    )
-
-
 _FROZEN_NOW = datetime(2026, 1, 30, tzinfo=UTC)
 
 
@@ -63,112 +55,75 @@ def _make_update(pkg: str, latest: str = "2.0.0") -> UpdateFinding:
     )
 
 
+def _no_lookup(pkg, version):
+    pytest.fail("no publication lookup expected")
+
+
 class TestFilterByAge:
-    def test_returns_all_when_min_age_is_zero(self):
-        """Age gating disabled -- all updates pass through, no HTTP calls."""
+    def test_returns_all_without_lookups_when_min_age_is_zero(self):
         updates = [_make_update("lodash"), _make_update("express")]
-        result = filter_by_age(updates, manager="bun", min_age_days=0)
-        assert len(result) == 2
+        result = filter_by_age(updates, _no_lookup, min_age_days=0)
+        assert result == updates
         assert all(u.published_date is None for u in result)
 
     def test_empty_updates_returns_empty(self):
-        result = filter_by_age([], manager="bun", min_age_days=7)
-        assert result == []
+        assert filter_by_age([], _no_lookup, min_age_days=7) == []
 
-    def test_filters_young_npm_package(self):
-        """Package published 2 days ago, min_age=7 -- filtered out."""
-        updates = [_make_update("lodash", "4.17.21")]
-        two_days_ago = "2026-01-28T00:00:00.000Z"
+    @pytest.mark.parametrize(
+        ("published", "kept"),
+        [
+            (datetime(2026, 1, 28, tzinfo=UTC), False),
+            (datetime(2026, 1, 23, tzinfo=UTC), False),
+            (datetime(2026, 1, 22, 23, 59, 59, tzinfo=UTC), True),
+            (datetime(2025, 12, 31, tzinfo=UTC), True),
+        ],
+    )
+    def test_withholds_versions_younger_than_the_minimum_age(self, published, kept):
+        with patch(_PATCH_NOW, return_value=_FROZEN_NOW):
+            result = filter_by_age(
+                [_make_update("lodash")], lambda pkg, v: published, min_age_days=7
+            )
+        assert [u.published_date for u in result] == ([published] if kept else [])
 
-        with (
-            patch(_PATCH_SUBRUN, return_value=_bun_info_result(two_days_ago)),
-            patch(_PATCH_NOW, return_value=_FROZEN_NOW),
-        ):
-            result = filter_by_age(updates, manager="bun", min_age_days=7)
+    @pytest.mark.parametrize("outcome", [None, RuntimeError("network error")])
+    def test_unknown_or_failed_lookup_keeps_the_update(self, outcome):
+        def lookup(pkg, version):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
 
-        assert len(result) == 0
+        result = filter_by_age([_make_update("pkg")], lookup, min_age_days=7)
+        assert [u.published_date for u in result] == [None]
 
-    def test_keeps_old_npm_package(self):
-        """Package published 30 days ago, min_age=7 -- passes."""
-        updates = [_make_update("lodash", "4.17.21")]
-        thirty_days_ago = "2025-12-31T00:00:00.000Z"
+    def test_lookup_receives_package_and_target_version(self):
+        seen = []
 
-        with (
-            patch(_PATCH_SUBRUN, return_value=_bun_info_result(thirty_days_ago)),
-            patch(_PATCH_NOW, return_value=_FROZEN_NOW),
-        ):
-            result = filter_by_age(updates, manager="bun", min_age_days=7)
+        def lookup(pkg, version):
+            seen.append((pkg, version))
 
-        assert len(result) == 1
-        assert result[0].published_date is not None
+        filter_by_age([_make_update("lodash", "4.17.21")], lookup, min_age_days=7)
+        assert seen == [("lodash", "4.17.21")]
 
-    def test_keeps_update_on_registry_error(self):
-        """If registry lookup fails, keep the update (fail open)."""
-        updates = [_make_update("unknown-pkg")]
 
-        with patch(_PATCH_SUBRUN, side_effect=Exception("network error")):
-            result = filter_by_age(updates, manager="bun", min_age_days=7)
+def test_pypi_lookup_reads_upload_time_and_caches_it(tmp_path):
+    pypi_data = {"urls": [{"upload_time_iso_8601": "2025-12-31T00:00:00"}]}
+    expected = datetime(2025, 12, 31, tzinfo=UTC)
+    with (
+        patch(_PATCH_CACHE_DIR, return_value=tmp_path),
+        patch(_PATCH_FETCH, return_value=pypi_data) as fetch,
+    ):
+        assert get_pypi_publish_date("requests", "2.31.0") == expected
+        assert get_pypi_publish_date("requests", "2.31.0") == expected
+    assert fetch.call_count == 1
 
-        assert len(result) == 1
-        assert result[0].published_date is None
 
-    def test_pypi_lookup(self, tmp_path):
-        """Test PyPI registry lookup for uv packages (cache miss path)."""
-        updates = [_make_update("requests", "2.31.0")]
-        thirty_days_ago = "2025-12-31T00:00:00"
-
-        pypi_data = {
-            "urls": [{"upload_time_iso_8601": thirty_days_ago}],
-        }
-
-        with (
-            patch(_PATCH_CACHE_DIR, return_value=tmp_path),
-            patch(_PATCH_FETCH, return_value=pypi_data),
-            patch(_PATCH_NOW, return_value=_FROZEN_NOW),
-        ):
-            result = filter_by_age(updates, manager="uv", min_age_days=7)
-
-        assert len(result) == 1
-        assert result[0].published_date is not None
-
-    def test_pypi_cache_hit(self, tmp_path):
-        """Second lookup should hit the dbm cache — no additional HTTP call."""
-        updates = [_make_update("requests", "2.31.0")]
-        thirty_days_ago = "2025-12-31T00:00:00"
-
-        pypi_data = {
-            "urls": [{"upload_time_iso_8601": thirty_days_ago}],
-        }
-
-        with (
-            patch(_PATCH_CACHE_DIR, return_value=tmp_path),
-            patch(_PATCH_FETCH, return_value=pypi_data) as mock_fetch,
-            patch(_PATCH_NOW, return_value=_FROZEN_NOW),
-        ):
-            filter_by_age(updates, manager="uv", min_age_days=7)
-            assert mock_fetch.call_count == 1
-
-            result = filter_by_age(updates, manager="uv", min_age_days=7)
-            assert mock_fetch.call_count == 1  # no additional call
-
-        assert len(result) == 1
-        assert result[0].published_date is not None
-
-    def test_maven_central_lookup(self):
-        """Test Maven Central registry lookup for mvn packages."""
-        updates = [_make_update("org.slf4j:slf4j-api", "2.0.16")]
-        thirty_days_ago_ms = int(datetime(2025, 12, 31, tzinfo=UTC).timestamp() * 1000)
-
-        maven_data = {"response": {"docs": [{"timestamp": thirty_days_ago_ms}]}}
-
-        with (
-            patch(_PATCH_FETCH, return_value=maven_data),
-            patch(_PATCH_NOW, return_value=_FROZEN_NOW),
-        ):
-            result = filter_by_age(updates, manager="mvn", min_age_days=7)
-
-        assert len(result) == 1
-        assert result[0].published_date is not None
+def test_maven_central_lookup_reads_the_timestamp():
+    published_ms = int(datetime(2025, 12, 31, tzinfo=UTC).timestamp() * 1000)
+    maven_data = {"response": {"docs": [{"timestamp": published_ms}]}}
+    with patch(_PATCH_FETCH, return_value=maven_data):
+        assert get_maven_publish_date("org.slf4j:slf4j-api", "2.0.16") == datetime(
+            2025, 12, 31, tzinfo=UTC
+        )
 
 
 def test_bun_info_runs_isolated_and_parses_any_exit_status(tmp_path, monkeypatch):
@@ -182,7 +137,7 @@ def test_bun_info_runs_isolated_and_parses_any_exit_status(tmp_path, monkeypatch
         )
 
     monkeypatch.setattr(_PATCH_SUBRUN, run)
-    assert _get_npm_publish_date("pkg", "1.0.0", cwd=tmp_path) == datetime(
+    assert get_npm_publish_date("pkg", "1.0.0", tmp_path) == datetime(
         2024, 1, 2, 3, 4, 5, tzinfo=UTC
     )
     ((cmd, kwargs),) = calls
@@ -200,12 +155,12 @@ def test_bun_info_runs_isolated_and_parses_any_exit_status(tmp_path, monkeypatch
         UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
     ],
 )
-def test_bun_info_execution_failure_is_an_unknown_date(monkeypatch, raised):
+def test_bun_info_execution_failure_is_an_unknown_date(tmp_path, monkeypatch, raised):
     def run(cmd, **kwargs):
         raise raised
 
     monkeypatch.setattr(_PATCH_SUBRUN, run)
-    assert _get_npm_publish_date("pkg", "1.0.0") is None
+    assert get_npm_publish_date("pkg", "1.0.0", tmp_path) is None
 
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)
@@ -245,10 +200,8 @@ def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch):
                 super().shutdown(wait=True)
 
     monkeypatch.setattr(age, "ThreadPoolExecutor", InterruptingPool)
-    monkeypatch.setattr(age, "_get_maven_publish_date", lookup)
-    monkeypatch.setitem(age._REGISTRY_LOOKUPS, "mvn", lookup)
     with pytest.raises(KeyboardInterrupt):
-        filter_by_age([_make_update(f"g:lib{i}") for i in range(40)], "mvn", 7)
+        filter_by_age([_make_update(f"g:lib{i}") for i in range(40)], lookup, 7)
     assert len(calls) == 8, "queued lookups ran after interruption"
 
 

@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import json
 import shutil
@@ -27,6 +28,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
 )
 from maintenance_man.outdated import OutdatedCheckError
+from maintenance_man.package_managers import PACKAGE_MANAGERS
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import (
     ScanError,
@@ -34,7 +36,7 @@ from maintenance_man.scanner import (
     scan_project,
 )
 from maintenance_man.storage import load_scan_results
-from tests.conftest import GRADLE_FIXTURES, make_update, make_vuln
+from tests.conftest import GRADLE_FIXTURES, make_update, make_vuln, ops_with_outdated
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -78,7 +80,9 @@ def test_outdated_failure_fails_the_scan_and_keeps_the_saved_result(
     mm_home, tmp_path, monkeypatch, error, previous
 ):
     monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
-    monkeypatch.setattr(scanner, "get_outdated", MagicMock(side_effect=error))
+    monkeypatch.setattr(
+        scanner, "package_manager_ops", ops_with_outdated(MagicMock(side_effect=error))
+    )
     results = mm_home / "scan-results"
     results.mkdir(parents=True)
     if previous is not None:
@@ -204,7 +208,9 @@ def test_scan_requires_trivy_only_for_trivy_work(
     monkeypatch.setattr(scanner, "require_tool", _missing_trivy)
     # uv audit is independent; stub it so this test isolates Trivy work.
     monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
-    monkeypatch.setattr(scanner, "get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        scanner, "package_manager_ops", ops_with_outdated(lambda project: [])
+    )
     monkeypatch.setattr(
         "maintenance_man.process.subprocess.run",
         lambda *args, **kwargs: pytest.fail(
@@ -303,7 +309,10 @@ class TestScanProjectWithUpdates:
             ),
         ]
         with (
-            patch("maintenance_man.scanner.get_outdated", return_value=fake_updates),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: fake_updates),
+            ),
             patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
         ):
             result = scan_project("clean", project)
@@ -348,7 +357,10 @@ class TestScanProjectWithUpdates:
         )
         with (
             patch("maintenance_man.process.subprocess.run", return_value=audit),
-            patch("maintenance_man.scanner.get_outdated", return_value=fake_updates),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: fake_updates),
+            ),
             patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
         ):
             result = scan_project("vulnerable", project)
@@ -363,7 +375,10 @@ class TestScanProjectWithUpdates:
         """min_version_age_days parameter is forwarded to filter_by_age."""
         project = _make_project(FIXTURES_DIR / "clean-project")
         with (
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
             patch("maintenance_man.scanner.filter_by_age", return_value=[]) as mock_age,
         ):
             scan_project("clean", project, min_version_age_days=14)
@@ -383,7 +398,10 @@ class TestUvNativeScan:
 
         with (
             patch("maintenance_man.process.subprocess.run", return_value=audit) as run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             result = scan_project("test-proj", project)
 
@@ -425,7 +443,10 @@ class TestUvNativeScan:
             patch(
                 "maintenance_man.process.subprocess.run", side_effect=[audit, trivy]
             ) as run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             result = scan_project("test-proj", project)
 
@@ -454,7 +475,10 @@ class TestRunTrivyScanSkipDirs:
                 "maintenance_man.process.subprocess.run",
                 return_value=fake_result,
             ) as mock_run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             scan_project("test-proj", project)
 
@@ -475,7 +499,10 @@ class TestRunTrivyScanSkipDirs:
                 "maintenance_man.process.subprocess.run",
                 return_value=fake_result,
             ) as mock_run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             scan_project("test-proj", project)
 
@@ -625,7 +652,9 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
     monkeypatch.setattr(
         scanner, "_run_gradle_scan", lambda project: (state.vulns, resolution)
     )
-    monkeypatch.setattr(scanner, "get_outdated", lambda project: state.findings)
+    monkeypatch.setattr(
+        scanner, "discover_gradle_updates", lambda project: state.findings
+    )
     state.project = gradle_project.model_copy(
         update={"scan_secrets": False, "gradle_repository_routing": "standard-public"}
     )
@@ -653,7 +682,7 @@ def test_gradle_discovery_failure_is_not_swallowed(
     def fail(project):
         raise GradleError("discovery failed")
 
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", fail)
+    monkeypatch.setattr("maintenance_man.scanner.discover_gradle_updates", fail)
     with pytest.raises(GradleError, match="discovery failed"):
         scan_project("android", scoped_publication_scan.project, 7)
 
@@ -918,7 +947,9 @@ def test_gradle_scan_rejects_omitted_resolved_modules(
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report", incomplete_inventory
     )
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner.discover_gradle_updates", lambda project: []
+    )
     gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
     _trivy_sbom(monkeypatch, stdout='{"Results": []}')
     with pytest.raises(GradleError, match="resolved module missing from inventory"):
@@ -1009,7 +1040,9 @@ def test_gradle_scan_runs_the_existing_secret_scan_when_enabled(
         _yield_fixture_bom(gradle_project),
     )
     _trivy_sbom(monkeypatch, stdout='{"Results": []}')
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner.discover_gradle_updates", lambda project: []
+    )
     secret_calls: list[Path] = []
     monkeypatch.setattr(
         "maintenance_man.scanner._run_trivy_secret_scan",
@@ -1051,7 +1084,9 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
 
     monkeypatch.setattr(subprocess, "run", _run)
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner.discover_gradle_updates", lambda project: []
+    )
     gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
     with pytest.raises(GradleError, match="cleanup denied"):
         scan_project("android", gradle_project, 7)
@@ -1323,3 +1358,73 @@ def test_gradle_scan_checks_local_project_provenance(
     else:
         with pytest.raises(GradleError):
             scanner._run_gradle_scan(gradle_project)
+
+
+@pytest.mark.parametrize(
+    ("manager", "source", "secrets", "expected"),
+    [
+        ("bun", "uv-audit", False, ["uv-audit"]),
+        ("bun", "uv-audit", True, ["uv-audit", "secret"]),
+        ("uv", "trivy", False, ["trivy"]),
+        ("uv", "trivy", True, ["trivy"]),
+    ],
+)
+def test_scan_steps_follow_the_table_vulnerability_source(
+    mm_home, tmp_path, monkeypatch, manager, source, secrets, expected
+):
+    calls = []
+
+    def uv_audit(path):
+        calls.append("uv-audit")
+        return []
+
+    def trivy(path, scan_secrets, skip_dirs):
+        calls.append("trivy")
+        return [], []
+
+    def secret(path, skip_dirs):
+        calls.append("secret")
+        return []
+
+    monkeypatch.setattr(scanner, "_run_uv_audit", uv_audit)
+    monkeypatch.setattr(scanner, "_run_trivy_scan", trivy)
+    monkeypatch.setattr(scanner, "_run_trivy_secret_scan", secret)
+    monkeypatch.setattr(
+        scanner,
+        "package_manager_ops",
+        lambda name: dataclasses.replace(
+            PACKAGE_MANAGERS[name],
+            vulnerability_source=source,
+            outdated=lambda project: [],
+        ),
+    )
+    project = ProjectConfig(
+        path=tmp_path, package_manager=manager, scan_secrets=secrets
+    )
+    scanner.scan_project("demo", project)
+    assert calls == expected
+
+
+def test_scan_binds_the_project_path_into_publication_lookups(
+    mm_home, tmp_path, monkeypatch
+):
+    seen = []
+
+    def publish_date(pkg, version, project_path):
+        seen.append((pkg, version, project_path))
+        return _OLD
+
+    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args: ([], []))
+    monkeypatch.setattr(
+        scanner,
+        "package_manager_ops",
+        lambda name: dataclasses.replace(
+            PACKAGE_MANAGERS[name],
+            outdated=lambda project: [make_update(pkg_name="zod")],
+            publish_date=publish_date,
+        ),
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="bun")
+    result = scanner.scan_project("demo", project, 7)
+    assert seen == [("zod", make_update(pkg_name="zod").latest_version, tmp_path)]
+    assert [u.published_date for u in result.updates] == [_OLD]

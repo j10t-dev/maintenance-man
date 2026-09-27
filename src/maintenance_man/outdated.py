@@ -4,7 +4,6 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from maintenance_man.gradle import discover_gradle_updates
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import UpdateFinding, classify_semver
 from maintenance_man.process import run_captured
@@ -17,16 +16,6 @@ from maintenance_man.uv_dependencies import (
 
 class OutdatedCheckError(Exception):
     pass
-
-
-def get_outdated(project: ProjectConfig) -> list[UpdateFinding]:
-    """Run the appropriate outdated check for the project's package manager."""
-    checker = _CHECKERS.get(project.package_manager)
-    if checker is None:
-        raise OutdatedCheckError(
-            f"No outdated checker for package manager: {project.package_manager}"
-        )
-    return checker(project)
 
 
 def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
@@ -153,14 +142,6 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         for line in completed.stdout.splitlines()
         if (m := _MVN_UPDATE_RE.match(line))
     ]
-
-
-_CHECKERS = {
-    "bun": bun_outdated,
-    "uv": uv_outdated,
-    "mvn": mvn_outdated,
-    "gradle": discover_gradle_updates,
-}
 
 
 def _parse_bun_table(output: str) -> list[dict[str, str]]:

@@ -32,7 +32,7 @@ from maintenance_man.models.scan import (
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.vcs import RevisionError
-from tests.conftest import make_scan_result, make_update
+from tests.conftest import make_scan_result, make_update, ops_with_outdated
 
 
 def _make_vulnerable_result() -> ScanResult:
@@ -174,7 +174,10 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
     monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("trivy"))
     monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner.package_manager_ops",
+        ops_with_outdated(lambda project: []),
+    )
     with pytest.raises(SystemExit) as exc:
         app(["scan"])
     assert exc.value.code == ExitCode.ERROR
@@ -202,7 +205,9 @@ def test_failed_project_scan_keeps_its_result_and_exits_error(
         return []
 
     monkeypatch.setattr("maintenance_man.scanner._run_trivy_scan", trivy)
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", outdated)
+    monkeypatch.setattr(
+        "maintenance_man.scanner.package_manager_ops", ops_with_outdated(outdated)
+    )
     with pytest.raises(SystemExit) as exc:
         app(argv)
     assert exc.value.code == ExitCode.ERROR

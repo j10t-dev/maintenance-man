@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeGuard
+from typing import TypeGuard, assert_never
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
@@ -20,6 +20,7 @@ from maintenance_man.dependency_age import (
 )
 from maintenance_man.gradle import (
     GradleError,
+    discover_gradle_updates,
 )
 from maintenance_man.gradle_resolution import (
     generate_gradle_report,
@@ -44,7 +45,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
-from maintenance_man.outdated import get_outdated
+from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
 from maintenance_man.process import require_tool, run_captured
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import revision_tree_id
@@ -69,17 +70,9 @@ def scan_project(
     if not project_path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
     resolution = None
-    if project.package_manager == "uv":
-        vulns = _run_uv_audit(project_path)
-        secrets = (
-            _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
-            if project.scan_secrets
-            else []
-        )
-        updates = _check_outdated(project, vulns, min_version_age_days)
-    elif project.package_manager == "gradle":
+    if project.package_manager == "gradle":
         vulns, resolution = _run_gradle_scan(project)
-        updates = get_outdated(project)
+        updates = discover_gradle_updates(project)
         with PublicationLookupContext(paths.gradle_publications_dir()) as context:
             updates = filter_gradle_updates_by_age(
                 updates, project, resolution, min_version_age_days, context
@@ -90,10 +83,22 @@ def scan_project(
             else []
         )
     else:
-        vulns, secrets = _run_trivy_scan(
-            project_path, project.scan_secrets, project.scan_skip_dirs
-        )
-        updates = _check_outdated(project, vulns, min_version_age_days)
+        ops = package_manager_ops(project.package_manager)
+        match ops.vulnerability_source:
+            case "uv-audit":
+                vulns = _run_uv_audit(project_path)
+                secrets = (
+                    _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
+                    if project.scan_secrets
+                    else []
+                )
+            case "trivy":
+                vulns, secrets = _run_trivy_scan(
+                    project_path, project.scan_secrets, project.scan_skip_dirs
+                )
+            case unreachable:
+                assert_never(unreachable)
+        updates = _check_outdated(project, ops, vulns, min_version_age_days)
 
     scan_result = ScanResult(
         project=name,
@@ -114,16 +119,16 @@ def scan_project(
 
 def _check_outdated(
     project: ProjectConfig,
+    ops: PackageManagerOps,
     vulns: list[VulnFinding],
     min_version_age_days: int,
 ) -> list[UpdateFinding]:
-    """Run non-Gradle outdated checks and return de-duplicated findings."""
-    raw_updates = get_outdated(project)
+    """Run the table's outdated check and return aged, de-duplicated findings."""
+    raw_updates = ops.outdated(project)
     aged_updates = filter_by_age(
         raw_updates,
-        manager=project.package_manager,
+        lambda pkg, version: ops.publish_date(pkg, version, project.path),
         min_age_days=min_version_age_days,
-        project_path=project.path,
     )
     vuln_pkgs = {v.pkg_name for v in vulns}
     return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]

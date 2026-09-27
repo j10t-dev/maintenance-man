@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 import pytest
 
-import maintenance_man.outdated
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import SemverTier
 from maintenance_man.outdated import (
@@ -15,12 +14,10 @@ from maintenance_man.outdated import (
     _get_uv_direct_dep_names,
     bun_outdated,
     classify_semver,
-    get_outdated,
     mvn_outdated,
     uv_outdated,
 )
 from maintenance_man.uv_dependencies import normalise_pkg_name
-from tests.conftest import make_update
 
 
 def _make_project(
@@ -457,62 +454,6 @@ class TestMvnOutdated:
             pytest.raises(OutdatedCheckError),
         ):
             mvn_outdated(project)
-
-
-class TestGetOutdated:
-    def test_dispatches_to_bun(self):
-        project = _make_project("bun")
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        with patch("maintenance_man.process.subprocess.run", return_value=completed):
-            updates = get_outdated(project)
-        assert updates == []
-
-    def test_dispatches_to_uv(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text("[project]\ndependencies = []\n")
-
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="[]", stderr=""
-        )
-        with patch("maintenance_man.process.subprocess.run", return_value=completed):
-            updates = get_outdated(project)
-        assert updates == []
-
-    def test_dispatches_to_mvn(self):
-        project = _make_project("mvn")
-        fake_output = "[INFO] No dependencies in Dependencies have newer versions.\n"
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_output, stderr=""
-        )
-        with patch("maintenance_man.process.subprocess.run", return_value=completed):
-            updates = get_outdated(project)
-        assert updates == []
-
-    def test_unsupported_manager_raises(self):
-        project = _make_project("bun")
-        # Bypass Pydantic validation to test the guard
-        object.__setattr__(project, "package_manager", "npm")
-        with pytest.raises(OutdatedCheckError):
-            get_outdated(project)
-
-
-def test_get_outdated_dispatches_gradle(monkeypatch):
-    project = ProjectConfig(path=Path("/tmp/fake"), package_manager="gradle")
-    seen: list[ProjectConfig] = []
-    sentinel = [make_update(pkg_name="room")]
-    # _CHECKERS captures the function object at import time, so patching the
-    # module attribute would not change what get_outdated calls.
-    monkeypatch.setitem(
-        maintenance_man.outdated._CHECKERS,
-        "gradle",
-        lambda p: (seen.append(p), sentinel)[1],
-    )
-
-    assert get_outdated(project) is sentinel
-    assert seen == [project]
 
 
 def test_uv_outdated_commands_run_without_the_host_virtualenv(tmp_path, monkeypatch):

@@ -2148,7 +2148,7 @@ def test_gradle_fresh_scan_does_not_clear_unfinished_ledger(driver, monkeypatch)
     monkeypatch.setattr(
         scanner, "_run_gradle_scan", lambda *args: ([], workflow.initial.resolution)
     )
-    monkeypatch.setattr(scanner, "get_outdated", lambda *args: [])
+    monkeypatch.setattr(scanner, "discover_gradle_updates", lambda *args: [])
     result_path = paths.MM_HOME / "scan-results" / "sample.json"
     result_path.parent.mkdir()
     result_path.write_bytes(b"previous current-main scan")

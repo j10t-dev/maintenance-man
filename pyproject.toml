@@ -69,6 +69,7 @@ forbidden_modules = [
     "maintenance_man.gradle_verification",
     "maintenance_man.gradle_workflow",
     "maintenance_man.outdated",
+    "maintenance_man.package_managers",
     "maintenance_man.paths",
     "maintenance_man.process",
     "maintenance_man.resources",
