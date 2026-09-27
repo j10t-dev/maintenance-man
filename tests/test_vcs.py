@@ -12,7 +12,6 @@ from maintenance_man.vcs import (
     _main_bookmark_is_conflicted,
     assert_safe_workspace_path,
     bookmark_exists,
-    bookmark_slug,
     check_gh_available,
     check_jj_available,
     commit_current_change,
@@ -76,20 +75,6 @@ class TestFinalVcsSurface:
     )
     def test_obsolete_git_mutation_helpers_are_removed(self, name: str):
         assert not hasattr(vcs, name)
-
-
-class TestBookmarkSlug:
-    @pytest.mark.parametrize(
-        ("input_name", "expected"),
-        [
-            pytest.param("express", "express", id="plain"),
-            pytest.param("@types/bun", "types-bun", id="scoped-npm"),
-            pytest.param("@babel/preset-env", "babel-preset-env", id="deeply-scoped"),
-            pytest.param("lodash", "lodash", id="no-at-no-slash"),
-        ],
-    )
-    def test_bookmark_slug(self, input_name: str, expected: str):
-        assert bookmark_slug(input_name) == expected
 
 
 class TestCheckGhAvailable:

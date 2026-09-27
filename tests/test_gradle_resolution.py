@@ -1,7 +1,5 @@
-import hashlib
 import json
 import subprocess
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -39,12 +37,7 @@ from maintenance_man.models.scan import (
     Severity,
     VulnFinding,
 )
-
-FIXTURE = Path(__file__).parent / "fixtures/gradle/resolution/empty.json"
-
-
-def report_payload():
-    return json.loads(FIXTURE.read_text())
+from tests.conftest import fixture_runner, report_payload
 
 
 @pytest.mark.parametrize(
@@ -99,34 +92,6 @@ def make_project(tmp_path):
     (tmp_path / "gradle").mkdir()
     (tmp_path / "gradle/libs.versions.toml").write_text('[versions]\nx = "1.0"\n')
     return ProjectConfig(path=tmp_path, package_manager="gradle")
-
-
-def fixture_runner(root, args, *, label):
-    assert args[0] == "mmGradleReport"
-    assert "--rerun-tasks" in args and "--no-build-cache" in args
-    owned = root / ".mm-gradle-inventory"
-    assert (owned / ".mm-owned").is_file()
-    assert (owned / "gradle-report.gradle").read_text().startswith("import ")
-    (owned / "bom.json").write_text(
-        '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[{"group":"g","name":"a","version":"1.0","purl":"pkg:maven/g/a@1.0"}]}'
-    )
-    value = report_payload()
-    value["scopes"][0]["components"].append(
-        {
-            "id": "a",
-            "kind": "module",
-            "module": {"group": "g", "artifact": "a", "version": "1.0"},
-            "variants": ["runtime"],
-        }
-    )
-    value["scopes"][0]["edges"].append(
-        {"source": "root", "target": "a", "requested": "g:a:1.0", "constraint": False}
-    )
-    value["catalogue_digest"] = hashlib.sha256(
-        (root / "gradle/libs.versions.toml").read_bytes()
-    ).hexdigest()
-    (owned / "report.json").write_text(json.dumps(value))
-    return subprocess.CompletedProcess(args, 0, "", "")
 
 
 def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):

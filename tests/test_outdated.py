@@ -12,13 +12,13 @@ from maintenance_man.models.scan import SemverTier
 from maintenance_man.outdated import (
     OutdatedCheckError,
     _get_uv_direct_dep_names,
-    _normalise_pkg_name,
     bun_outdated,
     classify_semver,
     get_outdated,
     mvn_outdated,
     uv_outdated,
 )
+from maintenance_man.uv_dependencies import normalise_pkg_name
 from tests.conftest import make_update
 
 
@@ -56,19 +56,19 @@ class TestClassifySemver:
 
 class TestNormalisePkgName:
     def test_lowercase(self):
-        assert _normalise_pkg_name("Requests") == "requests"
+        assert normalise_pkg_name("Requests") == "requests"
 
     def test_underscores_to_hyphens(self):
-        assert _normalise_pkg_name("pydantic_core") == "pydantic-core"
+        assert normalise_pkg_name("pydantic_core") == "pydantic-core"
 
     def test_dots_to_hyphens(self):
-        assert _normalise_pkg_name("zope.interface") == "zope-interface"
+        assert normalise_pkg_name("zope.interface") == "zope-interface"
 
     def test_consecutive_separators(self):
-        assert _normalise_pkg_name("Foo-_.Bar") == "foo-bar"
+        assert normalise_pkg_name("Foo-_.Bar") == "foo-bar"
 
     def test_already_normalised(self):
-        assert _normalise_pkg_name("rich") == "rich"
+        assert normalise_pkg_name("rich") == "rich"
 
 
 class TestGetUvDirectDepNames:

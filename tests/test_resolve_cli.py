@@ -122,7 +122,7 @@ class TestResolveCandidates:
             ],
         )
 
-        candidates = _ordered_resolve_candidates(scan_result, _uv_project(), 7)
+        candidates = _ordered_resolve_candidates(scan_result)
 
         assert {f.pkg_name for f in candidates} == {"pkg-a", "pkg-b", "pkg-e"}
 
@@ -139,7 +139,7 @@ class TestResolveCandidates:
             vulns=[],
         )
 
-        candidates = _ordered_resolve_candidates(scan_result, _uv_project(), 7)
+        candidates = _ordered_resolve_candidates(scan_result)
 
         assert [f.pkg_name for f in candidates] == ["pkg-a"]
 
@@ -165,7 +165,7 @@ class TestResolveCandidates:
             ],
         )
 
-        failed = _ordered_failed_findings(scan_result, _uv_project(), 7)
+        failed = _ordered_failed_findings(scan_result)
 
         assert [f.pkg_name for f in failed] == ["keep"]
 
@@ -190,9 +190,7 @@ class TestResolveCandidates:
             ],
         )
 
-        ready = _ordered_ready_findings(
-            scan_result, flow=Workflow.RESOLVE, proj_config=_uv_project()
-        )
+        ready = _ordered_ready_findings(scan_result, flow=Workflow.RESOLVE)
 
         assert [f.pkg_name for f in ready] == ["keep"]
 
@@ -1065,7 +1063,3 @@ def test_gradle_continuation_without_ledger_preserves_interrupted_outputs(
     assert exc.value.code == 4
     assert report.read_bytes() == b"preserved output"
     assert marker.exists() is owned
-
-
-def _uv_project() -> ProjectConfig:
-    return ProjectConfig(path=Path("/tmp/fake"), package_manager="uv")

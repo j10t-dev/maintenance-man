@@ -27,10 +27,6 @@ def get_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     return checker(project)
 
 
-def _normalise_pkg_name(name: str) -> str:
-    return normalise_pkg_name(name)
-
-
 def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
     try:
         return get_uv_direct_dep_names(project_path)
@@ -75,7 +71,7 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         if (cur := entry.get("version"))
         and (lat := entry.get("latest_version"))
         and cur != lat
-        and _normalise_pkg_name(entry["name"]) in direct_deps
+        and normalise_pkg_name(entry["name"]) in direct_deps
     ]
 
 

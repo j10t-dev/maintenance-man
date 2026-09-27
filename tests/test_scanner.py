@@ -931,7 +931,7 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
 def test_gradle_trivy_malformed_shape_is_scan_error(
     gradle_project, monkeypatch, payload
 ):
-    from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
+    from maintenance_man.scanner import TrivyScanError, _run_gradle_scan
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -939,7 +939,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
     )
     _trivy_sbom(monkeypatch, stdout=json.dumps(payload))
     with pytest.raises(TrivyScanError, match="Trivy"):
-        _run_gradle_vuln_scan(gradle_project)
+        _run_gradle_scan(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
@@ -954,7 +954,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
 def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
     gradle_project, monkeypatch, failure
 ):
-    from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
+    from maintenance_man.scanner import TrivyScanError, _run_gradle_scan
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -966,7 +966,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
 
     monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(TrivyScanError, match="Trivy"):
-        _run_gradle_vuln_scan(gradle_project)
+        _run_gradle_scan(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 

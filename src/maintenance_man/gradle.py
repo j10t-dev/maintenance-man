@@ -48,13 +48,6 @@ _DISCOVER_ARGS = [
     "--no-daemon",
     "--console=plain",
 ]
-_BOM_ARGS = [
-    "cyclonedxBom",
-    "--no-daemon",
-    "--console=plain",
-    "--rerun-tasks",
-    "--no-build-cache",
-]
 _UNSAFE_TEXT_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -483,19 +476,6 @@ def owned_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
         _remove_owned_tree(inventory_dir)
 
 
-@contextmanager
-def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
-    """Yield a freshly generated, validated CycloneDX inventory."""
-    with owned_gradle_inventory(project) as directory:
-        try:
-            run_gradle(Path(project.path), _BOM_ARGS, label="cyclonedxBom")
-            bom = directory / "bom.json"
-            _validate_inventory(bom)
-        except OSError as exc:
-            raise GradleError(f"Could not generate Gradle inventory: {exc}") from exc
-        yield bom
-
-
 def run_gradle(
     root: Path, args: list[str], *, label: str | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -600,9 +580,7 @@ def reclaim_gradle_outputs(root: Path) -> None:
         ) from e
 
 
-def workspace_environment_reason(
-    source_root: Path, workspace_root: Path, *, tracked_local_properties: bool = False
-) -> str | None:
+def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str | None:
     """Explain why a workspace build could not resolve the Android SDK.
 
     ``mm update`` applies inside a jj workspace, which checks out tracked files
@@ -618,8 +596,6 @@ def workspace_environment_reason(
         return None
     source = source_root / GRADLE_LOCAL_PROPERTIES_RELPATH
     if not source.is_file():
-        return None
-    if tracked_local_properties:
         return None
     return (
         f"{source} is not a tracked regular file in the selected revision, so it is "

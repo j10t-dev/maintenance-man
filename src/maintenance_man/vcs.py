@@ -276,11 +276,6 @@ def delete_bookmark(bookmark: str, path: Path) -> bool:
     return True
 
 
-def bookmark_slug(pkg_name: str) -> str:
-    """Normalise a package name into a bookmark-safe slug."""
-    return pkg_name.lstrip("@").replace("/", "-")
-
-
 def workspace_path_for_project(project: str) -> Path:
     return MM_WORKSPACES / sanitise_project_name(project)
 

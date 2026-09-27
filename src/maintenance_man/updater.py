@@ -79,7 +79,6 @@ class UpdateResult:
     kind: UpdateKind
     passed: bool
     failed_phase: str | None = None
-    blocked_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,7 +269,6 @@ def process_vulns(
     project_config: ProjectConfig,
     *,
     flow: Workflow,
-    minimum_age_days: int = 7,
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
@@ -283,7 +281,6 @@ def process_vulns(
         project_config,
         _VULN_STACK,
         flow=flow,
-        minimum_age_days=minimum_age_days,
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
@@ -295,7 +292,6 @@ def process_updates(
     project_config: ProjectConfig,
     *,
     flow: Workflow,
-    minimum_age_days: int = 7,
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
@@ -307,7 +303,6 @@ def process_updates(
         project_config,
         _UPDATE_STACK,
         flow=flow,
-        minimum_age_days=minimum_age_days,
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
@@ -411,7 +406,7 @@ def run_test_phases(
 
     Stops on first failure. Returns (True, None) if all phases pass.
     """
-    env = _project_env()
+    env = project_env()
     phases = [
         ("unit", project_config.test_unit),
         ("integration", project_config.test_integration),
@@ -443,7 +438,6 @@ def process_findings(
     cfg: _WorkflowConfig | None = None,
     *,
     flow: Workflow,
-    minimum_age_days: int = 7,
     on_failure: FailureStrategy = "continue",
     scan_result: ScanResult | None = None,
     project_name: str = "",
@@ -616,14 +610,6 @@ def _results_path(project_name: str, results_dir: Path) -> Path:
     return results_dir / f"{sanitise_project_name(project_name)}.json"
 
 
-def _project_env() -> dict[str, str]:
-    """Return a copy of os.environ with venv isolation.
-
-    Delegates to :func:`maintenance_man.env.project_env`.
-    """
-    return project_env()
-
-
 def _persist_status(
     scan_result: ScanResult | None,
     project_name: str,
@@ -638,7 +624,7 @@ def _apply_update(
     package_manager: str, pkg_name: str, version: str, project_path: Path
 ) -> bool:
     """Apply a single package update. Returns True on success."""
-    env = _project_env()
+    env = project_env()
     try:
         commands = get_update_commands(package_manager, pkg_name, version, project_path)
     except (UvDependencyError, ValueError) as e:

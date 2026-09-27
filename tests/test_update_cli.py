@@ -1379,7 +1379,7 @@ def _gradle_scan_state(mock_update_cli_deps):
     return scan_result
 
 
-def test_batch_summary_classifies_block_before_failed(capsys):
+def test_batch_summary_labels_pass_and_fail(capsys):
     from maintenance_man.cli import _print_mass_update_summary
 
     _print_mass_update_summary(
@@ -1387,19 +1387,21 @@ def test_batch_summary_classifies_block_before_failed(capsys):
             (
                 "android",
                 [
+                    UpdateResult(pkg_name="room", kind="update", passed=True),
                     UpdateResult(
-                        pkg_name="room",
-                        kind="update",
+                        pkg_name="okhttp",
+                        kind="vuln",
                         passed=False,
-                        blocked_reason="unknown age",
-                    )
+                        failed_phase="unit",
+                    ),
                 ],
             )
         ]
     )
     out = capsys.readouterr().out
-    assert "BLOCKED" in out
-    assert "FAIL" not in out
+    assert "PASS" in out
+    assert "FAIL (unit)" in out
+    assert "BLOCKED" not in out
 
 
 @pytest.mark.parametrize("batch", [False, True])
@@ -1458,88 +1460,30 @@ def test_gradle_ready_only_missing_bookmark_preserves_state(
     assert all(not values for values in gradle_update_cli.values())
 
 
-@pytest.mark.parametrize("resume", [False, True])
-def test_tracked_sdk_properties_use_inspected_revision_for_workspace(
-    gradle_update_cli, mock_update_cli_deps, gradle_project, monkeypatch, resume
+def test_gradle_workspace_revision_reports_uninspectable_local_properties(
+    gradle_project, monkeypatch
 ):
-    from maintenance_man.cli import _enter_update_workspace
+    from maintenance_man.cli import _gradle_workspace_revision, _UpdateSetupError
     from maintenance_man.vcs import RevisionFileCheck
 
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     (gradle_project.path / "local.properties").write_text("sdk.dir=/opt/android\n")
-    scan = _gradle_scan_state(mock_update_cli_deps)
-    if resume:
-        for finding in scan.updates:
-            finding.update_status = UpdateStatus.FAILED
-            finding.failed_phase = "unit"
-            finding.flow = Workflow.UPDATE
-    monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda *args: resume)
-    inspections = []
-    effects = []
-
-    def inspect(path, revision, filename):
-        inspections.append((revision, filename))
-        return RevisionFileCheck(ok=True, value=True, commit_id="a" * 40)
-
-    monkeypatch.setattr("maintenance_man.cli.revision_file", inspect, raising=False)
     monkeypatch.setattr(
-        "maintenance_man.cli.create_workspace",
-        lambda p, n, r: effects.append(("workspace", r)) or True,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.edit_new_change",
-        lambda p, r: effects.append(("new", r)) or True,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.create_or_reset_bookmark",
-        lambda n, p, r: effects.append(("bookmark", r)) or True,
-    )
-    _enter_update_workspace("android", gradle_project, scan)
-    assert inspections == [
-        ("mm/update-dependencies" if resume else "main", "local.properties")
-    ]
-    assert ("workspace", "a" * 40) in effects
-    assert ("new", "a" * 40) in effects
-    if not resume:
-        assert ("bookmark", "a" * 40) in effects
-
-
-@pytest.mark.parametrize("inspection_error", [False, True])
-def test_resumed_sdk_refusal_precedes_workspace_removal(
-    gradle_update_cli,
-    mock_update_cli_deps,
-    gradle_project,
-    monkeypatch,
-    inspection_error,
-):
-    from maintenance_man.cli import _enter_update_workspace, _UpdateSetupError
-    from maintenance_man.vcs import RevisionFileCheck
-
-    monkeypatch.delenv("ANDROID_HOME", raising=False)
-    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
-    (gradle_project.path / "local.properties").write_text("sdk.dir=/opt/android\n")
-    scan = _gradle_scan_state(mock_update_cli_deps)
-    scan.updates[0].update_status = UpdateStatus.FAILED
-    scan.updates[0].flow = Workflow.UPDATE
-    scan.updates[0].failed_phase = "unit"
-    effects = []
-    monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda *args: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.remove_workspace", lambda *args: effects.append("remove")
+        "maintenance_man.cli.revision_file",
+        lambda path, revision, filename: RevisionFileCheck(
+            ok=False, error="inspection failed"
+        ),
     )
 
-    def inspect(path, revision, filename):
-        assert revision == "mm/update-dependencies"
-        return RevisionFileCheck(
-            ok=not inspection_error, value=False, error="inspection failed"
-        )
-
-    monkeypatch.setattr("maintenance_man.cli.revision_file", inspect)
-    with pytest.raises(_UpdateSetupError):
-        _enter_update_workspace("android", gradle_project, scan)
-    assert effects == []
-    assert gradle_update_cli["workspaces"] == []
+    with pytest.raises(
+        _UpdateSetupError,
+        match=(
+            r"Cannot inspect local.properties in mm/update-dependencies: "
+            r"inspection failed"
+        ),
+    ):
+        _gradle_workspace_revision("android", gradle_project, "mm/update-dependencies")
 
 
 @pytest.mark.parametrize("batch", [False, True])

@@ -1,3 +1,6 @@
+import hashlib
+import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,40 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 GRADLE_FIXTURES = FIXTURES_DIR / "gradle"
 
 _GRADLEW_STUB = "#!/bin/sh\nexit 0\n"
+
+FIXTURE = GRADLE_FIXTURES / "resolution" / "empty.json"
+
+
+def report_payload():
+    return json.loads(FIXTURE.read_text())
+
+
+def fixture_runner(root, args, *, label):
+    assert args[0] == "mmGradleReport"
+    assert "--rerun-tasks" in args and "--no-build-cache" in args
+    owned = root / ".mm-gradle-inventory"
+    assert (owned / ".mm-owned").is_file()
+    assert (owned / "gradle-report.gradle").read_text().startswith("import ")
+    (owned / "bom.json").write_text(
+        '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[{"group":"g","name":"a","version":"1.0","purl":"pkg:maven/g/a@1.0"}]}'
+    )
+    value = report_payload()
+    value["scopes"][0]["components"].append(
+        {
+            "id": "a",
+            "kind": "module",
+            "module": {"group": "g", "artifact": "a", "version": "1.0"},
+            "variants": ["runtime"],
+        }
+    )
+    value["scopes"][0]["edges"].append(
+        {"source": "root", "target": "a", "requested": "g:a:1.0", "constraint": False}
+    )
+    value["catalogue_digest"] = hashlib.sha256(
+        (root / "gradle/libs.versions.toml").read_bytes()
+    ).hexdigest()
+    (owned / "report.json").write_text(json.dumps(value))
+    return subprocess.CompletedProcess(args, 0, "", "")
 
 
 def make_vuln(**overrides: Any) -> VulnFinding:

@@ -356,7 +356,7 @@ class TestApplyUpdate:
             'lint = ["pytest>=8.0"]\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr("maintenance_man.updater._project_env", dict)
+        monkeypatch.setattr("maintenance_man.updater.project_env", dict)
         mock_run = MagicMock(
             return_value=subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
@@ -384,7 +384,7 @@ class TestApplyUpdate:
             'lint = ["pytest>=8.0"]\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr("maintenance_man.updater._project_env", dict)
+        monkeypatch.setattr("maintenance_man.updater.project_env", dict)
         mock_run = MagicMock(
             side_effect=[
                 subprocess.CompletedProcess(
@@ -410,7 +410,7 @@ class TestApplyUpdate:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        monkeypatch.setattr("maintenance_man.updater._project_env", dict)
+        monkeypatch.setattr("maintenance_man.updater.project_env", dict)
         mock_run = MagicMock()
         monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
 

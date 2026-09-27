@@ -26,6 +26,7 @@ from maintenance_man.dependency_age import (
 )
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
+    GRADLE_INVENTORY_BOM_RELPATH,
     Catalogue,
     CatalogueEntry,
     GradleError,
@@ -143,7 +144,7 @@ def generate_gradle_report(
             logging.getLogger(__name__).info(
                 "Gradle graph/inventory %.3fs", time.monotonic() - report_started
             )
-            bom = directory / "bom.json"
+            bom = root / GRADLE_INVENTORY_BOM_RELPATH
             report_path = directory / "report.json"
             if bom.is_symlink() or report_path.is_symlink():
                 raise GradleError("Gradle report output is a symlink")

@@ -215,11 +215,6 @@ def _run_gradle_scan(
         return findings, outcome
 
 
-def _run_gradle_vuln_scan(project: ProjectConfig) -> list[VulnFinding]:
-    findings, _ = _run_gradle_scan(project)
-    return findings
-
-
 def _is_trivy_object(value: object) -> TypeGuard[dict[str, object]]:
     return isinstance(value, dict) and all(isinstance(key, str) for key in value)
 
