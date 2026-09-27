@@ -3,7 +3,6 @@ import hashlib
 import json
 import logging
 import re
-import shutil
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,7 +24,7 @@ from maintenance_man.gradle import (
 from maintenance_man.gradle_resolution import (
     generate_gradle_report,
 )
-from maintenance_man.gradle_verification import context_inputs_valid
+from maintenance_man.gradle_verification import TRIVY_INSTALL_HINT, context_inputs_valid
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     ComparisonContext,
@@ -46,13 +45,9 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.outdated import get_outdated
-from maintenance_man.process import run_captured
+from maintenance_man.process import require_tool, run_captured
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import revision_tree_id
-
-
-class TrivyNotFoundError(Exception):
-    pass
 
 
 class ScanError(Exception):
@@ -117,14 +112,6 @@ def scan_project(
     return scan_result
 
 
-def check_trivy_available() -> None:
-    """Raise TrivyNotFoundError if trivy is not on PATH."""
-    if shutil.which("trivy") is None:
-        raise TrivyNotFoundError(
-            "Trivy is not installed or not on PATH. Install it from https://trivy.dev/"
-        )
-
-
 def _check_outdated(
     project: ProjectConfig,
     vulns: list[VulnFinding],
@@ -146,6 +133,7 @@ def _run_gradle_scan(
     project: ProjectConfig,
 ) -> tuple[list[VulnFinding], CompleteResolution]:
     """Scan the project's own freshly captured resolution and inventory."""
+    require_tool("trivy", TRIVY_INSTALL_HINT)
     with generate_gradle_report(project) as (bom, outcome):
         if isinstance(outcome, IncompleteResolution):
             raise GradleError(
@@ -352,6 +340,7 @@ def _run_trivy_scan(
     scanners: str | None = None,
 ) -> tuple[list[VulnFinding], list[SecretFinding]]:
     """Run Trivy against *project_path* and return parsed findings."""
+    require_tool("trivy", TRIVY_INSTALL_HINT)
     scanners = scanners or ("vuln,secret" if scan_secrets else "vuln")
     cmd = [
         "trivy",

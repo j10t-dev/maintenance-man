@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 from maintenance_man import process
-from maintenance_man.process import ProcessError, run_captured, run_live
+from maintenance_man.process import (
+    ProcessError,
+    ToolNotFoundError,
+    require_tool,
+    run_captured,
+    run_live,
+)
 
 
 class _DomainError(Exception):
@@ -27,6 +33,43 @@ def _fake(result=None, *, raises=None, calls=None):
 def _host_venv(monkeypatch):
     monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
     monkeypatch.setenv("PATH", os.pathsep.join(["/host/venv/bin", "/usr/bin"]))
+
+
+def _executable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_require_tool_returns_the_absolute_path(tmp_path, monkeypatch):
+    tool = _executable(tmp_path / "bin" / "mm-probe-tool")
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setenv("PATH", str(tool.parent))
+    found = require_tool("mm-probe-tool", "Install it from https://example.test/")
+    assert found == tool
+    assert found.is_absolute()
+
+
+def test_missing_tool_names_the_executable_and_hint(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(
+        ToolNotFoundError,
+        match=(
+            r"^mm-probe-tool is not installed or not on PATH\. "
+            r"Install it from https://example\.test/$"
+        ),
+    ):
+        require_tool("mm-probe-tool", "Install it from https://example.test/")
+
+
+def test_tool_only_in_the_host_virtualenv_is_unavailable(tmp_path, monkeypatch):
+    venv = tmp_path / "venv"
+    _executable(venv / "bin" / "mm-probe-tool")
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    monkeypatch.setenv("PATH", str(venv / "bin"))
+    with pytest.raises(ToolNotFoundError):
+        require_tool("mm-probe-tool", "hint")
 
 
 def test_captured_run_is_isolated_and_non_interactive(tmp_path, monkeypatch):

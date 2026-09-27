@@ -12,13 +12,8 @@ from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.paths import sanitise_project_name
 from maintenance_man.process import run_captured
 
-
-class GitHubCLINotFoundError(Exception):
-    pass
-
-
-class JJCLINotFoundError(Exception):
-    pass
+JJ_INSTALL_HINT = "Install it from https://jj-vcs.github.io/jj/"
+GH_INSTALL_HINT = "Install it from https://cli.github.com/"
 
 
 class BookmarkLookupError(RuntimeError):
@@ -95,12 +90,6 @@ def revision_file(path: Path, revision: str, filename: str) -> RevisionFileCheck
 
 
 _MANAGED_BOOKMARK_PREFIXES = tuple(WORKFLOW_BOOKMARKS.values())
-
-
-def check_jj_available() -> None:
-    """Raise JJCLINotFoundError if jj is not on PATH."""
-    if shutil.which("jj") is None:
-        raise JJCLINotFoundError("jj is required for maintenance-man VCS operations")
 
 
 def _jj_stdout(cmd: list[str], project_path: Path) -> str:
@@ -592,15 +581,6 @@ def sync_main(project_path: Path) -> tuple[bool, str]:
         False,
         "local main and origin/main have diverged; resolve manually before syncing",
     )
-
-
-def check_gh_available() -> None:
-    """Raise GitHubCLINotFoundError if gh is not on PATH."""
-    if shutil.which("gh") is None:
-        raise GitHubCLINotFoundError(
-            "GitHub CLI (gh) is not installed or not on PATH. "
-            "Install it from https://cli.github.com/"
-        )
 
 
 def _run(

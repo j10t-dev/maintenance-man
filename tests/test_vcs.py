@@ -6,14 +6,10 @@ import pytest
 
 from maintenance_man import vcs
 from maintenance_man.vcs import (
-    GitHubCLINotFoundError,
-    JJCLINotFoundError,
     RevisionCheck,
     _main_bookmark_is_conflicted,
     assert_safe_workspace_path,
     bookmark_exists,
-    check_gh_available,
-    check_jj_available,
     commit_current_change,
     create_or_reset_bookmark,
     create_workspace,
@@ -153,34 +149,6 @@ class TestFinalVcsSurface:
     )
     def test_obsolete_git_mutation_helpers_are_removed(self, name: str):
         assert not hasattr(vcs, name)
-
-
-class TestCheckGhAvailable:
-    def test_gh_on_path(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(
-            "maintenance_man.vcs.shutil.which",
-            lambda cmd: "/usr/bin/gh" if cmd == "gh" else None,
-        )
-        check_gh_available()
-
-    def test_gh_not_on_path(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr("maintenance_man.vcs.shutil.which", lambda cmd: None)
-        with pytest.raises(GitHubCLINotFoundError):
-            check_gh_available()
-
-
-class TestCheckJjAvailable:
-    def test_jj_on_path(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(
-            "maintenance_man.vcs.shutil.which",
-            lambda cmd: "/usr/bin/jj" if cmd == "jj" else None,
-        )
-        check_jj_available()
-
-    def test_jj_not_on_path(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr("maintenance_man.vcs.shutil.which", lambda cmd: None)
-        with pytest.raises(JJCLINotFoundError, match="jj is required"):
-            check_jj_available()
 
 
 class TestCurrentLabel:

@@ -19,10 +19,11 @@ from maintenance_man.models.gradle import (
     VerifiedComparison,
 )
 from maintenance_man.models.scan import VulnFinding
-from maintenance_man.process import run_captured
+from maintenance_man.process import require_tool, run_captured
 
 _MARKER = ".mm-comparison-owner"
 _POLICY_FILES = ("trivy.yaml", "trivy.yml", ".trivyignore.yaml", ".trivyignore.yml")
+TRIVY_INSTALL_HINT = "Install it from https://trivy.dev/"
 
 
 def _digest(path: Path) -> str:
@@ -89,10 +90,7 @@ def initialize_comparison_context(
     try:
         (cache / "config.json").write_text("{}\n", encoding="utf-8")
         (cache / "ignore").write_bytes(policy)
-        executable = shutil.which("trivy")
-        if executable is None:
-            raise GradleError("Trivy is not installed")
-        executable_path = Path(executable).resolve(strict=True)
+        executable_path = require_tool("trivy", TRIVY_INSTALL_HINT).resolve(strict=True)
         version = _run([str(executable_path), "--version"], cache).strip()
         common = [
             str(executable_path),

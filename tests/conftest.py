@@ -23,6 +23,18 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 
+
+@pytest.fixture(autouse=True)
+def _tools_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve CLI and scanner tool requirements without the host PATH."""
+
+    def found(name: str, hint: str) -> Path:
+        return Path("/usr/bin") / name
+
+    monkeypatch.setattr("maintenance_man.cli.require_tool", found)
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", found)
+
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 GRADLE_FIXTURES = FIXTURES_DIR / "gradle"
 
@@ -182,8 +194,6 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     scan_result = make_scan_result()
     state: dict[str, object] = {"scan_result": scan_result}
 
-    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.check_jj_available", lambda: None)
     monkeypatch.setattr(
         "maintenance_man.cli.load_scan_results",
         lambda name, d: state["scan_result"],

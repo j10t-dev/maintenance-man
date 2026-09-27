@@ -27,11 +27,10 @@ from maintenance_man.models.scan import (
     UpdateFinding,
 )
 from maintenance_man.outdated import OutdatedCheckError
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import (
     ScanError,
-    TrivyNotFoundError,
     _parse_uv_audit_vulns,
-    check_trivy_available,
     scan_project,
 )
 from maintenance_man.storage import load_scan_results
@@ -186,15 +185,53 @@ class TestUvAuditParsing:
         assert vulns[0].fixed_version == "65.5.1"
 
 
-class TestCheckTrivyAvailable:
-    def test_trivy_is_available(self):
-        # Should not raise — trivy is installed on this machine
-        check_trivy_available()
+def _missing_trivy(name, hint):
+    raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
 
-    def test_trivy_not_available(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("PATH", "/nonexistent")
-        with pytest.raises(TrivyNotFoundError):
-            check_trivy_available()
+
+@pytest.mark.parametrize(
+    "manager, secrets, needs_trivy",
+    [
+        ("uv", False, False),
+        ("uv", True, True),
+        ("bun", False, True),
+        ("mvn", False, True),
+    ],
+)
+def test_scan_requires_trivy_only_for_trivy_work(
+    mm_home, tmp_path, monkeypatch, manager, secrets, needs_trivy
+):
+    monkeypatch.setattr(scanner, "require_tool", _missing_trivy)
+    # uv audit is independent; stub it so this test isolates Trivy work.
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
+    monkeypatch.setattr(scanner, "get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail(
+            "no Trivy command may run without its prerequisite check"
+        ),
+    )
+    project = ProjectConfig(
+        path=tmp_path, package_manager=manager, scan_secrets=secrets
+    )
+    if needs_trivy:
+        with pytest.raises(ToolNotFoundError, match="trivy"):
+            scanner.scan_project("demo", project)
+    else:
+        assert scanner.scan_project("demo", project).vulnerabilities == []
+
+
+def test_gradle_scan_requires_trivy_before_generating_a_report(
+    gradle_project, monkeypatch
+):
+    monkeypatch.setattr(scanner, "require_tool", _missing_trivy)
+    monkeypatch.setattr(
+        scanner,
+        "generate_gradle_report",
+        lambda *args: pytest.fail("report without trivy"),
+    )
+    with pytest.raises(ToolNotFoundError, match="trivy"):
+        scanner._run_gradle_scan(gradle_project)
 
 
 @pytest.mark.integration

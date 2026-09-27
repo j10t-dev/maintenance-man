@@ -38,6 +38,8 @@ mm update api -n worker   # same exclusion mode; flag position does not matter
 
 `mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed.
 
+If jj or gh is missing, `mm scan` warns and skips bookmark pruning; `mm update` and `mm resolve` still require both.
+
 ```bash
 ➜  maintenance-man git:(main) ✗ mm --help
 Usage: mm COMMAND
@@ -212,7 +214,7 @@ Configured projects are expected to be colocated jj/Git repositories with a GitH
 
 ## Requirements
 
-* trivy
+* trivy, except for uv projects with `scan_secrets = false`
 * jj
 * gh
 * Python 3.14

@@ -1,5 +1,6 @@
 """Run external commands with one set of execution and failure rules."""
 
+import shutil
 import subprocess
 from collections.abc import Collection, Sequence
 from pathlib import Path
@@ -11,6 +12,18 @@ _DIAGNOSTIC_CHARS = 2000
 
 class ProcessError(Exception):
     """A command could not run, timed out, or exited with a rejected status."""
+
+
+class ToolNotFoundError(Exception):
+    """A required executable is not on the isolated PATH."""
+
+
+def require_tool(name: str, hint: str) -> Path:
+    """Return the executable that isolated commands would run, or raise."""
+    found = shutil.which(name, path=project_env().get("PATH"))
+    if found is None:
+        raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+    return Path(found).absolute()
 
 
 def _where(cwd: str | Path | None) -> str:

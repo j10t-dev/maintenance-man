@@ -50,6 +50,7 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     Workflow,
 )
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import (
     ScanError,
     _run_gradle_scan,
@@ -576,6 +577,7 @@ def run_gradle_flow(
         _UpdateSetupError,
         BookmarkLookupError,
         RevisionError,
+        ToolNotFoundError,
         OSError,
     ) as exc:
         rprint(f"Cannot complete Gradle {flow}: {exc}")

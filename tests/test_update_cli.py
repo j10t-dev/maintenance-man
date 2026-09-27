@@ -12,6 +12,7 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     Workflow,
 )
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.storage import NoScanResultsError
 from maintenance_man.updater import UpdateResult
 from tests.conftest import (
@@ -19,6 +20,15 @@ from tests.conftest import (
     make_scan_result,
     make_update,
 )
+
+
+def _missing(tool):
+    def require(name, hint):
+        if name == tool:
+            raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+        return Path("/usr/bin") / name
+
+    return require
 
 
 def test_batch_reports_bookmark_access_error_without_requesting_rescan(
@@ -53,11 +63,9 @@ class TestUpdatePreChecks:
         (mm_home).mkdir(parents=True, exist_ok=True)
         (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
 
-        from maintenance_man.vcs import GitHubCLINotFoundError
-
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
-            MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
+            "maintenance_man.cli.require_tool",
+            _missing("gh"),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -71,11 +79,9 @@ class TestUpdatePreChecks:
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        from maintenance_man.vcs import GitHubCLINotFoundError
-
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
-            MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
+            "maintenance_man.cli.require_tool",
+            _missing("gh"),
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -87,12 +93,9 @@ class TestUpdatePreChecks:
         mock_update_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        from maintenance_man.vcs import JJCLINotFoundError
-
         monkeypatch.setattr(
-            "maintenance_man.cli.check_jj_available",
-            MagicMock(side_effect=JJCLINotFoundError("no jj")),
-            raising=False,
+            "maintenance_man.cli.require_tool",
+            _missing("jj"),
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -1001,11 +1004,9 @@ class TestUpdateTargetSelection:
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from maintenance_man.vcs import GitHubCLINotFoundError
-
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
-            MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
+            "maintenance_man.cli.require_tool",
+            _missing("gh"),
         )
 
         with pytest.raises(SystemExit) as exc_info:

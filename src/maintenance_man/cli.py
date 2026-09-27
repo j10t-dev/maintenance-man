@@ -59,12 +59,8 @@ from maintenance_man.models.scan import (
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import OutdatedCheckError
-from maintenance_man.scanner import (
-    ScanError,
-    TrivyNotFoundError,
-    check_trivy_available,
-    scan_project,
-)
+from maintenance_man.process import ToolNotFoundError, require_tool
+from maintenance_man.scanner import ScanError, scan_project
 from maintenance_man.storage import (
     NoScanResultsError,
     load_activity,
@@ -84,13 +80,11 @@ from maintenance_man.updater import (
     sort_updates_by_risk,
 )
 from maintenance_man.vcs import (
+    GH_INSTALL_HINT,
+    JJ_INSTALL_HINT,
     BookmarkLookupError,
-    GitHubCLINotFoundError,
-    JJCLINotFoundError,
     RevisionError,
     bookmark_exists,
-    check_gh_available,
-    check_jj_available,
     create_or_reset_bookmark,
     create_workspace,
     current_change_has_changes,
@@ -116,6 +110,7 @@ _SCAN_ERRORS: tuple[type[Exception], ...] = (
     GradleError,
     RevisionError,
     OutdatedCheckError,
+    ToolNotFoundError,
 )
 
 
@@ -184,6 +179,11 @@ def init() -> None:
     console.print(f"Edit {paths.config_path()} to add projects.")
 
 
+def _require_vcs_tools() -> None:
+    require_tool("gh", GH_INSTALL_HINT)
+    require_tool("jj", JJ_INSTALL_HINT)
+
+
 @app.command
 def scan(
     project: str | None = None,
@@ -200,11 +200,6 @@ def scan(
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
-
-    try:
-        check_trivy_available()
-    except TrivyNotFoundError as e:
-        _fatal(str(e))
 
     if not cfg.projects:
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
@@ -336,9 +331,8 @@ def update(
     _exit_if_no_update_targets(cfg, targets)
 
     try:
-        check_gh_available()
-        check_jj_available()
-    except (GitHubCLINotFoundError, JJCLINotFoundError) as e:
+        _require_vcs_tools()
+    except ToolNotFoundError as e:
         _fatal(str(e))
 
     if mode == "single":
@@ -1536,8 +1530,9 @@ def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -
 def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
     """Scan a single project with timing output."""
     try:
+        _require_vcs_tools()
         prune_stale_bookmarks(proj_config.path)
-    except RevisionError as exc:
+    except (ToolNotFoundError, RevisionError) as exc:
         console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
 
     t0 = time.monotonic()
@@ -1829,9 +1824,8 @@ def resolve(
     results_dir = paths.scan_results_dir()
     minimum_age_days = cfg.defaults.min_version_age_days
     try:
-        check_gh_available()
-        check_jj_available()
-    except (GitHubCLINotFoundError, JJCLINotFoundError) as e:
+        _require_vcs_tools()
+    except ToolNotFoundError as e:
         _fatal(str(e))
     if proj_config.package_manager == "gradle":
         sys.exit(

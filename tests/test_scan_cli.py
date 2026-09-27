@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from rich.console import Console
@@ -29,6 +30,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.outdated import OutdatedCheckError
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.vcs import RevisionError
 from tests.conftest import make_scan_result, make_update
 
@@ -80,7 +82,6 @@ def _make_updates_only_result() -> ScanResult:
 @pytest.fixture(autouse=True)
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
     monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda _path: True)
 
     def _fake_scan(
@@ -115,6 +116,70 @@ def _two_project_config(mm_home, tmp_path):
     results.mkdir(exist_ok=True)
     (results / "first.json").write_bytes(b"previous first result")
     return results
+
+
+def _missing(tool):
+    def require(name, hint):
+        if name == tool:
+            raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+        return Path("/usr/bin") / name
+
+    return require
+
+
+def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys):
+    mm_home.mkdir(parents=True)
+    (mm_home / "config.toml").write_text("")
+    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("trivy"))
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
+    with pytest.raises(SystemExit) as exc:
+        app(["scan"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "No projects configured" in output
+    assert "trivy" not in output.lower()
+
+
+def test_scan_without_trivy_reports_an_unknown_project(
+    mm_home_with_projects, monkeypatch, capsys
+):
+    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("trivy"))
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
+    with pytest.raises(SystemExit) as exc:
+        app(["scan", "nonexistent"])
+    assert exc.value.code == 1
+    assert "trivy" not in capsys.readouterr().out.lower()
+
+
+@pytest.mark.parametrize("tool", ["jj", "gh"])
+def test_scan_warns_and_continues_without_housekeeping_tools(
+    mm_home_with_projects, monkeypatch, capsys, tool
+):
+    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing(tool))
+    prune = MagicMock(return_value=True)
+    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", prune)
+    with pytest.raises(SystemExit) as exc:
+        app(["scan", "clean"])
+    assert exc.value.code == 0
+    prune.assert_not_called()
+    assert f"{tool} is not installed" in capsys.readouterr().out
+
+
+def test_batch_scan_without_trivy_scans_uv_and_exits_error(
+    mm_home, tmp_path, monkeypatch
+):
+    results = _two_project_config(mm_home, tmp_path)
+    (results / "first.json").unlink()
+    monkeypatch.setattr("maintenance_man.cli.scan_project", scanner.scan_project)
+    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("trivy"))
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
+    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    with pytest.raises(SystemExit) as exc:
+        app(["scan"])
+    assert exc.value.code == ExitCode.ERROR
+    assert not (results / "first.json").exists()
+    assert (results / "second.json").is_file()
 
 
 @pytest.mark.parametrize("failure", ["outdated", "scanner"])
@@ -360,8 +425,6 @@ def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
 
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
-
     def _boom(name, proj_config, min_age_days):
         raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
 
@@ -376,7 +439,6 @@ def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
 def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
     mm_home_with_gradle, monkeypatch, capsys
 ):
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
     scanned: list[str] = []
 
     def _scan(name, proj_config, min_age_days):
@@ -464,7 +526,6 @@ def test_all_scan_real_wrapper_launch_error_preserves_results_and_scans_next(
     results = mm_home / "scan-results"
     results.mkdir()
     (results / "android.json").write_bytes(b"previous scan results\n")
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr("maintenance_man.scanner._check_outdated", lambda *args: [])
     with pytest.raises(SystemExit) as exc:
@@ -572,7 +633,6 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
     results = mm_home / "scan-results"
     results.mkdir()
     (results / "android.json").write_bytes(b"old result bytes")
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr(
         "maintenance_man.scanner._check_outdated",
@@ -704,7 +764,6 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
     results.mkdir()
     (results / "android.json").write_bytes(b"old result bytes")
     monkeypatch.setattr("maintenance_man.cli.scan_project", scan_project)
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr(
         "maintenance_man.scanner._check_outdated",

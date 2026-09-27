@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -53,6 +54,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.vcs import RevisionCheck, RevisionError
 
 
@@ -283,7 +285,7 @@ def frozen_context(tmp_path, monkeypatch, resolution):
     project_path.mkdir()
     binary = tmp_path / "trivy"
     binary.write_text("binary")
-    monkeypatch.setattr(verification.shutil, "which", lambda name: str(binary))
+    monkeypatch.setattr(verification, "require_tool", lambda name, hint: binary)
     calls = []
 
     def command(argv, cwd):
@@ -306,6 +308,25 @@ def frozen_context(tmp_path, monkeypatch, resolution):
         project, resolution, tmp_path / "caches"
     )
     return project, context, calls
+
+
+def test_comparison_setup_requires_trivy_and_leaves_no_cache(
+    tmp_path, monkeypatch, resolution
+):
+    for name in tuple(verification.os.environ):
+        if name.startswith("TRIVY_"):
+            monkeypatch.delenv(name)
+    project = ProjectConfig(path=tmp_path / "project", package_manager="gradle")
+    (tmp_path / "project").mkdir()
+    parent = tmp_path / "cache"
+
+    def missing(name, hint):
+        raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+
+    monkeypatch.setattr(verification, "require_tool", missing)
+    with pytest.raises(ToolNotFoundError, match="trivy"):
+        verification.initialize_comparison_context(project, resolution, parent)
+    assert list(parent.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -680,9 +701,20 @@ def test_gradle_continue_revision_failure_after_checked_intent_is_preserved(
     assert not {"apply", "commit", "discard", "bookmark"} & set(workflow.effects)
 
 
-def test_gradle_flow_reports_revision_failures(workflow, monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize(
+    "error",
+    [
+        RevisionError("jj unavailable"),
+        ToolNotFoundError("trivy is not installed or not on PATH. hint"),
+    ],
+)
+def test_gradle_flow_reports_revision_failures(
+    workflow, monkeypatch, tmp_path, capsys, error
+):
     monkeypatch.setattr(
-        workflow_service.gradle_updater, "load_gradle_run", _revision_failure
+        workflow_service.gradle_updater,
+        "load_gradle_run",
+        MagicMock(side_effect=error),
     )
     assert (
         cli._run_gradle_flow(
@@ -695,7 +727,7 @@ def test_gradle_flow_reports_revision_failures(workflow, monkeypatch, tmp_path, 
         )
         == cli.ExitCode.UPDATE_FAILED
     )
-    assert "Cannot complete Gradle update: jj unavailable" in capsys.readouterr().out
+    assert f"Cannot complete Gradle update: {error}" in capsys.readouterr().out
 
 
 def test_gradle_run_has_reports_attempt_kinds(workflow):
@@ -2113,7 +2145,6 @@ def test_gradle_fresh_scan_does_not_clear_unfinished_ledger(driver, monkeypatch)
     monkeypatch.setattr(
         cli, "_load_cfg", lambda *args: MmConfig(projects={"sample": driver.project})
     )
-    monkeypatch.setattr(cli, "check_trivy_available", lambda: None)
     monkeypatch.setattr(
         scanner, "_run_gradle_scan", lambda *args: ([], workflow.initial.resolution)
     )

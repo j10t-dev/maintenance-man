@@ -16,6 +16,7 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     Workflow,
 )
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.storage import NoScanResultsError
 from maintenance_man.updater import UpdateResult
 from tests.conftest import (
@@ -26,6 +27,15 @@ from tests.conftest import (
 )
 
 _RESOLVE_BOOKMARK = "mm/resolve-dependencies"
+
+
+def _missing(tool):
+    def require(name, hint):
+        if name == tool:
+            raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+        return Path("/usr/bin") / name
+
+    return require
 
 
 def _clear_resolve_progress(scan_result: ScanResult) -> None:
@@ -63,8 +73,6 @@ def mock_resolve_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     )
     state: dict[str, object] = {"scan_result": scan_result}
 
-    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.check_jj_available", lambda: None)
     monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda p: True)
     monkeypatch.setattr("maintenance_man.cli.ensure_main_bookmark", lambda p: True)
     monkeypatch.setattr(
@@ -203,11 +211,9 @@ class TestResolvePreChecks:
         mock_resolve_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from maintenance_man.vcs import GitHubCLINotFoundError
-
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
-            MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
+            "maintenance_man.cli.require_tool",
+            _missing("gh"),
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
@@ -219,11 +225,9 @@ class TestResolvePreChecks:
         mock_resolve_cli_deps: dict,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from maintenance_man.vcs import JJCLINotFoundError
-
         monkeypatch.setattr(
-            "maintenance_man.cli.check_jj_available",
-            MagicMock(side_effect=JJCLINotFoundError("no jj")),
+            "maintenance_man.cli.require_tool",
+            _missing("jj"),
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
@@ -1025,8 +1029,6 @@ def test_gradle_legacy_resolve_history_never_authorizes_effects(
     results.parent.mkdir(exist_ok=True)
     results.write_text(scan.model_dump_json())
     before = results.read_bytes()
-    for name in ("check_gh_available", "check_jj_available"):
-        monkeypatch.setattr(f"maintenance_man.cli.{name}", lambda: None)
 
     def forbidden(*args, **kwargs):
         pytest.fail("legacy history must not run commands or alter bookmarks")
@@ -1054,8 +1056,6 @@ def test_gradle_continuation_without_ledger_preserves_interrupted_outputs(
     marker = gradle_project.path / "gradle/.mm-owned-report"
     if owned:
         marker.write_bytes(b"")
-    for name in ("check_gh_available", "check_jj_available"):
-        monkeypatch.setattr(f"maintenance_man.cli.{name}", lambda: None)
     monkeypatch.setattr(
         subprocess, "run", lambda *args, **kwargs: pytest.fail("no ledger")
     )
