@@ -100,9 +100,9 @@ from maintenance_man.vcs import (
     remove_workspace,
     resolve_bookmark_contains_current_change,
     revision_file,
-    sync_main,
     workspace_path_for_project,
 )
+from maintenance_man.vcs_workflow import make_vcs_services, sync_main
 
 # Errors that fail one project's scan without stopping a batch.
 _SCAN_ERRORS: tuple[type[Exception], ...] = (
@@ -364,6 +364,7 @@ def sync(
     ordered = _dedupe_preserve_order(list(projects))
     _validate_project_names(cfg, ordered)
     targets = ordered or _sorted_project_names(cfg)
+    vcs_services = make_vcs_services()
 
     had_errors = False
     for name in targets:
@@ -375,12 +376,13 @@ def sync(
             )
             had_errors = True
             continue
-        ok, msg = sync_main(proj_config.path)
-        if ok:
-            console.print(f"  {name} — {msg}")
-        else:
-            console.print(f"  [bold red]{name} — {msg}[/]")
+        try:
+            action = sync_main(repo=vcs_services.repository(proj_config.path))
+        except RevisionError as exc:
+            console.print(f"  [bold red]{name} — {exc}[/]")
             had_errors = True
+        else:
+            console.print(f"  {name} — {action.value}")
 
     sys.exit(ExitCode.SYNC_FAILED if had_errors else ExitCode.OK)
 

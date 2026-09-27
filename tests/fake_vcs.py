@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Literal
 
+from maintenance_man.github import CodeHostError
 from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.vcs import (
     ExpectedRevisions,
@@ -17,6 +18,7 @@ from maintenance_man.vcs import (
     WorkingCopyState,
     _temporary_workspace,
 )
+from maintenance_man.vcs_workflow import VcsServices
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +26,100 @@ class FakeCall:
     path: Path
     method: str
     arguments: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _HostFailure:
+    method: str
+    ordinal: int
+    error: CodeHostError
+    registered_after: int
+
+
+@dataclass(slots=True)
+class _HostData:
+    prs: list[tuple[str, Literal["open", "merged", "closed"], str]] = field(
+        default_factory=list
+    )
+    failures: list[_HostFailure] = field(default_factory=list)
+    ordinals: dict[str, int] = field(default_factory=dict)
+    attempts: list[FakeCall] = field(default_factory=list)
+    effects: list[FakeCall] = field(default_factory=list)
+
+
+class FakeCodeHost:
+    def __init__(self, path: Path, *, _data: _HostData | None = None):
+        self.path = path.resolve()
+        self._data = _data or _HostData()
+
+    @property
+    def attempts(self) -> list[FakeCall]:
+        return self._data.attempts
+
+    @property
+    def effects(self) -> list[FakeCall]:
+        return self._data.effects
+
+    def seed_pr(
+        self,
+        *,
+        bookmark: str,
+        state: Literal["open", "merged", "closed"],
+        message: str = "PR #1",
+    ) -> None:
+        self._data.prs.append((bookmark, state, message))
+
+    def fail(
+        self,
+        method: str,
+        *,
+        ordinal: int = 1,
+        error: CodeHostError,
+    ) -> None:
+        self._data.failures.append(
+            _HostFailure(
+                method,
+                ordinal,
+                error,
+                self._data.ordinals.get(method, 0),
+            )
+        )
+
+    def _begin(self, method: str, **arguments: object) -> None:
+        self._data.attempts.append(
+            FakeCall(self.path, method, tuple(arguments.items()))
+        )
+        ordinal = self._data.ordinals.get(method, 0) + 1
+        self._data.ordinals[method] = ordinal
+        for failure in self._data.failures:
+            if (
+                failure.method == method
+                and ordinal == failure.registered_after + failure.ordinal
+            ):
+                raise failure.error
+
+    def pr_bookmarks(self, *, state: Literal["merged", "closed"]) -> frozenset[str]:
+        self._begin("pr_bookmarks", state=state)
+        return frozenset(
+            bookmark
+            for bookmark, observed_state, _message in self._data.prs
+            if observed_state == state
+        )
+
+    def create_pr(self, *, bookmark: str) -> str:
+        self._begin("create_pr", bookmark=bookmark)
+        for existing, state, message in reversed(self._data.prs):
+            if existing == bookmark and state == "open":
+                return (
+                    message
+                    if message != "PR #1"
+                    else f"PR already exists for {bookmark}"
+                )
+        self._data.prs.append((bookmark, "open", "PR #1"))
+        self._data.effects.append(
+            FakeCall(self.path, "create_pr", (("bookmark", bookmark),))
+        )
+        return "PR #1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +216,7 @@ class FakeJjState:
         self._hook_ordinals: dict[tuple[str, str, Path], int] = {}
         self.attempts: list[FakeCall] = []
         self.effects: list[FakeCall] = []
+        self._hosts: dict[Path, _HostData] = {}
 
     def _identity(self, label: str) -> str:
         self._sequence += 1
@@ -159,6 +256,7 @@ class FakeJjState:
             origin_key=origin_key,
         )
         self._repositories[root] = data
+        self._hosts[root] = _HostData()
         self._bind(root, root, "default")
         self._project(data, data.workspaces["default"])
         return FakeJj(root)
@@ -173,6 +271,18 @@ class FakeJjState:
         if resolved not in self._bindings:
             raise AssertionError(f"unknown fake repository path: {resolved}")
         return FakeJj(resolved)
+
+    def code_host(self, path: Path) -> FakeCodeHost:
+        resolved = path.resolve()
+        try:
+            root, _workspace = self._bindings[resolved]
+            data = self._hosts[root]
+        except KeyError as exc:
+            raise AssertionError(f"unknown fake repository path: {resolved}") from exc
+        return FakeCodeHost(resolved, _data=data)
+
+    def services(self) -> VcsServices:
+        return VcsServices(repository=self.repository, code_host=self.code_host)
 
     def register_files(self, path: Path, *filenames: str) -> None:
         data, _ = self._view(path)
@@ -353,6 +463,14 @@ class FakeJjState:
             )
             for item in self._hooks
         ]
+        for host in self._hosts.values():
+            host.attempts.clear()
+            host.effects.clear()
+            host.ordinals.clear()
+            host.failures = [
+                _HostFailure(item.method, item.ordinal, item.error, 0)
+                for item in host.failures
+            ]
 
     def _matching_call_ordinal(self, method: str, path: Path | None) -> int:
         return sum(

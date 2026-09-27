@@ -68,6 +68,7 @@ forbidden_modules = [
     "maintenance_man.gradle_updates",
     "maintenance_man.gradle_verification",
     "maintenance_man.gradle_workflow",
+    "maintenance_man.github",
     "maintenance_man.outdated",
     "maintenance_man.package_managers",
     "maintenance_man.paths",
@@ -78,6 +79,7 @@ forbidden_modules = [
     "maintenance_man.updater",
     "maintenance_man.uv_dependencies",
     "maintenance_man.vcs",
+    "maintenance_man.vcs_workflow",
     "rich",
     "cyclopts",
 ]

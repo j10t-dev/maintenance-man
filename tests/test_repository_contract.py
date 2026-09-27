@@ -8,9 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man import vcs
+from maintenance_man import paths, vcs
+from maintenance_man.github import CodeHostError
 from maintenance_man.vcs import ExpectedRevisions, Repository, RevisionError
-from tests.fake_vcs import FakeJjState
+from maintenance_man.vcs_workflow import (
+    SyncAction,
+    create_workspace,
+    current_label,
+    prune_stale_bookmarks,
+    push_bookmark_and_create_pr,
+    refresh_working_copy_from_main,
+    remove_workspace,
+    sync_main,
+)
+from tests.fake_vcs import FakeCall, FakeCodeHost, FakeJjState
 
 MANAGED = "mm/update-dependencies"
 
@@ -35,6 +46,8 @@ class RepositoryCase:
     origin_peer: OriginPeer
     track_main: Callable[[bool], None]
     after_push: Callable[[Callable[[], None]], None]
+    attempts: list[FakeCall] | None
+    commands: list[tuple[str, ...]] | None
 
 
 def _run_jj(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -67,10 +80,12 @@ def _real_case(
     assert _run_jj(path, "bookmark", "create", "main", "-r", "@-").returncode == 0
     repo = vcs.JjRepository(path)
     pending_after_push: list[Callable[[], None]] = []
+    commands: list[tuple[str, ...]] = []
     if monkeypatch is not None:
         captured_run = vcs.run_captured
 
         def intercept_push(command, cwd, **kwargs):
+            commands.append(tuple(command))
             completed = captured_run(command, cwd, **kwargs)
             if (
                 pending_after_push
@@ -207,6 +222,8 @@ def _real_case(
         origin_peer=OriginPeer(peer_repo, peer_commit_file, peer_push_main),
         track_main=track_main,
         after_push=after_push,
+        attempts=None,
+        commands=commands,
     )
 
 
@@ -281,6 +298,8 @@ def _fake_case(tmp_path: Path) -> RepositoryCase:
         origin_peer=OriginPeer(peer_repo, peer_commit_file, peer_push_main),
         track_main=track_main,
         after_push=after_push,
+        attempts=state.attempts,
+        commands=None,
     )
 
 
@@ -743,6 +762,512 @@ def test_after_push_runs_once_after_successful_sender_push(
     c.repo.push_bookmark(bookmark="main")
     c.repo.push_bookmark(bookmark="main")
     assert observed == ["after"]
+
+
+def test_sync_equal_revisions_refreshes_and_reports_unchanged(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    original_change = c.repo.change_id()
+
+    assert sync_main(repo=c.repo) is SyncAction.UNCHANGED
+    assert c.repo.change_id() == original_change
+    assert c.repo.same_revision(left="main", right="main@origin") is True
+
+
+def test_fake_services_bind_repository_and_shared_code_host(tmp_path: Path) -> None:
+    state = FakeJjState()
+    source = tmp_path / "source"
+    repo = state.seed_repository(source, files={"dep.txt": "version=1\n"})
+    workspace = tmp_path / "workspace"
+    repo.add_workspace(name="update", path=workspace, revision="main")
+    services = state.services()
+
+    assert services.repository(source).path == source
+    assert services.repository(workspace).path == workspace
+    source_host = services.code_host(source)
+    workspace_host = services.code_host(workspace)
+    assert isinstance(source_host, FakeCodeHost)
+    assert isinstance(workspace_host, FakeCodeHost)
+    assert source_host.path == source
+    assert workspace_host.path == workspace
+    source_host.seed_pr(bookmark=MANAGED, state="merged")
+    assert workspace_host.pr_bookmarks(state="merged") == frozenset({MANAGED})
+
+
+def test_sync_pulls_remote_advance_when_main_is_untracked(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    c.track_main(False)
+    c.origin_peer.repo.rebase_working_copy(revision="main")
+    peer_tip = c.origin_peer.commit_file("dep.txt", "version=2\n", "peer advance")
+    c.origin_peer.push_main()
+
+    assert sync_main(repo=c.repo) is SyncAction.PULLED
+    assert c.repo.resolve_revision(revision="main") == peer_tip
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
+
+
+def test_sync_tracked_main_remote_advance_is_already_reconciled_by_fetch(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    c.origin_peer.repo.rebase_working_copy(revision="main")
+    peer_tip = c.origin_peer.commit_file("dep.txt", "version=2\n", "peer advance")
+    c.origin_peer.push_main()
+
+    assert sync_main(repo=c.repo) is SyncAction.UNCHANGED
+    assert c.repo.resolve_revision(revision="main") == peer_tip
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
+
+
+def test_sync_pushes_local_advance_then_fetches_before_refresh(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    tip = c.commit_file("dep.txt", "version=2\n", "local advance")
+    c.repo.set_bookmark(bookmark="main", revision=tip)
+
+    assert sync_main(repo=c.repo) is SyncAction.PUSHED
+    assert c.repo.resolve_revision(revision="main@origin") == tip
+    c.origin_peer.repo.fetch(main_only=True)
+    assert c.origin_peer.repo.resolve_revision(revision="main") == tip
+
+
+def test_sync_rechecks_remote_before_refresh(repository_case: RepositoryCase) -> None:
+    c = repository_case
+    tip = c.commit_file("dep.txt", "version=2\n", "local update")
+    c.repo.set_bookmark(bookmark="main", revision=tip)
+    observed: dict[str, object] = {}
+
+    def sender_advance() -> None:
+        observed["attempt_index"] = len(c.attempts) if c.attempts is not None else None
+        observed["command_index"] = len(c.commands) if c.commands is not None else None
+        moved = c.commit_file("dep.txt", "version=3\n", "concurrent local update")
+        c.repo.set_bookmark(bookmark="main", revision=moved)
+        observed["main"] = moved
+        observed["change"] = c.repo.change_id()
+
+    c.after_push(sender_advance)
+    with pytest.raises(RevisionError, match="match"):
+        sync_main(repo=c.repo)
+    assert c.repo.resolve_revision(revision="main") == observed["main"]
+    assert c.repo.resolve_revision(revision="main@origin") == tip
+    assert c.repo.change_id() == observed["change"]
+    if c.attempts is not None:
+        attempt_index = observed["attempt_index"]
+        assert isinstance(attempt_index, int)
+        assert not any(
+            call.method in {"rebase_working_copy", "new_change"}
+            for call in c.attempts[attempt_index:]
+        )
+    if c.commands is not None:
+        command_index = observed["command_index"]
+        assert isinstance(command_index, int)
+        assert not any(
+            command[:2] in {("jj", "rebase"), ("jj", "new")}
+            for command in c.commands[command_index:]
+        )
+
+
+def test_sync_fetch_failure_after_push_prevents_refresh(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    tip = state.seed_commit(
+        path,
+        parent=repo.resolve_revision(revision="main"),
+        files={"dep.txt": "version=2\n"},
+        description="local advance",
+    )
+    state.seed_bookmark(path, bookmark="main", targets=(tip,))
+    state.clear_calls()
+    state.fail(
+        "fetch", ordinal=2, error=RevisionError("second fetch failed"), path=path
+    )
+
+    with pytest.raises(RevisionError, match="second fetch failed"):
+        sync_main(repo=repo)
+
+    assert any(call.method == "push_bookmark" for call in state.effects)
+    assert not any(
+        call.method in {"rebase_working_copy", "new_change"} for call in state.attempts
+    )
+
+
+def test_sync_refuses_divergent_main_without_refresh(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    local = c.commit_file("dep.txt", "local\n", "local advance")
+    c.repo.set_bookmark(bookmark="main", revision=local)
+    c.origin_peer.repo.rebase_working_copy(revision="main")
+    c.origin_peer.commit_file("dep.txt", "remote\n", "remote advance")
+    c.origin_peer.push_main()
+    change_before = c.repo.change_id()
+
+    with pytest.raises(RevisionError):
+        sync_main(repo=c.repo)
+    assert c.repo.change_id() == change_before
+
+
+def test_sync_refuses_preexisting_conflicted_main_without_refresh(
+    tmp_path: Path,
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    base = repo.resolve_revision(revision="main")
+    sibling = state.seed_commit(
+        path,
+        parent=base,
+        files={"dep.txt": "sibling\n"},
+        description="sibling",
+    )
+    state.seed_bookmark(path, bookmark="main", targets=(base, sibling))
+    state.clear_calls()
+
+    with pytest.raises(RevisionError, match="conflicted"):
+        sync_main(repo=repo)
+    assert not any(
+        call.method in {"rebase_working_copy", "new_change"} for call in state.attempts
+    )
+
+
+def test_refresh_empty_change_preserves_change_identity(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    old_change = c.repo.change_id()
+    c.track_main(False)
+    c.origin_peer.repo.rebase_working_copy(revision="main")
+    c.origin_peer.commit_file("dep.txt", "version=2\n", "peer advance")
+    c.origin_peer.push_main()
+    c.repo.fetch(main_only=True)
+    c.repo.set_bookmark(bookmark="main", revision="main@origin")
+
+    refresh_working_copy_from_main(repo=c.repo)
+
+    assert c.repo.change_id() == old_change
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
+
+
+@pytest.mark.parametrize("protected_state", ["dirty", "described", "bookmarked"])
+def test_refresh_protected_change_starts_new_child_and_preserves_old_content(
+    repository_case: RepositoryCase, protected_state: str
+) -> None:
+    c = repository_case
+    expected_old_content = "version=1\n"
+    if protected_state == "dirty":
+        expected_old_content = "local dirty\n"
+        c.write_file("dep.txt", expected_old_content)
+    elif protected_state == "described":
+        c.describe("work in progress")
+    else:
+        c.repo.set_bookmark(bookmark="feature/current", revision="@")
+    old = c.repo.resolve_revision(revision="@")
+    c.track_main(False)
+    c.origin_peer.repo.rebase_working_copy(revision="main")
+    c.origin_peer.commit_file("dep.txt", "version=2\n", "peer advance")
+    c.origin_peer.push_main()
+    c.repo.fetch(main_only=True)
+    c.repo.set_bookmark(bookmark="main", revision="main@origin")
+
+    refresh_working_copy_from_main(repo=c.repo)
+
+    assert c.repo.resolve_revision(revision="@-") == c.repo.resolve_revision(
+        revision="main"
+    )
+    assert c.repo.revision_file(revision=old, filename="dep.txt").is_regular is True
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
+    with c.repo.temporary_workspace(revision=old) as preserved:
+        assert (preserved.path / "dep.txt").read_text(
+            encoding="utf-8"
+        ) == expected_old_content
+
+
+def test_refresh_inspection_failure_has_no_mutation(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    state.clear_calls()
+    state.fail(
+        "working_copy_state", error=RevisionError("inspection failed"), path=path
+    )
+
+    with pytest.raises(RevisionError, match="inspection failed"):
+        refresh_working_copy_from_main(repo=repo)
+    assert not any(
+        call.method in {"rebase_working_copy", "new_change"} for call in state.attempts
+    )
+
+
+@pytest.mark.parametrize("failed_listing", ["merged", "closed", "local"])
+def test_prune_finishes_all_listings_before_deletion(
+    tmp_path: Path, failed_listing: str
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / failed_listing
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    base = repo.resolve_revision(revision="main")
+    state.seed_bookmark(path, bookmark=MANAGED, targets=(base,))
+    host = state.code_host(path)
+    host.seed_pr(bookmark=MANAGED, state="merged")
+    state.clear_calls()
+    if failed_listing == "merged":
+        host.fail("pr_bookmarks", ordinal=1, error=CodeHostError("merged failed"))
+    elif failed_listing == "closed":
+        host.fail("pr_bookmarks", ordinal=2, error=CodeHostError("closed failed"))
+    else:
+        state.fail("local_bookmarks", error=RevisionError("local failed"), path=path)
+
+    with pytest.raises((CodeHostError, RevisionError)):
+        prune_stale_bookmarks(repo=repo, host=host)
+    assert not any(call.method == "delete_bookmark" for call in state.attempts)
+
+
+def test_prune_deletes_sorted_managed_intersection_and_stops_on_failure(
+    tmp_path: Path,
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    base = repo.resolve_revision(revision="main")
+    stale = [
+        "mm/resolve-dependencies-b",
+        "mm/update-dependencies-a",
+        "mm/update-dependencies-c",
+    ]
+    for bookmark in [*stale, "feature/unrelated"]:
+        state.seed_bookmark(path, bookmark=bookmark, targets=(base,))
+    host = state.code_host(path)
+    for bookmark in stale:
+        host.seed_pr(bookmark=bookmark, state="closed")
+    host.seed_pr(bookmark="feature/unrelated", state="closed")
+    state.clear_calls()
+    state.fail(
+        "delete_bookmark", ordinal=2, error=RevisionError("delete failed"), path=path
+    )
+
+    with pytest.raises(RevisionError, match="delete failed"):
+        prune_stale_bookmarks(repo=repo, host=host)
+
+    ordered = sorted(stale)
+    assert repo.bookmark_exists(bookmark=ordered[0]) is False
+    assert repo.bookmark_exists(bookmark=ordered[1]) is True
+    assert repo.bookmark_exists(bookmark=ordered[2]) is True
+    assert repo.bookmark_exists(bookmark="feature/unrelated") is True
+    delete_attempts = [
+        call for call in state.attempts if call.method == "delete_bookmark"
+    ]
+    assert [dict(call.arguments)["bookmark"] for call in delete_attempts] == ordered[:2]
+
+
+def _submission_case(tmp_path: Path):
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    base = repo.resolve_revision(revision="main")
+    tip = state.seed_commit(
+        path,
+        parent=base,
+        files={"dep.txt": "version=2\n"},
+        description="update",
+    )
+    state.seed_bookmark(path, bookmark=MANAGED, targets=(tip,))
+    state.clear_calls()
+    return state, repo, state.code_host(path), ExpectedRevisions(base, tip)
+
+
+def test_submission_push_failure_never_calls_host(tmp_path: Path) -> None:
+    state, repo, host, expected = _submission_case(tmp_path)
+    state.fail("push_bookmark", error=RevisionError("push failed"), path=repo.path)
+
+    with pytest.raises(RevisionError, match="push failed"):
+        push_bookmark_and_create_pr(
+            repo=repo, host=host, bookmark=MANAGED, expected=expected
+        )
+    assert host.attempts == []
+
+
+def test_submission_postcheck_failure_retains_push_and_never_calls_host(
+    tmp_path: Path,
+) -> None:
+    state, repo, host, expected = _submission_case(tmp_path)
+    state.hook(
+        "push_bookmark",
+        phase="postcheck",
+        path=repo.path,
+        action=lambda: state.seed_bookmark(
+            repo.path, bookmark="main", targets=(expected.tip,)
+        ),
+    )
+
+    with pytest.raises(RevisionError, match="changed"):
+        push_bookmark_and_create_pr(
+            repo=repo, host=host, bookmark=MANAGED, expected=expected
+        )
+    assert any(call.method == "push_bookmark" for call in state.effects)
+    assert host.attempts == []
+
+
+def test_submission_host_failure_retains_push_and_retry_succeeds(
+    tmp_path: Path,
+) -> None:
+    state, repo, host, expected = _submission_case(tmp_path)
+    host.fail("create_pr", error=CodeHostError("host unavailable"))
+
+    with pytest.raises(CodeHostError, match="host unavailable"):
+        push_bookmark_and_create_pr(
+            repo=repo, host=host, bookmark=MANAGED, expected=expected
+        )
+    assert any(call.method == "push_bookmark" for call in state.effects)
+    assert (
+        push_bookmark_and_create_pr(
+            repo=repo, host=host, bookmark=MANAGED, expected=expected
+        )
+        == "PR #1"
+    )
+    assert (
+        push_bookmark_and_create_pr(
+            repo=repo, host=host, bookmark=MANAGED, expected=expected
+        )
+        == f"PR already exists for {MANAGED}"
+    )
+
+
+def test_workspace_policy_creates_and_removes_registered_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / ".mm")
+    state = FakeJjState()
+    repo = state.seed_repository(tmp_path / "source", files={"dep.txt": "v1\n"})
+
+    created = create_workspace(repo=repo, project="owner/project", revision="main")
+    assert created == tmp_path / ".mm" / "workspaces" / "owner_project"
+    assert "mm-owner_project" in repo.workspace_names()
+
+    remove_workspace(repo=repo, project="owner/project")
+    assert not created.exists()
+    assert "mm-owner_project" not in repo.workspace_names()
+
+
+def test_workspace_removal_absence_is_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / ".mm")
+    state = FakeJjState()
+    repo = state.seed_repository(tmp_path / "source", files={"dep.txt": "v1\n"})
+    state.clear_calls()
+
+    remove_workspace(repo=repo, project="missing")
+
+    assert not any(call.method == "forget_workspace" for call in state.attempts)
+
+
+def test_workspace_removal_deletes_known_unregistered_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / ".mm")
+    state = FakeJjState()
+    repo = state.seed_repository(tmp_path / "source", files={"dep.txt": "v1\n"})
+    workspace = paths.workspaces_dir() / "recovery"
+    workspace.mkdir(parents=True)
+    (workspace / "keep.txt").write_text("obsolete", encoding="utf-8")
+
+    remove_workspace(repo=repo, project="recovery")
+
+    assert not workspace.exists()
+    assert not any(call.method == "forget_workspace" for call in state.attempts)
+
+
+def test_workspace_removal_rejects_final_symlink_and_preserves_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / ".mm")
+    state = FakeJjState()
+    repo = state.seed_repository(tmp_path / "source", files={"dep.txt": "v1\n"})
+    root = paths.workspaces_dir()
+    sibling = root / "project-b"
+    sibling.mkdir(parents=True)
+    keep = sibling / "keep.txt"
+    keep.write_text("recovery", encoding="utf-8")
+    (root / "project-a").symlink_to(sibling, target_is_directory=True)
+
+    with pytest.raises(RevisionError, match="symlink"):
+        remove_workspace(repo=repo, project="project-a")
+
+    assert keep.read_text(encoding="utf-8") == "recovery"
+    assert sibling.is_dir()
+    assert (root / "project-a").is_symlink()
+
+
+def test_workspace_path_computation_failure_is_typed_with_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / ".mm")
+    state = FakeJjState()
+    repo = state.seed_repository(tmp_path / "source", files={"dep.txt": "v1\n"})
+    failure = OSError("path resolution failed")
+
+    def fail_path(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(paths, "project_file", fail_path)
+
+    with pytest.raises(RevisionError, match="workspace path") as caught:
+        create_workspace(repo=repo, project="project-a", revision="main")
+    assert caught.value.__cause__ is failure
+
+
+def test_workspace_listing_failure_preserves_unregistered_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / ".mm")
+    state = FakeJjState()
+    source = tmp_path / "source"
+    repo = state.seed_repository(source, files={"dep.txt": "v1\n"})
+    recovery = paths.workspaces_dir() / "recovery"
+    recovery.mkdir(parents=True)
+    (recovery / "keep.txt").write_text("recovery", encoding="utf-8")
+    state.fail("workspace_names", error=RevisionError("inspection failed"), path=source)
+
+    with pytest.raises(RevisionError, match="inspection failed"):
+        remove_workspace(repo=repo, project="recovery")
+    assert (recovery / "keep.txt").read_text(encoding="utf-8") == "recovery"
+
+
+def test_workspace_forget_failure_preserves_registered_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / ".mm")
+    state = FakeJjState()
+    source = tmp_path / "source"
+    repo = state.seed_repository(source, files={"dep.txt": "v1\n"})
+    workspace = create_workspace(repo=repo, project="recovery", revision="main")
+    (workspace / "keep.txt").write_text("recovery", encoding="utf-8")
+    state.fail("forget_workspace", error=RevisionError("forget failed"), path=source)
+
+    with pytest.raises(RevisionError, match="forget failed"):
+        remove_workspace(repo=repo, project="recovery")
+    assert (workspace / "keep.txt").read_text(encoding="utf-8") == "recovery"
+
+
+def test_current_label_uses_current_then_parent_then_change_and_normalizes_failure(
+    tmp_path: Path,
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "v1\n"})
+    repo.set_bookmark(bookmark="current", revision="@")
+    assert current_label(repo=repo) == "current"
+    repo.delete_bookmark(bookmark="current")
+    assert current_label(repo=repo) == "main"
+    repo.delete_bookmark(bookmark="main")
+    assert current_label(repo=repo) == f"@ {repo.change_id()}"
+    state.fail("revision_bookmarks", error=RevisionError("lookup failed"), path=path)
+    assert current_label(repo=repo) == "unknown"
 
 
 @pytest.mark.integration
