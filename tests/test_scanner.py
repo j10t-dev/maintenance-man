@@ -717,6 +717,21 @@ def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
     monkeypatch.setattr("maintenance_man.scanner.subprocess.run", _run)
 
 
+def test_gradle_scan_unreadable_bom_is_gradle_error(gradle_project, monkeypatch):
+    from maintenance_man.scanner import _run_gradle_scan
+
+    @contextmanager
+    def _generate(_project):
+        yield (
+            Path(gradle_project.path) / "missing-bom.json",
+            _gradle_resolution_fixture(),
+        )
+
+    monkeypatch.setattr("maintenance_man.scanner.generate_gradle_report", _generate)
+    with pytest.raises(GradleError, match="Could not capture Gradle resolution"):
+        _run_gradle_scan(gradle_project)
+
+
 def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
     gradle_project, monkeypatch
 ):

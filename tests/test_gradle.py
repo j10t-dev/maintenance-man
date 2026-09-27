@@ -613,6 +613,16 @@ class TestGradleReportInventory:
 
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
+    def test_caller_exception_propagates_unchanged(self, gradle_project, monkeypatch):
+        monkeypatch.setattr(
+            "maintenance_man.gradle_resolution.run_gradle", fixture_runner
+        )
+        error = OSError("caller failure")
+        with pytest.raises(OSError) as caught, generate_gradle_report(gradle_project):
+            raise error
+        assert caught.value is error
+        assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
+
 
 class TestValidateInventory:
     @pytest.mark.parametrize(

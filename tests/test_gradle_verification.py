@@ -439,6 +439,22 @@ def test_capture_reads_before_cleanup_and_never_discovers(
     assert not bom.exists()
 
 
+def test_capture_unreadable_bom_is_gradle_error(
+    frozen_context, resolution, monkeypatch
+):
+    project, context, _ = frozen_context
+
+    @contextmanager
+    def report(_project):
+        yield project.path / "missing-bom.json", resolution
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", report)
+    with pytest.raises(
+        scanner.GradleError, match="Could not capture Gradle resolution"
+    ):
+        scanner.capture_gradle_snapshot(project, context)
+
+
 @pytest.fixture
 def workflow(frozen_context, resolution, candidate, scope, monkeypatch, tmp_path):
     project, context, _ = frozen_context

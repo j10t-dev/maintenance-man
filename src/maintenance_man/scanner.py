@@ -160,7 +160,7 @@ def _run_gradle_scan(
             raise GradleError(
                 "Incomplete Gradle resolution: " + "; ".join(outcome.reasons)
             )
-        modules = _inventory_modules(bom.read_bytes(), outcome.report)
+        modules = _inventory_modules(_read_inventory(bom), outcome.report)
         module_scopes = _resolution_module_scopes(outcome.report)
         coverage_errors = _inventory_coverage_errors(modules, module_scopes)
         if coverage_errors:
@@ -559,6 +559,13 @@ def _inventory_coverage_errors(
     )
 
 
+def _read_inventory(bom: Path) -> bytes:
+    try:
+        return bom.read_bytes()
+    except OSError as exc:
+        raise GradleError(f"Could not capture Gradle resolution: {exc}") from exc
+
+
 def capture_gradle_snapshot(
     project: ProjectConfig, context: ComparisonContext
 ) -> GradleSnapshot | IncompleteResolution:
@@ -577,7 +584,7 @@ def capture_gradle_snapshot(
             return IncompleteResolution(
                 report=report, reasons=("selected scopes or producer versions changed",)
             )
-        inventory = bom.read_bytes()
+        inventory = _read_inventory(bom)
         modules = _inventory_modules(inventory, report)
         scopes = _resolution_module_scopes(report)
         coverage_errors = _inventory_coverage_errors(modules, scopes)

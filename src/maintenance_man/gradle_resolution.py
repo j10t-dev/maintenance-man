@@ -155,9 +155,9 @@ def generate_gradle_report(
             ).hexdigest()
             if before != after or outcome.report.catalogue_digest != before:
                 raise GradleError("Catalogue changed during report generation")
-            yield bom, outcome
         except (OSError, UnicodeError) as exc:
             raise GradleError(f"Could not capture Gradle resolution: {exc}") from exc
+        yield bom, outcome
 
 
 def collect_gradle_resolution(
