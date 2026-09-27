@@ -258,6 +258,32 @@ class TestUvOutdated:
         ):
             uv_outdated(project)
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            '{"name": "a"}',
+            '"text"',
+            "[1]",
+            '[{"version": "1.0", "latest_version": "2.0"}]',
+            '[{"name": "a", "version": 1, "latest_version": "2.0"}]',
+            '[{"name": "a", "version": "1.0"}]',
+        ],
+    )
+    def test_uv_outdated_rejects_wrongly_shaped_output(
+        self, tmp_path, monkeypatch, payload
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: {"a"}
+        )
+        monkeypatch.setattr(
+            "maintenance_man.process.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                cmd, 0, payload if cmd[1] == "pip" else "", ""
+            ),
+        )
+        with pytest.raises(OutdatedCheckError, match="Unexpected uv output"):
+            uv_outdated(ProjectConfig(path=tmp_path, package_manager="uv"))
+
     def test_excludes_transitive_deps(self, tmp_path):
         """uv_outdated should only return direct dependencies from pyproject.toml."""
         pyproject = tmp_path / "pyproject.toml"

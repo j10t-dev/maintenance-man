@@ -58,9 +58,10 @@ from maintenance_man.models.scan import (
     highest_fix_version,
     sort_vulns_by_severity,
 )
+from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.scanner import (
+    ScanError,
     TrivyNotFoundError,
-    TrivyScanError,
     check_trivy_available,
     scan_project,
 )
@@ -107,6 +108,14 @@ from maintenance_man.vcs import (
     revision_file,
     sync_main,
     workspace_path_for_project,
+)
+
+# Errors that fail one project's scan without stopping a batch.
+_SCAN_ERRORS: tuple[type[Exception], ...] = (
+    ScanError,
+    GradleError,
+    RevisionError,
+    OutdatedCheckError,
 )
 
 
@@ -205,7 +214,7 @@ def scan(
         proj_config = _resolve_proj(cfg, project)
         try:
             result = _scan_one(project, proj_config, cfg.defaults.min_version_age_days)
-        except (TrivyScanError, GradleError) as e:
+        except _SCAN_ERRORS as e:
             _fatal(str(e))
 
         sys.exit(
@@ -215,7 +224,7 @@ def scan(
     # Scan all projects
     has_vulns = False
     has_updates = False
-    had_gradle_error = False
+    had_error = False
     for name, proj_config in cfg.projects.items():
         if not proj_config.path.exists():
             console.print(
@@ -225,15 +234,15 @@ def scan(
             continue
         try:
             result = _scan_one(name, proj_config, cfg.defaults.min_version_age_days)
-        except (TrivyScanError, GradleError) as e:
+        except _SCAN_ERRORS as e:
             console.print(f"[bold red]Error:[/] {name} — {e}")
-            had_gradle_error |= proj_config.package_manager == "gradle"
+            had_error = True
             continue
 
         has_vulns |= _scan_has_vulns(result, proj_config)
         has_updates |= result.has_updates
 
-    if had_gradle_error:
+    if had_error:
         sys.exit(ExitCode.ERROR)
     sys.exit(_scan_exit_code(has_vulns, has_updates))
 

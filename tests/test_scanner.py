@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,7 +26,9 @@ from maintenance_man.models.scan import (
     Severity,
     UpdateFinding,
 )
+from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.scanner import (
+    ScanError,
     TrivyNotFoundError,
     _parse_uv_audit_vulns,
     check_trivy_available,
@@ -63,6 +65,79 @@ def test_scan_project_replaces_results_symlink(mm_home, tmp_path, monkeypatch):
     scanner.scan_project("demo", project)
     assert not (results / "demo.json").is_symlink()
     assert outside.read_text() == "keep"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OutdatedCheckError("uv sync --locked failed (exit 1): lock mismatch"),
+        RuntimeError("bug"),
+    ],
+)
+@pytest.mark.parametrize("previous", [b"previous result bytes", None])
+def test_outdated_failure_fails_the_scan_and_keeps_the_saved_result(
+    mm_home, tmp_path, monkeypatch, error, previous
+):
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
+    monkeypatch.setattr(scanner, "get_outdated", MagicMock(side_effect=error))
+    results = mm_home / "scan-results"
+    results.mkdir(parents=True)
+    if previous is not None:
+        (results / "demo.json").write_bytes(previous)
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+    with pytest.raises(type(error)):
+        scanner.scan_project("demo", project)
+    if previous is None:
+        assert not (results / "demo.json").exists()
+    else:
+        assert (results / "demo.json").read_bytes() == previous
+
+
+def test_uv_audit_runs_isolated_and_accepts_findings_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 1, "", "")
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    assert scanner._run_uv_audit(tmp_path) == []
+    ((cmd, kwargs),) = calls
+    assert cmd == ["uv", "audit", "--locked"]
+    assert kwargs["timeout"] == 300
+    assert "VIRTUAL_ENV" not in kwargs["env"]
+
+
+@pytest.mark.parametrize(
+    "scan, match",
+    [
+        (lambda path: scanner._run_uv_audit(path), "uv audit"),
+        (lambda path: scanner._run_trivy_scan(path, scan_secrets=False), "Trivy"),
+    ],
+)
+@pytest.mark.parametrize(
+    "raised",
+    [
+        FileNotFoundError(2, "No such file or directory", "tool"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_scanner_execution_failure_is_a_scan_error(
+    tmp_path, monkeypatch, scan, match, raised
+):
+    def run(cmd, **kwargs):
+        raise raised
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    with pytest.raises(ScanError, match=match):
+        scan(tmp_path)
+
+
+def test_stale_comparison_context_is_a_gradle_error(gradle_project, monkeypatch):
+    monkeypatch.setattr(scanner, "context_inputs_valid", lambda *args: False)
+    with pytest.raises(GradleError, match="Comparison context expired"):
+        scanner.capture_gradle_snapshot(gradle_project, MagicMock())
 
 
 def _make_project(
@@ -235,7 +310,7 @@ class TestScanProjectWithUpdates:
             stderr="",
         )
         with (
-            patch("maintenance_man.scanner.subprocess.run", return_value=audit),
+            patch("maintenance_man.process.subprocess.run", return_value=audit),
             patch("maintenance_man.scanner.get_outdated", return_value=fake_updates),
             patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
         ):
@@ -246,18 +321,6 @@ class TestScanProjectWithUpdates:
         assert "cryptography" in vuln_pkg_names
         assert "cryptography" not in update_pkg_names
         assert "brand-new-pkg" in update_pkg_names
-
-    def test_scan_outdated_failure_does_not_crash(self, scan_results_dir: Path):
-        """If the outdated check fails, scan still returns Trivy results."""
-        project = _make_project(FIXTURES_DIR / "clean-project")
-        with patch(
-            "maintenance_man.scanner.get_outdated",
-            side_effect=Exception("bun not found"),
-        ):
-            result = scan_project("clean", project)
-
-        assert isinstance(result, ScanResult)
-        assert result.updates == []
 
     def test_scan_passes_min_version_age_days(self, scan_results_dir: Path):
         """min_version_age_days parameter is forwarded to filter_by_age."""
@@ -282,7 +345,7 @@ class TestUvNativeScan:
         )
 
         with (
-            patch("maintenance_man.scanner.subprocess.run", return_value=audit) as run,
+            patch("maintenance_man.process.subprocess.run", return_value=audit) as run,
             patch("maintenance_man.scanner.get_outdated", return_value=[]),
         ):
             result = scan_project("test-proj", project)
@@ -323,7 +386,7 @@ class TestUvNativeScan:
 
         with (
             patch(
-                "maintenance_man.scanner.subprocess.run", side_effect=[audit, trivy]
+                "maintenance_man.process.subprocess.run", side_effect=[audit, trivy]
             ) as run,
             patch("maintenance_man.scanner.get_outdated", return_value=[]),
         ):
@@ -351,7 +414,7 @@ class TestRunTrivyScanSkipDirs:
         )
         with (
             patch(
-                "maintenance_man.scanner.subprocess.run",
+                "maintenance_man.process.subprocess.run",
                 return_value=fake_result,
             ) as mock_run,
             patch("maintenance_man.scanner.get_outdated", return_value=[]),
@@ -372,7 +435,7 @@ class TestRunTrivyScanSkipDirs:
         )
         with (
             patch(
-                "maintenance_man.scanner.subprocess.run",
+                "maintenance_man.process.subprocess.run",
                 return_value=fake_result,
             ) as mock_run,
             patch("maintenance_man.scanner.get_outdated", return_value=[]),
@@ -714,7 +777,7 @@ def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
         assert cmd[:5] == ["trivy", "sbom", "--format", "json", "--scanners"]
         return subprocess.CompletedProcess(cmd, returncode, stdout=payload, stderr="")
 
-    monkeypatch.setattr("maintenance_man.scanner.subprocess.run", _run)
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", _run)
 
 
 def test_gradle_scan_unreadable_bom_is_gradle_error(gradle_project, monkeypatch):
@@ -973,14 +1036,14 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
 def test_gradle_trivy_malformed_shape_is_scan_error(
     gradle_project, monkeypatch, payload
 ):
-    from maintenance_man.scanner import TrivyScanError, _run_gradle_scan
+    from maintenance_man.scanner import ScanError, _run_gradle_scan
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
     _trivy_sbom(monkeypatch, stdout=json.dumps(payload))
-    with pytest.raises(TrivyScanError, match="Trivy"):
+    with pytest.raises(ScanError, match="Trivy"):
         _run_gradle_scan(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
@@ -996,7 +1059,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
 def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
     gradle_project, monkeypatch, failure
 ):
-    from maintenance_man.scanner import TrivyScanError, _run_gradle_scan
+    from maintenance_man.scanner import ScanError, _run_gradle_scan
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -1007,7 +1070,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
         raise failure
 
     monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(TrivyScanError, match="Trivy"):
+    with pytest.raises(ScanError, match="Trivy"):
         _run_gradle_scan(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
@@ -1032,7 +1095,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
     ],
 )
 def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, value):
-    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+    from maintenance_man.scanner import ScanError, _parse_gradle_trivy_output
 
     row = {
         "VulnerabilityID": "CVE-example",
@@ -1040,7 +1103,7 @@ def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, 
         "InstalledVersion": "1",
     }
     row[field] = value
-    with pytest.raises(TrivyScanError, match=field):
+    with pytest.raises(ScanError, match=field):
         _parse_gradle_trivy_output(
             json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
         )
@@ -1048,7 +1111,7 @@ def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, 
 
 @pytest.mark.parametrize("field", ["VulnerabilityID", "PkgName", "InstalledVersion"])
 def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
-    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+    from maintenance_man.scanner import ScanError, _parse_gradle_trivy_output
 
     row = {
         "VulnerabilityID": "CVE-example",
@@ -1056,7 +1119,7 @@ def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
         "InstalledVersion": "1",
     }
     del row[field]
-    with pytest.raises(TrivyScanError, match=field):
+    with pytest.raises(ScanError, match=field):
         _parse_gradle_trivy_output(
             json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
         )
@@ -1072,9 +1135,9 @@ def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
     ],
 )
 def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
-    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+    from maintenance_man.scanner import ScanError, _parse_gradle_trivy_output
 
-    with pytest.raises(TrivyScanError):
+    with pytest.raises(ScanError):
         _parse_gradle_trivy_output(json.dumps({"Results": [result]}))
 
 

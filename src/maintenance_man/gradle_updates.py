@@ -60,7 +60,7 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     Workflow,
 )
-from maintenance_man.scanner import TrivyScanError, capture_gradle_snapshot
+from maintenance_man.scanner import ScanError, capture_gradle_snapshot
 from maintenance_man.storage import atomic_write_text
 from maintenance_man.updater import run_test_phases
 from maintenance_man.vcs import (
@@ -377,7 +377,7 @@ def process_gradle_run(
             run = verify_applied_gradle_attempt(
                 run, candidate, project, publication, minimum_age_days
             )
-        except (GradleError, TrivyScanError, RevisionError) as exc:
+        except (GradleError, ScanError, RevisionError) as exc:
             # Read latest pre-effect intent to retain commit-crash evidence.
             latest = load_gradle_run(gradle_run_path(run.project))
             if latest is not None:
@@ -790,7 +790,7 @@ def continue_gradle_resolve(
             minimum_age_days,
             committed_revision=repaired_commit,
         )
-    except (GradleError, TrivyScanError, RevisionError) as exc:
+    except (GradleError, ScanError, RevisionError) as exc:
         latest = load_gradle_run(gradle_run_path(run.project)) or run
         state = next(
             item

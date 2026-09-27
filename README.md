@@ -36,6 +36,8 @@ mm update -n api worker   # batch update all except api and worker
 mm update api -n worker   # same exclusion mode; flag position does not matter
 ```
 
+`mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed.
+
 ```bash
 ➜  maintenance-man git:(main) ✗ mm --help
 Usage: mm COMMAND

@@ -424,7 +424,7 @@ def test_capture_reads_before_cleanup_and_never_discovers(
             "",
         )
 
-    monkeypatch.setattr(scanner.subprocess, "run", trivy)
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", trivy)
     result = scanner.capture_gradle_snapshot(project, context)
     if expected == "incomplete":
         assert isinstance(result, IncompleteResolution)
@@ -992,7 +992,7 @@ def driver(workflow, resolution, monkeypatch, tmp_path):
     monkeypatch.setattr(workflow_service, "prune_stale_bookmarks", lambda *args: True)
     monkeypatch.setattr(workflow_service, "ensure_main_bookmark", lambda *args: True)
     monkeypatch.setattr(
-        cli, "_gradle_workspace_revision", lambda name, project, revision: revision
+        cli, "_gradle_workspace_revision", lambda _name, _project, revision: revision
     )
     monkeypatch.setattr(
         workflow_service, "workspace_path_for_project", lambda *args: project.path
@@ -2250,8 +2250,7 @@ def test_snapshot_checks_local_project_provenance(
         else []
     )
     monkeypatch.setattr(
-        scanner.subprocess,
-        "run",
+        "maintenance_man.process.subprocess.run",
         lambda command, **kwargs: subprocess.CompletedProcess(
             command,
             0,
@@ -2476,7 +2475,7 @@ def test_snapshot_refuses_inventory_missing_a_resolved_module(
         scans.append(command)
         return subprocess.CompletedProcess(command, 0, '{"Results": []}', "")
 
-    monkeypatch.setattr(scanner.subprocess, "run", scan)
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", scan)
     result = scanner.capture_gradle_snapshot(project, context)
     assert isinstance(result, IncompleteResolution)
     assert any("inventory" in reason and "lib" in reason for reason in result.reasons)

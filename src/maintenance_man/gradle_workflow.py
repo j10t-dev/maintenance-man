@@ -51,7 +51,7 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.scanner import (
-    TrivyScanError,
+    ScanError,
     _run_gradle_scan,
     _run_trivy_secret_scan,
 )
@@ -572,7 +572,7 @@ def run_gradle_flow(
         return ExitCode.OK
     except (
         GradleError,
-        TrivyScanError,
+        ScanError,
         _UpdateSetupError,
         BookmarkLookupError,
         RevisionError,

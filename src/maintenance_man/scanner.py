@@ -4,7 +4,6 @@ import json
 import logging
 import re
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -47,6 +46,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.outdated import get_outdated
+from maintenance_man.process import run_captured
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import revision_tree_id
 
@@ -55,8 +55,8 @@ class TrivyNotFoundError(Exception):
     pass
 
 
-class TrivyScanError(Exception):
-    pass
+class ScanError(Exception):
+    """Trivy and uv audit execution and response errors."""
 
 
 def scan_project(
@@ -67,7 +67,7 @@ def scan_project(
     Also writes the results JSON to ~/.mm/scan-results/<name>.json.
 
     Raises:
-        TrivyScanError: If trivy exits with non-zero status.
+        ScanError: If trivy exits with non-zero status.
         FileNotFoundError: If the project path does not exist.
     """
     project_path = Path(project.path)
@@ -81,7 +81,7 @@ def scan_project(
             if project.scan_secrets
             else []
         )
-        updates = _check_outdated(name, project, vulns, min_version_age_days)
+        updates = _check_outdated(project, vulns, min_version_age_days)
     elif project.package_manager == "gradle":
         vulns, resolution = _run_gradle_scan(project)
         updates = get_outdated(project)
@@ -98,7 +98,7 @@ def scan_project(
         vulns, secrets = _run_trivy_scan(
             project_path, project.scan_secrets, project.scan_skip_dirs
         )
-        updates = _check_outdated(name, project, vulns, min_version_age_days)
+        updates = _check_outdated(project, vulns, min_version_age_days)
 
     scan_result = ScanResult(
         project=name,
@@ -126,29 +126,20 @@ def check_trivy_available() -> None:
 
 
 def _check_outdated(
-    name: str,
     project: ProjectConfig,
     vulns: list[VulnFinding],
     min_version_age_days: int,
 ) -> list[UpdateFinding]:
     """Run non-Gradle outdated checks and return de-duplicated findings."""
-    try:
-        raw_updates = get_outdated(project)
-        aged_updates = filter_by_age(
-            raw_updates,
-            manager=project.package_manager,
-            min_age_days=min_version_age_days,
-            project_path=project.path,
-        )
-        vuln_pkgs = {v.pkg_name for v in vulns}
-        return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "Outdated check failed for %s — skipping update results",
-            name,
-            exc_info=True,
-        )
-        return []
+    raw_updates = get_outdated(project)
+    aged_updates = filter_by_age(
+        raw_updates,
+        manager=project.package_manager,
+        min_age_days=min_version_age_days,
+        project_path=project.path,
+    )
+    vuln_pkgs = {v.pkg_name for v in vulns}
+    return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
 
 
 def _run_gradle_scan(
@@ -168,24 +159,13 @@ def _run_gradle_scan(
                 "Incomplete Gradle inventory: " + "; ".join(coverage_errors)
             )
         cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
-        try:
-            completed = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=project.path,
-                timeout=300,
-            )
-        except subprocess.TimeoutExpired as e:
-            raise TrivyScanError(f"Trivy timed out scanning {bom}") from e
-        except (OSError, UnicodeDecodeError) as e:
-            raise TrivyScanError(f"Could not run Trivy SBOM scan of {bom}: {e}") from e
-
-        if completed.returncode != 0:
-            raise TrivyScanError(
-                f"Trivy exited with code {completed.returncode}: "
-                f"{completed.stderr.strip()}"
-            )
+        completed = run_captured(
+            cmd,
+            project.path,
+            timeout=300,
+            label="Trivy SBOM scan",
+            error=ScanError,
+        )
         findings = _parse_gradle_trivy_output(completed.stdout)
         scoped = {
             (module.coordinate, module.version): {
@@ -214,77 +194,65 @@ def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
     try:
         output: object = json.loads(payload)
     except json.JSONDecodeError as e:
-        raise TrivyScanError(f"Failed to parse Trivy SBOM output: {e}") from e
+        raise ScanError(f"Failed to parse Trivy SBOM output: {e}") from e
     if not _is_trivy_object(output):
-        raise TrivyScanError("Malformed Trivy SBOM output: expected an object")
+        raise ScanError("Malformed Trivy SBOM output: expected an object")
     results = output.get("Results", [])
     if not isinstance(results, list):
-        raise TrivyScanError("Malformed Trivy SBOM Results: expected an array")
+        raise ScanError("Malformed Trivy SBOM Results: expected an array")
     validated_results: list[dict[str, object]] = []
     for index, result in enumerate(results):
         label = f"Trivy SBOM Results[{index}]"
         if not _is_trivy_object(result):
-            raise TrivyScanError(f"Malformed {label}: expected an object")
+            raise ScanError(f"Malformed {label}: expected an object")
         validated_results.append(result)
         if "Class" in result and not isinstance(result["Class"], str):
-            raise TrivyScanError(f"Malformed {label}.Class: expected a string")
+            raise ScanError(f"Malformed {label}.Class: expected a string")
         vulnerabilities = result.get("Vulnerabilities")
         if vulnerabilities is None:
             continue
         if not isinstance(vulnerabilities, list):
-            raise TrivyScanError(
-                f"Malformed {label}.Vulnerabilities: expected an array"
-            )
+            raise ScanError(f"Malformed {label}.Vulnerabilities: expected an array")
         for row_index, row in enumerate(vulnerabilities):
             row_label = f"{label}.Vulnerabilities[{row_index}]"
             if not _is_trivy_object(row):
-                raise TrivyScanError(f"Malformed {row_label}: expected an object")
+                raise ScanError(f"Malformed {row_label}: expected an object")
             if result.get("Class") != "lang-pkgs":
                 continue
             for field in ("VulnerabilityID", "PkgName", "InstalledVersion"):
                 if not isinstance(row.get(field), str) or not row[field]:
-                    raise TrivyScanError(
+                    raise ScanError(
                         f"Malformed {row_label}.{field}: expected a nonempty string"
                     )
             for field in ("Severity", "Title", "Description", "Status"):
                 if field in row and not isinstance(row[field], str):
-                    raise TrivyScanError(
-                        f"Malformed {row_label}.{field}: expected a string"
-                    )
+                    raise ScanError(f"Malformed {row_label}.{field}: expected a string")
             for field in ("FixedVersion", "PrimaryURL", "PublishedDate"):
                 if (
                     field in row
                     and row[field] is not None
                     and not isinstance(row[field], str)
                 ):
-                    raise TrivyScanError(
+                    raise ScanError(
                         f"Malformed {row_label}.{field}: expected a string or null"
                     )
     try:
         return _parse_vulns(validated_results)
     except ValidationError as e:
-        raise TrivyScanError(f"Malformed Trivy SBOM vulnerability fields: {e}") from e
+        raise ScanError(f"Malformed Trivy SBOM vulnerability fields: {e}") from e
 
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
     """Run uv's native lockfile-based audit against a project."""
     cmd = ["uv", "audit", "--locked"]
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=project_path,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise TrivyScanError(f"uv audit timed out scanning {project_path}") from e
-
-    if completed.returncode not in {0, 1}:
-        raise TrivyScanError(
-            f"uv audit exited with code {completed.returncode}: "
-            f"{completed.stderr.strip()}"
-        )
+    completed = run_captured(
+        cmd,
+        project_path,
+        timeout=300,
+        label="uv audit --locked",
+        error=ScanError,
+        ok_codes={0, 1},
+    )
 
     return _parse_uv_audit_vulns(completed.stdout)
 
@@ -396,26 +364,18 @@ def _run_trivy_scan(
     for d in skip_dirs or []:
         cmd.extend(["--skip-dirs", d])
     cmd.append(".")
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=project_path,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise TrivyScanError(f"Trivy timed out scanning {project_path}") from e
-
-    if completed.returncode != 0:
-        raise TrivyScanError(
-            f"Trivy exited with code {completed.returncode}: {completed.stderr.strip()}"
-        )
+    completed = run_captured(
+        cmd,
+        project_path,
+        timeout=300,
+        label="Trivy filesystem scan",
+        error=ScanError,
+    )
 
     try:
         trivy_output = json.loads(completed.stdout)
     except json.JSONDecodeError as e:
-        raise TrivyScanError(f"Failed to parse Trivy output: {e}") from e
+        raise ScanError(f"Failed to parse Trivy output: {e}") from e
 
     results = trivy_output.get("Results", [])
     return _parse_vulns(results), _parse_secrets(results)
@@ -570,7 +530,7 @@ def capture_gradle_snapshot(
     project: ProjectConfig, context: ComparisonContext
 ) -> GradleSnapshot | IncompleteResolution:
     if not context_inputs_valid(context, project, datetime.now(UTC)):
-        raise TrivyScanError(
+        raise GradleError(
             "Comparison context expired or inputs changed; rebuild baseline and tip"
         )
     with generate_gradle_report(project) as (bom, resolution):
@@ -599,18 +559,13 @@ def capture_gradle_snapshot(
             if key.startswith("binary:")
         )
         trivy_started = time.monotonic()
-        try:
-            completed = subprocess.run(
-                [binary, *context.scanner_flags, str(bom)],
-                cwd=project.path,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
-            raise TrivyScanError(f"Trivy snapshot failed: {exc}") from exc
-        if completed.returncode != 0:
-            raise TrivyScanError(f"Trivy snapshot failed: {completed.stderr.strip()}")
+        completed = run_captured(
+            [binary, *context.scanner_flags, str(bom)],
+            project.path,
+            timeout=300,
+            label="Trivy snapshot",
+            error=ScanError,
+        )
         logging.getLogger(__name__).info(
             "Gradle Trivy snapshot %.3fs", time.monotonic() - trivy_started
         )
@@ -658,7 +613,7 @@ def capture_gradle_snapshot(
         )
     # Generated report/BOM cleanup must precede the jj source-tree snapshot.
     if not context_inputs_valid(context, project, datetime.now(UTC)):
-        raise TrivyScanError("Comparison inputs changed during capture")
+        raise GradleError("Comparison inputs changed during capture")
     return GradleSnapshot(
         tree_id=revision_tree_id(Path(project.path)),
         resolution=resolution,

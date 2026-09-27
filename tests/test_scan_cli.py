@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
-from maintenance_man import cli
+from maintenance_man import cli, scanner
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
@@ -28,6 +28,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
+from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.vcs import RevisionError
 from tests.conftest import make_scan_result, make_update
 
@@ -98,6 +99,50 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
                 raise FileNotFoundError(f"Unknown project: {name}")
 
     monkeypatch.setattr("maintenance_man.cli.scan_project", _fake_scan)
+
+
+def _two_project_config(mm_home, tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    mm_home.mkdir(parents=True, exist_ok=True)
+    (mm_home / "config.toml").write_text(
+        f'[projects.first]\npath = "{first}"\npackage_manager = "bun"\n'
+        f'[projects.second]\npath = "{second}"\npackage_manager = "uv"\n'
+        "scan_secrets = false\n"
+    )
+    results = mm_home / "scan-results"
+    results.mkdir(exist_ok=True)
+    (results / "first.json").write_bytes(b"previous first result")
+    return results
+
+
+@pytest.mark.parametrize("failure", ["outdated", "scanner"])
+@pytest.mark.parametrize("argv", [["scan"], ["scan", "first"]])
+def test_failed_project_scan_keeps_its_result_and_exits_error(
+    mm_home, tmp_path, monkeypatch, failure, argv
+):
+    results = _two_project_config(mm_home, tmp_path)
+    monkeypatch.setattr("maintenance_man.cli.scan_project", scanner.scan_project)
+    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
+
+    def trivy(*args, **kwargs):
+        if failure == "scanner":
+            raise scanner.ScanError("Trivy filesystem scan failed (exit 1): boom")
+        return [], []
+
+    def outdated(project):
+        if failure == "outdated" and project.package_manager == "bun":
+            raise OutdatedCheckError("bun outdated failed (exit 1): boom")
+        return []
+
+    monkeypatch.setattr("maintenance_man.scanner._run_trivy_scan", trivy)
+    monkeypatch.setattr("maintenance_man.scanner.get_outdated", outdated)
+    with pytest.raises(SystemExit) as exc:
+        app(argv)
+    assert exc.value.code == ExitCode.ERROR
+    assert (results / "first.json").read_bytes() == b"previous first result"
+    assert (results / "second.json").is_file() is (argv == ["scan"])
 
 
 def test_scan_warns_and_continues_when_bookmark_pruning_cannot_run(
@@ -531,10 +576,8 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr(
         "maintenance_man.scanner._check_outdated",
-        lambda name, project, *args: (
-            []
-            if project.package_manager == "uv"
-            else _check_outdated(name, project, *args)
+        lambda project, *args: (
+            [] if project.package_manager == "uv" else _check_outdated(project, *args)
         ),
     )
     if phase == "inventory-mkdir":
@@ -665,10 +708,8 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr(
         "maintenance_man.scanner._check_outdated",
-        lambda name, project, *args: (
-            []
-            if project.package_manager == "uv"
-            else _check_outdated(name, project, *args)
+        lambda project, *args: (
+            [] if project.package_manager == "uv" else _check_outdated(project, *args)
         ),
     )
     if failure == "report-false":
