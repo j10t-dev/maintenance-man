@@ -460,7 +460,7 @@ class TestRunTestPhases:
                 args=[], returncode=0, stdout="", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -478,7 +478,7 @@ class TestRunTestPhases:
                 args=[], returncode=1, stdout="FAIL", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
         passed, failed_phase = run_test_phases(tc, tmp_path)
         assert passed is False
@@ -487,8 +487,7 @@ class TestRunTestPhases:
 
     def test_integration_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         def side_effect(*args, **kwargs):
-            cmd_str = " ".join(args[0])
-            if "integration" in cmd_str:
+            if "integration" in args[0]:
                 return subprocess.CompletedProcess(
                     args=[], returncode=1, stdout="", stderr=""
                 )
@@ -497,7 +496,7 @@ class TestRunTestPhases:
             )
 
         mock_run = MagicMock(side_effect=side_effect)
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -516,7 +515,7 @@ class TestRunTestPhases:
                 args=[], returncode=0, stdout="", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(
             path=tmp_path, package_manager="bun", test_unit="bun test"
         )  # no integration or component
@@ -530,7 +529,7 @@ class TestRunTestPhases:
                 args=[], returncode=0, stdout="", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -539,8 +538,37 @@ class TestRunTestPhases:
         )
         assert run_test_phases(tc, tmp_path) == (True, None)
         assert [c.args[0] for c in mock_run.call_args_list] == [
-            ["bun", "run", "test:integration"]
+            "bun run test:integration"
         ]
+
+
+def test_test_phases_run_through_bash(tmp_path):
+    config = ProjectConfig(
+        path=tmp_path,
+        package_manager="bun",
+        test_unit="printf '%s' 'a b' > out.txt && test \"$(cat out.txt)\" = 'a b'",
+    )
+    assert run_test_phases(config, tmp_path) == (True, None)
+    # Under shlex.split printf prints every argument and exits 0; only Bash
+    # performs the redirect.
+    assert (tmp_path / "out.txt").read_text() == "a b"
+
+
+def test_first_failed_phase_stops_later_phases(tmp_path):
+    config = ProjectConfig(
+        path=tmp_path,
+        package_manager="bun",
+        test_unit="exit 3",
+        test_integration="touch integration-ran",
+    )
+    assert run_test_phases(config, tmp_path) == (False, "unit")
+    assert not (tmp_path / "integration-ran").exists()
+
+
+def test_test_phase_launch_failure_is_a_failed_phase(tmp_path, capsys):
+    config = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="true")
+    assert run_test_phases(config, tmp_path / "missing") == (False, "unit")
+    assert "Could not run unit tests" in capsys.readouterr().out
 
 
 # -- sort_updates_by_risk --

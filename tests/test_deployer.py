@@ -14,7 +14,7 @@ from maintenance_man.deployer import (
 
 
 class TestRunBuild:
-    @patch("maintenance_man.deployer.subprocess.run")
+    @patch("maintenance_man.process.subprocess.run")
     def test_successful_build(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
         run_build("myproject", "scripts/build.sh", tmp_path)
@@ -25,13 +25,13 @@ class TestRunBuild:
         assert call_kwargs["executable"] == "/bin/bash"
         assert call_kwargs["timeout"] == 600
 
-    @patch("maintenance_man.deployer.subprocess.run")
+    @patch("maintenance_man.process.subprocess.run")
     def test_failed_build_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1)
         with pytest.raises(BuildError, match="myproject"):
             run_build("myproject", "scripts/build.sh", tmp_path)
 
-    @patch("maintenance_man.deployer.subprocess.run")
+    @patch("maintenance_man.process.subprocess.run")
     def test_build_strips_virtual_env(
         self,
         mock_run: MagicMock,
@@ -44,7 +44,7 @@ class TestRunBuild:
         env = mock_run.call_args.kwargs["env"]
         assert "VIRTUAL_ENV" not in env
 
-    @patch("maintenance_man.deployer.subprocess.run")
+    @patch("maintenance_man.process.subprocess.run")
     def test_build_scrubs_venv_from_path(
         self,
         mock_run: MagicMock,
@@ -61,7 +61,7 @@ class TestRunBuild:
         assert "/usr/bin" in env["PATH"].split(":")
 
     @patch(
-        "maintenance_man.deployer.subprocess.run",
+        "maintenance_man.process.subprocess.run",
         side_effect=subprocess.TimeoutExpired(cmd="scripts/build.sh", timeout=600),
     )
     def test_build_timeout_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
@@ -70,7 +70,7 @@ class TestRunBuild:
 
 
 class TestRunDeploy:
-    @patch("maintenance_man.deployer.subprocess.run")
+    @patch("maintenance_man.process.subprocess.run")
     def test_successful_deploy(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
         run_deploy("myproject", "scripts/deploy.sh", tmp_path)
@@ -79,19 +79,27 @@ class TestRunDeploy:
         assert call_kwargs["shell"] is True
         assert call_kwargs["executable"] == "/bin/bash"
 
-    @patch("maintenance_man.deployer.subprocess.run")
+    @patch("maintenance_man.process.subprocess.run")
     def test_failed_deploy_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1)
         with pytest.raises(DeployError, match="myproject"):
             run_deploy("myproject", "scripts/deploy.sh", tmp_path)
 
     @patch(
-        "maintenance_man.deployer.subprocess.run",
+        "maintenance_man.process.subprocess.run",
         side_effect=subprocess.TimeoutExpired(cmd="scripts/deploy.sh", timeout=600),
     )
     def test_deploy_timeout_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
         with pytest.raises(DeployError, match="timed out"):
             run_deploy("myproject", "scripts/deploy.sh", tmp_path)
+
+
+@pytest.mark.parametrize(
+    "runner, error", [(run_build, BuildError), (run_deploy, DeployError)]
+)
+def test_script_launch_failure_raises_the_domain_error(tmp_path, runner, error):
+    with pytest.raises(error, match="myproject"):
+        runner("myproject", "true", tmp_path / "missing")
 
 
 class TestCheckHealth:

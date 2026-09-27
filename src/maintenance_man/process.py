@@ -49,3 +49,29 @@ def run_captured(
         message = f"{label} failed (exit {completed.returncode})"
         raise error(f"{message}: {detail[-_DIAGNOSTIC_CHARS:]}" if detail else message)
     return completed
+
+
+def run_live(
+    command: str,
+    cwd: str | Path,
+    *,
+    timeout: int,
+    label: str,
+    error: type[Exception] = ProcessError,
+) -> None:
+    """Run a configured command string through Bash with inherited streams."""
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            shell=True,
+            executable="/bin/bash",
+            timeout=timeout,
+            env=project_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise error(f"{label} timed out after {timeout}s{_where(cwd)}") from exc
+    except OSError as exc:
+        raise error(f"Could not run {label}{_where(cwd)}: {exc}") from exc
+    if completed.returncode != 0:
+        raise error(f"{label} failed (exit {completed.returncode})")

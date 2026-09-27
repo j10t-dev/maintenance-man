@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from maintenance_man import process
-from maintenance_man.process import ProcessError, run_captured
+from maintenance_man.process import ProcessError, run_captured, run_live
 
 
 class _DomainError(Exception):
@@ -127,3 +127,68 @@ def test_captured_runs_a_real_command(tmp_path):
         label="python",
     )
     assert Path(completed.stdout.strip()).resolve() == tmp_path.resolve()
+
+
+def test_live_run_executes_bash_syntax(tmp_path):
+    run_live(
+        "printf '%s\\n' 'a b' | tr ' ' '_' > out.txt && [[ -s out.txt ]]",
+        tmp_path,
+        timeout=30,
+        label="shell",
+    )
+    assert (tmp_path / "out.txt").read_text() == "a_b\n"
+
+
+@pytest.mark.parametrize(
+    "command, fails",
+    [
+        ("false | true", False),
+        ("true | false", True),
+        ("set -o pipefail; false | true", True),
+    ],
+)
+def test_live_run_uses_normal_pipeline_status(tmp_path, command, fails):
+    if fails:
+        with pytest.raises(ProcessError, match=r"^pipeline failed \(exit 1\)$"):
+            run_live(command, tmp_path, timeout=30, label="pipeline")
+    else:
+        run_live(command, tmp_path, timeout=30, label="pipeline")
+
+
+def test_live_run_strips_the_host_virtualenv(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    run_live('test -z "${VIRTUAL_ENV:-}"', tmp_path, timeout=30, label="env")
+
+
+def test_live_run_launch_failure_raises_selected_error(tmp_path):
+    missing = tmp_path / "missing"
+    with pytest.raises(
+        _DomainError, match=r"^Could not run build in .*missing: "
+    ) as caught:
+        run_live("true", missing, timeout=30, label="build", error=_DomainError)
+    assert isinstance(caught.value.__cause__, OSError)
+
+
+def test_live_run_timeout_raises_selected_error(tmp_path, monkeypatch):
+    raised = subprocess.TimeoutExpired("sleep 60", 5)
+    monkeypatch.setattr(process.subprocess, "run", _fake(raises=raised))
+    with pytest.raises(_DomainError, match=r"^deploy timed out after 5s in ") as caught:
+        run_live("sleep 60", tmp_path, timeout=5, label="deploy", error=_DomainError)
+    assert caught.value.__cause__ is raised
+
+
+def test_live_run_inherits_standard_streams(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        process.subprocess,
+        "run",
+        _fake(subprocess.CompletedProcess("true", 0), calls=calls),
+    )
+    run_live("true", tmp_path, timeout=5, label="noop")
+    ((command, kwargs),) = calls
+    assert command == "true"
+    assert kwargs["shell"] is True
+    assert kwargs["executable"] == "/bin/bash"
+    assert kwargs["cwd"] == tmp_path
+    assert kwargs["timeout"] == 5
+    assert not {"stdin", "stdout", "stderr", "capture_output"} & kwargs.keys()

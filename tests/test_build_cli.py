@@ -3,11 +3,26 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from maintenance_man import cli, paths
 from maintenance_man.cli import ExitCode, app
 from maintenance_man.deployer import BuildError
+from maintenance_man.models.config import ProjectConfig
+from maintenance_man.storage import load_activity
 
 
 class TestBuildCommand:
+    def test_build_launch_failure_records_a_failed_build(
+        self, mm_home: Path, tmp_path: Path
+    ) -> None:
+        mm_home.mkdir(parents=True)
+        missing = tmp_path / "missing"
+        config = ProjectConfig(path=missing, package_manager="uv", build_command="true")
+        with pytest.raises(BuildError):
+            cli._run_build_step("demo", config)
+        recorded = load_activity(paths.activity_path())["demo"].last_build
+        assert recorded is not None
+        assert recorded.success is False
+
     def test_no_build_config(self, mm_home_with_projects: Path) -> None:
         """Error when project has no build_command configured."""
         with pytest.raises(SystemExit) as exc_info:

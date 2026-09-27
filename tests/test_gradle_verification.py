@@ -1219,6 +1219,19 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
     assert updater.load_gradle_run(updater.gradle_run_path("sample")) is None
 
 
+def test_gradle_checks_run_configured_tests_through_bash(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "run_build", lambda *args: None)
+    project = ProjectConfig(
+        path=tmp_path,
+        package_manager="gradle",
+        build_command="./gradlew assembleDebug",
+        test_unit="printf ok > tests-ran && test -f tests-ran",
+    )
+    evidence = real_run_gradle_checks(project, "sample")
+    assert evidence.success is True
+    assert (tmp_path / "tests-ran").read_text() == "ok"
+
+
 @pytest.mark.parametrize("stage", ["intent", "mutated", "checked-before-commit"])
 @pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
 def test_gradle_uncommitted_interruption_becomes_failed(

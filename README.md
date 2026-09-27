@@ -87,6 +87,8 @@ deploy_command = "scripts/deploy.sh" # optional, path to script defining the dep
 scan_skip_dirs = ["tests/fixtures"] # optional, an array of relative directories that trivy should ignore in its scans.
 ```
 
+Test, build and deploy commands run through `/bin/bash` in the project directory, so shell syntax such as `&&`, pipes, redirects and quoting works. A pipeline's status is its last command's status unless the command sets `set -o pipefail`. Gradle verification runs the configured test commands the same way. Test commands were previously split into arguments without a shell, so a test command containing literal shell characters may now need quoting.
+
 The following defaults can be globally configured: 
 
 ```toml

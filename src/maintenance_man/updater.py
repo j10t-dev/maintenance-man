@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shlex
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,7 +8,6 @@ from typing import Literal, Protocol
 
 from rich import print as rprint
 
-from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
@@ -21,7 +19,7 @@ from maintenance_man.models.scan import (
     Workflow,
     highest_fix_version,
 )
-from maintenance_man.process import ProcessError, run_captured
+from maintenance_man.process import ProcessError, run_captured, run_live
 from maintenance_man.storage import save_scan_results
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
@@ -347,21 +345,12 @@ def run_test_phases(
 
     Stops on first failure. Returns (True, None) if all phases pass.
     """
-    env = project_env()
     for phase_name, command in project_config.test_phases:
         rprint(f"  [dim]$ {command}[/]")
         try:
-            completed = subprocess.run(
-                shlex.split(command),
-                cwd=project_path,
-                timeout=600,
-                text=True,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            rprint(f"  [bold red]FAIL[/] {phase_name} timed out after 600s")
-            return False, phase_name
-        if completed.returncode != 0:
+            run_live(command, project_path, timeout=600, label=f"{phase_name} tests")
+        except ProcessError as exc:
+            rprint(f"  [bold red]FAIL[/] {exc}")
             return False, phase_name
     return True, None
 
