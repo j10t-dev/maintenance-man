@@ -15,6 +15,7 @@ import pytest
 from maintenance_man.dependency_age import (
     PublicationError,
     PublicationLookupContext,
+    _get_npm_publish_date,
     _public_url,
     _publication_http,
     evaluate_gradle_candidate_age,
@@ -35,7 +36,7 @@ from maintenance_man.models.scan import (
 )
 
 _PATCH_FETCH = "maintenance_man.dependency_age._fetch_json"
-_PATCH_SUBRUN = "maintenance_man.dependency_age.subprocess.run"
+_PATCH_SUBRUN = "maintenance_man.process.subprocess.run"
 _PATCH_NOW = "maintenance_man.dependency_age._utcnow"
 _PATCH_CACHE_DIR = "maintenance_man.dependency_age._pypi_cache_dir"
 
@@ -168,6 +169,43 @@ class TestFilterByAge:
 
         assert len(result) == 1
         assert result[0].published_date is not None
+
+
+def test_bun_info_runs_isolated_and_parses_any_exit_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(
+            cmd, 1, "pkg@1.0.0 | MIT\nPublished: 2024-01-02T03:04:05Z\n", "warning"
+        )
+
+    monkeypatch.setattr(_PATCH_SUBRUN, run)
+    assert _get_npm_publish_date("pkg", "1.0.0", cwd=tmp_path) == datetime(
+        2024, 1, 2, 3, 4, 5, tzinfo=UTC
+    )
+    ((cmd, kwargs),) = calls
+    assert cmd == ["bun", "info", "pkg@1.0.0"]
+    assert kwargs["cwd"] == tmp_path
+    assert kwargs["timeout"] == 30
+    assert "VIRTUAL_ENV" not in kwargs["env"]
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        subprocess.TimeoutExpired(["bun", "info"], 30),
+        FileNotFoundError(2, "No such file or directory", "bun"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_bun_info_execution_failure_is_an_unknown_date(monkeypatch, raised):
+    def run(cmd, **kwargs):
+        raise raised
+
+    monkeypatch.setattr(_PATCH_SUBRUN, run)
+    assert _get_npm_publish_date("pkg", "1.0.0") is None
 
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)

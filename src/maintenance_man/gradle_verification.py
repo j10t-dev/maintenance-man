@@ -1,7 +1,6 @@
 import hashlib
 import os
 import shutil
-import subprocess
 import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -20,6 +19,7 @@ from maintenance_man.models.gradle import (
     VerifiedComparison,
 )
 from maintenance_man.models.scan import VulnFinding
+from maintenance_man.process import run_captured
 
 _MARKER = ".mm-comparison-owner"
 _POLICY_FILES = ("trivy.yaml", "trivy.yml", ".trivyignore.yaml", ".trivyignore.yml")
@@ -51,15 +51,13 @@ def _policy(project: ProjectConfig) -> bytes:
 
 
 def _run(command: list[str], cwd: Path) -> str:
-    try:
-        result = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True, timeout=600
-        )
-    except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
-        raise GradleError(f"Comparison context command failed: {exc}") from exc
-    if result.returncode != 0:
-        raise GradleError(f"Comparison context command failed: {result.stderr.strip()}")
-    return result.stdout
+    return run_captured(
+        command,
+        cwd,
+        timeout=600,
+        label="Trivy comparison setup",
+        error=GradleError,
+    ).stdout
 
 
 def _database_digests(cache: Path) -> dict[str, str]:

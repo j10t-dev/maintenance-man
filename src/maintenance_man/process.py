@@ -1,0 +1,51 @@
+"""Run external commands with one set of execution and failure rules."""
+
+import subprocess
+from collections.abc import Collection, Sequence
+from pathlib import Path
+
+from maintenance_man.env import project_env
+
+_DIAGNOSTIC_CHARS = 2000
+
+
+class ProcessError(Exception):
+    """A command could not run, timed out, or exited with a rejected status."""
+
+
+def _where(cwd: str | Path | None) -> str:
+    return f" in {cwd}" if cwd is not None else ""
+
+
+def run_captured(
+    cmd: Sequence[str],
+    cwd: str | Path | None,
+    *,
+    timeout: int,
+    label: str,
+    error: type[Exception] = ProcessError,
+    ok_codes: Collection[int] | None = frozenset({0}),
+) -> subprocess.CompletedProcess[str]:
+    """Run *cmd* without a shell, capturing text output with stdin closed.
+
+    ``ok_codes=None`` returns every completed status to the caller.
+    """
+    try:
+        completed = subprocess.run(
+            list(cmd),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            env=project_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise error(f"{label} timed out after {timeout}s{_where(cwd)}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise error(f"Could not run {label}{_where(cwd)}: {exc}") from exc
+    if ok_codes is not None and completed.returncode not in ok_codes:
+        detail = (completed.stderr or "").strip() or (completed.stdout or "").strip()
+        message = f"{label} failed (exit {completed.returncode})"
+        raise error(f"{message}: {detail[-_DIAGNOSTIC_CHARS:]}" if detail else message)
+    return completed

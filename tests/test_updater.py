@@ -20,6 +20,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
+from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
     _apply_update,
     _get_uv_update_command,
@@ -283,13 +284,12 @@ class TestApplyUpdate:
             'lint = ["pytest>=8.0"]\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr("maintenance_man.updater.project_env", dict)
         mock_run = MagicMock(
             return_value=subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
 
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is True
         assert [call.args[0] for call in mock_run.call_args_list] == [
@@ -311,7 +311,6 @@ class TestApplyUpdate:
             'lint = ["pytest>=8.0"]\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr("maintenance_man.updater.project_env", dict)
         mock_run = MagicMock(
             side_effect=[
                 subprocess.CompletedProcess(
@@ -325,7 +324,7 @@ class TestApplyUpdate:
                 ),
             ]
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
 
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
         assert mock_run.call_count == 2
@@ -337,13 +336,118 @@ class TestApplyUpdate:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        monkeypatch.setattr("maintenance_man.updater.project_env", dict)
         mock_run = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
 
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
         assert mock_run.call_count == 0
         assert "Failed to read" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        subprocess.TimeoutExpired(["uv", "add"], 300),
+        FileNotFoundError(2, "No such file or directory", "uv"),
+    ],
+)
+def test_package_command_execution_failure_stops_the_apply(
+    tmp_path, monkeypatch, capsys, raised
+):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["pytest>=8.0"]\n\n'
+        "[dependency-groups]\n"
+        'dev = ["pytest>=8.0"]\n',
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        raise raised
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
+    assert calls == [["uv", "add", "pytest==9.0.3"]]
+    assert "uv add pytest==9.0.3" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        subprocess.TimeoutExpired(["mvn", "versions:commit"], 120),
+        FileNotFoundError(2, "No such file or directory", "mvn"),
+    ],
+)
+def test_maven_finalisation_execution_failure_is_an_apply_failure(
+    tmp_path, monkeypatch, raised
+):
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs["timeout"]))
+        if cmd == ["mvn", "versions:commit"]:
+            raise raised
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    assert _apply_update("mvn", "g:a", "2.0", tmp_path) is False
+    assert calls == [
+        (
+            ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"],
+            300,
+        ),
+        (["mvn", "versions:commit"], 120),
+    ]
+
+
+def test_maven_finalisation_does_not_run_after_a_failed_update(tmp_path, monkeypatch):
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 1, "", "no such dependency")
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    assert _apply_update("mvn", "g:a", "2.0", tmp_path) is False
+    assert calls == [
+        ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"]
+    ]
+
+
+def test_package_timeout_is_persisted_as_a_failed_apply(
+    mock_local_vcs, project_config, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("maintenance_man.updater._apply_update", _apply_update)
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+
+    def timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", timeout)
+    scan_result = ScanResult(
+        project="demo",
+        scanned_at=datetime.now(UTC),
+        trivy_target=str(tmp_path),
+        updates=[make_update(SemverTier.PATCH)],
+    )
+    update = scan_result.updates[0]
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+
+    results = process_findings(
+        [update],
+        project_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan_result,
+        project_name="demo",
+        results_dir=results_dir,
+    )
+
+    assert results[0].failed_phase == "apply"
+    saved = load_scan_results("demo", results_dir)
+    assert saved.updates[0].update_status == UpdateStatus.FAILED
+    assert saved.updates[0].failed_phase == "apply"
 
 
 # -- run_test_phases --

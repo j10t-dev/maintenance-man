@@ -5,7 +5,6 @@ import http.client
 import json
 import logging
 import os
-import subprocess
 import threading
 import time
 import urllib.error
@@ -31,6 +30,7 @@ from maintenance_man.models.gradle import (
 from maintenance_man.models.scan import (
     UpdateFinding,
 )
+from maintenance_man.process import ProcessError, run_captured
 from maintenance_man.storage import atomic_write_text
 
 
@@ -89,14 +89,14 @@ def _get_npm_publish_date(
 ) -> datetime | None:
     """Fetch publish date via ``bun info``."""
     try:
-        completed = subprocess.run(
+        completed = run_captured(
             ["bun", "info", f"{pkg}@{version}"],
-            capture_output=True,
-            text=True,
-            cwd=cwd,
+            cwd,
             timeout=30,
+            label="bun info",
+            ok_codes=None,
         )
-    except subprocess.TimeoutExpired:
+    except ProcessError:
         return None
 
     ts = next(

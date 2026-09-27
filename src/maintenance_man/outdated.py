@@ -1,11 +1,11 @@
 import json
 import re
-import subprocess
 from pathlib import Path
 
 from maintenance_man.gradle import discover_gradle_updates
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import UpdateFinding, classify_semver
+from maintenance_man.process import run_captured
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     get_uv_direct_dep_names,
@@ -36,21 +36,23 @@ def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
 
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `uv pip list --outdated --format json` and parse results."""
-    _run_checked(
+    run_captured(
         ["uv", "sync", "--locked"],
-        cwd=project.path,
+        project.path,
         timeout=300,
         label="uv sync --locked",
+        error=OutdatedCheckError,
     )
     venv_python = Path(project.path) / ".venv" / "bin" / "python"
     cmd = ["uv", "pip", "list", "--outdated", "--format", "json"]
     if venv_python.exists():
         cmd += ["--python", str(venv_python)]
-    completed = _run_checked(
+    completed = run_captured(
         cmd,
-        cwd=project.path,
+        project.path,
         timeout=120,
         label="uv pip list --outdated",
+        error=OutdatedCheckError,
     )
 
     try:
@@ -78,14 +80,20 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `bun outdated` without progress output and parse the table output."""
     cmd = ["bun", "outdated", "--no-progress"]
-    completed = _run_checked(
+    completed = run_captured(
         cmd,
-        cwd=project.path,
+        project.path,
         timeout=120,
         label="bun outdated",
-        allow_nonzero_with_stdout=True,
+        error=OutdatedCheckError,
+        ok_codes=None,
     )
 
+    if completed.returncode != 0 and not completed.stdout.strip():
+        raise OutdatedCheckError(
+            f"bun outdated failed (exit {completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
     if not completed.stdout.strip():
         return []
 
@@ -109,11 +117,12 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         "versions:display-dependency-updates",
         "-DprocessDependencyManagement=false",
     ]
-    completed = _run_checked(
+    completed = run_captured(
         cmd,
-        cwd=project.path,
+        project.path,
         timeout=300,
         label="mvn versions:display-dependency-updates",
+        error=OutdatedCheckError,
     )
 
     return [
@@ -134,36 +143,6 @@ _CHECKERS = {
     "mvn": mvn_outdated,
     "gradle": discover_gradle_updates,
 }
-
-
-def _run_checked(
-    cmd: list[str],
-    cwd: str | Path,
-    timeout: int,
-    *,
-    label: str,
-    allow_nonzero_with_stdout: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess with common error handling."""
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise OutdatedCheckError(f"{label} timed out") from e
-
-    if completed.returncode != 0:
-        if allow_nonzero_with_stdout and completed.stdout.strip():
-            return completed
-        raise OutdatedCheckError(
-            f"{label} failed (exit {completed.returncode}): {completed.stderr.strip()}"
-        )
-    return completed
 
 
 def _parse_bun_table(output: str) -> list[dict[str, str]]:

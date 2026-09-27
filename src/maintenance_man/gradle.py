@@ -31,6 +31,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     classify_semver,
 )
+from maintenance_man.process import run_captured
 
 GRADLE_CATALOGUE_RELPATH = "gradle/libs.versions.toml"
 GRADLE_UPDATE_REPORT_RELPATH = "gradle/libs.versions.updates.toml"
@@ -485,31 +486,13 @@ def run_gradle(
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
         raise GradleError(f"No executable Gradle wrapper at {wrapper}")
 
-    label = label or args[0]
-    try:
-        completed = subprocess.run(
-            [str(wrapper), *args],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=GRADLE_TIMEOUT_SECONDS,
-            stdin=subprocess.DEVNULL,
-            env=project_env(),
-        )
-    except subprocess.TimeoutExpired as e:
-        raise GradleError(
-            f"./gradlew {label} timed out after {GRADLE_TIMEOUT_SECONDS}s in {root}"
-        ) from e
-
-    except (OSError, UnicodeDecodeError) as e:
-        raise GradleError(f"Could not run ./gradlew {label} in {root}: {e}") from e
-
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()[-2000:]
-        raise GradleError(
-            f"./gradlew {label} failed (exit {completed.returncode}): {detail}"
-        )
-    return completed
+    return run_captured(
+        [str(wrapper), *args],
+        root,
+        timeout=GRADLE_TIMEOUT_SECONDS,
+        label=f"./gradlew {label or args[0]}",
+        error=GradleError,
+    )
 
 
 def claim_owned_file(path: Path, marker: Path, label: str) -> None:

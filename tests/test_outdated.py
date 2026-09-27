@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -147,7 +148,7 @@ class TestUvOutdated:
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with patch(
-            "maintenance_man.outdated.subprocess.run",
+            "maintenance_man.process.subprocess.run",
             side_effect=[sync_completed, list_completed],
         ) as run:
             updates = uv_outdated(project)
@@ -171,7 +172,7 @@ class TestUvOutdated:
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with (
-            patch("maintenance_man.outdated.subprocess.run", return_value=failed),
+            patch("maintenance_man.process.subprocess.run", return_value=failed),
             pytest.raises(OutdatedCheckError, match="uv sync --locked"),
         ):
             uv_outdated(project)
@@ -207,7 +208,7 @@ class TestUvOutdated:
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with patch(
-            "maintenance_man.outdated.subprocess.run",
+            "maintenance_man.process.subprocess.run",
             side_effect=[sync_completed, list_completed],
         ):
             updates = uv_outdated(project)
@@ -232,7 +233,7 @@ class TestUvOutdated:
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with patch(
-            "maintenance_man.outdated.subprocess.run",
+            "maintenance_man.process.subprocess.run",
             side_effect=[sync_completed, list_completed],
         ):
             updates = uv_outdated(project)
@@ -250,7 +251,7 @@ class TestUvOutdated:
 
         with (
             patch(
-                "maintenance_man.outdated.subprocess.run",
+                "maintenance_man.process.subprocess.run",
                 side_effect=[sync_completed, list_failed],
             ),
             pytest.raises(OutdatedCheckError, match="uv pip list --outdated"),
@@ -292,7 +293,7 @@ class TestUvOutdated:
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
         with patch(
-            "maintenance_man.outdated.subprocess.run",
+            "maintenance_man.process.subprocess.run",
             side_effect=[sync_completed, list_completed],
         ):
             updates = uv_outdated(project)
@@ -316,7 +317,7 @@ class TestBunOutdated:
         )
         project = _make_project("bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = bun_outdated(project)
 
         assert len(updates) == 2
@@ -340,7 +341,7 @@ class TestBunOutdated:
         )
         project = _make_project("bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = bun_outdated(project)
 
         assert len(updates) == 2
@@ -353,7 +354,7 @@ class TestBunOutdated:
         )
         project = _make_project("bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = bun_outdated(project)
 
         assert updates == []
@@ -365,7 +366,7 @@ class TestBunOutdated:
         project = _make_project("bun")
 
         with patch(
-            "maintenance_man.outdated.subprocess.run", return_value=completed
+            "maintenance_man.process.subprocess.run", return_value=completed
         ) as run:
             bun_outdated(project)
 
@@ -378,7 +379,7 @@ class TestBunOutdated:
         project = _make_project("bun")
 
         with (
-            patch("maintenance_man.outdated.subprocess.run", return_value=completed),
+            patch("maintenance_man.process.subprocess.run", return_value=completed),
             pytest.raises(OutdatedCheckError),
         ):
             bun_outdated(project)
@@ -397,7 +398,7 @@ class TestMvnOutdated:
         )
         project = _make_project("mvn")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = mvn_outdated(project)
 
         assert len(updates) == 2
@@ -414,7 +415,7 @@ class TestMvnOutdated:
         )
         project = _make_project("mvn")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = mvn_outdated(project)
 
         assert updates == []
@@ -426,7 +427,7 @@ class TestMvnOutdated:
         project = _make_project("mvn")
 
         with (
-            patch("maintenance_man.outdated.subprocess.run", return_value=completed),
+            patch("maintenance_man.process.subprocess.run", return_value=completed),
             pytest.raises(OutdatedCheckError),
         ):
             mvn_outdated(project)
@@ -438,7 +439,7 @@ class TestGetOutdated:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr=""
         )
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = get_outdated(project)
         assert updates == []
 
@@ -450,7 +451,7 @@ class TestGetOutdated:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="[]", stderr=""
         )
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = get_outdated(project)
         assert updates == []
 
@@ -460,7 +461,7 @@ class TestGetOutdated:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=fake_output, stderr=""
         )
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch("maintenance_man.process.subprocess.run", return_value=completed):
             updates = get_outdated(project)
         assert updates == []
 
@@ -486,3 +487,47 @@ def test_get_outdated_dispatches_gradle(monkeypatch):
 
     assert get_outdated(project) is sentinel
     assert seen == [project]
+
+
+def test_uv_outdated_commands_run_without_the_host_virtualenv(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    monkeypatch.setenv("PATH", os.pathsep.join(["/host/venv/bin", "/usr/bin"]))
+    monkeypatch.setattr(
+        "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: set()
+    )
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    assert uv_outdated(ProjectConfig(path=tmp_path, package_manager="uv")) == []
+    assert [cmd[:3] for cmd, _ in calls] == [
+        ["uv", "sync", "--locked"],
+        ["uv", "pip", "list"],
+    ]
+    for _, kwargs in calls:
+        assert "VIRTUAL_ENV" not in kwargs["env"]
+        assert "/host/venv/bin" not in kwargs["env"]["PATH"].split(os.pathsep)
+        assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        FileNotFoundError(2, "No such file or directory", "uv"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_outdated_execution_failure_is_an_outdated_check_error(
+    tmp_path, monkeypatch, raised
+):
+    def run(cmd, **kwargs):
+        raise raised
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    with pytest.raises(
+        OutdatedCheckError, match=r"^Could not run uv sync --locked in "
+    ):
+        uv_outdated(ProjectConfig(path=tmp_path, package_manager="uv"))

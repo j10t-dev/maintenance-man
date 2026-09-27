@@ -21,6 +21,7 @@ from maintenance_man.models.scan import (
     Workflow,
     highest_fix_version,
 )
+from maintenance_man.process import ProcessError, run_captured
 from maintenance_man.storage import save_scan_results
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
@@ -552,7 +553,6 @@ def _apply_update(
     package_manager: str, pkg_name: str, version: str, project_path: Path
 ) -> bool:
     """Apply a single package update. Returns True on success."""
-    env = project_env()
     try:
         commands = get_update_commands(package_manager, pkg_name, version, project_path)
     except (UvDependencyError, ValueError) as e:
@@ -560,35 +560,22 @@ def _apply_update(
         return False
 
     for cmd in commands:
-        completed = subprocess.run(
-            cmd,
-            cwd=project_path,
-            timeout=300,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        if completed.returncode != 0:
-            rprint(
-                f"  [bold red]FAIL[/] Package manager command failed: "
-                f"{' '.join(cmd)}\n  {completed.stderr.strip()}"
-            )
+        try:
+            run_captured(cmd, project_path, timeout=300, label=shlex.join(cmd))
+        except ProcessError as e:
+            rprint(f"  [bold red]FAIL[/] Package manager command failed: {e}")
             return False
 
     # Maven needs a second command to finalise
     if package_manager == "mvn":
-        commit = subprocess.run(
-            ["mvn", "versions:commit"],
-            cwd=project_path,
-            timeout=120,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        if commit.returncode != 0:
-            rprint(
-                f"  [bold red]FAIL[/] mvn versions:commit failed: "
-                f"{commit.stderr.strip()}"
+        try:
+            run_captured(
+                ["mvn", "versions:commit"],
+                project_path,
+                timeout=120,
+                label="mvn versions:commit",
             )
+        except ProcessError as e:
+            rprint(f"  [bold red]FAIL[/] {e}")
             return False
     return True
