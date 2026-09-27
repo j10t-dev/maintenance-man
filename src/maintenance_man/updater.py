@@ -8,19 +8,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
-from packaging.version import InvalidVersion, Version
 from rich import print as rprint
 
 from maintenance_man import sanitise_project_name
 from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     ScanResult,
     SemverTier,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
     Workflow,
+    highest_fix_version,
 )
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
@@ -37,17 +38,6 @@ from maintenance_man.vcs import (
 
 class NoScanResultsError(Exception):
     pass
-
-
-def has_test_config(project_config: ProjectConfig) -> bool:
-    """Return True if any test phase is configured."""
-    return any(
-        [
-            project_config.test_unit,
-            project_config.test_integration,
-            project_config.test_component,
-        ]
-    )
 
 
 type UpdateKind = Literal["vuln", "update"]
@@ -108,29 +98,6 @@ _RISK_ORDER = {
     SemverTier.MAJOR: 2,
     SemverTier.UNKNOWN: 3,
 }
-
-_WORKFLOW_BOOKMARKS = {
-    Workflow.UPDATE: "mm/update-dependencies",
-    Workflow.RESOLVE: "mm/resolve-dependencies",
-}
-
-
-def highest_fix_version(vulns: list[VulnFinding]) -> str:
-    """Return the highest ``fixed_version`` from *vulns*.
-
-    Uses :class:`packaging.version.Version` for comparison. Unparsable
-    version strings are ignored; if *none* can be parsed the last item
-    in the list is returned as a fallback.
-    """
-
-    def _sort_key(v: VulnFinding) -> Version:
-        try:
-            return Version(v.fixed_version or "0")
-        except InvalidVersion:
-            return Version("0")
-
-    best = max(vulns, key=_sort_key)
-    return best.fixed_version or vulns[-1].fixed_version or ""
 
 
 def _first_non_none(values: Sequence[str | Workflow | None]):
@@ -407,14 +374,7 @@ def run_test_phases(
     Stops on first failure. Returns (True, None) if all phases pass.
     """
     env = project_env()
-    phases = [
-        ("unit", project_config.test_unit),
-        ("integration", project_config.test_integration),
-        ("component", project_config.test_component),
-    ]
-    for phase_name, command in phases:
-        if command is None:
-            continue
+    for phase_name, command in project_config.test_phases:
         rprint(f"  [dim]$ {command}[/]")
         try:
             completed = subprocess.run(
@@ -454,7 +414,7 @@ def process_findings(
     """
     results: list[UpdateResult] = []
     project_path = Path(project_config.path)
-    has_tests = has_test_config(project_config)
+    has_tests = bool(project_config.test_phases)
 
     for f in findings:
         flow_cfg = _workflow_config(f, cfg)
@@ -523,7 +483,7 @@ def process_findings(
                         break
                     continue
                 if not create_or_reset_bookmark(
-                    _WORKFLOW_BOOKMARKS[flow], project_path, "@-"
+                    WORKFLOW_BOOKMARKS[flow], project_path, "@-"
                 ):
                     results.append(
                         _record_failure(

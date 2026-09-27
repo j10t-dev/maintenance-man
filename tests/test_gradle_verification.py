@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from maintenance_man import cli, scanner
 from maintenance_man import gradle_resolution as candidates
@@ -28,9 +29,11 @@ from maintenance_man.models.gradle import (
     FindingEvidence,
     FindingKey,
     GradleCandidate,
+    GradleRun,
     GradleSnapshot,
     IncompleteResolution,
     ModuleId,
+    PlannedAttempt,
     PublicationEvidence,
     PublicationFact,
     ReadyAttempt,
@@ -528,6 +531,32 @@ def begin_workflow(workflow, flow=Workflow.UPDATE, candidate=None):
         workflow.context,
         (candidate or workflow.candidate,),
     )
+
+
+def test_gradle_run_has_reports_attempt_kinds(workflow):
+    run = begin_workflow(workflow)
+    assert run.has(PlannedAttempt)
+    assert not run.has(FailedAttempt)
+    assert run.has(ApplyingAttempt, PlannedAttempt)
+
+
+def test_gradle_run_rejects_bookmark_of_other_flow(workflow):
+    run = begin_workflow(workflow)
+    data = run.model_dump(mode="json")
+    data["managed_bookmark"] = {
+        "update": "mm/resolve-dependencies",
+        "resolve": "mm/update-dependencies",
+    }[run.flow]
+    with pytest.raises(ValidationError, match="run bookmark and flow disagree"):
+        GradleRun.model_validate(data)
+
+
+def test_blank_only_test_command_is_a_setup_prerequisite(workflow):
+    project = workflow.project.model_copy(
+        update={"test_unit": "  ", "test_integration": None, "test_component": None}
+    )
+    with pytest.raises(updater.GradleError, match="Setup prerequisite"):
+        updater.gradle_check_commands(project)
 
 
 def test_ordinary_residual_is_ready_without_cve_lifecycle(workflow):

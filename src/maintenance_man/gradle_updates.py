@@ -58,6 +58,7 @@ from maintenance_man.models.gradle import (
     WithheldAttempt,
 )
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     GradleUpdateTarget,
     Workflow,
 )
@@ -74,11 +75,6 @@ from maintenance_man.vcs import (
     is_ancestor,
     revision_tree_id,
 )
-
-_WORKFLOW_BOOKMARKS = {
-    Workflow.UPDATE: "mm/update-dependencies",
-    Workflow.RESOLVE: "mm/resolve-dependencies",
-}
 
 
 def gradle_run_path(project: str) -> Path:
@@ -175,15 +171,7 @@ def _replace_gradle_attempt(run: GradleRun, attempt: AttemptState) -> GradleRun:
 
 
 def gradle_check_commands(project: ProjectConfig) -> tuple[str, ...]:
-    tests = tuple(
-        command
-        for command in (
-            project.test_unit,
-            project.test_integration,
-            project.test_component,
-        )
-        if command
-    )
+    tests = tuple(command for _, command in project.test_phases)
     if not project.build_command or not tests:
         raise GradleError(
             "Setup prerequisite: configure build_command and at least one test phase"
@@ -264,7 +252,7 @@ def start_gradle_run(
         context,
         expected_tree=revision_tree_id(project.path, base_commit_id),
     )
-    bookmark = _WORKFLOW_BOOKMARKS[flow]
+    bookmark = WORKFLOW_BOOKMARKS[flow]
     run = GradleRun(
         project=project_name,
         flow=flow,
@@ -452,10 +440,7 @@ def gradle_run_finalization_check(
     publication: PublicationLookupContext,
     minimum_age_days: int,
 ) -> None:
-    if any(
-        isinstance(attempt, (ApplyingAttempt, FailedAttempt, PlannedAttempt))
-        for attempt in run.attempts
-    ):
+    if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
         raise GradleError("Unfinished or failed Gradle attempt prevents finalization")
     accepted = [
         attempt
@@ -537,7 +522,7 @@ def rebuild_gradle_run_evidence(
     *,
     persist: bool = True,
 ) -> GradleRun:
-    if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
+    if run.has(ApplyingAttempt):
         raise GradleError("Reconcile interrupted attempt before rebuilding context")
     accepted = [
         item
@@ -640,11 +625,9 @@ def rebuild_gradle_run_evidence(
 
 
 def rollback_failed_gradle_update(run: GradleRun, project: ProjectConfig) -> None:
-    if run.flow != Workflow.UPDATE or any(
-        isinstance(item, ApplyingAttempt) for item in run.attempts
-    ):
+    if run.flow != Workflow.UPDATE or run.has(ApplyingAttempt):
         raise GradleError("Rollback requires a failed update ledger")
-    if not any(isinstance(item, FailedAttempt) for item in run.attempts):
+    if not run.has(FailedAttempt):
         raise GradleError("Rollback requires a failed update ledger")
     reclaim_gradle_outputs(project.path)
     if (

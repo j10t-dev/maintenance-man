@@ -26,7 +26,6 @@ from maintenance_man.updater import (
     _get_uv_update_command,
     consolidate_vulns,
     get_update_commands,
-    highest_fix_version,
     load_scan_results,
     process_findings,
     process_updates,
@@ -493,6 +492,24 @@ class TestRunTestPhases:
         assert passed is True
         assert mock_run.call_count == 1  # only unit
 
+    def test_blank_phase_is_skipped(self, monkeypatch, tmp_path):
+        mock_run = MagicMock(
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+        )
+        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        tc = ProjectConfig(
+            path=tmp_path,
+            package_manager="bun",
+            test_unit="  ",
+            test_integration="bun run test:integration",
+        )
+        assert run_test_phases(tc, tmp_path) == (True, None)
+        assert [c.args[0] for c in mock_run.call_args_list] == [
+            ["bun", "run", "test:integration"]
+        ]
+
 
 # -- sort_updates_by_risk --
 
@@ -518,36 +535,6 @@ class TestSortUpdatesByRisk:
         result = sort_updates_by_risk([make_update(SemverTier.MINOR)])
         assert len(result) == 1
         assert result[0].semver_tier == SemverTier.MINOR
-
-
-# -- highest_fix_version --
-
-
-class TestHighestFixVersion:
-    def test_picks_highest_semver(self):
-        vulns = [
-            make_vuln(fixed_version="2.31.0"),
-            make_vuln(fixed_version="2.32.4"),
-            make_vuln(fixed_version="2.32.0"),
-        ]
-        assert highest_fix_version(vulns) == "2.32.4"
-
-    def test_single_vuln(self):
-        assert highest_fix_version([make_vuln(fixed_version="1.0.1")]) == "1.0.1"
-
-    def test_invalid_version_ignored(self):
-        vulns = [
-            make_vuln(fixed_version="not-a-version"),
-            make_vuln(fixed_version="2.0.0"),
-        ]
-        assert highest_fix_version(vulns) == "2.0.0"
-
-    def test_invalid_version_order_independent(self):
-        vulns = [
-            make_vuln(fixed_version="2.0.0"),
-            make_vuln(fixed_version="not-a-version"),
-        ]
-        assert highest_fix_version(vulns) == "2.0.0"
 
 
 # -- consolidate_vulns --

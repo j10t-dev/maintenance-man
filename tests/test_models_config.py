@@ -6,6 +6,24 @@ from pydantic import ValidationError
 from maintenance_man.models.config import DefaultsConfig, ProjectConfig
 
 
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
+        ({}, ()),
+        ({"test_unit": "make unit"}, (("unit", "make unit"),)),
+        (
+            {"test_unit": "u", "test_integration": "i", "test_component": "c"},
+            (("unit", "u"), ("integration", "i"), ("component", "c")),
+        ),
+        ({"test_unit": "", "test_integration": "i"}, (("integration", "i"),)),
+        ({"test_unit": "  ", "test_component": "c"}, (("component", "c"),)),
+    ],
+)
+def test_test_phases(tmp_path, fields, expected):
+    project = ProjectConfig(path=tmp_path, package_manager="uv", **fields)
+    assert project.test_phases == expected
+
+
 class TestProjectConfigTestFields:
     def test_no_test_fields(self):
         pc = ProjectConfig(path=Path("/tmp/x"), package_manager="bun")

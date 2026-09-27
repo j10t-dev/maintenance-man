@@ -637,18 +637,14 @@ def capture_gradle_snapshot(
                     advisory_id=row.vuln_id, coordinate=row.pkg_name, scope=scope
                 )
                 grouped.setdefault(key, []).append(row)
-        rank = {
-            Severity.UNKNOWN: 0,
-            Severity.LOW: 1,
-            Severity.MEDIUM: 2,
-            Severity.HIGH: 3,
-            Severity.CRITICAL: 4,
-        }
         findings = tuple(
             FindingEvidence(
                 key=key,
                 affected_versions=frozenset(row.installed_version for row in evidence),
-                severity=max((row.severity for row in evidence), key=rank.__getitem__),
+                severity=max(
+                    (row.severity for row in evidence),
+                    key=lambda severity: severity.rank,
+                ),
                 has_unknown=any(row.severity == Severity.UNKNOWN for row in evidence),
                 rows=tuple(evidence),
             )

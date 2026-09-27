@@ -54,11 +54,13 @@ from maintenance_man.models.gradle import (
     WithheldAttempt,
 )
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     ScanResult,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
     Workflow,
+    highest_fix_version,
     sort_vulns_by_severity,
 )
 from maintenance_man.scanner import (
@@ -72,8 +74,6 @@ from maintenance_man.updater import (
     NoScanResultsError,
     UpdateResult,
     consolidate_vulns,
-    has_test_config,
-    highest_fix_version,
     load_scan_results,
     process_findings,
     process_updates,
@@ -154,9 +154,6 @@ def should_deploy(
 console = Console()
 
 _TABLE_STYLE: dict[str, Any] = {"show_edge": False, "pad_edge": False, "box": None}
-
-_UPDATE_BOOKMARK = "mm/update-dependencies"
-_RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
 app = cyclopts.App(
     name="mm",
@@ -459,18 +456,19 @@ def _enter_update_workspace(
     project: str, proj_config: ProjectConfig, scan_result: ScanResult
 ) -> Path:
     """Create a fresh or resumed update jj workspace. Returns its path."""
+    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
     remove_workspace(proj_config.path, project)
     workspace_path = workspace_path_for_project(project)
 
     if _has_update_progress(scan_result):
-        if not bookmark_exists(_UPDATE_BOOKMARK, proj_config.path):
+        if not bookmark_exists(bookmark, proj_config.path):
             raise _UpdateSetupError(
-                f"update bookmark '{_UPDATE_BOOKMARK}' is missing but in-progress "
+                f"update bookmark '{bookmark}' is missing but in-progress "
                 f"state exists — rescan required"
             )
-        if not create_workspace(proj_config.path, project, _UPDATE_BOOKMARK):
+        if not create_workspace(proj_config.path, project, bookmark):
             raise _UpdateSetupError("could not attach workspace to update bookmark")
-        if not edit_new_change(workspace_path, _UPDATE_BOOKMARK):
+        if not edit_new_change(workspace_path, bookmark):
             raise _UpdateSetupError("could not create clean change on update bookmark")
         return workspace_path
 
@@ -478,13 +476,13 @@ def _enter_update_workspace(
         raise _UpdateSetupError("failed to sync trunk")
     if not ensure_main_bookmark(proj_config.path):
         raise _UpdateSetupError("main bookmark not found")
-    if bookmark_exists(_UPDATE_BOOKMARK, proj_config.path):
-        delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
-    if not create_or_reset_bookmark(_UPDATE_BOOKMARK, proj_config.path, "main"):
+    if bookmark_exists(bookmark, proj_config.path):
+        delete_bookmark(bookmark, proj_config.path)
+    if not create_or_reset_bookmark(bookmark, proj_config.path, "main"):
         raise _UpdateSetupError("could not create update bookmark")
     if not create_workspace(proj_config.path, project, "main"):
         raise _UpdateSetupError("could not create workspace")
-    if not edit_new_change(workspace_path, _UPDATE_BOOKMARK):
+    if not edit_new_change(workspace_path, bookmark):
         remove_workspace(proj_config.path, project)
         raise _UpdateSetupError("could not create update change")
     return workspace_path
@@ -595,14 +593,14 @@ def _has_update_progress(scan_result: ScanResult) -> bool:
     return any(
         f.update_status in (UpdateStatus.READY, UpdateStatus.FAILED)
         and f.flow == Workflow.UPDATE
-        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+        for f in scan_result.findings
     )
 
 
 def _has_update_failures(scan_result: ScanResult) -> bool:
     return any(
         f.update_status == UpdateStatus.FAILED and f.flow == Workflow.UPDATE
-        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+        for f in scan_result.findings
     )
 
 
@@ -611,7 +609,7 @@ class _FlowConflictError(Exception):
 
 
 def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:
-    for f in (*scan_result.vulnerabilities, *scan_result.updates):
+    for f in scan_result.findings:
         if f.update_status is not None and f.flow is None:
             raise _FlowConflictError(
                 f"{project} has in-progress findings without flow ownership — "
@@ -638,7 +636,7 @@ def _assert_no_conflicting_flow(
 ) -> None:
     conflicts = [
         f
-        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+        for f in scan_result.findings
         if f.update_status is not None
         and f.flow is not None
         and f.flow != active_flow
@@ -660,15 +658,15 @@ def _finalise_local_update(
     project_name: str,
     results_dir: Path,
 ) -> bool:
-    """Promote `_UPDATE_BOOKMARK` to main and promote READY findings.
+    """Promote the update bookmark to main and promote READY findings.
 
     Dirty-tree checks are unnecessary here because update work runs in an
     isolated jj workspace, then only the managed bookmark is promoted.
     """
-    if not promote_bookmark_to_main(orig_path, _UPDATE_BOOKMARK):
+    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
+    if not promote_bookmark_to_main(orig_path, bookmark):
         console.print(
-            f"[bold red]Promotion failed:[/] {_UPDATE_BOOKMARK} could not be "
-            f"promoted to main"
+            f"[bold red]Promotion failed:[/] {bookmark} could not be promoted to main"
         )
         return False
 
@@ -688,12 +686,12 @@ def _finalise_local_update(
 
     remove_completed_findings(scan_result)
     save_scan_results(project_name, results_dir, scan_result)
-    console.print(f"[bold green]Promoted {_UPDATE_BOOKMARK} to main.[/]")
+    console.print(f"[bold green]Promoted {bookmark} to main.[/]")
     return True
 
 
 def _warn_missing_test_config(project: str, proj_config: ProjectConfig) -> None:
-    if not has_test_config(proj_config):
+    if not proj_config.test_phases:
         console.print(
             f"  [bold yellow]Warning:[/] {project} — no test configuration "
             f"(test phases will be skipped)"
@@ -800,7 +798,7 @@ def _ordered_ready_findings(
 def _has_ready_resolve_progress(scan_result: ScanResult) -> bool:
     return any(
         f.update_status == UpdateStatus.READY and f.flow == Workflow.RESOLVE
-        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+        for f in scan_result.findings
     )
 
 
@@ -810,21 +808,22 @@ def _prepare_resolve_bookmark(
     candidates: list[Finding],
 ) -> bool:
     """Create or resume the resolve bookmark without dropping committed progress."""
+    bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
     if _has_ready_resolve_progress(scan_result):
-        if not bookmark_exists(_RESOLVE_BOOKMARK, project_path):
+        if not bookmark_exists(bookmark, project_path):
             _fatal(
-                f"resolve bookmark '{_RESOLVE_BOOKMARK}' is missing but "
+                f"resolve bookmark '{bookmark}' is missing but "
                 "in-progress state exists — rescan or recover the bookmark manually"
             )
         if candidates:
-            return edit_new_change(project_path, _RESOLVE_BOOKMARK)
+            return edit_new_change(project_path, bookmark)
         return True
 
-    if bookmark_exists(_RESOLVE_BOOKMARK, project_path):
-        delete_bookmark(_RESOLVE_BOOKMARK, project_path)
-    if not create_or_reset_bookmark(_RESOLVE_BOOKMARK, project_path, "main"):
+    if bookmark_exists(bookmark, project_path):
+        delete_bookmark(bookmark, project_path)
+    if not create_or_reset_bookmark(bookmark, project_path, "main"):
         return False
-    return edit_new_change(project_path, _RESOLVE_BOOKMARK)
+    return edit_new_change(project_path, bookmark)
 
 
 def _run_resolve_findings(
@@ -871,6 +870,7 @@ def _submit_resolve_bookmark(
     ready_findings: list[Finding],
 ) -> int:
     """Push the resolve bookmark, open a PR, and promote READY findings on success."""
+    bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
     if scan_result.blocked_findings:
         _print_blocked_findings(scan_result)
         console.print(
@@ -882,14 +882,13 @@ def _submit_resolve_bookmark(
     for f in ready_findings:
         f.failed_phase = None
 
-    ok, output = push_bookmark_and_create_pr(project_path, _RESOLVE_BOOKMARK)
+    ok, output = push_bookmark_and_create_pr(project_path, bookmark)
     if output:
         console.print(f"  [dim]{output}[/]")
     if not ok:
         save_scan_results(project, results_dir, scan_result)
         console.print(
-            f"  [bold yellow]Submit failed.[/] Keeping {_RESOLVE_BOOKMARK} "
-            f"for manual recovery."
+            f"  [bold yellow]Submit failed.[/] Keeping {bookmark} for manual recovery."
         )
         return ExitCode.UPDATE_FAILED
 
@@ -1479,7 +1478,7 @@ def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
 
 
 def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
-    if not has_test_config(proj_config):
+    if not proj_config.test_phases:
         _fatal(
             f"No test configuration for [bold]{project}[/]. "
             f"Add test_unit to [projects.{project}] in ~/.mm/config.toml."
@@ -1686,7 +1685,7 @@ def _run_update_flow(
         remove_workspace(proj_config.path, project)
     if not finalised:
         return ExitCode.UPDATE_FAILED
-    delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
+    delete_bookmark(WORKFLOW_BOOKMARKS[Workflow.UPDATE], proj_config.path)
     return ExitCode.OK
 
 
@@ -1757,7 +1756,7 @@ def _update_batch(
     finally:
         remove_workspace(proj_config.path, project)
     if finalised:
-        delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
+        delete_bookmark(WORKFLOW_BOOKMARKS[Workflow.UPDATE], proj_config.path)
     return (
         all_results,
         bool(scan_result.blocked_findings) or (promotion_attempted and (not finalised)),
@@ -1872,12 +1871,9 @@ def _handle_resolve_continue(
     results_dir: Path,
 ) -> int:
     """Retest the paused blocker on the resolve bookmark."""
-    if not resolve_bookmark_contains_current_change(
-        proj_config.path, _RESOLVE_BOOKMARK
-    ):
-        _fatal(
-            f"--continue requires current jj change to descend from {_RESOLVE_BOOKMARK}"
-        )
+    bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
+    if not resolve_bookmark_contains_current_change(proj_config.path, bookmark):
+        _fatal(f"--continue requires current jj change to descend from {bookmark}")
     if current_change_has_changes(proj_config.path):
         _fatal(
             "--continue requires an empty current jj change — commit or discard "
@@ -1898,9 +1894,9 @@ def _handle_resolve_continue(
                 f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
             )
             return ExitCode.UPDATE_FAILED
-        if not create_or_reset_bookmark(_RESOLVE_BOOKMARK, proj_config.path, "@-"):
+        if not create_or_reset_bookmark(bookmark, proj_config.path, "@-"):
             save_scan_results(project, results_dir, scan_result)
-            _fatal(f"could not move {_RESOLVE_BOOKMARK} to the committed manual fix")
+            _fatal(f"could not move {bookmark} to the committed manual fix")
         for blocker in failed:
             blocker.update_status = UpdateStatus.READY
             blocker.failed_phase = None

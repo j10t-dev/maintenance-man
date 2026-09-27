@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     GradleKind,
     GradleUpdateTarget,
     Severity,
@@ -502,12 +503,7 @@ class GradleRun(GradleRecord):
         keys = [attempt.candidate.target.group_key for attempt in self.attempts]
         if len(keys) != len(set(keys)):
             raise ValueError("a run may attempt each group only once")
-        expected = (
-            "mm/update-dependencies"
-            if self.flow == Workflow.UPDATE
-            else "mm/resolve-dependencies"
-        )
-        if self.managed_bookmark != expected:
+        if self.managed_bookmark != WORKFLOW_BOOKMARKS[self.flow]:
             raise ValueError("run bookmark and flow disagree")
         if (
             self.initial_snapshot.context_identity != self.context.identity
@@ -517,3 +513,7 @@ class GradleRun(GradleRecord):
         if self.refreshed and not self.promoted_commit_id:
             raise ValueError("refresh requires a recorded promotion")
         return self
+
+    def has(self, *kinds: type[GradleRecord]) -> bool:
+        """True when any attempt is an instance of one of *kinds*."""
+        return any(isinstance(attempt, kinds) for attempt in self.attempts)

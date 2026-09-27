@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     GradleMember,
     GradleUpdateTarget,
     ScanResult,
@@ -14,9 +15,70 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     VulnFinding,
     Workflow,
+    highest_fix_version,
     sort_vulns_by_severity,
 )
-from tests.conftest import make_scan_result, make_update
+from tests.conftest import make_scan_result, make_update, make_vuln
+
+
+def test_workflow_bookmarks_hold_the_managed_names():
+    assert dict(WORKFLOW_BOOKMARKS) == {
+        Workflow.UPDATE: "mm/update-dependencies",
+        Workflow.RESOLVE: "mm/resolve-dependencies",
+    }
+
+
+@pytest.mark.parametrize(
+    "severity, rank",
+    [
+        (Severity.UNKNOWN, 0),
+        (Severity.LOW, 1),
+        (Severity.MEDIUM, 2),
+        (Severity.HIGH, 3),
+        (Severity.CRITICAL, 4),
+    ],
+)
+def test_severity_rank(severity, rank):
+    assert severity.rank == rank
+
+
+def test_sort_keeps_critical_first_and_unknown_last():
+    vulns = [
+        make_vuln(pkg_name="a", severity=Severity.UNKNOWN),
+        make_vuln(pkg_name="b", severity=Severity.LOW),
+        make_vuln(pkg_name="c", severity=Severity.CRITICAL),
+        make_vuln(pkg_name="d", severity=Severity.HIGH),
+        make_vuln(pkg_name="e", severity=Severity.MEDIUM),
+    ]
+    assert [v.pkg_name for v in sort_vulns_by_severity(vulns)] == [
+        "c",
+        "d",
+        "e",
+        "b",
+        "a",
+    ]
+
+
+@pytest.mark.parametrize(
+    "versions, expected",
+    [
+        (["2.0.0", "10.0.0", "1.5"], "10.0.0"),
+        (["1.0", "bad", "2.0"], "2.0"),
+        (["bad-first", "bad-last"], "bad-first"),
+        ([None, "bad"], "bad"),
+        ([None], ""),
+    ],
+)
+def test_highest_fix_version(versions, expected):
+    vulns = [make_vuln(fixed_version=v) for v in versions]
+    assert highest_fix_version(vulns) == expected
+
+
+def test_findings_lists_vulnerabilities_then_updates():
+    vuln = make_vuln(pkg_name="v")
+    update = make_update(pkg_name="u")
+    result = make_scan_result(vulns=[vuln], updates=[update])
+    assert result.findings == (vuln, update)
 
 
 class TestVulnFinding:
@@ -328,6 +390,36 @@ class TestSortVulnsBySeverity:
             "requests-med",
             "flask-high",
         ]
+
+
+# -- highest_fix_version --
+
+
+class TestHighestFixVersion:
+    def test_picks_highest_semver(self):
+        vulns = [
+            make_vuln(fixed_version="2.31.0"),
+            make_vuln(fixed_version="2.32.4"),
+            make_vuln(fixed_version="2.32.0"),
+        ]
+        assert highest_fix_version(vulns) == "2.32.4"
+
+    def test_single_vuln(self):
+        assert highest_fix_version([make_vuln(fixed_version="1.0.1")]) == "1.0.1"
+
+    def test_invalid_version_ignored(self):
+        vulns = [
+            make_vuln(fixed_version="not-a-version"),
+            make_vuln(fixed_version="2.0.0"),
+        ]
+        assert highest_fix_version(vulns) == "2.0.0"
+
+    def test_invalid_version_order_independent(self):
+        vulns = [
+            make_vuln(fixed_version="2.0.0"),
+            make_vuln(fixed_version="not-a-version"),
+        ]
+        assert highest_fix_version(vulns) == "2.0.0"
 
 
 class TestSemverTier:

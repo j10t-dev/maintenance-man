@@ -9,6 +9,7 @@ from rich import print as rprint
 from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
 from maintenance_man.gradle import GradleError
+from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 
 
 class GitHubCLINotFoundError(Exception):
@@ -88,10 +89,7 @@ def revision_file(path: Path, revision: str, filename: str) -> RevisionFileCheck
     )
 
 
-_MANAGED_BOOKMARK_PREFIXES = (
-    "mm/update-dependencies",
-    "mm/resolve-dependencies",
-)
+_MANAGED_BOOKMARK_PREFIXES = tuple(WORKFLOW_BOOKMARKS.values())
 
 MM_WORKSPACES = _config.MM_HOME / "workspaces"
 

@@ -45,6 +45,7 @@ from maintenance_man.models.gradle import (
     WithheldAttempt,
 )
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     ScanResult,
     UpdateFinding,
     UpdateStatus,
@@ -77,9 +78,6 @@ from maintenance_man.vcs import (
     revision_tree_id,
     workspace_path_for_project,
 )
-
-_UPDATE_BOOKMARK = "mm/update-dependencies"
-_RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
 
 @dataclass(frozen=True)
@@ -316,8 +314,8 @@ def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> N
     if (
         run.flow != Workflow.UPDATE
         or run.promoted_commit_id is not None
-        or any(isinstance(item, ApplyingAttempt) for item in run.attempts)
-        or not any(isinstance(item, FailedAttempt) for item in run.attempts)
+        or run.has(ApplyingAttempt)
+        or not run.has(FailedAttempt)
     ):
         raise GradleError("Only rolled-back failed update runs can restart")
     workspace = workspace_path_for_project(run.project)
@@ -381,7 +379,7 @@ def _new_gradle_workspace(
         )
     legacy = [
         item
-        for item in (*scan_result.vulnerabilities, *scan_result.updates)
+        for item in scan_result.findings
         if item.update_status in {UpdateStatus.FAILED, UpdateStatus.READY}
     ]
     if legacy:
@@ -396,7 +394,7 @@ def _new_gradle_workspace(
     ):
         raise GradleError("Cannot prepare main")
     base = exact_commit_id(project.path, "main")
-    bookmark = _UPDATE_BOOKMARK if flow == Workflow.UPDATE else _RESOLVE_BOOKMARK
+    bookmark = WORKFLOW_BOOKMARKS[flow]
     if flow == Workflow.UPDATE:
         interaction.workspace_revision(project_name, project, base)
         remove_workspace(project.path, project_name)
@@ -424,7 +422,7 @@ def _resume_gradle_workspace(
     if flow == Workflow.UPDATE:
         workspace = workspace_path_for_project(project_name)
         if not workspace.exists():
-            if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
+            if run.has(ApplyingAttempt):
                 raise GradleError(
                     "Interrupted workspace missing; manual review required"
                 )
@@ -440,7 +438,7 @@ def _resume_gradle_workspace(
     if main not in {expected_main, run.managed_tip_id}:
         raise GradleError("Main moved outside the recorded Gradle run")
     if (
-        not any(isinstance(item, ApplyingAttempt) for item in run.attempts)
+        not run.has(ApplyingAttempt)
         and exact_commit_id(work.path, run.managed_bookmark) != run.managed_tip_id
     ):
         raise GradleError("Managed Gradle bookmark changed")
@@ -481,7 +479,7 @@ def run_gradle_flow(
             run is not None
             and run.flow == Workflow.UPDATE
             and not continue_
-            and any(isinstance(item, FailedAttempt) for item in run.attempts)
+            and run.has(FailedAttempt)
         ):
             _archive_rolled_back_gradle_run(run, project)
             run = None
@@ -528,7 +526,7 @@ def run_gradle_flow(
                     != run.context.private_cache_path
                 ):
                     gradle_updater.retire_gradle_context(previous.context)
-            if any(isinstance(item, ApplyingAttempt) for item in run.attempts):
+            if run.has(ApplyingAttempt):
                 run = gradle_updater.reconcile_gradle_applying(
                     run, work, publication, minimum_age_days
                 )
@@ -536,7 +534,7 @@ def run_gradle_flow(
                 run = gradle_updater.continue_gradle_resolve(
                     run, work, publication, minimum_age_days
                 )
-            elif any(isinstance(item, FailedAttempt) for item in run.attempts):
+            elif run.has(FailedAttempt):
                 raise GradleError(
                     "Preserved Gradle failure requires manual review "
                     "or resolve --continue"
@@ -551,16 +549,10 @@ def run_gradle_flow(
             run = gradle_updater.process_gradle_run(
                 run, work, publication, minimum_age_days
             )
-            if any(
-                isinstance(item, (ApplyingAttempt, FailedAttempt, PlannedAttempt))
-                for item in run.attempts
-            ):
+            if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
                 interaction.report(run, project, results_dir)
                 return ExitCode.UPDATE_FAILED
-            if not any(
-                isinstance(item, (ReadyAttempt, CompletedAttempt))
-                for item in run.attempts
-            ):
+            if not run.has(ReadyAttempt, CompletedAttempt):
                 interaction.report(run, project, results_dir)
                 rprint("No eligible Gradle changes")
                 # A clean/withheld-only run has no effects requiring recovery.

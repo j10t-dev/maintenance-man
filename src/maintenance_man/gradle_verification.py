@@ -19,17 +19,10 @@ from maintenance_man.models.gradle import (
     RejectedComparison,
     VerifiedComparison,
 )
-from maintenance_man.models.scan import Severity, VulnFinding
+from maintenance_man.models.scan import VulnFinding
 
 _MARKER = ".mm-comparison-owner"
 _POLICY_FILES = ("trivy.yaml", "trivy.yml", ".trivyignore.yaml", ".trivyignore.yml")
-_SEVERITY = {
-    Severity.LOW: 1,
-    Severity.MEDIUM: 2,
-    Severity.HIGH: 3,
-    Severity.CRITICAL: 4,
-    Severity.UNKNOWN: 0,
-}
 
 
 def _digest(path: Path) -> str:
@@ -217,7 +210,7 @@ def compare_gradle_snapshots(
         return IncomparableComparison(reasons=("UNKNOWN severity changed", *unknown))
     regressions = [f"new finding: {key}" for key in new.keys() - old.keys()]
     for key in old.keys() & new.keys():
-        if _SEVERITY[new[key].severity] > _SEVERITY[old[key].severity]:
+        if new[key].severity.rank > old[key].severity.rank:
             regressions.append(f"severity increased: {key}")
         if len(new[key].affected_versions) > len(old[key].affected_versions):
             regressions.append(f"affected version count increased: {key}")
