@@ -46,3 +46,63 @@ markers = [
     "component: tests that require Docker or full service stack",
 ]
 addopts = "-m 'not integration and not component'"
+
+[tool.importlinter]
+root_package = "maintenance_man"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+id = "models-pure"
+name = "Models are pure"
+type = "forbidden"
+source_modules = ["maintenance_man.models"]
+forbidden_modules = [
+    "maintenance_man.cli",
+    "maintenance_man.config",
+    "maintenance_man.dependency_age",
+    "maintenance_man.deployer",
+    "maintenance_man.env",
+    "maintenance_man.exit_codes",
+    "maintenance_man.gradle",
+    "maintenance_man.gradle_resolution",
+    "maintenance_man.gradle_updates",
+    "maintenance_man.gradle_verification",
+    "maintenance_man.gradle_workflow",
+    "maintenance_man.outdated",
+    "maintenance_man.resources",
+    "maintenance_man.scanner",
+    "maintenance_man.updater",
+    "maintenance_man.uv_dependencies",
+    "maintenance_man.vcs",
+    "rich",
+    "cyclopts",
+]
+
+# Allowlist removed by design C (vcs) and design D (updater, gradle_workflow).
+[[tool.importlinter.contracts]]
+id = "rich-cli-only"
+name = "Only the CLI imports rich"
+type = "protected"
+protected_modules = ["rich"]
+allowed_importers = ["maintenance_man.cli"]
+ignore_imports = [
+    "maintenance_man.vcs -> rich",
+    "maintenance_man.updater -> rich",
+    "maintenance_man.gradle_workflow -> rich",
+]
+
+# Allowlist removed by design B.
+[[tool.importlinter.contracts]]
+id = "vcs-no-gradle"
+name = "VCS does not import gradle"
+type = "forbidden"
+source_modules = ["maintenance_man.vcs"]
+forbidden_modules = ["maintenance_man.gradle"]
+ignore_imports = ["maintenance_man.vcs -> maintenance_man.gradle"]
+
+[[tool.importlinter.contracts]]
+id = "cli-leaf"
+name = "The CLI is a leaf"
+type = "protected"
+protected_modules = ["maintenance_man.cli"]
+allowed_importers = []
