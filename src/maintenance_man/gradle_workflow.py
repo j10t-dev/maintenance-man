@@ -63,6 +63,7 @@ from maintenance_man.storage import (
 )
 from maintenance_man.vcs import (
     BookmarkLookupError,
+    RevisionError,
     create_or_reset_bookmark,
     create_workspace,
     current_change_has_changes,
@@ -574,6 +575,7 @@ def run_gradle_flow(
         TrivyScanError,
         _UpdateSetupError,
         BookmarkLookupError,
+        RevisionError,
         OSError,
     ) as exc:
         rprint(f"Cannot complete Gradle {flow}: {exc}")

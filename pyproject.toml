@@ -94,14 +94,12 @@ ignore_imports = [
     "maintenance_man.gradle_workflow -> rich",
 ]
 
-# Allowlist removed by design B2.
 [[tool.importlinter.contracts]]
 id = "vcs-no-gradle"
 name = "VCS does not import gradle"
 type = "forbidden"
 source_modules = ["maintenance_man.vcs"]
 forbidden_modules = ["maintenance_man.gradle"]
-ignore_imports = ["maintenance_man.vcs -> maintenance_man.gradle"]
 
 [[tool.importlinter.contracts]]
 id = "cli-leaf"

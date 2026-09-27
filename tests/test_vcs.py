@@ -47,6 +47,84 @@ def _completed(
     )
 
 
+def _missing_jj(cmd, **kwargs):
+    raise FileNotFoundError(2, "No such file or directory", "jj")
+
+
+def test_vcs_runner_translates_launch_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", _missing_jj)
+    with pytest.raises(vcs.RevisionError, match=r"^Could not run jj log -r main in "):
+        vcs._run(["jj", "log", "-r", "main"], tmp_path)
+
+
+def test_vcs_runner_returns_rejected_statuses_to_callers(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, "", "no main"),
+    )
+    assert vcs._run(["jj", "log", "-r", "main"], tmp_path).returncode == 1
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_commit_lookup_execution_failure_is_unresolved(
+    tmp_path, monkeypatch, read_only
+):
+    def fail(cmd, path, **kwargs):
+        raise vcs.RevisionError("Could not run jj log: missing jj")
+
+    monkeypatch.setattr(vcs, "_run", fail)
+    assert vcs._single_commit_id(tmp_path, "main", read_only=read_only) == (
+        vcs.RevisionResolve(ok=False, error="Could not run jj log: missing jj")
+    )
+
+
+def _log_then(inspector_stdout):
+    def run(cmd, path, **kwargs):
+        if "log" in cmd:
+            return _completed(stdout="a" * 40 + "\n")
+        return _completed(stdout=inspector_stdout)
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "run, call, message",
+    [
+        (
+            lambda cmd, path, **kw: _completed(1, stderr="no such revision"),
+            lambda path: vcs.exact_commit_id(path, "main"),
+            "no such revision",
+        ),
+        (
+            lambda cmd, path, **kw: _completed(1, stderr="no such revision"),
+            lambda path: vcs.revision_tree_id(path, "main"),
+            "no such revision",
+        ),
+        (
+            _log_then("unfamiliar\n"),
+            lambda path: vcs.revision_tree_id(path, "main"),
+            "Cannot identify the verified jj tree",
+        ),
+        (
+            _log_then(""),
+            lambda path: vcs._guarded_tip("other", "a" * 40, "b" * 40),
+            "Unexpected managed Gradle bookmark",
+        ),
+        (
+            _log_then(""),
+            lambda path: vcs._guarded_tip("mm/update-dependencies", "base", "b" * 40),
+            "Invalid expected revision identity",
+        ),
+    ],
+)
+def test_former_gradle_error_cases_raise_revision_error(
+    tmp_path, monkeypatch, run, call, message
+):
+    monkeypatch.setattr(vcs, "_run", run)
+    with pytest.raises(vcs.RevisionError, match=message):
+        call(tmp_path)
+
+
 class TestFinalVcsSurface:
     @pytest.mark.parametrize(
         "name",
@@ -160,7 +238,8 @@ class TestBookmarkHelpers:
             bookmark_exists("main", tmp_path)
 
     @pytest.mark.parametrize(
-        "error", [OSError("read-only filesystem"), subprocess.TimeoutExpired("jj", 30)]
+        "error",
+        [vcs.RevisionError("Could not run jj bookmark list: read-only filesystem")],
     )
     @patch("maintenance_man.vcs._run")
     def test_bookmark_inspection_wraps_execution_errors(
@@ -1149,9 +1228,9 @@ def test_revision_file_inspection_failure_is_explicit(
         if cmd[4] == "log" and phase == "list":
             return _completed(stdout="a" * 40 + "\n")
         if failure == "launch":
-            raise FileNotFoundError("missing jj")
+            raise vcs.RevisionError("missing jj")
         if failure == "timeout":
-            raise subprocess.TimeoutExpired(cmd, 30)
+            raise vcs.RevisionError("timed out")
         return _completed(1, stdout="file\n", stderr="inspection failed")
 
     monkeypatch.setattr(vcs, "_run", run)

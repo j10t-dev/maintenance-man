@@ -1,5 +1,4 @@
 import contextlib
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -87,6 +86,7 @@ from maintenance_man.vcs import (
     BookmarkLookupError,
     GitHubCLINotFoundError,
     JJCLINotFoundError,
+    RevisionError,
     bookmark_exists,
     check_gh_available,
     check_jj_available,
@@ -1528,7 +1528,7 @@ def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanR
     """Scan a single project with timing output."""
     try:
         prune_stale_bookmarks(proj_config.path)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except RevisionError as exc:
         console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
 
     t0 = time.monotonic()

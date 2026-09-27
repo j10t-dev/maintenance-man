@@ -28,6 +28,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
+from maintenance_man.vcs import RevisionError
 from tests.conftest import make_scan_result, make_update
 
 
@@ -97,6 +98,19 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
                 raise FileNotFoundError(f"Unknown project: {name}")
 
     monkeypatch.setattr("maintenance_man.cli.scan_project", _fake_scan)
+
+
+def test_scan_warns_and_continues_when_bookmark_pruning_cannot_run(
+    mm_home_with_projects, monkeypatch, capsys
+):
+    def fail(path):
+        raise RevisionError("Could not run jj git fetch: missing jj")
+
+    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", fail)
+    with pytest.raises(SystemExit) as exc:
+        app(["scan", "clean"])
+    assert exc.value.code == 0
+    assert "failed to sync remote" in capsys.readouterr().out
 
 
 class TestScanSingleProject:

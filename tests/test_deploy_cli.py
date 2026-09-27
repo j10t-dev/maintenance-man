@@ -23,6 +23,10 @@ def _activity(*, success: bool, commit_id: str | None) -> dict[str, ProjectActiv
     }
 
 
+def _jj_missing(cmd, **kwargs):
+    raise FileNotFoundError(2, "No such file or directory", "jj")
+
+
 @pytest.fixture
 def _open_deploy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
@@ -30,6 +34,29 @@ def _open_deploy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda path: RevisionResolve(ok=True, commit_id="gateopen0001"),
     )
     monkeypatch.setattr("maintenance_man.cli.load_activity", lambda path: {})
+
+
+@pytest.mark.parametrize(
+    "argv, code, deployed",
+    [
+        (["deploy", "deploy-only"], ExitCode.ERROR, False),
+        (["deploy"], ExitCode.OK, False),
+        (["deploy", "deploy-only", "--force"], ExitCode.OK, True),
+    ],
+)
+@patch("maintenance_man.cli.record_activity")
+@patch("maintenance_man.cli.run_deploy")
+def test_missing_jj_uses_the_existing_deploy_gate(
+    mock_deploy, mock_record, mm_home_with_projects, monkeypatch, argv, code, deployed
+):
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", _jj_missing)
+    monkeypatch.setattr("maintenance_man.cli.load_activity", lambda path: {})
+    with pytest.raises(SystemExit) as exc:
+        app(argv, exit_on_error=False)
+    assert exc.value.code == code
+    assert mock_deploy.called is deployed
+    if deployed:
+        assert mock_record.call_args.kwargs["commit_id"] is None
 
 
 class TestShouldDeploy:

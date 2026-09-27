@@ -53,7 +53,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
-from maintenance_man.vcs import RevisionCheck
+from maintenance_man.vcs import RevisionCheck, RevisionError
 
 
 def test_saved_ledger_is_private(workflow, tmp_path):
@@ -560,6 +560,142 @@ def begin_workflow(workflow, flow=Workflow.UPDATE, candidate=None):
         workflow.context,
         (candidate or workflow.candidate,),
     )
+
+
+def _revision_failure(*args, **kwargs):
+    raise RevisionError("jj unavailable")
+
+
+@pytest.mark.parametrize("stage", ["before-checked", "after-checked"])
+def test_gradle_revision_failure_is_recorded_or_preserved(workflow, monkeypatch, stage):
+    run = begin_workflow(workflow, Workflow.RESOLVE)
+    if stage == "before-checked":
+        monkeypatch.setattr(updater, "revision_tree_id", _revision_failure)
+        result = updater.process_gradle_run(
+            run, workflow.project, workflow.publication, 7
+        )
+        assert isinstance(result.attempts[0], FailedAttempt)
+        assert result.attempts[0].reason == "jj unavailable"
+        stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+        assert stored == result
+    else:
+        original = updater.exact_commit_id
+        monkeypatch.setattr(
+            updater,
+            "exact_commit_id",
+            lambda path, revision: (
+                _revision_failure() if revision == "@-" else original(path, revision)
+            ),
+        )
+        with pytest.raises(RevisionError, match="jj unavailable"):
+            updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+        stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+        assert stored is not None
+        assert isinstance(stored.attempts[0], ApplyingAttempt)
+        assert stored.attempts[0].checked_tree_id is not None
+        assert "discard" not in workflow.effects
+
+
+def test_gradle_continue_revision_failure_is_recorded(workflow, monkeypatch):
+    security = workflow.candidate.model_copy(
+        update={
+            "origins": frozenset({"security"}),
+            "requested_advisories": frozenset({"CVE-1"}),
+            "requested_coordinates": frozenset({"g:lib"}),
+        }
+    )
+    failed = updater.process_gradle_run(
+        begin_workflow(workflow, Workflow.RESOLVE, security),
+        workflow.project,
+        workflow.publication,
+        7,
+    )
+    monkeypatch.setattr(updater, "reclaim_gradle_outputs", lambda *args: None)
+    monkeypatch.setattr(updater, "current_change_has_changes", lambda *args: False)
+    monkeypatch.setattr(
+        updater, "is_ancestor", lambda *args: RevisionCheck(ok=True, value=True)
+    )
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "revision_tree_id", _revision_failure)
+    with pytest.raises(RevisionError, match="jj unavailable"):
+        updater.continue_gradle_resolve(
+            failed, workflow.project, workflow.publication, 7
+        )
+    stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert stored is not None
+    assert isinstance(stored.attempts[0], FailedAttempt)
+    assert stored.attempts[0].reason == "jj unavailable"
+
+
+def test_gradle_continue_revision_failure_after_checked_intent_is_preserved(
+    workflow, monkeypatch
+):
+    run = begin_workflow(workflow, Workflow.RESOLVE)
+    run = updater._replace_gradle_attempt(
+        run, ApplyingAttempt(candidate=workflow.candidate, baseline=workflow.initial)
+    )
+    updater.save_gradle_run(updater.gradle_run_path("sample"), run)
+    workflow.state.update(snapshot=workflow.after, tree="after-tree")
+
+    def exact(path, revision):
+        # "@-" resolves the repair; the lookup of the repair itself runs after
+        # verify_applied_gradle_attempt has saved checked_tree_id.
+        if revision == "repair":
+            raise RevisionError("jj unavailable")
+        return "base" if revision == run.managed_bookmark else "repair"
+
+    monkeypatch.setattr(updater, "exact_commit_id", exact)
+    monkeypatch.setattr(updater, "current_change_has_changes", lambda *args: False)
+    monkeypatch.setattr(updater, "reclaim_gradle_outputs", lambda *args: None)
+    monkeypatch.setattr(
+        updater, "is_ancestor", lambda *args: RevisionCheck(ok=True, value=True)
+    )
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: True)
+    failed = updater.reconcile_gradle_applying(
+        run, workflow.project, workflow.publication, 7
+    )
+    assert isinstance(failed.attempts[0], FailedAttempt)
+
+    saves = []
+    original_save = updater.save_gradle_run
+
+    def record(path, value):
+        saves.append(value)
+        original_save(path, value)
+
+    monkeypatch.setattr(updater, "save_gradle_run", record)
+    with pytest.raises(RevisionError, match="jj unavailable"):
+        updater.continue_gradle_resolve(
+            failed, workflow.project, workflow.publication, 7
+        )
+
+    stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert stored is not None
+    assert stored == saves[-1]
+    attempt = stored.attempts[0]
+    assert isinstance(attempt, ApplyingAttempt)
+    assert attempt.checked_tree_id == "after-tree"
+    assert attempt.accepted_commit_id is None
+    assert not {"apply", "commit", "discard", "bookmark"} & set(workflow.effects)
+
+
+def test_gradle_flow_reports_revision_failures(workflow, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        workflow_service.gradle_updater, "load_gradle_run", _revision_failure
+    )
+    assert (
+        cli._run_gradle_flow(
+            "sample",
+            workflow.project,
+            tmp_path,
+            Workflow.UPDATE,
+            interactive=False,
+            minimum_age_days=7,
+        )
+        == cli.ExitCode.UPDATE_FAILED
+    )
+    assert "Cannot complete Gradle update: jj unavailable" in capsys.readouterr().out
 
 
 def test_gradle_run_has_reports_attempt_kinds(workflow):
