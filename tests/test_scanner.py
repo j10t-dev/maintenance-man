@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from maintenance_man import gradle_resolution as candidates
+from maintenance_man import paths, scanner
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GRADLE_INVENTORY_BOM_RELPATH,
@@ -31,11 +32,37 @@ from maintenance_man.scanner import (
     check_trivy_available,
     scan_project,
 )
+from maintenance_man.storage import load_scan_results
 from tests.conftest import GRADLE_FIXTURES, make_update, make_vuln
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def _quiet_uv_scan(monkeypatch):
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
+    monkeypatch.setattr(scanner, "_check_outdated", lambda *args: [])
+
+
+def test_scan_project_saves_through_storage(mm_home, tmp_path, monkeypatch):
+    _quiet_uv_scan(monkeypatch)
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+    result = scanner.scan_project("demo", project)
+    assert load_scan_results("demo", mm_home / "scan-results") == result
+
+
+def test_scan_project_replaces_results_symlink(mm_home, tmp_path, monkeypatch):
+    _quiet_uv_scan(monkeypatch)
+    results = mm_home / "scan-results"
+    results.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("keep")
+    (results / "demo.json").symlink_to(outside)
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+    scanner.scan_project("demo", project)
+    assert not (results / "demo.json").is_symlink()
+    assert outside.read_text() == "keep"
 
 
 def _make_project(
@@ -1075,7 +1102,6 @@ def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semanti
 def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch):
     from contextlib import contextmanager
 
-    from maintenance_man import paths, scanner
     from maintenance_man.gradle import GradleError
     from maintenance_man.gradle_resolution import parse_resolution_report
     from maintenance_man.models.config import ProjectConfig

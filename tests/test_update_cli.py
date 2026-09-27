@@ -12,7 +12,8 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     Workflow,
 )
-from maintenance_man.updater import NoScanResultsError, UpdateResult
+from maintenance_man.storage import NoScanResultsError
+from maintenance_man.updater import UpdateResult
 from tests.conftest import (
     make_gradle_target,
     make_scan_result,

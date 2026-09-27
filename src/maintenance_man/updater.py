@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shlex
 import subprocess
 from collections.abc import Sequence
@@ -22,7 +21,7 @@ from maintenance_man.models.scan import (
     Workflow,
     highest_fix_version,
 )
-from maintenance_man.paths import sanitise_project_name
+from maintenance_man.storage import save_scan_results
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     UvDependencyLocation,
@@ -34,11 +33,6 @@ from maintenance_man.vcs import (
     current_change_has_changes,
     discard_current_change,
 )
-
-
-class NoScanResultsError(Exception):
-    pass
-
 
 type UpdateKind = Literal["vuln", "update"]
 
@@ -274,27 +268,6 @@ def process_updates(
         project_name=project_name,
         results_dir=results_dir,
     )
-
-
-def load_scan_results(project_name: str, results_dir: Path) -> ScanResult:
-    """Load scan results JSON for a project. Raises NoScanResultsError if missing."""
-    results_file = _results_path(project_name, results_dir)
-    try:
-        data = json.loads(results_file.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise NoScanResultsError(
-            f"No scan results found for '{project_name}'. "
-            f"Run 'mm scan {project_name}' first."
-        ) from None
-    return ScanResult.model_validate(data)
-
-
-def save_scan_results(
-    project_name: str, results_dir: Path, scan_result: ScanResult
-) -> None:
-    """Write scan results (with update statuses) back to disk."""
-    results_file = _results_path(project_name, results_dir)
-    results_file.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
 
 
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
@@ -563,11 +536,6 @@ def _record_failure(
         passed=False,
         failed_phase=phase,
     )
-
-
-def _results_path(project_name: str, results_dir: Path) -> Path:
-    """Return the path to a project's scan results file."""
-    return results_dir / f"{sanitise_project_name(project_name)}.json"
 
 
 def _persist_status(

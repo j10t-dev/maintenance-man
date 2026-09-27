@@ -47,7 +47,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.outdated import get_outdated
-from maintenance_man.paths import sanitise_project_name
+from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import revision_tree_id
 
 
@@ -113,15 +113,7 @@ def scan_project(
             else None
         ),
     )
-    results_dir = paths.scan_results_dir()
-    results_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = sanitise_project_name(name)
-    results_file = results_dir / f"{safe_name}.json"
-    if not results_file.resolve().is_relative_to(results_dir.resolve()):
-        raise ValueError(f"Invalid project name for results file: {name!r}")
-    temporary = results_file.with_suffix(".json.tmp")
-    temporary.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
-    temporary.replace(results_file)
+    save_scan_results(name, paths.scan_results_dir(), scan_result)
     return scan_result
 
 

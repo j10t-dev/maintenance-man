@@ -2,11 +2,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from maintenance_man.models.activity import (
-    ActivityEvent,
-    load_activity,
-    record_activity,
-)
+from maintenance_man.models.activity import ActivityEvent
+from maintenance_man.storage import load_activity, record_activity
 
 _TS = datetime(2026, 3, 20, 14, 32, tzinfo=UTC)
 

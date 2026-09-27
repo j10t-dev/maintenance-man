@@ -1,6 +1,5 @@
 """Gradle workflow preparation, workspace coordination, and finalization."""
 
-import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -56,8 +55,9 @@ from maintenance_man.scanner import (
     _run_gradle_scan,
     _run_trivy_secret_scan,
 )
-from maintenance_man.updater import (
+from maintenance_man.storage import (
     NoScanResultsError,
+    fsync_dir,
     load_scan_results,
     save_scan_results,
 )
@@ -353,11 +353,7 @@ def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> N
     ):
         raise GradleError("Revisions changed during restart; original ledger retained")
     path.unlink()
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    fsync_dir(path.parent)
     gradle_updater.retire_gradle_context(run.context)
     rprint(f"Archived failed Gradle run to {archive}; rebuilding candidates from main")
 

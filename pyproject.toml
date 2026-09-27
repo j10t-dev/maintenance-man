@@ -72,6 +72,7 @@ forbidden_modules = [
     "maintenance_man.paths",
     "maintenance_man.resources",
     "maintenance_man.scanner",
+    "maintenance_man.storage",
     "maintenance_man.updater",
     "maintenance_man.uv_dependencies",
     "maintenance_man.vcs",

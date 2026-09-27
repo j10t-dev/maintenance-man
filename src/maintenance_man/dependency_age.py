@@ -31,6 +31,7 @@ from maintenance_man.models.gradle import (
 from maintenance_man.models.scan import (
     UpdateFinding,
 )
+from maintenance_man.storage import atomic_write_text
 
 
 def filter_by_age(
@@ -560,11 +561,7 @@ class PublicationLookupContext:
             try:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 path = self._path(key, method)
-                temporary = path.with_suffix(
-                    f".{os.getpid()}.{threading.get_ident()}.tmp"
-                )
-                temporary.write_text(fact.model_dump_json())
-                temporary.replace(path)
+                atomic_write_text(path, fact.model_dump_json())
             except OSError:
                 # Evidence was verified live; disk errors cannot supply evidence.
                 pass

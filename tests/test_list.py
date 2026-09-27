@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from maintenance_man.cli import _relative_time, app
-from maintenance_man.models.activity import record_activity
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -14,6 +13,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
+from maintenance_man.storage import record_activity
 
 _NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 

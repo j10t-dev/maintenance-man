@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 from contextlib import contextmanager
 from datetime import timedelta
@@ -52,6 +54,17 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.vcs import RevisionCheck
+
+
+def test_saved_ledger_is_private(workflow, tmp_path):
+    run = begin_workflow(workflow)
+    path = tmp_path / "ledger" / "run.json"
+    previous = os.umask(0o022)
+    try:
+        updater.save_gradle_run(path, run)
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 @pytest.fixture

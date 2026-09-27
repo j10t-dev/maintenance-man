@@ -21,18 +21,15 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.updater import (
-    NoScanResultsError,
     _apply_update,
     _get_uv_update_command,
     consolidate_vulns,
     get_update_commands,
-    load_scan_results,
     process_findings,
     process_updates,
     process_vulns,
     remove_completed_findings,
     run_test_phases,
-    save_scan_results,
     sort_updates_by_risk,
 )
 from maintenance_man.uv_dependencies import (
@@ -88,21 +85,6 @@ def project_config(tmp_path: Path) -> ProjectConfig:
 
 
 @pytest.fixture()
-def scan_result() -> ScanResult:
-    return ScanResult(
-        project="myapp",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target="/tmp/myapp",
-        vulnerabilities=[make_vuln()],
-        updates=[
-            make_update(SemverTier.MAJOR),
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ],
-    )
-
-
-@pytest.fixture()
 def mock_local_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     """Mock VCS and updater calls for single-bookmark update processing."""
     mocks = {}
@@ -138,60 +120,6 @@ def mock_resolve_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
         mocks[name] = mock
     return mocks
-
-
-# -- save_scan_results --
-
-
-class TestSaveScanResults:
-    def test_writes_json_to_disk(self, scan_results_dir: Path, scan_result: ScanResult):
-        save_scan_results("myapp", scan_results_dir, scan_result)
-        import json
-
-        data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
-        assert data["project"] == "myapp"
-
-    def test_preserves_update_status(self, scan_results_dir: Path):
-        result = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-            updates=[
-                UpdateFinding(
-                    pkg_name="pkg-a",
-                    installed_version="1.0.0",
-                    latest_version="1.0.1",
-                    semver_tier=SemverTier.PATCH,
-                    update_status=UpdateStatus.COMPLETED,
-                ),
-            ],
-        )
-        save_scan_results("myapp", scan_results_dir, result)
-        import json
-
-        data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
-        assert data["updates"][0]["update_status"] == "completed"
-
-
-# -- load_scan_results --
-
-
-class TestLoadScanResults:
-    def test_load_existing(self, scan_results_dir: Path):
-        result = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-        )
-        (scan_results_dir / "myapp.json").write_text(
-            result.model_dump_json(indent=2), encoding="utf-8"
-        )
-        loaded = load_scan_results("myapp", scan_results_dir)
-        assert loaded.project == "myapp"
-
-    def test_load_missing(self, scan_results_dir: Path):
-        with pytest.raises(NoScanResultsError, match="nonexistent"):
-            load_scan_results("nonexistent", scan_results_dir)
 
 
 # -- get_update_commands --

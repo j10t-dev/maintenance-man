@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import shutil
 import tempfile
 import time
@@ -62,6 +61,7 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.scanner import TrivyScanError, capture_gradle_snapshot
+from maintenance_man.storage import atomic_write_text
 from maintenance_man.updater import run_test_phases
 from maintenance_man.vcs import (
     _run,
@@ -87,31 +87,10 @@ def save_gradle_run(path: Path, run: GradleRun) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         raise GradleError("Refusing symlinked Gradle run ledger")
-    temporary: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=".gradle-run-",
-            delete=False,
-        ) as stream:
-            temporary = stream.name
-            stream.write(run.model_dump_json(indent=2))
-            stream.flush()
-            os.fsync(stream.fileno())
-        Path(temporary).replace(path)
-        temporary = None
-        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        atomic_write_text(path, run.model_dump_json(indent=2), durable=True, mode=0o600)
     except OSError as exc:
         raise GradleError(f"Cannot persist Gradle run: {exc}") from exc
-    finally:
-        if temporary is not None:
-            Path(temporary).unlink(missing_ok=True)
 
 
 def load_gradle_run(path: Path) -> GradleRun | None:

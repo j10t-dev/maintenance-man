@@ -41,8 +41,6 @@ from maintenance_man.gradle_verification import snapshot_vulnerabilities
 from maintenance_man.models.activity import (
     ActivityEvent,
     ProjectActivity,
-    load_activity,
-    record_activity,
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.gradle import (
@@ -67,18 +65,22 @@ from maintenance_man.scanner import (
     check_trivy_available,
     scan_project,
 )
+from maintenance_man.storage import (
+    NoScanResultsError,
+    load_activity,
+    load_scan_results,
+    record_activity,
+    save_scan_results,
+)
 from maintenance_man.updater import (
     Finding,
-    NoScanResultsError,
     UpdateResult,
     consolidate_vulns,
-    load_scan_results,
     process_findings,
     process_updates,
     process_vulns,
     remove_completed_findings,
     run_test_phases,
-    save_scan_results,
     sort_updates_by_risk,
 )
 from maintenance_man.vcs import (
