@@ -16,10 +16,8 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from maintenance_man import __version__, gradle_workflow
-from maintenance_man import config as _config
+from maintenance_man import __version__, gradle_workflow, paths
 from maintenance_man.config import (
-    MM_HOME,
     ConfigError,
     ProjectNotFoundError,
     ensure_mm_home,
@@ -171,8 +169,8 @@ def main() -> None:
 def init() -> None:
     """Initialise the ~/.mm directory and skeleton config."""
     ensure_mm_home()
-    console.print(f"Initialised {MM_HOME}")
-    console.print(f"Edit {MM_HOME / 'config.toml'} to add projects.")
+    console.print(f"Initialised {paths.mm_home()}")
+    console.print(f"Edit {paths.config_path()} to add projects.")
 
 
 @app.command
@@ -390,7 +388,7 @@ def _update_batch_targets(
     """Update an explicit ordered set of projects, auto-selecting all findings."""
     _exit_if_no_update_targets(cfg, target_names)
 
-    results_dir = _config.MM_HOME / "scan-results"
+    results_dir = paths.scan_results_dir()
     all_project_results: list[tuple[str, list[UpdateResult]]] = []
     had_errors = False
     gradle_reported = False
@@ -981,7 +979,7 @@ def _deploy_all(cfg: MmConfig, *, check: bool = False, force: bool = False) -> N
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         sys.exit(ExitCode.OK)
 
-    activity = load_activity(_config.MM_HOME / "activity.json")
+    activity = load_activity(paths.activity_path())
     results: list[DeployResult] = []
 
     for name, proj_config in sorted(cfg.projects.items()):
@@ -1082,7 +1080,7 @@ def _record_deploy_activity(
     commit_id: str | None = None,
 ) -> None:
     """Record build/deploy activity for a project."""
-    activity_path = _config.MM_HOME / "activity.json"
+    activity_path = paths.activity_path()
     branch = current_label(project_path)
     record_activity(
         activity_path,
@@ -1202,7 +1200,7 @@ def deploy(
             f"Add deploy_command to [projects.{project}] in ~/.mm/config.toml."
         )
 
-    activity = load_activity(_config.MM_HOME / "activity.json")
+    activity = load_activity(paths.activity_path())
     decision, current_id = should_deploy(
         project, proj_config.path, activity, force=force
     )
@@ -1306,7 +1304,7 @@ def build(
 
     console.print(f"[bold]Building {project}[/]\n")
 
-    activity_path = _config.MM_HOME / "activity.json"
+    activity_path = paths.activity_path()
     branch = current_label(proj_config.path)
     try:
         run_build(project, proj_config.build_command, proj_config.path)
@@ -1343,7 +1341,7 @@ def list_projects(
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
-    results_dir = _config.MM_HOME / "scan-results"
+    results_dir = paths.scan_results_dir()
     scan_results: dict[str, ScanResult] = {}
     for name in cfg.projects:
         try:
@@ -1355,7 +1353,7 @@ def list_projects(
                 f"[yellow]Warning:[/] corrupt scan results for '{name}' — skipping"
             )
 
-    activity = load_activity(_config.MM_HOME / "activity.json")
+    activity = load_activity(paths.activity_path())
 
     table = Table(title="Configured Projects")
     for col, kw in [
@@ -1766,7 +1764,7 @@ def _update_batch(
 def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
     """Update a single project with interactive selection."""
     proj_config = _resolve_proj(cfg, project)
-    results_dir = _config.MM_HOME / "scan-results"
+    results_dir = paths.scan_results_dir()
     if proj_config.package_manager == "gradle":
         sys.exit(
             _run_gradle_flow(
@@ -1817,7 +1815,7 @@ def resolve(
     """
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
-    results_dir = _config.MM_HOME / "scan-results"
+    results_dir = paths.scan_results_dir()
     minimum_age_days = cfg.defaults.min_version_age_days
     try:
         check_gh_available()

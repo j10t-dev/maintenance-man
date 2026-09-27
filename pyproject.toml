@@ -69,6 +69,7 @@ forbidden_modules = [
     "maintenance_man.gradle_verification",
     "maintenance_man.gradle_workflow",
     "maintenance_man.outdated",
+    "maintenance_man.paths",
     "maintenance_man.resources",
     "maintenance_man.scanner",
     "maintenance_man.updater",
@@ -91,7 +92,7 @@ ignore_imports = [
     "maintenance_man.gradle_workflow -> rich",
 ]
 
-# Allowlist removed by design B.
+# Allowlist removed by design B2.
 [[tool.importlinter.contracts]]
 id = "vcs-no-gradle"
 name = "VCS does not import gradle"

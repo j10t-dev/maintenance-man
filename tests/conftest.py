@@ -104,7 +104,7 @@ def make_scan_result(
 def mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect MM_HOME to a temp directory (not yet created on disk)."""
     home = tmp_path / ".mm"
-    monkeypatch.setattr("maintenance_man.config.MM_HOME", home)
+    monkeypatch.setattr("maintenance_man.paths.MM_HOME", home)
     return home
 
 

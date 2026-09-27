@@ -1075,7 +1075,7 @@ def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semanti
 def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch):
     from contextlib import contextmanager
 
-    from maintenance_man import scanner
+    from maintenance_man import paths, scanner
     from maintenance_man.gradle import GradleError
     from maintenance_man.gradle_resolution import parse_resolution_report
     from maintenance_man.models.config import ProjectConfig
@@ -1090,7 +1090,7 @@ def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch
         yield tmp_path / "bom.json", resolution
 
     monkeypatch.setattr(scanner, "generate_gradle_report", capture)
-    monkeypatch.setattr(scanner._config, "MM_HOME", tmp_path / "mm")
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / "mm")
     saved = tmp_path / "mm/scan-results/demo.json"
     saved.parent.mkdir(parents=True)
     saved.write_text("previous findings")

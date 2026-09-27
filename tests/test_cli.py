@@ -32,6 +32,18 @@ class TestVersion:
         assert __version__ in capsys.readouterr().out
 
 
+class TestInitCommand:
+    def test_init_uses_redirected_home(
+        self, mm_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            app(["init"])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out.replace("\n", "")
+        assert str(mm_home) in out
+        assert (mm_home / "config.toml").is_file()
+
+
 class TestDeployCommand:
     def test_deploy_no_project_is_mass_mode(self, mm_home: Path):
         """Deploy with no project triggers mass mode (exits OK with no projects)."""

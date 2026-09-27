@@ -6,10 +6,10 @@ from pathlib import Path
 
 from rich import print as rprint
 
-from maintenance_man import config as _config
-from maintenance_man import sanitise_project_name
+from maintenance_man import paths
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
+from maintenance_man.paths import sanitise_project_name
 
 
 class GitHubCLINotFoundError(Exception):
@@ -90,8 +90,6 @@ def revision_file(path: Path, revision: str, filename: str) -> RevisionFileCheck
 
 
 _MANAGED_BOOKMARK_PREFIXES = tuple(WORKFLOW_BOOKMARKS.values())
-
-MM_WORKSPACES = _config.MM_HOME / "workspaces"
 
 
 def check_jj_available() -> None:
@@ -275,11 +273,11 @@ def delete_bookmark(bookmark: str, path: Path) -> bool:
 
 
 def workspace_path_for_project(project: str) -> Path:
-    return MM_WORKSPACES / sanitise_project_name(project)
+    return paths.project_file(paths.workspaces_dir(), project)
 
 
 def assert_safe_workspace_path(path: Path) -> Path:
-    root = MM_WORKSPACES.resolve()
+    root = paths.workspaces_dir().resolve()
     target = path.resolve()
 
     if target == root:

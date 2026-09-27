@@ -9,8 +9,8 @@ from pathlib import Path
 
 from rich import print as rprint
 
-from maintenance_man import config as _config
 from maintenance_man import gradle_updates as gradle_updater
+from maintenance_man import paths
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     filter_gradle_updates_by_age,
@@ -149,7 +149,7 @@ def _prepare_gradle_run(
         )
     gradle_updater.gradle_check_commands(project)
     context = initialize_comparison_context(
-        project, resolution, _config.MM_HOME / "gradle-contexts"
+        project, resolution, paths.gradle_contexts_dir()
     )
     try:
         # The first durable record is a complete plan and checked baseline.
@@ -494,9 +494,7 @@ def run_gradle_flow(
         else:
             work = _resume_gradle_workspace(run, project)
             base = run.base_commit_id
-        with PublicationLookupContext(
-            _config.MM_HOME / "gradle-publications"
-        ) as publication:
+        with PublicationLookupContext(paths.gradle_publications_dir()) as publication:
             unfinished = run is not None and _gradle_run_needs_replanning(run)
             if unfinished:
                 _require_gradle_accepted_workspace(run, work)

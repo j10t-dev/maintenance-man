@@ -3,6 +3,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from maintenance_man import paths
 from maintenance_man.models.config import MmConfig, ProjectConfig
 
 
@@ -14,9 +15,6 @@ class ProjectNotFoundError(Exception):
     """Raised when a requested project is not found or its path does not exist."""
 
 
-MM_HOME: Path = Path.home() / ".mm"
-
-
 def load_config(config_path: Path | None = None) -> MmConfig:
     """Load and validate config from a TOML file.
 
@@ -25,7 +23,7 @@ def load_config(config_path: Path | None = None) -> MmConfig:
     """
     if config_path is None:
         ensure_mm_home()
-        config_path = MM_HOME / "config.toml"
+        config_path = paths.config_path()
 
     if not config_path.exists():
         raise ConfigError(f"Config file not found: {config_path}")
@@ -70,11 +68,11 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
 
 def ensure_mm_home() -> None:
     """Create ~/.mm/ directory structure and skeleton config if missing."""
-    MM_HOME.mkdir(parents=True, exist_ok=True)
-    (MM_HOME / "scan-results").mkdir(exist_ok=True)
-    (MM_HOME / "workspaces").mkdir(exist_ok=True)
+    paths.mm_home().mkdir(parents=True, exist_ok=True)
+    paths.scan_results_dir().mkdir(exist_ok=True)
+    paths.workspaces_dir().mkdir(exist_ok=True)
 
-    config_path = MM_HOME / "config.toml"
+    config_path = paths.config_path()
     if not config_path.exists():
         config_path.write_text(_SKELETON_CONFIG)
 

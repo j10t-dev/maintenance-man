@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from maintenance_man import cli, scanner
+from maintenance_man import cli, paths, scanner
 from maintenance_man import gradle_resolution as candidates
 from maintenance_man import gradle_updates as updater
 from maintenance_man import gradle_verification as verification
@@ -440,7 +440,7 @@ def workflow(frozen_context, resolution, candidate, scope, monkeypatch, tmp_path
     after = snapshot(
         resolution, [evidence(scope, version="2")], context.identity, "after-tree"
     )
-    monkeypatch.setattr(updater._config, "MM_HOME", tmp_path / "mm")
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / "mm")
     commands = (project.build_command, project.test_unit)
     checks = CheckEvidence(
         commands=commands,
@@ -1940,7 +1940,7 @@ def test_gradle_fresh_scan_does_not_clear_unfinished_ledger(driver, monkeypatch)
         scanner, "_run_gradle_scan", lambda *args: ([], workflow.initial.resolution)
     )
     monkeypatch.setattr(scanner, "get_outdated", lambda *args: [])
-    result_path = updater._config.MM_HOME / "scan-results" / "sample.json"
+    result_path = paths.MM_HOME / "scan-results" / "sample.json"
     result_path.parent.mkdir()
     result_path.write_bytes(b"previous current-main scan")
     with pytest.raises(SystemExit) as exc:

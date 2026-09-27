@@ -14,8 +14,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
 
-from maintenance_man import config as _config
-from maintenance_man import sanitise_project_name
+from maintenance_man import paths
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     filter_by_age,
@@ -48,6 +47,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.outdated import get_outdated
+from maintenance_man.paths import sanitise_project_name
 from maintenance_man.vcs import revision_tree_id
 
 
@@ -85,9 +85,7 @@ def scan_project(
     elif project.package_manager == "gradle":
         vulns, resolution = _run_gradle_scan(project)
         updates = get_outdated(project)
-        with PublicationLookupContext(
-            _config.MM_HOME / "gradle-publications"
-        ) as context:
+        with PublicationLookupContext(paths.gradle_publications_dir()) as context:
             updates = filter_gradle_updates_by_age(
                 updates, project, resolution, min_version_age_days, context
             )
@@ -115,7 +113,7 @@ def scan_project(
             else None
         ),
     )
-    results_dir = _config.MM_HOME / "scan-results"
+    results_dir = paths.scan_results_dir()
     results_dir.mkdir(parents=True, exist_ok=True)
     safe_name = sanitise_project_name(name)
     results_file = results_dir / f"{safe_name}.json"

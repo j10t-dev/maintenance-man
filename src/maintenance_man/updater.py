@@ -10,7 +10,6 @@ from typing import Literal, Protocol
 
 from rich import print as rprint
 
-from maintenance_man import sanitise_project_name
 from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
@@ -23,6 +22,7 @@ from maintenance_man.models.scan import (
     Workflow,
     highest_fix_version,
 )
+from maintenance_man.paths import sanitise_project_name
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     UvDependencyLocation,

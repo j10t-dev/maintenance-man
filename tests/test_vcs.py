@@ -400,7 +400,7 @@ class TestWorkspacePathSafety:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         root = tmp_path / ".mm" / "workspaces"
-        monkeypatch.setattr("maintenance_man.vcs.MM_WORKSPACES", root)
+        monkeypatch.setattr("maintenance_man.paths.MM_HOME", root.parent)
         assert workspace_path_for_project("api/service") == root / "api_service"
 
     @pytest.mark.parametrize(
@@ -417,10 +417,7 @@ class TestWorkspacePathSafety:
     def test_refuses_unsafe_workspace_paths(
         self, bad_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        monkeypatch.setattr(
-            "maintenance_man.vcs.MM_WORKSPACES",
-            Path("/home/glykon/.mm/workspaces"),
-        )
+        monkeypatch.setattr("maintenance_man.paths.MM_HOME", Path("/home/glykon/.mm"))
         with pytest.raises(ValueError, match="refusing"):
             assert_safe_workspace_path(bad_path)
 
@@ -433,7 +430,7 @@ class TestWorkspacePathSafety:
         outside.mkdir()
         link = root / "project"
         link.symlink_to(outside, target_is_directory=True)
-        monkeypatch.setattr("maintenance_man.vcs.MM_WORKSPACES", root)
+        monkeypatch.setattr("maintenance_man.paths.MM_HOME", root.parent)
 
         with pytest.raises(ValueError, match="outside"):
             assert_safe_workspace_path(link)
@@ -444,7 +441,7 @@ class TestWorkspacePathSafety:
         root = tmp_path / ".mm" / "workspaces"
         workspace = root / "project"
         workspace.mkdir(parents=True)
-        monkeypatch.setattr("maintenance_man.vcs.MM_WORKSPACES", root)
+        monkeypatch.setattr("maintenance_man.paths.MM_HOME", root.parent)
         assert assert_safe_workspace_path(workspace) == workspace.resolve()
 
 
@@ -454,7 +451,7 @@ class TestWorkspaceHelpers:
         self, mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         root = tmp_path / ".mm" / "workspaces"
-        monkeypatch.setattr("maintenance_man.vcs.MM_WORKSPACES", root)
+        monkeypatch.setattr("maintenance_man.paths.MM_HOME", root.parent)
         mock_run.return_value = _completed()
 
         assert create_workspace(Path("/repo"), "api/service", "main") is True
@@ -486,7 +483,7 @@ class TestWorkspaceHelpers:
         root = tmp_path / ".mm" / "workspaces"
         workspace = root / "api"
         workspace.mkdir(parents=True)
-        monkeypatch.setattr("maintenance_man.vcs.MM_WORKSPACES", root)
+        monkeypatch.setattr("maintenance_man.paths.MM_HOME", root.parent)
         mock_run.return_value = _completed()
 
         remove_workspace(Path("/repo"), "api")

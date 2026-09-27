@@ -14,8 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from maintenance_man import config as _config
-from maintenance_man import sanitise_project_name
+from maintenance_man import paths
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     evaluate_gradle_candidate_age,
@@ -78,11 +77,10 @@ from maintenance_man.vcs import (
 
 
 def gradle_run_path(project: str) -> Path:
-    root = _config.MM_HOME / "gradle-runs"
-    target = root / f"{sanitise_project_name(project)}.json"
-    if target.parent.resolve() != root.resolve():
-        raise GradleError("Invalid Gradle run path")
-    return target
+    try:
+        return paths.project_file(paths.gradle_runs_dir(), project, ".json")
+    except ValueError as exc:
+        raise GradleError("Invalid Gradle run path") from exc
 
 
 def save_gradle_run(path: Path, run: GradleRun) -> None:
@@ -535,7 +533,7 @@ def rebuild_gradle_run_evidence(
         if isinstance(resolution, IncompleteResolution):
             raise GradleError("Recorded baseline cannot produce complete coverage")
         context = initialize_comparison_context(
-            base_project, resolution, _config.MM_HOME / "gradle-contexts"
+            base_project, resolution, paths.gradle_contexts_dir()
         )
         try:
             _, initial = capture_checked_gradle_snapshot(
