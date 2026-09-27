@@ -121,6 +121,175 @@ def test_former_gradle_error_cases_raise_revision_error(
         call(tmp_path)
 
 
+class TestJjRepositoryBoundary:
+    def test_temporary_workspace_normalizes_allocation_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        repo = vcs.JjRepository(tmp_path)
+        failure = OSError("allocation denied")
+
+        def fail_allocate(*, prefix: str):
+            assert prefix == "mm-gradle-proof-"
+            raise failure
+
+        monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
+        monkeypatch.setattr(vcs.tempfile, "mkdtemp", fail_allocate)
+        with (
+            pytest.raises(
+                vcs.RevisionError, match="allocate proof workspace"
+            ) as caught,
+            repo.temporary_workspace(revision="main"),
+        ):
+            pytest.fail("allocation failure must prevent entry")
+        assert caught.value.__cause__ is failure
+
+    def test_temporary_workspace_marker_failure_removes_allocated_container(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        repo = vcs.JjRepository(tmp_path)
+        container = tmp_path / "proof-container"
+        failure = OSError("marker denied")
+
+        def allocate(*, prefix: str) -> str:
+            assert prefix == "mm-gradle-proof-"
+            container.mkdir()
+            return str(container)
+
+        original_write_text = Path.write_text
+
+        def fail_marker(path: Path, data: str, **kwargs):
+            if path.name == ".mm-proof-owner":
+                raise failure
+            return original_write_text(path, data, **kwargs)
+
+        monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
+        monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
+        monkeypatch.setattr(Path, "write_text", fail_marker)
+        with (
+            pytest.raises(vcs.RevisionError, match="mark proof workspace") as caught,
+            repo.temporary_workspace(revision="main"),
+        ):
+            pytest.fail("marker failure must prevent entry")
+        assert caught.value.__cause__ is failure
+        assert not container.exists()
+
+    @pytest.mark.parametrize(
+        ("stdout", "message"),
+        [
+            ("", "exactly one"),
+            (f"{'a' * 40}\n{'b' * 40}\n", "exactly one"),
+            ("not-a-commit\n", "malformed commit identity"),
+            (f"{'A' * 40}\n", "malformed commit identity"),
+        ],
+    )
+    def test_resolve_revision_rejects_empty_ambiguous_or_malformed_identity(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        stdout: str,
+        message: str,
+    ):
+        repo = vcs.JjRepository(tmp_path)
+        monkeypatch.setattr(repo, "local_bookmarks", lambda: frozenset())
+        monkeypatch.setattr(
+            repo, "_run", lambda arguments, **kwargs: _completed(stdout=stdout)
+        )
+        with pytest.raises(vcs.RevisionError, match=message):
+            repo.resolve_revision(revision="main")
+
+    @pytest.mark.parametrize("listing", ["file\nfile\n", "unknown\n", "\nfile\n"])
+    def test_revision_file_rejects_malformed_file_listing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        listing: str,
+    ):
+        repo = vcs.JjRepository(tmp_path)
+        monkeypatch.setattr(
+            repo,
+            "resolve_revision",
+            lambda **kwargs: "a" * 40,
+        )
+        monkeypatch.setattr(
+            repo, "_run", lambda arguments, **kwargs: _completed(stdout=listing)
+        )
+        with pytest.raises(vcs.RevisionError, match="Unexpected revision file listing"):
+            repo.revision_file(revision="main", filename="dep.txt")
+
+    @pytest.mark.parametrize(
+        ("listing", "regular"),
+        [("", False), ("file\n", True), ("symlink\n", False), ("tree\n", False)],
+    )
+    def test_revision_file_distinguishes_absence_and_regular_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        listing: str,
+        regular: bool,
+    ):
+        repo = vcs.JjRepository(tmp_path)
+        monkeypatch.setattr(
+            repo,
+            "resolve_revision",
+            lambda **kwargs: "a" * 40,
+        )
+        monkeypatch.setattr(
+            repo, "_run", lambda arguments, **kwargs: _completed(stdout=listing)
+        )
+        assert repo.revision_file(revision="main", filename="dep.txt") == (
+            vcs.RevisionFile(commit_id="a" * 40, is_regular=regular)
+        )
+
+    @pytest.mark.parametrize(
+        "inspector", ["", "unfamiliar\n", '    root_tree: Conflict("a")\n']
+    )
+    def test_tree_id_rejects_malformed_or_conflicted_inspector_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        inspector: str,
+    ):
+        repo = vcs.JjRepository(tmp_path)
+        monkeypatch.setattr(
+            repo,
+            "resolve_revision",
+            lambda **kwargs: "a" * 40,
+        )
+        monkeypatch.setattr(
+            repo, "_run", lambda arguments, **kwargs: _completed(stdout=inspector)
+        )
+        with pytest.raises(vcs.RevisionError, match="Cannot identify"):
+            repo.tree_id(revision="main")
+
+    @pytest.mark.parametrize(
+        ("main_only", "arguments"),
+        [
+            (False, ["git", "fetch", "--remote", "origin"]),
+            (
+                True,
+                ["git", "fetch", "--remote", "origin", "--branch", "main"],
+            ),
+        ],
+    )
+    def test_fetch_uses_origin_and_remote_timeout(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        main_only: bool,
+        arguments: list[str],
+    ):
+        repo = vcs.JjRepository(tmp_path)
+        calls: list[tuple[list[str], int]] = []
+
+        def run(command: list[str], *, timeout: int = 30):
+            calls.append((command, timeout))
+            return _completed()
+
+        monkeypatch.setattr(repo, "_run", run)
+        repo.fetch(main_only=main_only)
+        assert calls == [(arguments, 120)]
+
+
 class TestFinalVcsSurface:
     @pytest.mark.parametrize(
         "name",
