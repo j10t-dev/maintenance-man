@@ -547,7 +547,7 @@ class TestGradleReportInventory:
         monkeypatch.setattr(subprocess, "run", _report_wrapper(returncode=1))
 
         with (
-            pytest.raises(GradleError, match=r"failed \(exit 1\)"),
+            pytest.raises(GradleError, match=r"failed \(exit 1\): boom$"),
             generate_gradle_report(gradle_project),
         ):
             pytest.fail("failed wrapper must not yield an inventory")

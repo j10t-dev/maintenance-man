@@ -1,10 +1,11 @@
 """Structural guardrails: lint, import contracts and private-name access."""
 
 import ast
+import os
 import subprocess
 import sys
 import tomllib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,12 +37,14 @@ ALLOWED_PRIVATE_ACCESS: frozenset[PrivateAccess] = frozenset(
     }
 )
 
-type _Function = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
+type _Def = ast.FunctionDef | ast.AsyncFunctionDef
+type _Function = _Def | ast.Lambda
+type _Scope = ast.Module | _Function
 type _Comprehension = ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
+# Maps each name to the project modules it may be bound to.
+type _Env = Mapping[str, frozenset[str]]
 
-_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-# A name bound to something other than a project module.
-_SHADOWED = None
+_NOT_A_MODULE: frozenset[str] = frozenset()
 
 
 def _is_private(name: str) -> bool:
@@ -63,19 +66,78 @@ def _parameters(args: ast.arguments) -> list[ast.arg]:
     return [*args.posonlyargs, *args.args, *args.kwonlyargs, *optional]
 
 
-def _enclosing_parts(node: _Function) -> list[ast.expr]:
-    """Expressions of a function evaluated in the enclosing scope."""
-    args = node.args
-    defaults = [*args.defaults, *(d for d in args.kw_defaults if d is not None)]
-    if isinstance(node, ast.Lambda):
-        return defaults
-    annotations = [a.annotation for a in _parameters(args) if a.annotation]
+def _decorators(node: _Function) -> list[ast.expr]:
+    return [] if isinstance(node, ast.Lambda) else list(node.decorator_list)
+
+
+def _defaults(args: ast.arguments) -> list[ast.expr]:
+    return [*args.defaults, *(d for d in args.kw_defaults if d is not None)]
+
+
+def _annotations(node: _Def) -> list[ast.expr]:
+    annotations = [a.annotation for a in _parameters(node.args) if a.annotation]
     returns = [node.returns] if node.returns is not None else []
-    return [*node.decorator_list, *defaults, *annotations, *returns]
+    return [*annotations, *returns]
 
 
-def _body(node: _Function) -> list[ast.AST]:
+def _body(node: _Scope) -> list[ast.AST]:
     return [node.body] if isinstance(node, ast.Lambda) else list(node.body)
+
+
+def _local_nodes(scope: _Scope) -> Iterator[ast.AST]:
+    """Yield the nodes whose bindings land in *scope*."""
+    stack: list[ast.AST] = _body(scope)
+    if not isinstance(scope, ast.Module):
+        stack.extend(_parameters(scope.args))
+    while stack:
+        node = stack.pop()
+        yield node
+        match node:
+            case ast.comprehension():
+                # The target binds in the comprehension's own scope; a walrus
+                # in iter or ifs still binds here.
+                stack.extend([node.iter, *node.ifs])
+            case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.Lambda():
+                # Decorators and defaults run here, so a walrus in them binds here.
+                stack.extend([*_decorators(node), *_defaults(node.args)])
+            case ast.ClassDef():
+                stack.extend([*node.decorator_list, *node.bases, *node.keywords])
+            case _:
+                stack.extend(ast.iter_child_nodes(node))
+
+
+def _declarations(function: _Function) -> tuple[set[str], set[str]]:
+    """Return the names *function* declares global and nonlocal."""
+    declared_global: set[str] = set()
+    declared_nonlocal: set[str] = set()
+    for node in _local_nodes(function):
+        match node:
+            case ast.Global(names=names):
+                declared_global.update(names)
+            case ast.Nonlocal(names=names):
+                declared_nonlocal.update(names)
+    return declared_global, declared_nonlocal
+
+
+def _child_functions(scope: _Scope) -> Iterator[_Def]:
+    """Yield the functions defined in *scope*'s body, including in class bodies."""
+    stack = _body(scope)
+    while stack:
+        node = stack.pop()
+        match node:
+            case ast.FunctionDef() | ast.AsyncFunctionDef():
+                yield node
+            case ast.Lambda():
+                pass  # a lambda cannot declare global or nonlocal
+            case _:
+                stack.extend(ast.iter_child_nodes(node))
+
+
+def _merge(
+    into: dict[str, frozenset[str]], pairs: Iterable[tuple[str, frozenset[str]]]
+) -> None:
+    for name, targets in pairs:
+        into[name] = into.get(name, _NOT_A_MODULE) | targets
 
 
 def _relative(absolute: str) -> str | None:
@@ -93,6 +155,7 @@ class _Scanner:
         self.path = path
         self.modules = modules
         self.package = module if path.endswith("__init__.py") else _parent(module)
+        self.module_env: _Env = {}
         self.sites: list[PrivateAccessSite] = []
 
     def import_base(self, node: ast.ImportFrom) -> str | None:
@@ -106,78 +169,97 @@ class _Scanner:
             return None
         return _join(base, node.module) if node.module else base
 
-    def module_or_shadowed(self, target: str | None) -> str | None:
-        return target if target in self.modules else _SHADOWED
+    def targets(self, module: str | None) -> frozenset[str]:
+        return frozenset({module}) if module in self.modules else _NOT_A_MODULE
 
-    def bindings(self, node: ast.AST) -> Iterator[tuple[str, str | None]]:
-        """Yield (name, bound project module or _SHADOWED) for one node."""
+    def bindings(self, node: ast.AST) -> Iterator[tuple[str, frozenset[str]]]:
+        """Yield (name, project modules it binds) for one node."""
         match node:
             case ast.Import():
                 for alias in node.names:
                     if alias.asname is None:
                         top = alias.name.partition(".")[0]
-                        yield top, ("" if top == PACKAGE else _SHADOWED)
+                        yield top, self.targets("" if top == PACKAGE else None)
                     else:
-                        yield (
-                            alias.asname,
-                            self.module_or_shadowed(_relative(alias.name)),
-                        )
+                        yield alias.asname, self.targets(_relative(alias.name))
             case ast.ImportFrom():
                 base = self.import_base(node)
                 for alias in node.names:
                     if alias.name == "*":
                         continue
                     target = None if base is None else _join(base, alias.name)
-                    yield alias.asname or alias.name, self.module_or_shadowed(target)
+                    yield alias.asname or alias.name, self.targets(target)
             case ast.Name(ctx=ast.Store() | ast.Del()):
-                yield node.id, _SHADOWED
+                yield node.id, _NOT_A_MODULE
             case ast.arg():
-                yield node.arg, _SHADOWED
+                yield node.arg, _NOT_A_MODULE
             case ast.ExceptHandler(name=str() as name):
-                yield name, _SHADOWED
+                yield name, _NOT_A_MODULE
             case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.ClassDef():
-                yield node.name, _SHADOWED
+                yield node.name, _NOT_A_MODULE
             case ast.MatchAs(name=str() as name) | ast.MatchStar(name=str() as name):
-                yield name, _SHADOWED
+                yield name, _NOT_A_MODULE
             case ast.MatchMapping(rest=str() as name):
-                yield name, _SHADOWED
+                yield name, _NOT_A_MODULE
 
-    def scope_env(
-        self, scope: ast.Module | _Function, parent: Mapping[str, str | None]
-    ) -> dict[str, str | None]:
-        """Resolve names bound directly in *scope*, over the enclosing env."""
-        bound: dict[str, set[str | None]] = {}
-        stack: list[ast.AST] = (
-            list(scope.body)
-            if isinstance(scope, ast.Module)
-            else [*_parameters(scope.args), *_body(scope)]
-        )
-        while stack:
-            node = stack.pop()
-            for name, target in self.bindings(node):
-                bound.setdefault(name, set()).add(target)
-            if isinstance(node, ast.comprehension):
-                # The target binds in the comprehension's own scope; a walrus
-                # in iter or ifs still binds here.
-                stack.extend([node.iter, *node.ifs])
-            elif not isinstance(node, _NESTED_SCOPES):
-                stack.extend(ast.iter_child_nodes(node))
-        local = {
-            name: next(iter(targets)) if len(targets) == 1 else _SHADOWED
-            for name, targets in bound.items()
-        }
-        return {**parent, **local}
+    def bound_names(self, scope: _Scope) -> dict[str, frozenset[str]]:
+        """Union every binding made in *scope*, ignoring global and nonlocal."""
+        bound: dict[str, frozenset[str]] = {}
+        for node in _local_nodes(scope):
+            _merge(bound, self.bindings(node))
+        return bound
 
-    def resolve(self, node: ast.expr, env: Mapping[str, str | None]) -> str | None:
-        """Return the project module an expression names, if any."""
+    def escaping(
+        self, function: _Def
+    ) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+        """Bindings in *function* or its nested functions that land outside it.
+
+        Returns those made through ``global`` and those made through
+        ``nonlocal`` that no function up to *function* binds locally.
+        """
+        bound = self.bound_names(function)
+        declared_global, declared_nonlocal = _declarations(function)
+        local = bound.keys() - declared_global - declared_nonlocal
+        to_module = {n: bound[n] for n in declared_global & bound.keys()}
+        to_enclosing = {n: bound[n] for n in declared_nonlocal & bound.keys()}
+        for child in _child_functions(function):
+            child_module, child_enclosing = self.escaping(child)
+            _merge(to_module, child_module.items())
+            _merge(
+                to_enclosing,
+                ((n, t) for n, t in child_enclosing.items() if n not in local),
+            )
+        return to_module, to_enclosing
+
+    def scope_env(self, scope: _Scope, parent: _Env) -> dict[str, frozenset[str]]:
+        """Resolve names bound in *scope*, over the enclosing env."""
+        bound = self.bound_names(scope)
+        if isinstance(scope, ast.Module):
+            for child in _child_functions(scope):
+                _merge(bound, self.escaping(child)[0].items())
+            return {**parent, **bound}
+        declared_global, declared_nonlocal = _declarations(scope)
+        local = bound.keys() - declared_global - declared_nonlocal
+        for child in _child_functions(scope):
+            _, to_enclosing = self.escaping(child)
+            _merge(bound, ((n, t) for n, t in to_enclosing.items() if n in local))
+        env = {**parent, **{n: bound[n] for n in local}}
+        for name in declared_global:
+            env[name] = self.module_env.get(name, _NOT_A_MODULE)
+        return env
+
+    def resolve(self, node: ast.expr, env: _Env) -> frozenset[str]:
+        """Return the project modules an expression may name."""
         match node:
             case ast.Name(id=name):
-                return env.get(name)
+                return env.get(name, _NOT_A_MODULE)
             case ast.Attribute(value=value, attr=attr):
-                base = self.resolve(value, env)
-                if base is not None and _join(base, attr) in self.modules:
-                    return _join(base, attr)
-        return None
+                return frozenset(
+                    module
+                    for base in self.resolve(value, env)
+                    if (module := _join(base, attr)) in self.modules
+                )
+        return _NOT_A_MODULE
 
     def report(self, owner: str, name: str, line: int) -> None:
         if owner != self.module and _is_private(name):
@@ -185,16 +267,45 @@ class _Scanner:
                 PrivateAccessSite((self.module, owner, name), self.path, line)
             )
 
-    def visit_function(self, node: _Function, env: Mapping[str, str | None]) -> None:
-        for part in _enclosing_parts(node):
+    def scan(self, tree: ast.Module) -> None:
+        self.module_env = self.scope_env(tree, {})
+        self.visit(tree, self.module_env)
+
+    def type_param_env(
+        self, node: _Def | ast.ClassDef | ast.TypeAlias, env: _Env
+    ) -> _Env:
+        """Visit PEP 695 type parameters; return their annotation scope's env."""
+        if not node.type_params:
+            return env
+        names = [
+            param.name
+            for param in node.type_params
+            if isinstance(param, ast.TypeVar | ast.ParamSpec | ast.TypeVarTuple)
+        ]
+        inner = {**env, **dict.fromkeys(names, _NOT_A_MODULE)}
+        for param in node.type_params:
+            self.visit(param, inner)
+        return inner
+
+    def visit_function(self, node: _Function, env: _Env) -> None:
+        for part in [*_decorators(node), *_defaults(node.args)]:
             self.visit(part, env)
+        if not isinstance(node, ast.Lambda):
+            env = self.type_param_env(node, env)
+            for part in _annotations(node):
+                self.visit(part, env)
         inner = self.scope_env(node, env)
         for part in _body(node):
             self.visit(part, inner)
 
-    def visit_comprehension(
-        self, node: _Comprehension, env: Mapping[str, str | None]
-    ) -> None:
+    def visit_class(self, node: ast.ClassDef, env: _Env) -> None:
+        for part in node.decorator_list:
+            self.visit(part, env)
+        inner = self.type_param_env(node, env)
+        for part in [*node.bases, *node.keywords, *node.body]:
+            self.visit(part, inner)
+
+    def visit_comprehension(self, node: _Comprehension, env: _Env) -> None:
         first = node.generators[0]
         self.visit(first.iter, env)
         targets = {
@@ -203,7 +314,7 @@ class _Scanner:
             for name in ast.walk(generator.target)
             if isinstance(name, ast.Name)
         }
-        inner = {**env, **dict.fromkeys(targets, _SHADOWED)}
+        inner = {**env, **dict.fromkeys(targets, _NOT_A_MODULE)}
         for generator in node.generators:
             if generator is not first:
                 self.visit(generator.iter, inner)
@@ -215,22 +326,38 @@ class _Scanner:
         for element in elements:
             self.visit(element, inner)
 
-    def visit(self, node: ast.AST, env: Mapping[str, str | None]) -> None:
+    def visit_import(self, node: ast.Import) -> None:
+        """Report private modules named along each imported dotted path."""
+        for alias in node.names:
+            parts = (_relative(alias.name) or "").split(".")
+            for index, name in enumerate(parts):
+                owner = ".".join(parts[:index])
+                if owner in self.modules:
+                    self.report(owner, name, alias.lineno)
+
+    def visit(self, node: ast.AST, env: _Env) -> None:
         match node:
             case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.Lambda():
                 self.visit_function(node, env)
                 return
+            case ast.ClassDef():
+                self.visit_class(node, env)
+                return
+            case ast.TypeAlias():
+                self.visit(node.value, self.type_param_env(node, env))
+                return
             case ast.ListComp() | ast.SetComp() | ast.DictComp() | ast.GeneratorExp():
                 self.visit_comprehension(node, env)
                 return
+            case ast.Import():
+                self.visit_import(node)
             case ast.ImportFrom():
                 base = self.import_base(node)
                 if base is not None and base in self.modules:
                     for alias in node.names:
-                        self.report(base, alias.name, node.lineno)
+                        self.report(base, alias.name, alias.lineno)
             case ast.Attribute(value=value, attr=attr):
-                owner = self.resolve(value, env)
-                if owner is not None:
+                for owner in sorted(self.resolve(value, env)):
                     self.report(owner, attr, node.lineno)
         for child in ast.iter_child_nodes(node):
             self.visit(child, env)
@@ -244,8 +371,7 @@ def find_private_accesses(
     sites: list[PrivateAccessSite] = []
     for module, (path, text) in sorted(sources.items()):
         scanner = _Scanner(module, path, modules)
-        tree = ast.parse(text, filename=path)
-        scanner.visit(tree, scanner.scope_env(tree, {}))
+        scanner.scan(ast.parse(text, filename=path))
         sites.extend(scanner.sites)
     return sites
 
@@ -282,6 +408,8 @@ def run_tool(name: str, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [executable, *args],
         cwd=REPO_ROOT,
+        # Import this checkout's package, not whatever the venv's install points at.
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -315,6 +443,18 @@ def test_models_contract_covers_all_modules() -> None:
     }
     assert {m for m in forbidden if m.startswith(f"{PACKAGE}.")} == expected
     assert {"rich", "cyclopts"} <= forbidden
+
+
+def test_package_directories_are_regular_packages() -> None:
+    # grimp leaves namespace packages out of the graph, so no contract sees them.
+    namespace = sorted(
+        {
+            path.parent.relative_to(REPO_ROOT).as_posix()
+            for path in PACKAGE_DIR.rglob("*.py")
+            if not (path.parent / "__init__.py").is_file()
+        }
+    )
+    assert namespace == [], f"add __init__.py to: {namespace}"
 
 
 def _site_lines(sites: list[PrivateAccessSite]) -> str:
@@ -554,6 +694,86 @@ _TOP = "src/maintenance_man/probe.py"
             set(),
             id="comprehension-walrus-binds-in-function",
         ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "import maintenance_man.vcs as v\n"
+            "def f():\n    def g(x=(v := 1)):\n        return x\n    return v._run()\n",
+            set(),
+            id="walrus-in-nested-default-binds-in-function",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "try:\n    import maintenance_man.vcs as v\n"
+            "except ImportError:\n    v = None\nv._run()\n",
+            {("probe", "vcs", "_run")},
+            id="alias-with-import-fallback",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "def f():\n    global v\n    import maintenance_man.vcs as v\nv._run()\n",
+            {("probe", "vcs", "_run")},
+            id="global-binds-in-module",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "import maintenance_man.vcs as v\n"
+            "def f(v):\n    def g():\n        global v\n        return v._run()\n",
+            {("probe", "vcs", "_run")},
+            id="global-reads-module-binding",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "def f():\n    v = None\n"
+            "    def g():\n        nonlocal v\n"
+            "        import maintenance_man.vcs as v\n"
+            "    return v._run()\n",
+            {("probe", "vcs", "_run")},
+            id="nonlocal-binds-in-enclosing-function",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "import maintenance_man.vcs as v\n"
+            "def f[v](x: v._T) -> v._R:\n    return v._x\n",
+            set(),
+            id="function-type-param-shadows-alias",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "import maintenance_man.vcs as v\n"
+            "def f[T: v._B = v._D](x: T):\n    return x\n",
+            {("probe", "vcs", "_B"), ("probe", "vcs", "_D")},
+            id="type-param-bound-uses-enclosing-scope",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "import maintenance_man.vcs as v\n"
+            "class C[v](v._Base):\n    x = v._x\n"
+            "class D[T: v._B]:\n    pass\n",
+            {("probe", "vcs", "_B")},
+            id="class-type-params",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "import maintenance_man.vcs as v\ntype A[v] = v._T\ntype B = v._U\n",
+            {("probe", "vcs", "_U")},
+            id="type-alias-params",
+        ),
+        pytest.param(
+            "probe",
+            _TOP,
+            "import maintenance_man.vcs._impl\nimport maintenance_man._util as u\n",
+            {("probe", "vcs", "_impl"), ("probe", "", "_util")},
+            id="plain-import-of-private-module",
+        ),
     ],
 )
 def test_private_access_scanner(module, path, text, expected):
@@ -567,3 +787,9 @@ def test_stale_allowlist_entry_is_reported():
     allowed = frozenset({("probe", "vcs", "_run"), ("probe", "gradle", "_gone")})
     assert stale_allowlist_entries(sites, allowed) == {("probe", "gradle", "_gone")}
     assert unallowed_sites(sites, allowed) == []
+
+
+def test_private_access_site_is_the_alias_line():
+    text = "from maintenance_man.vcs import (\n    run,\n    _run,\n)\n"
+    sites = find_private_accesses({**_OWNERS, "probe": (_TOP, text)})
+    assert [site.line for site in sites] == [3]

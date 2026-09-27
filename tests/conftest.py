@@ -7,6 +7,11 @@ from typing import Any
 
 import pytest
 
+from maintenance_man.gradle import (
+    GRADLE_INVENTORY_BOM_RELPATH,
+    GRADLE_INVENTORY_MARKER_RELPATH,
+    GRADLE_INVENTORY_RELPATH,
+)
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
@@ -33,10 +38,10 @@ def report_payload():
 def fixture_runner(root, args, *, label):
     assert args[0] == "mmGradleReport"
     assert "--rerun-tasks" in args and "--no-build-cache" in args
-    owned = root / ".mm-gradle-inventory"
-    assert (owned / ".mm-owned").is_file()
+    owned = root / GRADLE_INVENTORY_RELPATH
+    assert (root / GRADLE_INVENTORY_MARKER_RELPATH).is_file()
     assert (owned / "gradle-report.gradle").read_text().startswith("import ")
-    (owned / "bom.json").write_text(
+    (root / GRADLE_INVENTORY_BOM_RELPATH).write_text(
         '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[{"group":"g","name":"a","version":"1.0","purl":"pkg:maven/g/a@1.0"}]}'
     )
     value = report_payload()
