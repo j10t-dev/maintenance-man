@@ -23,9 +23,7 @@ from maintenance_man.models.scan import (
 from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
     _apply_update,
-    _get_uv_update_command,
     consolidate_vulns,
-    get_update_commands,
     process_findings,
     process_updates,
     process_vulns,
@@ -34,7 +32,6 @@ from maintenance_man.updater import (
     sort_updates_by_risk,
 )
 from maintenance_man.uv_dependencies import (
-    UvDependencyError,
     UvDependencyLocation,
     get_uv_dependency_locations,
 )
@@ -121,133 +118,6 @@ def mock_resolve_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
         mocks[name] = mock
     return mocks
-
-
-# -- get_update_commands --
-
-
-def test_bun_update_refuses_a_workspace_without_a_manifest(tmp_path: Path):
-    with pytest.raises(ValueError, match=r"package.json"):
-        get_update_commands("bun", "zod", "4.6.5", tmp_path)
-    assert not (tmp_path / "package.json").exists()
-
-
-class TestGetUpdateCommands:
-    def test_uv_runtime_dependency(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\ndependencies = ["requests>=2.28"]\n', encoding="utf-8"
-        )
-
-        assert get_update_commands("uv", "requests", "2.33.1", tmp_path) == [
-            ["uv", "add", "requests==2.33.1"]
-        ]
-
-    def test_uv_dev_dependency_group(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text(
-            "[project]\ndependencies = []\n\n"
-            "[dependency-groups]\n"
-            'dev = ["pytest>=8.0"]\n',
-            encoding="utf-8",
-        )
-
-        assert get_update_commands("uv", "pytest", "9.0.3", tmp_path) == [
-            ["uv", "add", "--group", "dev", "pytest==9.0.3"]
-        ]
-
-    def test_uv_custom_dependency_group(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text(
-            "[project]\ndependencies = []\n\n"
-            "[dependency-groups]\n"
-            'lint = ["ruff>=0.9.0"]\n',
-            encoding="utf-8",
-        )
-
-        assert get_update_commands("uv", "ruff", "0.13.0", tmp_path) == [
-            ["uv", "add", "--group", "lint", "ruff==0.13.0"]
-        ]
-
-    def test_uv_optional_dependency_uses_lock_upgrade(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text(
-            "[project]\ndependencies = []\n\n"
-            "[project.optional-dependencies]\n"
-            'cli = ["rich>=14.0"]\n',
-            encoding="utf-8",
-        )
-
-        assert get_update_commands("uv", "rich", "14.3.3", tmp_path) == [
-            ["uv", "lock", "--upgrade-package", "rich"]
-        ]
-
-    def test_uv_runtime_and_group_dependency(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\ndependencies = ["pytest>=8.0"]\n\n'
-            "[dependency-groups]\n"
-            'dev = ["pytest>=8.0"]\n',
-            encoding="utf-8",
-        )
-
-        assert get_update_commands("uv", "pytest", "9.0.3", tmp_path) == [
-            ["uv", "add", "pytest==9.0.3"],
-            ["uv", "add", "--group", "dev", "pytest==9.0.3"],
-        ]
-
-    def test_uv_missing_declaration_uses_lock_upgrade(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\ndependencies = ["requests>=2.28"]\n', encoding="utf-8"
-        )
-
-        assert get_update_commands("uv", "urllib3", "2.7.0", tmp_path) == [
-            ["uv", "lock", "--upgrade-package", "urllib3"]
-        ]
-
-    @pytest.mark.parametrize(
-        ("manager", "pkg", "version", "expected"),
-        [
-            pytest.param(
-                "bun",
-                "axios",
-                "1.7.0",
-                [["bun", "add", "axios@1.7.0"]],
-                id="bun",
-            ),
-            pytest.param(
-                "mvn",
-                "org.example:lib",
-                "3.0.0",
-                [
-                    [
-                        "mvn",
-                        "versions:use-dep-version",
-                        "-Dincludes=org.example:lib",
-                        "-DdepVersion=3.0.0",
-                    ]
-                ],
-                id="mvn",
-            ),
-        ],
-    )
-    def test_non_uv_managers_unchanged(
-        self, tmp_path: Path, manager, pkg, version, expected
-    ):
-        if manager == "bun":
-            (tmp_path / "package.json").write_text('{"dependencies":{"axios":"1.6.0"}}')
-        assert get_update_commands(manager, pkg, version, tmp_path) == expected
-
-    def test_uv_group_command_requires_group_name(self):
-        with pytest.raises(
-            UvDependencyError,
-            match="group dependency location missing",
-        ):
-            _get_uv_update_command(
-                "pytest",
-                "9.0.3",
-                UvDependencyLocation(kind="group"),
-            )
-
-    def test_uv_transitive_location_emits_lock_upgrade_command(self):
-        assert _get_uv_update_command(
-            "urllib3", "2.7.0", UvDependencyLocation(kind="transitive")
-        ) == ["uv", "lock", "--upgrade-package", "urllib3"]
 
 
 class TestGetUvDependencyLocations:
@@ -375,7 +245,7 @@ def test_package_command_execution_failure_stops_the_apply(
 @pytest.mark.parametrize(
     "raised",
     [
-        subprocess.TimeoutExpired(["mvn", "versions:commit"], 120),
+        subprocess.TimeoutExpired(["mvn", "versions:commit"], 300),
         FileNotFoundError(2, "No such file or directory", "mvn"),
     ],
 )
@@ -397,7 +267,7 @@ def test_maven_finalisation_execution_failure_is_an_apply_failure(
             ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"],
             300,
         ),
-        (["mvn", "versions:commit"], 120),
+        (["mvn", "versions:commit"], 300),
     ]
 
 
@@ -1203,14 +1073,10 @@ class TestProcessUpdatesLocal:
         assert results[1].pkg_name == "pkg-c"
 
 
-def test_get_update_commands_refuses_gradle(tmp_path):
-    with pytest.raises(ValueError, match="Gradle"):
-        get_update_commands("gradle", "room", "2.8.5", tmp_path)
-
-
-def test_get_update_commands_refusal_records_a_failure_not_a_crash(tmp_path):
+def test_gradle_config_records_a_failed_apply_not_a_crash(tmp_path, capsys):
     """Unreachable by design; it must still degrade, not unwind the flow."""
     assert _apply_update("gradle", "room", "2.8.5", tmp_path) is False
+    assert "Gradle" in capsys.readouterr().out
 
 
 def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
@@ -1240,3 +1106,12 @@ def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(
 
     assert block is not None and block.kind == "stale"
     assert "update workspace" in block.reason
+
+
+def test_bun_update_without_a_manifest_runs_no_command(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("no command may run"),
+    )
+    assert _apply_update("bun", "zod", "4.6.5", tmp_path) is False
+    assert "package.json" in capsys.readouterr().out

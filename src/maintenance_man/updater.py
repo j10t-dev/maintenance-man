@@ -19,13 +19,13 @@ from maintenance_man.models.scan import (
     Workflow,
     highest_fix_version,
 )
+from maintenance_man.package_managers import (
+    UnsupportedPackageManagerError,
+    UpdateCommandError,
+    package_manager_ops,
+)
 from maintenance_man.process import ProcessError, run_captured, run_live
 from maintenance_man.storage import save_scan_results
-from maintenance_man.uv_dependencies import (
-    UvDependencyError,
-    UvDependencyLocation,
-    get_uv_dependency_locations,
-)
 from maintenance_man.vcs import (
     commit_current_change,
     create_or_reset_bookmark,
@@ -284,59 +284,6 @@ def remove_completed_findings(scan_result: ScanResult) -> None:
     scan_result.updates = _keep_incomplete(scan_result.updates)
 
 
-def get_update_commands(
-    package_manager: str,
-    pkg_name: str,
-    version: str,
-    project_path: Path,
-) -> list[list[str]]:
-    """Return the shell command or commands to update a package."""
-    match package_manager:
-        case "bun":
-            if not (project_path / "package.json").is_file():
-                raise ValueError(
-                    "package.json is missing from the update workspace; "
-                    "check that the project exists on main and rescan"
-                )
-            return [["bun", "add", f"{pkg_name}@{version}"]]
-        case "uv":
-            locations = get_uv_dependency_locations(project_path, pkg_name)
-            return [
-                _get_uv_update_command(pkg_name, version, location)
-                for location in locations
-            ]
-        case "mvn":
-            return [
-                [
-                    "mvn",
-                    "versions:use-dep-version",
-                    f"-Dincludes={pkg_name}",
-                    f"-DdepVersion={version}",
-                ]
-            ]
-        case "gradle":
-            raise ValueError(
-                "Gradle updates are applied through the Gradle adapter, not a "
-                "package-manager command"
-            )
-        case _:
-            raise ValueError(f"Unsupported package manager: {package_manager}")
-
-
-def _get_uv_update_command(
-    pkg_name: str, version: str, location: UvDependencyLocation
-) -> list[str]:
-    if location.kind == "transitive":
-        return ["uv", "lock", "--upgrade-package", pkg_name]
-    command = ["uv", "add"]
-    if location.kind == "group":
-        if location.group is None:
-            raise UvDependencyError("UV group dependency location missing group name")
-        command.extend(["--group", location.group])
-    command.append(f"{pkg_name}=={version}")
-    return command
-
-
 # TODO: extract as part of test command feature
 def run_test_phases(
     project_config: ProjectConfig, project_path: Path
@@ -543,8 +490,10 @@ def _apply_update(
 ) -> bool:
     """Apply a single package update. Returns True on success."""
     try:
-        commands = get_update_commands(package_manager, pkg_name, version, project_path)
-    except (UvDependencyError, ValueError) as e:
+        commands = package_manager_ops(package_manager).update_commands(
+            pkg_name, version, project_path
+        )
+    except (UnsupportedPackageManagerError, UpdateCommandError) as e:
         rprint(f"  [bold red]FAIL[/] {e}")
         return False
 
@@ -553,18 +502,5 @@ def _apply_update(
             run_captured(cmd, project_path, timeout=300, label=shlex.join(cmd))
         except ProcessError as e:
             rprint(f"  [bold red]FAIL[/] Package manager command failed: {e}")
-            return False
-
-    # Maven needs a second command to finalise
-    if package_manager == "mvn":
-        try:
-            run_captured(
-                ["mvn", "versions:commit"],
-                project_path,
-                timeout=120,
-                label="mvn versions:commit",
-            )
-        except ProcessError as e:
-            rprint(f"  [bold red]FAIL[/] {e}")
             return False
     return True

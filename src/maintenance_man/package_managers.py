@@ -11,6 +11,11 @@ from maintenance_man import dependency_age
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import UpdateFinding
 from maintenance_man.outdated import bun_outdated, mvn_outdated, uv_outdated
+from maintenance_man.uv_dependencies import (
+    UvDependencyError,
+    UvDependencyLocation,
+    get_uv_dependency_locations,
+)
 
 type VulnerabilitySource = Literal["uv-audit", "trivy"]
 
@@ -19,11 +24,16 @@ class UnsupportedPackageManagerError(Exception):
     """The package manager has no entry in the operations table."""
 
 
+class UpdateCommandError(Exception):
+    """The update workspace cannot produce commands for a package update."""
+
+
 @dataclass(frozen=True, slots=True)
 class PackageManagerOps:
     vulnerability_source: VulnerabilitySource
     outdated: Callable[[ProjectConfig], list[UpdateFinding]]
     publish_date: Callable[[str, str, Path], datetime | None]
+    update_commands: Callable[[str, str, Path], list[list[str]]]
 
 
 def package_manager_ops(name: str) -> PackageManagerOps:
@@ -53,10 +63,59 @@ def _maven_publish_date(pkg: str, version: str, project_path: Path) -> datetime 
     return dependency_age.get_maven_publish_date(pkg, version)
 
 
+def _bun_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
+    if not (workspace / "package.json").is_file():
+        raise UpdateCommandError(
+            "package.json is missing from the update workspace; "
+            "check that the project exists on main and rescan"
+        )
+    return [["bun", "add", f"{pkg}@{version}"]]
+
+
+def _uv_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
+    try:
+        locations = get_uv_dependency_locations(workspace, pkg)
+    except UvDependencyError as e:
+        raise UpdateCommandError(str(e)) from e
+    return [_uv_update_command(pkg, version, location) for location in locations]
+
+
+def _uv_update_command(
+    pkg: str, version: str, location: UvDependencyLocation
+) -> list[str]:
+    if location.kind == "transitive":
+        return ["uv", "lock", "--upgrade-package", pkg]
+    command = ["uv", "add"]
+    if location.kind == "group":
+        if location.group is None:
+            raise UpdateCommandError("UV group dependency location missing group name")
+        command.extend(["--group", location.group])
+    command.append(f"{pkg}=={version}")
+    return command
+
+
+def _mvn_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
+    return [
+        [
+            "mvn",
+            "versions:use-dep-version",
+            f"-Dincludes={pkg}",
+            f"-DdepVersion={version}",
+        ],
+        ["mvn", "versions:commit"],
+    ]
+
+
 PACKAGE_MANAGERS: Mapping[str, PackageManagerOps] = MappingProxyType(
     {
-        "bun": PackageManagerOps("trivy", bun_outdated, _npm_publish_date),
-        "uv": PackageManagerOps("uv-audit", uv_outdated, _pypi_publish_date),
-        "mvn": PackageManagerOps("trivy", mvn_outdated, _maven_publish_date),
+        "bun": PackageManagerOps(
+            "trivy", bun_outdated, _npm_publish_date, _bun_update_commands
+        ),
+        "uv": PackageManagerOps(
+            "uv-audit", uv_outdated, _pypi_publish_date, _uv_update_commands
+        ),
+        "mvn": PackageManagerOps(
+            "trivy", mvn_outdated, _maven_publish_date, _mvn_update_commands
+        ),
     }
 )
