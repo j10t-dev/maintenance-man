@@ -14,8 +14,10 @@ from maintenance_man import gradle_resolution as candidates
 from maintenance_man import gradle_updates as updater
 from maintenance_man import gradle_verification as verification
 from maintenance_man import gradle_workflow as workflow_service
-from maintenance_man.cli import _gradle_workspace_revision as _SDK_WORKSPACE_CHECK
-from maintenance_man.gradle_updates import run_gradle_checks as _RUN_GRADLE_CHECKS
+from maintenance_man.cli import (
+    _gradle_workspace_revision as real_gradle_workspace_revision,
+)
+from maintenance_man.gradle_updates import run_gradle_checks as real_run_gradle_checks
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     ApplyingAttempt,
@@ -328,7 +330,7 @@ def test_context_rejects_modified_inputs(frozen_context, mutation):
 
 
 def test_cleanup_refuses_changed_owner(frozen_context):
-    project, context, _ = frozen_context
+    _, context, _ = frozen_context
     (context.private_cache_path / ".mm-comparison-owner").write_text("caller")
     with pytest.raises(verification.GradleError, match="ownership"):
         verification.release_comparison_context(context)
@@ -485,7 +487,7 @@ def workflow(frozen_context, resolution, candidate, scope, monkeypatch, tmp_path
         effects.append("apply")
         catalogue.write_text(catalogue.read_text().replace('lib = "1"', 'lib = "2"'))
         state.update(snapshot=after, tree="after-tree")
-        return None
+        return
 
     monkeypatch.setattr(updater, "apply_gradle_update", apply)
     monkeypatch.setattr(updater, "current_change_has_changes", lambda *args: True)
@@ -957,7 +959,9 @@ def test_gradle_driver_refuses_sdk_before_sync_or_workspace_effects(
     from maintenance_man import cli
     from maintenance_man.vcs import RevisionFileCheck
 
-    monkeypatch.setattr(cli, "_gradle_workspace_revision", _SDK_WORKSPACE_CHECK)
+    monkeypatch.setattr(
+        cli, "_gradle_workspace_revision", real_gradle_workspace_revision
+    )
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     (driver.project.path / "local.properties").write_text("sdk.dir=/unavailable\n")
@@ -989,7 +993,9 @@ def test_gradle_driver_rechecks_sdk_at_pinned_base_before_workspace_effects(
     from maintenance_man import cli
     from maintenance_man.vcs import RevisionFileCheck
 
-    monkeypatch.setattr(cli, "_gradle_workspace_revision", _SDK_WORKSPACE_CHECK)
+    monkeypatch.setattr(
+        cli, "_gradle_workspace_revision", real_gradle_workspace_revision
+    )
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     (driver.project.path / "local.properties").write_text("sdk.dir=/android\n")
@@ -1040,7 +1046,9 @@ def test_gradle_driver_skips_unneeded_sdk_revision_inspection(
 ):
     from maintenance_man import cli
 
-    monkeypatch.setattr(cli, "_gradle_workspace_revision", _SDK_WORKSPACE_CHECK)
+    monkeypatch.setattr(
+        cli, "_gradle_workspace_revision", real_gradle_workspace_revision
+    )
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     if sdk_env:
@@ -1127,7 +1135,7 @@ def test_gradle_failed_attempt_prevents_finalization_after_another_group_passes(
 def test_gradle_baseline_checks_fail_before_capture_or_ledger(
     workflow, monkeypatch, failure
 ):
-    monkeypatch.setattr(updater, "run_gradle_checks", _RUN_GRADLE_CHECKS)
+    monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
     effects = []
 
     def build(*args):
@@ -2129,7 +2137,7 @@ def rebuild_evidence(workflow, monkeypatch):
 def test_rebuilt_evidence_refuses_a_tree_changed_by_checks(rebuild_evidence, revision):
     state = rebuild_evidence
     state.observations.mutated = revision
-    with pytest.raises(updater.GradleError, match="tree|baseline"):
+    with pytest.raises(updater.GradleError, match=r"tree|baseline"):
         updater.rebuild_gradle_run_evidence(
             state.run, state.workflow.project, state.workflow.publication, 7
         )
@@ -2365,7 +2373,7 @@ def test_failed_save_after_replace_keeps_new_context(rebuild_evidence, monkeypat
 
 
 def test_cleanup_retry_is_idempotent_and_keeps_foreign_cache(frozen_context):
-    project, context, _ = frozen_context
+    _, context, _ = frozen_context
     cache = context.private_cache_path
     verification.release_comparison_context(context)
     verification.release_comparison_context(context)

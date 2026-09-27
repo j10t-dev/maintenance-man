@@ -3,16 +3,17 @@ import subprocess
 import threading
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.message import Message
 from threading import Event, Lock
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
 
 from maintenance_man.dependency_age import (
-    PublicationFailure,
+    PublicationError,
     PublicationLookupContext,
     _public_url,
     _publication_http,
@@ -49,7 +50,7 @@ def _bun_info_result(published_iso: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-_FROZEN_NOW = datetime(2026, 1, 30, tzinfo=timezone.utc)
+_FROZEN_NOW = datetime(2026, 1, 30, tzinfo=UTC)
 
 
 def _make_update(pkg: str, latest: str = "2.0.0") -> UpdateFinding:
@@ -155,9 +156,7 @@ class TestFilterByAge:
     def test_maven_central_lookup(self):
         """Test Maven Central registry lookup for mvn packages."""
         updates = [_make_update("org.slf4j:slf4j-api", "2.0.16")]
-        thirty_days_ago_ms = int(
-            datetime(2025, 12, 31, tzinfo=timezone.utc).timestamp() * 1000
-        )
+        thirty_days_ago_ms = int(datetime(2025, 12, 31, tzinfo=UTC).timestamp() * 1000)
 
         maven_data = {"response": {"docs": [{"timestamp": thirty_days_ago_ms}]}}
 
@@ -171,7 +170,7 @@ class TestFilterByAge:
         assert result[0].published_date is not None
 
 
-_OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
+_OLD = datetime(2024, 1, 1, tzinfo=UTC)
 
 
 def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch):
@@ -215,7 +214,7 @@ def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch):
     assert len(calls) == 8, "queued lookups ran after interruption"
 
 
-_PUB_NOW = datetime(2026, 9, 18, tzinfo=timezone.utc)
+_PUB_NOW = datetime(2026, 9, 18, tzinfo=UTC)
 
 
 def _pom(module, dependency=None):
@@ -300,7 +299,7 @@ def test_publication_redirect_trust(repository, url, allowed):
     if allowed:
         _public_url(url, repository, "a/b/2/b-2.pom")
     else:
-        with pytest.raises(PublicationFailure):
+        with pytest.raises(PublicationError):
             _public_url(url, repository, "a/b/2/b-2.pom")
 
 
@@ -425,7 +424,7 @@ def test_publication_policy(tmp_path, date, days, blocked):
     [
         (None, False),
         (TimeoutError("timeout"), True),
-        (PublicationFailure("HTTP 429"), True),
+        (PublicationError("HTTP 429"), True),
         (
             (b"<project/>", {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"}),
             True,
@@ -454,7 +453,7 @@ def test_publication_cache_and_current_policy(tmp_path):
     _, _, second_calls, second = _publication_fixture(tmp_path)
     with second:
         assert lookup_gradle_publication(request, second).timestamp == datetime(
-            2026, 9, 1, tzinfo=timezone.utc
+            2026, 9, 1, tzinfo=UTC
         )
         assert second_calls == []
         assert second.cache_hits == 1
@@ -485,7 +484,7 @@ def test_publication_negative_results_retry_next_command(tmp_path):
 
 def test_publication_failure_has_readable_reason_and_debug_details(tmp_path, caplog):
     def transport(url, repository, suffix, count):
-        raise PublicationFailure("publication lookup timed out")
+        raise PublicationError("publication lookup timed out")
 
     _, request, _, context = _publication_fixture(tmp_path)
     context.transport = transport
@@ -495,8 +494,8 @@ def test_publication_failure_has_readable_reason_and_debug_details(tmp_path, cap
     assert isinstance(result, AgeBlock)
     assert "org.example:lib:2.0" in result.reason
     assert "publication lookup timed out" in result.reason
-    assert "PublicationFailure" not in result.reason
-    assert "PublicationFailure" in caplog.text
+    assert "PublicationError" not in result.reason
+    assert "PublicationError" in caplog.text
 
 
 def test_publication_youngest_and_content_conflict(tmp_path):
@@ -509,7 +508,7 @@ def test_publication_youngest_and_content_conflict(tmp_path):
     )
     with context:
         assert lookup_gradle_publication(request, context).timestamp == datetime(
-            2026, 9, 17, tzinfo=timezone.utc
+            2026, 9, 17, tzinfo=UTC
         )
     responses["google"] = (_pom(module) + b"\n", responses["google"][1])
     _, request, _, context = _publication_fixture(
@@ -605,7 +604,7 @@ def test_publication_shared_pool_bounds_and_inflight_dedup(tmp_path):
         assert release.wait(5)
         with lock:
             active -= 1
-        return None
+        return
 
     with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
         modules = [
@@ -645,7 +644,7 @@ def test_publication_transport_redirect_bound(
 
     class Response:
         status = 200
-        headers = {}
+        headers: ClassVar[dict[str, str]] = {}
         fp = SimpleNamespace(
             raw=SimpleNamespace(_sock=SimpleNamespace(settimeout=lambda _: None))
         )
@@ -687,7 +686,7 @@ def test_publication_transport_redirect_bound(
     if allowed:
         assert operation()[0] == b"<project/>"
     else:
-        with pytest.raises(PublicationFailure):
+        with pytest.raises(PublicationError):
             operation()
     assert len(calls) == expected_calls
 
@@ -793,7 +792,7 @@ def test_publication_http_response_oversized_body_is_refused(monkeypatch):
         monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
         suffix = "org/example/lib/2.0/lib-2.0.pom"
         url = "https://repo.maven.apache.org/maven2/" + suffix
-        with pytest.raises(PublicationFailure):
+        with pytest.raises(PublicationError):
             _publication_http(url, "central", suffix, lambda: None)
     finally:
         producer.join(5)
@@ -805,7 +804,7 @@ def test_publication_exact_central_timestamp(tmp_path):
     import json
 
     module = ModuleId(group="org.example", artifact="lib", version="2.0")
-    timestamp = int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    timestamp = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000)
     calls = []
 
     def transport(url, repository, suffix, count):
@@ -839,7 +838,7 @@ def test_publication_exact_central_timestamp(tmp_path):
             context,
         )
         assert result.facts[0].method == "central_timestamp"
-        assert result.timestamp == datetime(2026, 9, 1, tzinfo=timezone.utc)
+        assert result.timestamp == datetime(2026, 9, 1, tzinfo=UTC)
         assert len(calls) == 2
 
 
@@ -957,7 +956,7 @@ def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeyp
             if len(calls) == 8:
                 started.set()
         assert release.wait(10), "context cleanup did not release active requests"
-        return None
+        return
 
     monkeypatch.setattr(age, "ThreadPoolExecutor", ReleasingPool)
     requests = tuple(
@@ -968,11 +967,13 @@ def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeyp
         )
         for i in range(40)
     )
-    with pytest.raises(KeyboardInterrupt):
-        with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
-            context.prefetch(requests)
-            assert started.wait(10), "eight requests did not start"
-            raise KeyboardInterrupt
+    with (
+        pytest.raises(KeyboardInterrupt),
+        PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context,
+    ):
+        context.prefetch(requests)
+        assert started.wait(10), "eight requests did not start"
+        raise KeyboardInterrupt
     assert len(calls) == 8, "queued publication requests ran after interruption"
 
 

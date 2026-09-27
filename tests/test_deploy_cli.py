@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +14,7 @@ def _activity(*, success: bool, commit_id: str | None) -> dict[str, ProjectActiv
     return {
         "app": ProjectActivity(
             last_deploy=ActivityEvent(
-                timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                 success=success,
                 branch="main",
                 commit_id=commit_id,
@@ -98,7 +98,7 @@ class TestShouldDeploy:
         activity = {
             "app": ProjectActivity(
                 last_build=ActivityEvent(
-                    timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                    timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                     success=True,
                     branch="main",
                     commit_id="C",
@@ -477,7 +477,7 @@ class TestDeployGateWiring:
                 | {
                     "deploy-only": ProjectActivity(
                         last_deploy=ActivityEvent(
-                            timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                            timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                             success=True,
                             branch="main",
                             commit_id="C",
@@ -510,7 +510,7 @@ class TestDeployGateWiring:
             lambda path: {
                 "deploy-only": ProjectActivity(
                     last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                         success=True,
                         branch="main",
                         commit_id="C",
@@ -540,7 +540,7 @@ class TestDeployGateWiring:
             lambda path: {
                 "deploy-only": ProjectActivity(
                     last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                         success=True,
                         branch="main",
                         commit_id="C",
@@ -606,7 +606,7 @@ class TestDeployGateWiring:
             lambda path: {
                 "deployable": ProjectActivity(
                     last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                         success=True,
                         branch="main",
                         commit_id="C",
@@ -652,7 +652,7 @@ class TestDeployGateWiring:
             lambda path: {
                 "deployable": ProjectActivity(
                     last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                         success=True,
                         branch="main",
                         commit_id="C",
@@ -660,7 +660,7 @@ class TestDeployGateWiring:
                 ),
                 "deploy-only": ProjectActivity(
                     last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=timezone.utc),
+                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
                         success=True,
                         branch="main",
                         commit_id="C",

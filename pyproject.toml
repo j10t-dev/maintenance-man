@@ -12,8 +12,6 @@ dependencies = [
     "cyclopts==4.25.2",
     "packaging==26.3",
     "pydantic==2.13.5",
-    "pygments==2.21.0",
-    "pytest==9.1.1",
     "rich==15.0.0",
 ]
 
@@ -22,6 +20,7 @@ mm = "maintenance_man.cli:main"
 
 [dependency-groups]
 dev = [
+    "import-linter==2.15",
     "pytest==9.1.1",
     "ruff==0.15.20",
     "ty>=0.0.34",
@@ -29,9 +28,10 @@ dev = [
 
 [tool.ruff]
 line-length = 88
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N"]
 
 [tool.ty.src]
 include = ["src/**/*.py", "tests/**/*.py"]

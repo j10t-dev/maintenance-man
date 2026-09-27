@@ -568,9 +568,11 @@ class TestGenerateGradleInventory:
             subprocess, "run", self._wrapper_writing(fixture, returncode=returncode)
         )
 
-        with pytest.raises(GradleError, match=expected):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("unusable inventory must not be yielded")
+        with (
+            pytest.raises(GradleError, match=expected),
+            generate_gradle_inventory(gradle_project),
+        ):
+            pytest.fail("unusable inventory must not be yielded")
 
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
@@ -597,9 +599,11 @@ class TestGenerateGradleInventory:
             with generate_gradle_inventory(gradle_project) as bom:
                 assert bom.is_file()
         else:
-            with pytest.raises(GradleError, match="1.5 or later"):
-                with generate_gradle_inventory(gradle_project):
-                    pytest.fail("unsupported spec version must not be yielded")
+            with (
+                pytest.raises(GradleError, match=r"1.5 or later"),
+                generate_gradle_inventory(gradle_project),
+            ):
+                pytest.fail("unsupported spec version must not be yielded")
 
     def test_malformed_inventory_json_is_an_error(self, gradle_project, monkeypatch):
         def _run(cmd, **kwargs):
@@ -610,9 +614,11 @@ class TestGenerateGradleInventory:
 
         monkeypatch.setattr(subprocess, "run", _run)
 
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("unreachable")
+        with (
+            pytest.raises(GradleError, match="malformed CycloneDX inventory"),
+            generate_gradle_inventory(gradle_project),
+        ):
+            pytest.fail("unreachable")
 
     def test_existing_inventory_directory_is_a_collision(
         self, gradle_project, monkeypatch
@@ -624,9 +630,11 @@ class TestGenerateGradleInventory:
             subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
         )
 
-        with pytest.raises(GradleError, match="Refusing to overwrite"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("unreachable")
+        with (
+            pytest.raises(GradleError, match="Refusing to overwrite"),
+            generate_gradle_inventory(gradle_project),
+        ):
+            pytest.fail("unreachable")
 
         assert (owned / "keep.txt").read_text(encoding="utf-8") == "caller owned\n"
 
@@ -652,9 +660,11 @@ class TestGenerateGradleInventory:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(subprocess, "run", _run)
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("malformed inventory must not be yielded")
+        with (
+            pytest.raises(GradleError, match="malformed CycloneDX inventory"),
+            generate_gradle_inventory(gradle_project),
+        ):
+            pytest.fail("malformed inventory must not be yielded")
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
     @pytest.mark.parametrize("symlink_marker", [False, True])
@@ -675,9 +685,11 @@ class TestGenerateGradleInventory:
         monkeypatch.setattr(
             subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
         )
-        with pytest.raises(GradleError, match="Refusing to overwrite"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("caller inventory must not be yielded")
+        with (
+            pytest.raises(GradleError, match="Refusing to overwrite"),
+            generate_gradle_inventory(gradle_project),
+        ):
+            pytest.fail("caller inventory must not be yielded")
         assert keep.read_bytes() == b"caller bytes\n"
         if symlink_marker:
             assert (inventory / "keep.txt").read_bytes() == b"inventory caller bytes\n"
@@ -689,9 +701,11 @@ class TestGenerateGradleInventory:
     ):
         monkeypatch.setattr(subprocess, "run", self._wrapper_writing("bom.json"))
 
-        with pytest.raises(ValueError):
-            with generate_gradle_inventory(gradle_project):
-                raise ValueError("caller failed")
+        with (
+            pytest.raises(ValueError),
+            generate_gradle_inventory(gradle_project),
+        ):
+            raise ValueError("caller failed")
 
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
@@ -706,9 +720,11 @@ def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
             raise PermissionError("cleanup denied")
 
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
-    with pytest.raises(GradleError, match="cleanup denied"):
-        with generate_gradle_inventory(gradle_project) as bom:
-            assert bom.is_file()
+    with (
+        pytest.raises(GradleError, match="cleanup denied"),
+        generate_gradle_inventory(gradle_project) as bom,
+    ):
+        assert bom.is_file()
 
 
 def _apply_wrapper(edits: dict[str, str] | None = None, *, returncode: int = 0):
@@ -1036,7 +1052,7 @@ def test_missing_wrapper_interpreter_is_gradle_error_and_cleans_owned_artifacts(
 def test_prospective_workspace_properties_are_not_sdk_evidence(
     gradle_project, tmp_path, monkeypatch
 ):
-    monkeypatch.setattr("maintenance_man.gradle.project_env", lambda: {})
+    monkeypatch.setattr("maintenance_man.gradle.project_env", dict)
     source = Path(gradle_project.path)
     (source / "local.properties").write_text("sdk.dir=/opt/android\n")
     workspace = tmp_path / "leftover"
@@ -1246,9 +1262,11 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
         pytest.fail("setup failure must not launch wrapper")
 
     monkeypatch.setattr(subprocess, "run", forbidden)
-    with pytest.raises(GradleError, match="denied"):
-        with generate_gradle_inventory(gradle_project):
-            pytest.fail("setup failure must not yield")
+    with (
+        pytest.raises(GradleError, match="denied"),
+        generate_gradle_inventory(gradle_project),
+    ):
+        pytest.fail("setup failure must not yield")
     if phase == "claim":
         assert (inventory / "bom.json").read_bytes() == b"old inventory"
         assert marker.exists()
@@ -1325,11 +1343,10 @@ def test_owned_context_cleanup_preserves_caller_exception(
         if resource == "inventory"
         else _owned_update_report(root)
     )
-    with pytest.raises(type(exception)) as caught:
-        with context as output:
-            if resource == "report":
-                output.write_bytes(b"owned report")
-            raise exception
+    with pytest.raises(type(exception)) as caught, context as output:
+        if resource == "report":
+            output.write_bytes(b"owned report")
+        raise exception
     assert caught.value is exception
     assert not (root / GRADLE_INVENTORY_RELPATH).exists()
     assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()

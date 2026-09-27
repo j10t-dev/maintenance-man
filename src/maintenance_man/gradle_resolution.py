@@ -11,7 +11,7 @@ from collections import deque
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 from typing import TypedDict
@@ -81,16 +81,15 @@ def parse_resolution_report(text: str) -> ResolutionOutcome:
             for component in scope.components:
                 if not component.id:
                     raise ValueError("empty component ID")
-                if component.module is not None:
-                    if any(
-                        not value or re.search(r"[\s:/\\]", value)
-                        for value in (
-                            component.module.group,
-                            component.module.artifact,
-                            component.module.version,
-                        )
-                    ):
-                        raise ValueError("invalid Maven identity")
+                if component.module is not None and any(
+                    not value or re.search(r"[\s:/\\]", value)
+                    for value in (
+                        component.module.group,
+                        component.module.artifact,
+                        component.module.version,
+                    )
+                ):
+                    raise ValueError("invalid Maven identity")
     except (ValidationError, ValueError) as exc:
         raise GradleError(f"Malformed Gradle resolution report: {exc}") from exc
     reasons = list(report.selection_errors)
@@ -740,7 +739,7 @@ def prepare_gradle_candidates(
             result.append(item)
             continue
         age = evaluate_gradle_candidate_age(
-            item.candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+            item.candidate, minimum_age_days, publication, datetime.now(UTC)
         )
         result.append(
             PreparedCandidate(

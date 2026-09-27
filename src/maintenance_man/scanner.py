@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import logging
@@ -6,7 +7,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeGuard
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -103,7 +104,7 @@ def scan_project(
 
     scan_result = ScanResult(
         project=name,
-        scanned_at=datetime.now(timezone.utc),
+        scanned_at=datetime.now(UTC),
         trivy_target=str(project_path),
         vulnerabilities=vulns,
         secrets=secrets,
@@ -450,10 +451,8 @@ def _parse_vulns(results: list[dict]) -> list[VulnFinding]:
 
             published = None
             if v.get("PublishedDate"):
-                try:
+                with contextlib.suppress(ValueError):
                     published = datetime.fromisoformat(v["PublishedDate"])
-                except ValueError:
-                    pass
 
             findings.append(
                 VulnFinding(
@@ -578,7 +577,7 @@ def _inventory_coverage_errors(
 def capture_gradle_snapshot(
     project: ProjectConfig, context: ComparisonContext
 ) -> GradleSnapshot | IncompleteResolution:
-    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
+    if not context_inputs_valid(context, project, datetime.now(UTC)):
         raise TrivyScanError(
             "Comparison context expired or inputs changed; rebuild baseline and tip"
         )
@@ -670,7 +669,7 @@ def capture_gradle_snapshot(
             )
         )
     # Generated report/BOM cleanup must precede the jj source-tree snapshot.
-    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
+    if not context_inputs_valid(context, project, datetime.now(UTC)):
         raise TrivyScanError("Comparison inputs changed during capture")
     return GradleSnapshot(
         tree_id=revision_tree_id(Path(project.path)),

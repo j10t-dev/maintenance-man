@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -138,7 +138,7 @@ def _get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
 
     dt = datetime.fromisoformat(ts)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
 
     with _pypi_cache_lock:
         try:
@@ -163,9 +163,10 @@ def _get_maven_publish_date(pkg: str, version: str) -> datetime | None:
         f"&rows=1&wt=json"
     )
     data = _fetch_json(url)
-    if docs := data.get("response", {}).get("docs", []):
-        if ts_ms := docs[0].get("timestamp"):
-            return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    if (docs := data.get("response", {}).get("docs", [])) and (
+        ts_ms := docs[0].get("timestamp")
+    ):
+        return datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
     return None
 
 
@@ -178,7 +179,7 @@ _REGISTRY_LOOKUPS = {
 
 def _utcnow() -> datetime:
     """Return current UTC time. Extracted for testability."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _fetch_json(url: str) -> dict:
@@ -257,7 +258,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class PublicationFailure(Exception):
+class PublicationError(Exception):
     """Publication evidence could not be trusted or obtained."""
 
 
@@ -278,9 +279,9 @@ def _public_url(url, repository, suffix=None):
         or parsed.query
         or parsed.fragment
     ):
-        raise PublicationFailure("untrusted publication redirect")
+        raise PublicationError("untrusted publication redirect")
     if suffix is not None and not parsed.path.endswith("/" + suffix):
-        raise PublicationFailure("redirect changed exact artifact path")
+        raise PublicationError("redirect changed exact artifact path")
 
 
 def _publication_http(url, repository, suffix, count):
@@ -291,10 +292,10 @@ def _publication_http(url, repository, suffix, count):
         if suffix is not None:
             _public_url(url, repository, suffix)
         elif urllib.parse.urlsplit(url).netloc != "search.maven.org":
-            raise PublicationFailure("untrusted Central timestamp endpoint")
+            raise PublicationError("untrusted Central timestamp endpoint")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise PublicationFailure("publication lookup timed out")
+            raise PublicationError("publication lookup timed out")
         count()
         try:
             response = opener.open(urllib.request.Request(url), timeout=remaining)
@@ -306,17 +307,17 @@ def _publication_http(url, repository, suffix, count):
                 location = error.headers.get("Location")
                 error.close()
                 if suffix is None or redirects == 5 or not location:
-                    raise PublicationFailure(
+                    raise PublicationError(
                         "publication redirect limit or invalid redirect"
-                    )
+                    ) from error
                 url = urllib.parse.urljoin(url, location)
                 _public_url(url, repository, suffix)
                 continue
             error.close()
-            raise PublicationFailure(f"publication HTTP {error.code}") from error
+            raise PublicationError(f"publication HTTP {error.code}") from error
         with response:
             if response.status != 200:
-                raise PublicationFailure(f"publication HTTP {response.status}")
+                raise PublicationError(f"publication HTTP {response.status}")
             chunks = []
             size = 0
             while size <= _MAX_BYTES:
@@ -324,7 +325,7 @@ def _publication_http(url, repository, suffix, count):
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise PublicationFailure("publication lookup timed out")
+                    raise PublicationError("publication lookup timed out")
                 # HTTPResponse.read1 performs at most one underlying read.
                 # Bound that read by the remaining operation deadline.
                 response.fp.raw._sock.settimeout(remaining)
@@ -335,9 +336,9 @@ def _publication_http(url, repository, suffix, count):
                 size += len(chunk)
             body = b"".join(chunks)
             if len(body) > _MAX_BYTES or time.monotonic() > deadline:
-                raise PublicationFailure("publication response exceeds limit")
+                raise PublicationError("publication response exceeds limit")
             return body, dict(response.headers.items()), url
-    raise PublicationFailure("publication redirect limit")
+    raise PublicationError("publication redirect limit")
 
 
 def _pom_identity(body, module):
@@ -350,10 +351,10 @@ def _pom_identity(body, module):
     # fail closed before parsing. UTF-8 POMs are the supported trust-v1 format.
     text = body.decode("utf-8-sig")
     if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
-        raise PublicationFailure("POM entity declarations are unsupported")
+        raise PublicationError("POM entity declarations are unsupported")
     root = ET.fromstring(text)
     if root.tag not in ("project", "{http://maven.apache.org/POM/4.0.0}project"):
-        raise PublicationFailure("invalid POM root")
+        raise PublicationError("invalid POM root")
     ns = "{http://maven.apache.org/POM/4.0.0}" if root.tag.startswith("{") else ""
 
     def identity(node, *, inherit=False):
@@ -370,17 +371,17 @@ def _pom_identity(body, module):
                     continue
             value = (matches[0].text or "").strip() if len(matches) == 1 else ""
             if not value or "${" in value:
-                raise PublicationFailure("unresolved or ambiguous POM identity")
+                raise PublicationError("unresolved or ambiguous POM identity")
             values.append(value)
         return ModuleId(group=values[0], artifact=values[1], version=values[2])
 
     if identity(root, inherit=True) != module:
-        raise PublicationFailure("POM identity mismatch")
+        raise PublicationError("POM identity mismatch")
     implementation = None
     if module.artifact.endswith(".gradle.plugin"):
         dependencies = root.findall(ns + "dependencies/" + ns + "dependency")
         if len(dependencies) != 1:
-            raise PublicationFailure("unsupported plugin marker mapping")
+            raise PublicationError("unsupported plugin marker mapping")
         implementation = identity(dependencies[0])
     return implementation
 
@@ -449,7 +450,7 @@ class PublicationLookupContext:
                 with self.lock:
                     self.cache_hits += 1
                 return fact
-            except OSError, ValueError, ValidationError, PublicationFailure:
+            except OSError, ValueError, ValidationError, PublicationError:
                 continue
         return None
 
@@ -491,7 +492,7 @@ class PublicationLookupContext:
             body, headers, final_url = response
             _public_url(final_url, repository, suffix)
             if len(body) > _MAX_BYTES:
-                raise PublicationFailure("POM exceeds size limit")
+                raise PublicationError("POM exceeds size limit")
             implementation = _pom_identity(body, module)
             headers = {k.lower(): v for k, v in headers.items()}
             method = "last_modified"
@@ -499,7 +500,7 @@ class PublicationLookupContext:
             if raw is not None:
                 timestamp = parsedate_to_datetime(raw)
                 if timestamp.tzinfo is None:
-                    raise PublicationFailure("publication timestamp lacks timezone")
+                    raise PublicationError("publication timestamp lacks timezone")
             elif repository == "central":
                 method = "central_timestamp"
                 query = urllib.parse.urlencode(
@@ -519,11 +520,11 @@ class PublicationLookupContext:
                     self._count,
                 )
                 if result is None:
-                    raise PublicationFailure("Central timestamp unavailable")
+                    raise PublicationError("Central timestamp unavailable")
                 data = json.loads(result[0])
                 docs = data["response"]["docs"]
                 if not isinstance(docs, list) or not docs:
-                    raise PublicationFailure("Central timestamp missing")
+                    raise PublicationError("Central timestamp missing")
                 dates = []
                 for doc in docs:
                     if (doc["g"], doc["a"], doc["v"]) != (
@@ -531,21 +532,21 @@ class PublicationLookupContext:
                         module.artifact,
                         module.version,
                     ):
-                        raise PublicationFailure("Central timestamp identity mismatch")
+                        raise PublicationError("Central timestamp identity mismatch")
                     ms = doc["timestamp"]
                     if (
                         isinstance(ms, bool)
                         or not isinstance(ms, int)
                         or not 0 < ms <= _MAX_EPOCH_MS
                     ):
-                        raise PublicationFailure("invalid Central timestamp")
-                    dates.append(datetime.fromtimestamp(ms / 1000, timezone.utc))
+                        raise PublicationError("invalid Central timestamp")
+                    dates.append(datetime.fromtimestamp(ms / 1000, UTC))
                 timestamp = max(dates)
             else:
-                raise PublicationFailure("publication timestamp missing")
-            timestamp = timestamp.astimezone(timezone.utc)
+                raise PublicationError("publication timestamp missing")
+            timestamp = timestamp.astimezone(UTC)
             if timestamp > self.now():
-                raise PublicationFailure("future publication timestamp")
+                raise PublicationError("future publication timestamp")
             fact = PublicationFact(
                 repository=repository,
                 module=module,
@@ -577,7 +578,7 @@ class PublicationLookupContext:
             TypeError,
             ET.ParseError,
             urllib.error.URLError,
-            PublicationFailure,
+            PublicationError,
         ) as error:
             logging.getLogger(__name__).debug(
                 "Publication lookup failed for %s:%s",
@@ -587,7 +588,7 @@ class PublicationLookupContext:
             )
             reason = (
                 str(error)
-                if isinstance(error, PublicationFailure)
+                if isinstance(error, PublicationError)
                 else "publication lookup failed"
             )
             return AgeBlock(reason=f"{module.coordinate}:{module.version}: {reason}")
@@ -614,7 +615,7 @@ def _artifact_suffix(module):
     if any(
         not p or "/" in p or "\\" in p or "${" in p or p in (".", "..") for p in parts
     ):
-        raise PublicationFailure("unsupported artifact identity")
+        raise PublicationError("unsupported artifact identity")
     quote = functools.partial(urllib.parse.quote, safe="")
     return "/".join(
         [

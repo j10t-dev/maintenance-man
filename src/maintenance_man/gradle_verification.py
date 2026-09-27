@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from maintenance_man.gradle import GradleError
@@ -138,7 +138,7 @@ def initialize_comparison_context(
             selected_scopes=resolution.report.selected_scopes,
             producer_versions=resolution.report.producer_versions,
             scanner_flags=flags,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             private_cache_path=cache,
             owner_token=token,
         )

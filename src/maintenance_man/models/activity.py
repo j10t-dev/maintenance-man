@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -48,7 +48,7 @@ def record_activity(
         activity = load_activity(path)
         proj = activity.get(project, ProjectActivity())
         event = ActivityEvent(
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             success=success,
             branch=branch,
             commit_id=commit_id,

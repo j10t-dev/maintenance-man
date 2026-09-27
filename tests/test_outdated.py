@@ -170,9 +170,11 @@ class TestUvOutdated:
         )
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=failed):
-            with pytest.raises(OutdatedCheckError, match="uv sync --locked"):
-                uv_outdated(project)
+        with (
+            patch("maintenance_man.outdated.subprocess.run", return_value=failed),
+            pytest.raises(OutdatedCheckError, match="uv sync --locked"),
+        ):
+            uv_outdated(project)
 
     def test_parses_json_output(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
@@ -246,12 +248,14 @@ class TestUvOutdated:
         )
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch(
-            "maintenance_man.outdated.subprocess.run",
-            side_effect=[sync_completed, list_failed],
+        with (
+            patch(
+                "maintenance_man.outdated.subprocess.run",
+                side_effect=[sync_completed, list_failed],
+            ),
+            pytest.raises(OutdatedCheckError, match="uv pip list --outdated"),
         ):
-            with pytest.raises(OutdatedCheckError, match="uv pip list --outdated"):
-                uv_outdated(project)
+            uv_outdated(project)
 
     def test_excludes_transitive_deps(self, tmp_path):
         """uv_outdated should only return direct dependencies from pyproject.toml."""
@@ -373,9 +377,11 @@ class TestBunOutdated:
         )
         project = _make_project("bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            with pytest.raises(OutdatedCheckError):
-                bun_outdated(project)
+        with (
+            patch("maintenance_man.outdated.subprocess.run", return_value=completed),
+            pytest.raises(OutdatedCheckError),
+        ):
+            bun_outdated(project)
 
 
 class TestMvnOutdated:
@@ -419,9 +425,11 @@ class TestMvnOutdated:
         )
         project = _make_project("mvn")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            with pytest.raises(OutdatedCheckError):
-                mvn_outdated(project)
+        with (
+            patch("maintenance_man.outdated.subprocess.run", return_value=completed),
+            pytest.raises(OutdatedCheckError),
+        ):
+            mvn_outdated(project)
 
 
 class TestGetOutdated:

@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Literal
@@ -171,7 +171,7 @@ class PublicationFact(BaseModel):
     def utc_date(cls, value):
         if value.tzinfo is None:
             raise ValueError("publication dates require a timezone")
-        return value.astimezone(timezone.utc)
+        return value.astimezone(UTC)
 
     @field_validator("artifact_digest")
     @classmethod

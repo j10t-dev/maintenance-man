@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from maintenance_man import config as _config
@@ -106,7 +106,7 @@ def save_gradle_run(path: Path, run: GradleRun) -> None:
             stream.write(run.model_dump_json(indent=2))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        Path(temporary).replace(path)
         temporary = None
         fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -217,7 +217,7 @@ def run_gradle_checks(project: ProjectConfig, project_name: str) -> CheckEvidenc
             hashlib.sha256(command.encode()).hexdigest() for command in commands
         ),
         success=True,
-        checked_at=datetime.now(timezone.utc),
+        checked_at=datetime.now(UTC),
     )
 
 
@@ -314,7 +314,7 @@ def verify_applied_gradle_attempt(
             "Security verification failed: " + "; ".join(comparison.reasons)
         )
     block = evaluate_gradle_candidate_age(
-        candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+        candidate, minimum_age_days, publication, datetime.now(UTC)
     )
     if block is not None:
         raise GradleError(block.reason)
@@ -386,7 +386,7 @@ def process_gradle_run(
         candidate = planned.candidate
         block = validate_gradle_target(project, candidate.target)
         age = evaluate_gradle_candidate_age(
-            candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+            candidate, minimum_age_days, publication, datetime.now(UTC)
         )
         reason = block.reason if block else age.reason if age else None
         if reason:
@@ -395,7 +395,7 @@ def process_gradle_run(
             )
             save_gradle_run(gradle_run_path(run.project), run)
             continue
-        if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+        if not context_inputs_valid(run.context, project, datetime.now(UTC)):
             raise GradleError(
                 "Comparison context expired or changed; "
                 "rebuild evidence before continuing"
@@ -464,7 +464,7 @@ def gradle_run_finalization_check(
     ]
     if not accepted:
         raise GradleError("No verified Gradle update to finalize")
-    if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+    if not context_inputs_valid(run.context, project, datetime.now(UTC)):
         raise GradleError("Final comparison context is stale")
     if (
         exact_commit_id(project.path, run.managed_bookmark) != run.managed_tip_id
@@ -489,7 +489,7 @@ def gradle_run_finalization_check(
         raise GradleError("An earlier credited fix was reintroduced")
     for attempt in accepted:
         block = evaluate_gradle_candidate_age(
-            attempt.candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+            attempt.candidate, minimum_age_days, publication, datetime.now(UTC)
         )
         if block is not None:
             raise GradleError(block.reason)
@@ -585,7 +585,7 @@ def rebuild_gradle_run_evidence(
                     old.candidate,
                     minimum_age_days,
                     publication,
-                    datetime.now(timezone.utc),
+                    datetime.now(UTC),
                 )
                 if block is not None:
                     raise GradleError(block.reason)
@@ -722,7 +722,7 @@ def reconcile_gradle_applying(
     if block is not None:
         raise GradleError(block.reason)
     after, checks, checked_tree = state.after, state.checks, state.checked_tree_id
-    if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+    if not context_inputs_valid(run.context, project, datetime.now(UTC)):
         # Keep the on-disk intent until BOTH historical accepted work and the
         # checked interrupted commit have been proven under one fresh context.
         previous_context = run.context
@@ -765,7 +765,7 @@ def reconcile_gradle_applying(
     if not isinstance(comparison, VerifiedComparison):
         raise GradleError("Interrupted comparison does not prove acceptance")
     block = evaluate_gradle_candidate_age(
-        state.candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+        state.candidate, minimum_age_days, publication, datetime.now(UTC)
     )
     if block is not None:
         raise GradleError(block.reason)
@@ -818,7 +818,7 @@ def continue_gradle_resolve(
     block = validate_gradle_recovery(project, candidate.target)
     if block is not None:
         raise GradleError(block.reason)
-    if not context_inputs_valid(run.context, project, datetime.now(timezone.utc)):
+    if not context_inputs_valid(run.context, project, datetime.now(UTC)):
         run = rebuild_gradle_run_evidence(run, project, publication, minimum_age_days)
     try:
         return verify_applied_gradle_attempt(

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -31,7 +31,7 @@ class TestVulnFinding:
             description="Memory exhaustion from malformed RELATIVE-OID.",
             status="fixed",
             primary_url="https://avd.aquasec.com/nvd/cve-2026-23490",
-            published_date=datetime(2026, 1, 16, tzinfo=timezone.utc),
+            published_date=datetime(2026, 1, 16, tzinfo=UTC),
         )
         assert finding.vuln_id == "CVE-2026-23490"
         assert finding.fixed_version == "0.6.2"
@@ -79,7 +79,7 @@ class TestScanResult:
     def test_scan_result_round_trips_ready_and_update_flow(self):
         result = ScanResult(
             project="project-ready-update",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-ready-update",
             vulnerabilities=[
                 VulnFinding(
@@ -117,7 +117,7 @@ class TestScanResult:
     def test_scan_result_round_trips_ready_and_resolve_flow(self):
         result = ScanResult(
             project="project-ready-resolve",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-ready-resolve",
             vulnerabilities=[
                 VulnFinding(
@@ -158,7 +158,7 @@ class TestScanResult:
     def test_scan_result_empty(self):
         result = ScanResult(
             project="project-alpha",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-alpha",
             vulnerabilities=[],
             secrets=[],
@@ -178,7 +178,7 @@ class TestScanResult:
         )
         result = ScanResult(
             project="project-beta",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-beta",
             vulnerabilities=[vuln],
             secrets=[],
@@ -194,7 +194,7 @@ class TestScanResult:
         )
         result = ScanResult(
             project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-gamma",
             updates=[finding],
         )
@@ -204,7 +204,7 @@ class TestScanResult:
     def test_scan_result_empty_has_no_updates(self):
         result = ScanResult(
             project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-gamma",
         )
         assert result.has_updates is False
@@ -228,7 +228,7 @@ class TestUpdateFinding:
             installed_version="4.17.20",
             latest_version="4.17.21",
             semver_tier=SemverTier.PATCH,
-            published_date=datetime(2026, 1, 10, tzinfo=timezone.utc),
+            published_date=datetime(2026, 1, 10, tzinfo=UTC),
         )
         assert finding.published_date is not None
         assert finding.semver_tier == SemverTier.PATCH
@@ -239,11 +239,11 @@ class TestUpdateFinding:
             installed_version="18.2.0",
             latest_version="19.0.0",
             semver_tier=SemverTier.MAJOR,
-            published_date=datetime(2026, 1, 20, tzinfo=timezone.utc),
+            published_date=datetime(2026, 1, 20, tzinfo=UTC),
         )
         result = ScanResult(
             project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-gamma",
             updates=[finding],
         )

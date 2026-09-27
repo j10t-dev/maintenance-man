@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,7 +34,7 @@ from tests.conftest import make_scan_result, make_update
 def _make_vulnerable_result() -> ScanResult:
     return ScanResult(
         project="vulnerable",
-        scanned_at=datetime.now(tz=timezone.utc),
+        scanned_at=datetime.now(tz=UTC),
         trivy_target="tests/fixtures/vulnerable-project",
         vulnerabilities=[
             VulnFinding(
@@ -54,7 +54,7 @@ def _make_vulnerable_result() -> ScanResult:
 def _make_clean_result() -> ScanResult:
     return ScanResult(
         project="clean",
-        scanned_at=datetime.now(tz=timezone.utc),
+        scanned_at=datetime.now(tz=UTC),
         trivy_target="tests/fixtures/clean-project",
     )
 
@@ -62,7 +62,7 @@ def _make_clean_result() -> ScanResult:
 def _make_updates_only_result() -> ScanResult:
     return ScanResult(
         project="outdated",
-        scanned_at=datetime.now(tz=timezone.utc),
+        scanned_at=datetime.now(tz=UTC),
         trivy_target="tests/fixtures/clean-project",
         updates=[
             UpdateFinding(
@@ -731,7 +731,7 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager):
     ]
     result = ScanResult(
         project="android",
-        scanned_at=datetime.now(timezone.utc),
+        scanned_at=datetime.now(UTC),
         trivy_target="/fixture",
         vulnerabilities=findings,
     )
@@ -760,7 +760,7 @@ def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
     )
     result = ScanResult(
         project="android",
-        scanned_at=datetime.now(timezone.utc),
+        scanned_at=datetime.now(UTC),
         trivy_target="/fixture",
         vulnerabilities=[
             VulnFinding(

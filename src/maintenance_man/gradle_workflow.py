@@ -4,7 +4,7 @@ import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich import print as rprint
@@ -129,7 +129,7 @@ def _prepare_gradle_run(
         interaction.report_scan(
             ScanResult(
                 project=project_name,
-                scanned_at=datetime.now(timezone.utc),
+                scanned_at=datetime.now(UTC),
                 trivy_target=str(project.path),
                 vulnerabilities=vulnerabilities,
                 gradle_resolution=resolution.report.model_dump(mode="json"),
@@ -211,7 +211,7 @@ def _publish_verified_gradle_scan(
     )
     fresh = ScanResult(
         project=run.project,
-        scanned_at=datetime.now(timezone.utc),
+        scanned_at=datetime.now(UTC),
         trivy_target=str(project.path),
         vulnerabilities=rows,
         secrets=secrets,
@@ -257,7 +257,7 @@ def _finish_verified_gradle_run(
     with gradle_updater._gradle_evidence_workspace(
         project, run.managed_tip_id
     ) as verified:
-        if not context_inputs_valid(run.context, verified, datetime.now(timezone.utc)):
+        if not context_inputs_valid(run.context, verified, datetime.now(UTC)):
             run = gradle_updater.rebuild_gradle_run_evidence(
                 run, verified, publication, minimum_age_days
             )
@@ -284,14 +284,13 @@ def _finish_verified_gradle_run(
         return run
     main = exact_commit_id(project.path, "main")
     if run.promoted_commit_id is None:
-        if main != run.managed_tip_id:
-            if not promote_bookmark_to_main(
-                project.path,
-                run.managed_bookmark,
-                expected_base=run.base_commit_id,
-                expected_tip=run.managed_tip_id,
-            ):
-                raise GradleError("Main or managed tip changed; promotion refused")
+        if main != run.managed_tip_id and not promote_bookmark_to_main(
+            project.path,
+            run.managed_bookmark,
+            expected_base=run.base_commit_id,
+            expected_tip=run.managed_tip_id,
+        ):
+            raise GradleError("Main or managed tip changed; promotion refused")
         # main already equals verified tip also covers crash after promotion but
         # before this durable record. Finalization above still checks exact tip.
         run = run.model_copy(update={"promoted_commit_id": run.managed_tip_id})
@@ -377,7 +376,7 @@ def _new_gradle_workspace(
     except NoScanResultsError:
         scan_result = ScanResult(
             project=project_name,
-            scanned_at=datetime.now(timezone.utc),
+            scanned_at=datetime.now(UTC),
             trivy_target=str(project.path),
         )
     legacy = [
@@ -440,9 +439,11 @@ def _resume_gradle_workspace(
     main = exact_commit_id(project.path, "main")
     if main not in {expected_main, run.managed_tip_id}:
         raise GradleError("Main moved outside the recorded Gradle run")
-    if not any(isinstance(item, ApplyingAttempt) for item in run.attempts):
-        if exact_commit_id(work.path, run.managed_bookmark) != run.managed_tip_id:
-            raise GradleError("Managed Gradle bookmark changed")
+    if (
+        not any(isinstance(item, ApplyingAttempt) for item in run.attempts)
+        and exact_commit_id(work.path, run.managed_bookmark) != run.managed_tip_id
+    ):
+        raise GradleError("Managed Gradle bookmark changed")
     return work
 
 
@@ -543,7 +544,7 @@ def run_gradle_flow(
             # Committed resolve repair is separately verified above and becomes
             # the new accepted tip before automatic processing can resume.
             _require_gradle_accepted_workspace(run, work)
-            if not context_inputs_valid(run.context, work, datetime.now(timezone.utc)):
+            if not context_inputs_valid(run.context, work, datetime.now(UTC)):
                 run = gradle_updater.rebuild_gradle_run_evidence(
                     run, work, publication, minimum_age_days
                 )

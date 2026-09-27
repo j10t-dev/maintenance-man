@@ -3,7 +3,7 @@ import json
 import shutil
 import subprocess
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 from unittest.mock import patch
@@ -33,7 +33,7 @@ from maintenance_man.scanner import (
 )
 from tests.conftest import GRADLE_FIXTURES, make_update, make_vuln
 
-_OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
+_OLD = datetime(2024, 1, 1, tzinfo=UTC)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -410,16 +410,17 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
     )
     components = (
         ResolvedComponent(id="root", kind="root", module=None, variants=()),
-    ) + tuple(
-        ResolvedComponent(
-            id=module.artifact,
-            kind="module",
-            module=ModuleId(
-                group=module.group, artifact=module.artifact, version="1.0"
-            ),
-            variants=("runtime",),
-        )
-        for module in modules.values()
+        *(
+            ResolvedComponent(
+                id=module.artifact,
+                kind="module",
+                module=ModuleId(
+                    group=module.group, artifact=module.artifact, version="1.0"
+                ),
+                variants=("runtime",),
+            )
+            for module in modules.values()
+        ),
     )
     edges = tuple(
         ResolutionEdge(
@@ -486,7 +487,7 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         )
         return body, {"Last-Modified": published}, url
 
-    now = datetime(2026, 9, 18, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 18, tzinfo=UTC)
     monkeypatch.setattr(
         scanner,
         "PublicationLookupContext",

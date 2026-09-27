@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -10,18 +10,18 @@ from maintenance_man.models.activity import (
     record_activity,
 )
 
-_TS = datetime(2026, 3, 20, 14, 32, tzinfo=timezone.utc)
+_TS = datetime(2026, 3, 20, 14, 32, tzinfo=UTC)
 
 
 class TestActivityEvent:
     def test_timestamp_truncated_to_minutes(self):
         """Seconds and microseconds stripped from timestamp."""
         event = ActivityEvent(
-            timestamp=datetime(2026, 3, 20, 14, 32, 45, 123456, tzinfo=timezone.utc),
+            timestamp=datetime(2026, 3, 20, 14, 32, 45, 123456, tzinfo=UTC),
             success=True,
             branch="main",
         )
-        assert event.timestamp == datetime(2026, 3, 20, 14, 32, tzinfo=timezone.utc)
+        assert event.timestamp == datetime(2026, 3, 20, 14, 32, tzinfo=UTC)
         assert event.timestamp.second == 0
         assert event.timestamp.microsecond == 0
 

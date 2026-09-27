@@ -1,5 +1,5 @@
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -47,16 +47,16 @@ from tests.conftest import make_gradle_target
 
 
 def make_vuln(**overrides: Any) -> VulnFinding:
-    defaults = dict(
-        vuln_id="CVE-2024-0001",
-        pkg_name="some-pkg",
-        installed_version="1.0.0",
-        fixed_version="1.0.1",
-        severity=Severity.HIGH,
-        title="Test vuln",
-        description="desc",
-        status="fixed",
-    )
+    defaults = {
+        "vuln_id": "CVE-2024-0001",
+        "pkg_name": "some-pkg",
+        "installed_version": "1.0.0",
+        "fixed_version": "1.0.1",
+        "severity": Severity.HIGH,
+        "title": "Test vuln",
+        "description": "desc",
+        "status": "fixed",
+    }
     return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
@@ -67,12 +67,12 @@ def make_update(tier: SemverTier = SemverTier.PATCH, **overrides: Any) -> Update
         SemverTier.MAJOR: ("pkg-c", "1.0.0", "2.0.0"),
     }
     name, installed, latest = tier_defaults.get(tier, ("pkg-x", "1.0.0", "2.0.0"))
-    defaults = dict(
-        pkg_name=name,
-        installed_version=installed,
-        latest_version=latest,
-        semver_tier=tier,
-    )
+    defaults = {
+        "pkg_name": name,
+        "installed_version": installed,
+        "latest_version": latest,
+        "semver_tier": tier,
+    }
     return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
@@ -92,7 +92,7 @@ def project_config(tmp_path: Path) -> ProjectConfig:
 def scan_result() -> ScanResult:
     return ScanResult(
         project="myapp",
-        scanned_at=datetime.now(tz=timezone.utc),
+        scanned_at=datetime.now(tz=UTC),
         trivy_target="/tmp/myapp",
         vulnerabilities=[make_vuln()],
         updates=[
@@ -155,7 +155,7 @@ class TestSaveScanResults:
     def test_preserves_update_status(self, scan_results_dir: Path):
         result = ScanResult(
             project="myapp",
-            scanned_at=datetime.now(tz=timezone.utc),
+            scanned_at=datetime.now(tz=UTC),
             trivy_target="/tmp/myapp",
             updates=[
                 UpdateFinding(
@@ -181,7 +181,7 @@ class TestLoadScanResults:
     def test_load_existing(self, scan_results_dir: Path):
         result = ScanResult(
             project="myapp",
-            scanned_at=datetime.now(tz=timezone.utc),
+            scanned_at=datetime.now(tz=UTC),
             trivy_target="/tmp/myapp",
         )
         (scan_results_dir / "myapp.json").write_text(
@@ -199,7 +199,7 @@ class TestLoadScanResults:
 
 
 def test_bun_update_refuses_a_workspace_without_a_manifest(tmp_path: Path):
-    with pytest.raises(ValueError, match="package.json"):
+    with pytest.raises(ValueError, match=r"package.json"):
         get_update_commands("bun", "zod", "4.6.5", tmp_path)
     assert not (tmp_path / "package.json").exists()
 
@@ -356,7 +356,7 @@ class TestApplyUpdate:
             'lint = ["pytest>=8.0"]\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr("maintenance_man.updater._project_env", lambda: {})
+        monkeypatch.setattr("maintenance_man.updater._project_env", dict)
         mock_run = MagicMock(
             return_value=subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
@@ -384,7 +384,7 @@ class TestApplyUpdate:
             'lint = ["pytest>=8.0"]\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr("maintenance_man.updater._project_env", lambda: {})
+        monkeypatch.setattr("maintenance_man.updater._project_env", dict)
         mock_run = MagicMock(
             side_effect=[
                 subprocess.CompletedProcess(
@@ -410,7 +410,7 @@ class TestApplyUpdate:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        monkeypatch.setattr("maintenance_man.updater._project_env", lambda: {})
+        monkeypatch.setattr("maintenance_man.updater._project_env", dict)
         mock_run = MagicMock()
         monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
 
@@ -657,7 +657,7 @@ class TestRemoveCompletedFindings:
         ]
         scan = ScanResult(
             project="myapp",
-            scanned_at=datetime.now(tz=timezone.utc),
+            scanned_at=datetime.now(tz=UTC),
             trivy_target="/tmp/myapp",
             vulnerabilities=vulns,
             updates=updates,
@@ -675,7 +675,7 @@ class TestRemoveCompletedFindings:
     def test_no_completed_is_noop(self):
         scan = ScanResult(
             project="myapp",
-            scanned_at=datetime.now(tz=timezone.utc),
+            scanned_at=datetime.now(tz=UTC),
             trivy_target="/tmp/myapp",
             updates=[make_update(SemverTier.PATCH, update_status=UpdateStatus.FAILED)],
         )
@@ -912,7 +912,7 @@ class TestProcessFindingsLocal:
         upd_fail = make_update(SemverTier.MINOR)
         scan = ScanResult(
             project="myapp",
-            scanned_at=datetime.now(tz=timezone.utc),
+            scanned_at=datetime.now(tz=UTC),
             trivy_target="/tmp/myapp",
             updates=[upd_pass, upd_fail],
         )
@@ -1076,7 +1076,7 @@ class TestProcessFindingsResolve:
         upd_fail = make_update(SemverTier.PATCH, update_status=UpdateStatus.FAILED)
         scan = ScanResult(
             project="myapp",
-            scanned_at=datetime.now(tz=timezone.utc),
+            scanned_at=datetime.now(tz=UTC),
             trivy_target="/tmp/myapp",
             updates=[upd_fail],
         )

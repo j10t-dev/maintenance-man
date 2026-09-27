@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,26 +22,26 @@ _GRADLEW_STUB = "#!/bin/sh\nexit 0\n"
 
 
 def make_vuln(**overrides: Any) -> VulnFinding:
-    defaults = dict(
-        vuln_id="CVE-2024-0001",
-        pkg_name="some-pkg",
-        installed_version="1.0.0",
-        fixed_version="1.0.1",
-        severity=Severity.HIGH,
-        title="Test vuln",
-        description="desc",
-        status="fixed",
-    )
+    defaults = {
+        "vuln_id": "CVE-2024-0001",
+        "pkg_name": "some-pkg",
+        "installed_version": "1.0.0",
+        "fixed_version": "1.0.1",
+        "severity": Severity.HIGH,
+        "title": "Test vuln",
+        "description": "desc",
+        "status": "fixed",
+    }
     return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
 def make_update(**overrides: Any) -> UpdateFinding:
-    defaults = dict(
-        pkg_name="pkg-a",
-        installed_version="1.0.0",
-        latest_version="1.0.1",
-        semver_tier=SemverTier.PATCH,
-    )
+    defaults = {
+        "pkg_name": "pkg-a",
+        "installed_version": "1.0.0",
+        "latest_version": "1.0.1",
+        "semver_tier": SemverTier.PATCH,
+    }
     return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
@@ -51,7 +51,7 @@ def make_scan_result(
 ) -> ScanResult:
     return ScanResult(
         project="vulnerable",
-        scanned_at=datetime.now(tz=timezone.utc),
+        scanned_at=datetime.now(tz=UTC),
         trivy_target="tests/fixtures/vulnerable-project",
         vulnerabilities=vulns if vulns is not None else [make_vuln()],
         updates=updates if updates is not None else [make_update()],
@@ -182,19 +182,19 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
 
 
 def make_gradle_member(**overrides: Any) -> GradleMember:
-    defaults = dict(
-        kind="library",
-        alias="room-runtime",
-        coordinate="androidx.room:room-runtime",
-        installed_version="2.8.4",
-    )
+    defaults = {
+        "kind": "library",
+        "alias": "room-runtime",
+        "coordinate": "androidx.room:room-runtime",
+        "installed_version": "2.8.4",
+    }
     return GradleMember(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
 def make_gradle_target(**overrides: Any) -> GradleUpdateTarget:
-    defaults = dict(
-        version_ref="room",
-        members=[
+    defaults = {
+        "version_ref": "room",
+        "members": [
             make_gradle_member(
                 alias="room-runtime", coordinate="androidx.room:room-runtime"
             ),
@@ -205,8 +205,8 @@ def make_gradle_target(**overrides: Any) -> GradleUpdateTarget:
                 alias="room-testing", coordinate="androidx.room:room-testing"
             ),
         ],
-        target_version="2.8.5",
-    )
+        "target_version": "2.8.5",
+    }
     return GradleUpdateTarget(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
@@ -249,7 +249,7 @@ def set_maven_dates(
     published *days_old* days ago.  The date is relative to now so an age
     threshold in a test means what it says regardless of the current date.
     """
-    published = datetime.now(timezone.utc) - timedelta(days=days_old)
+    published = datetime.now(UTC) - timedelta(days=days_old)
     monkeypatch.setattr(
         "maintenance_man.dependency_age._get_maven_publish_date",
         lambda pkg, version: None if pkg in undated else published,

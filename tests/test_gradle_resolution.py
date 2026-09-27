@@ -150,10 +150,12 @@ def test_unmarked_output_is_never_reclaimed(tmp_path):
     owned = tmp_path / ".mm-gradle-inventory"
     owned.mkdir()
     (owned / "caller.txt").write_text("keep")
-    with patch("maintenance_man.gradle_resolution.run_gradle") as runner:
-        with pytest.raises(GradleError):
-            with generate_gradle_report(project):
-                pass
+    with (
+        patch("maintenance_man.gradle_resolution.run_gradle") as runner,
+        pytest.raises(GradleError),
+        generate_gradle_report(project),
+    ):
+        pass
     runner.assert_not_called()
     assert (owned / "caller.txt").read_text() == "keep"
 
@@ -947,14 +949,16 @@ def test_validate_gradle_candidates_refuses_duplicate_request_id(tmp_path):
             json.dumps({"schema_version": 1, "results": rows})
         )
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match="coverage"),
     ):
-        with pytest.raises(GradleError, match="coverage"):
-            validate_gradle_candidates(
-                project, [two_member_candidate()], _resolution_with_repositories(())
-            )
+        validate_gradle_candidates(
+            project, [two_member_candidate()], _resolution_with_repositories(())
+        )
 
 
 def test_validate_gradle_candidates_refuses_extra_row(tmp_path):
@@ -969,14 +973,16 @@ def test_validate_gradle_candidates_refuses_extra_row(tmp_path):
             json.dumps({"schema_version": 1, "results": rows})
         )
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match="coverage"),
     ):
-        with pytest.raises(GradleError, match="coverage"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
+        validate_gradle_candidates(
+            project, [candidate()], _resolution_with_repositories(())
+        )
 
 
 @pytest.mark.parametrize("identity", [{"alias": "wrong-alias"}, {"kind": "plugin"}])
@@ -989,14 +995,16 @@ def test_validate_gradle_candidates_refuses_identity_mismatch(tmp_path, identity
             json.dumps({"schema_version": 1, "results": rows})
         )
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match="identity mismatch"),
     ):
-        with pytest.raises(GradleError, match="identity mismatch"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
+        validate_gradle_candidates(
+            project, [candidate()], _resolution_with_repositories(())
+        )
 
 
 def test_validate_gradle_candidates_refuses_success_with_different_version(tmp_path):
@@ -1008,14 +1016,16 @@ def test_validate_gradle_candidates_refuses_success_with_different_version(tmp_p
             json.dumps({"schema_version": 1, "results": rows})
         )
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match="selected a different version"),
     ):
-        with pytest.raises(GradleError, match="selected a different version"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
+        validate_gradle_candidates(
+            project, [candidate()], _resolution_with_repositories(())
+        )
 
 
 def test_validate_gradle_candidates_refuses_plugin_success_without_implementation(
@@ -1032,14 +1042,16 @@ def test_validate_gradle_candidates_refuses_plugin_success_without_implementatio
             json.dumps({"schema_version": 1, "results": rows})
         )
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match="marker success lacks implementation"),
     ):
-        with pytest.raises(GradleError, match="marker success lacks implementation"):
-            validate_gradle_candidates(
-                project, [two_member_candidate()], _resolution_with_repositories(())
-            )
+        validate_gradle_candidates(
+            project, [two_member_candidate()], _resolution_with_repositories(())
+        )
 
 
 def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
@@ -1057,11 +1069,13 @@ def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
         (directory / "candidate-validation.json").symlink_to(external)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    with patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner):
-        with pytest.raises(GradleError, match="symlink"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
+    with (
+        patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner),
+        pytest.raises(GradleError, match="symlink"),
+    ):
+        validate_gradle_candidates(
+            project, [candidate()], _resolution_with_repositories(())
+        )
 
 
 def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
@@ -1074,14 +1088,16 @@ def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
         )
         (root / "gradle/libs.versions.toml").write_text("mutated = true\n")
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match="modified the catalogue"),
     ):
-        with pytest.raises(GradleError, match="modified the catalogue"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
+        validate_gradle_candidates(
+            project, [candidate()], _resolution_with_repositories(())
+        )
 
 
 def test_mixed_library_plugin_alias_keeps_member_validation_separate():

@@ -77,7 +77,7 @@ def get_uv_dependency_locations(
 def _load_pyproject(project_path: Path) -> dict:
     pyproject_path = project_path / "pyproject.toml"
     try:
-        with open(pyproject_path, "rb") as f:
+        with pyproject_path.open("rb") as f:
             return tomllib.load(f)
     except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
         raise UvDependencyError(f"Failed to read {pyproject_path}: {e}") from e

@@ -485,7 +485,7 @@ class TestUpdateResume:
         assert exc_info.value.code == 0
 
         args, _ = mock_workspace.call_args
-        # create_workspace(repo_path, project, revision)
+        # Positional args are repo path, project, revision.
         assert args[1] == "vulnerable"
         assert args[2] == "mm/update-dependencies"
         mock_prune.assert_not_called()
@@ -522,7 +522,7 @@ class TestUpdateResume:
         assert exc_info.value.code == 0
         mock_prompt.assert_not_called()
         mock_promote.assert_called_once()
-        # promote_bookmark_to_main(path, source_bookmark)
+        # The second positional arg is the source bookmark.
         assert mock_promote.call_args.args[1] == "mm/update-dependencies"
 
     def test_resume_shows_only_failed_findings(

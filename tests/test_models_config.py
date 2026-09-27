@@ -96,7 +96,11 @@ class TestDefaultsConfigHealthcheck:
 @pytest.mark.parametrize("value", [None, "standard-public"])
 def test_gradle_routing_declaration_values(tmp_path, value):
     project = ProjectConfig.model_validate(
-        dict(path=tmp_path, package_manager="gradle", gradle_repository_routing=value)
+        {
+            "path": tmp_path,
+            "package_manager": "gradle",
+            "gradle_repository_routing": value,
+        }
     )
     assert project.gradle_repository_routing == value
 
@@ -110,9 +114,9 @@ def test_gradle_routing_omission_is_backward_compatible(tmp_path):
 def test_gradle_routing_rejects_unknown_declarations(tmp_path, value):
     with pytest.raises(ValidationError, match="gradle_repository_routing"):
         ProjectConfig.model_validate(
-            dict(
-                path=tmp_path,
-                package_manager="gradle",
-                gradle_repository_routing=value,
-            )
+            {
+                "path": tmp_path,
+                "package_manager": "gradle",
+                "gradle_repository_routing": value,
+            }
         )

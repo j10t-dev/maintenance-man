@@ -1,8 +1,9 @@
+import contextlib
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
@@ -152,7 +153,7 @@ def should_deploy(
 
 console = Console()
 
-_TABLE_STYLE: dict[str, Any] = dict(show_edge=False, pad_edge=False, box=None)
+_TABLE_STYLE: dict[str, Any] = {"show_edge": False, "pad_edge": False, "box": None}
 
 _UPDATE_BOOKMARK = "mm/update-dependencies"
 _RESOLVE_BOOKMARK = "mm/resolve-dependencies"
@@ -362,7 +363,7 @@ def sync(
 
     ordered = _dedupe_preserve_order(list(projects))
     _validate_project_names(cfg, ordered)
-    targets = ordered if ordered else _sorted_project_names(cfg)
+    targets = ordered or _sorted_project_names(cfg)
 
     had_errors = False
     for name in targets:
@@ -1076,7 +1077,7 @@ def _print_deploy_summary(results: list[DeployResult]) -> None:
         console.print("\n[dim]No projects have deploy_command configured.[/]")
         return
 
-    _STATUS_DISPLAY = {
+    status_display = {
         "pass": "[green]PASS[/]",
         "fail": "[red]FAIL[/]",
         "skip": "[dim]SKIP[/]",
@@ -1092,8 +1093,8 @@ def _print_deploy_summary(results: list[DeployResult]) -> None:
     for r in results:
         table.add_row(
             r.project,
-            _STATUS_DISPLAY[r.build_status],
-            _STATUS_DISPLAY[r.deploy_status],
+            status_display[r.build_status],
+            status_display[r.deploy_status],
         )
 
     console.print()
@@ -1541,7 +1542,7 @@ def _pluralise(n: int, singular: str, plural: str) -> str:
 
 def _relative_time(dt: datetime, now: datetime | None = None) -> str:
     """Format a datetime as a human-readable relative time string."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     total_seconds = int((now - dt).total_seconds())
     match total_seconds:
         case s if s < 60:
@@ -1723,7 +1724,7 @@ def _run_update_flow(
         )
         _print_update_summary(all_results)
         if (
-            any((not r.passed for r in all_results))
+            any(not r.passed for r in all_results)
             or _has_update_failures(scan_result)
             or scan_result.blocked_findings
         ):
@@ -1794,7 +1795,7 @@ def _update_batch(
         ) + _process_selected_updates(
             _selectable_updates(updates), work_config, scan_result, project, results_dir
         )
-        any_failed_result = any((not r.passed for r in all_results))
+        any_failed_result = any(not r.passed for r in all_results)
         any_failed_finding = _has_update_failures(scan_result)
         if not (
             any_failed_result or any_failed_finding or scan_result.blocked_findings
@@ -1887,7 +1888,7 @@ def resolve(
                 continue_=continue_,
             )
         )
-    scan_result, actionable_vulns, updates = _load_validated_scan(
+    scan_result, _, _ = _load_validated_scan(
         project, results_dir, proj_config, Workflow.RESOLVE
     )
     if continue_:
@@ -1956,7 +1957,7 @@ def _handle_resolve_continue(
                 blocker.failed_phase = failed_phase
         if not passed:
             save_scan_results(project, results_dir, scan_result)
-            names = ", ".join((b.pkg_name for b in failed))
+            names = ", ".join(b.pkg_name for b in failed)
             console.print(
                 f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
             )
@@ -2005,7 +2006,7 @@ def _print_gradle_run_summary(run: GradleRun) -> None:
         f"failed: {counts['failed'] + counts['applying']}; "
         f"residual advisories: {len(run.accepted_snapshot.findings)}"
     )
-    for (kind, identity, version, reason), label in sorted(withheld.items()):
+    for (kind, _identity, _version, reason), label in sorted(withheld.items()):
         prefix = "WITHHELD TARGET" if kind == "target" else "RESIDUAL PACKAGE"
         console.print(f"  {prefix} {escape(label)} — {escape(reason)}")
     for attempt in run.attempts:
@@ -2118,7 +2119,7 @@ def _print_scan_result(
         for u in updates:
             age = ""
             if u.published_date:
-                days = (datetime.now(timezone.utc) - u.published_date).days
+                days = (datetime.now(UTC) - u.published_date).days
                 age = f"({days} days old)"
             table.add_row(
                 "UPDATE",
@@ -2145,11 +2146,9 @@ def _print_gradle_run_result(
 ) -> None:
     result = None
     if run.refreshed:
-        try:
+        # A removed results file must not hide durable residual evidence.
+        with contextlib.suppress(NoScanResultsError):
             result = load_scan_results(run.project, results_dir)
-        except NoScanResultsError:
-            # A removed results file must not hide durable residual evidence.
-            pass
     if result is None:
         result = ScanResult(
             project=run.project,

@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -15,7 +15,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 
-_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
 
 def _write_scan_result(mm_home: Path, name: str, result: ScanResult) -> None:
