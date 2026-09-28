@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -87,6 +88,27 @@ class Repository(Protocol):
 
 def workspace_path_for_project(project: str) -> Path:
     return paths.project_file(paths.workspaces_dir(), project)
+
+
+def assert_safe_workspace_path(path: Path) -> Path:
+    try:
+        path_status = path.lstat()
+    except FileNotFoundError:
+        path_status = None
+    if path_status is not None and stat.S_ISLNK(path_status.st_mode):
+        raise ValueError(f"refusing to remove symlink workspace path: {path}")
+
+    root = paths.workspaces_dir().resolve()
+    target = path.resolve()
+    if target == root:
+        raise ValueError("refusing to remove workspace root")
+    if root not in target.parents:
+        raise ValueError(f"refusing to remove path outside {root}: {target}")
+    if target.parent != root:
+        raise ValueError(
+            f"refusing to remove nested/non-project workspace path: {target}"
+        )
+    return target
 
 
 def _guarded_tip(source_bookmark: str, expected_base: str, expected_tip: str) -> str:

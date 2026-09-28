@@ -1811,9 +1811,13 @@ def _run_update_flow(
             finalised = False
     if not finalised:
         return ExitCode.UPDATE_FAILED
-    vcs.repository(proj_config.path).delete_bookmark(
-        bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    )
+    try:
+        vcs.repository(proj_config.path).delete_bookmark(
+            bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
+        )
+    except RevisionError as exc:
+        console.print(f"[bold red]Bookmark cleanup failed:[/] {exc}")
+        return ExitCode.UPDATE_FAILED
     return ExitCode.OK
 
 
@@ -1895,9 +1899,13 @@ def _update_batch(
             finalised = False
             promotion_attempted = True
     if finalised:
-        vcs.repository(proj_config.path).delete_bookmark(
-            bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-        )
+        try:
+            vcs.repository(proj_config.path).delete_bookmark(
+                bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
+            )
+        except RevisionError as exc:
+            console.print(f"  [bold red]Bookmark cleanup failed:[/] {project} — {exc}")
+            finalised = False
     return (
         all_results,
         bool(scan_result.blocked_findings) or (promotion_attempted and (not finalised)),

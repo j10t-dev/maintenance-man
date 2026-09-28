@@ -844,6 +844,38 @@ class TestUpdateFinalise:
         effects = [call.method for call in state.effects]
         assert effects.index("forget_workspace") < effects.index("delete_bookmark")
 
+    def test_final_bookmark_cleanup_failure_preserves_completed_update(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: dict,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        project_path = mock_update_cli_deps["project_paths"]["vulnerable"]
+        state = mock_update_cli_deps["vcs_state"]
+        state.fail(
+            "delete_bookmark",
+            ordinal=1,
+            error=RevisionError("injected final cleanup failure"),
+            path=project_path,
+        )
+        monkeypatch.setattr(
+            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable"])
+
+        assert exc_info.value.code == ExitCode.UPDATE_FAILED
+        output = capsys.readouterr().out
+        assert "Bookmark cleanup failed" in output
+        assert "injected final cleanup failure" in output
+        repo = mock_update_cli_deps["services"].repository(project_path)
+        assert repo.same_revision(left="main", right="mm/update-dependencies")
+        assert (project_path / "mm-fixture-some-pkg.txt").read_text() == "1.0.1"
+        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        assert not saved.findings
+
     def test_failed_workspace_removal_retains_directory_and_reports_failure(
         self,
         mm_home_with_projects: Path,
@@ -945,6 +977,39 @@ class TestUpdateAll:
         with pytest.raises(SystemExit) as exc_info:
             app(["update"])
         assert exc_info.value.code == 4
+
+    def test_batch_continues_after_final_bookmark_cleanup_failure(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: dict,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        vulnerable_path = mock_update_cli_deps["project_paths"]["vulnerable"]
+        clean_path = mock_update_cli_deps["project_paths"]["clean"]
+        state = mock_update_cli_deps["vcs_state"]
+        state.fail(
+            "delete_bookmark",
+            ordinal=1,
+            error=RevisionError("injected final cleanup failure"),
+            path=vulnerable_path,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["update", "vulnerable", "clean"])
+
+        assert exc_info.value.code == ExitCode.UPDATE_FAILED
+        output = capsys.readouterr().out
+        assert "Bookmark cleanup failed" in output
+        vulnerable_repo = mock_update_cli_deps["services"].repository(vulnerable_path)
+        clean_repo = mock_update_cli_deps["services"].repository(clean_path)
+        assert vulnerable_repo.same_revision(
+            left="main", right="mm/update-dependencies"
+        )
+        assert not clean_repo.bookmark_exists(bookmark="mm/update-dependencies")
+        assert (clean_path / "mm-fixture-some-pkg.txt").read_text() == "1.0.1"
+        for project in ("vulnerable", "clean"):
+            saved = load_scan_results(project, mm_home_with_projects / "scan-results")
+            assert not saved.findings
 
     def test_batch_no_test_config_does_not_abort(
         self,

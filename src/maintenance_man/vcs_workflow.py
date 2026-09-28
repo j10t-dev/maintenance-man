@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -16,6 +15,7 @@ from maintenance_man.vcs import (
     JjRepository,
     Repository,
     RevisionError,
+    assert_safe_workspace_path,
 )
 
 
@@ -132,28 +132,15 @@ def _workspace_name(project: str) -> str:
 def _workspace_path(project: str) -> Path:
     try:
         return paths.project_file(paths.workspaces_dir(), project)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise RevisionError(f"Cannot compute workspace path: {exc}") from exc
 
 
-def _safe_workspace_path(project: str) -> Path:
-    candidate = _workspace_path(project)
+def _checked_workspace_path(path: Path) -> Path:
     try:
-        try:
-            candidate_status = candidate.lstat()
-        except FileNotFoundError:
-            candidate_status = None
-        if candidate_status is not None and stat.S_ISLNK(candidate_status.st_mode):
-            raise RevisionError(
-                f"Refusing to remove symlink workspace path: {candidate}"
-            )
-        root = paths.workspaces_dir().resolve()
-        target = candidate.resolve()
-    except OSError as exc:
+        return assert_safe_workspace_path(path)
+    except (OSError, ValueError) as exc:
         raise RevisionError(f"Cannot inspect workspace path: {exc}") from exc
-    if target == root or root not in target.parents or target.parent != root:
-        raise RevisionError(f"Refusing to remove unsafe workspace path: {target}")
-    return candidate
 
 
 def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
@@ -171,19 +158,16 @@ def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
 def remove_workspace(*, repo: Repository, project: str) -> None:
     names = repo.workspace_names()
     workspace_name = _workspace_name(project)
-    workspace_path = _safe_workspace_path(project)
+    workspace_path = _checked_workspace_path(_workspace_path(project))
     if workspace_name in names:
         repo.forget_workspace(name=workspace_name)
     try:
-        workspace_status = workspace_path.lstat()
+        workspace_path.lstat()
     except FileNotFoundError:
         return
     except OSError as exc:
         raise RevisionError(f"Cannot inspect workspace path: {exc}") from exc
-    if stat.S_ISLNK(workspace_status.st_mode):
-        raise RevisionError(
-            f"Refusing to remove symlink workspace path: {workspace_path}"
-        )
+    workspace_path = _checked_workspace_path(workspace_path)
     try:
         shutil.rmtree(workspace_path)
     except OSError as exc:

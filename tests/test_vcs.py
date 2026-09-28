@@ -19,6 +19,62 @@ def _completed(
     )
 
 
+@pytest.mark.parametrize("existing", [False, True], ids=["absent", "existing"])
+def test_assert_safe_workspace_path_accepts_direct_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    monkeypatch.setattr(vcs.paths, "MM_HOME", tmp_path / ".mm")
+    root = vcs.paths.workspaces_dir()
+    root.mkdir(parents=True)
+    child = root / "project"
+    if existing:
+        child.mkdir()
+
+    assert vcs.assert_safe_workspace_path(child) == child.resolve()
+
+
+@pytest.mark.parametrize("location", ["root", "outside", "nested"])
+def test_assert_safe_workspace_path_rejects_unsafe_locations_without_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    monkeypatch.setattr(vcs.paths, "MM_HOME", tmp_path / ".mm")
+    root = vcs.paths.workspaces_dir()
+    root.mkdir(parents=True)
+    targets = {
+        "root": root,
+        "outside": tmp_path / "outside",
+        "nested": root / "project" / "nested",
+    }
+    target = targets[location]
+    target.mkdir(parents=True, exist_ok=True)
+    marker = target / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        vcs.assert_safe_workspace_path(target)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_assert_safe_workspace_path_rejects_final_symlink_and_preserves_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(vcs.paths, "MM_HOME", tmp_path / ".mm")
+    root = vcs.paths.workspaces_dir()
+    sibling = root / "project-b"
+    sibling.mkdir(parents=True)
+    marker = sibling / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    candidate = root / "project-a"
+    candidate.symlink_to(sibling, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        vcs.assert_safe_workspace_path(candidate)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert candidate.is_symlink()
+
+
 class TestJjRepositoryBoundary:
     def test_command_launch_failure_is_a_revision_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

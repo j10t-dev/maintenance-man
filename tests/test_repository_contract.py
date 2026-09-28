@@ -1452,9 +1452,10 @@ def test_workspace_removal_rejects_final_symlink_and_preserves_sibling(
     keep.write_text("recovery", encoding="utf-8")
     (root / "project-a").symlink_to(sibling, target_is_directory=True)
 
-    with pytest.raises(RevisionError, match="symlink"):
+    with pytest.raises(RevisionError, match="symlink") as caught:
         remove_workspace(repo=repo, project="project-a")
 
+    assert isinstance(caught.value.__cause__, ValueError)
     assert keep.read_text(encoding="utf-8") == "recovery"
     assert sibling.is_dir()
     assert (root / "project-a").is_symlink()
