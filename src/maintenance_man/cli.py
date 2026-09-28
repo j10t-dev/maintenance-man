@@ -2275,6 +2275,7 @@ def _run_gradle_flow(
         interactive=interactive,
         minimum_age_days=minimum_age_days,
         continue_=continue_,
+        vcs=vcs,
         interaction=gradle_workflow.GradleInteraction(
             choose=_choose_gradle_candidates,
             report=_print_gradle_run_result,

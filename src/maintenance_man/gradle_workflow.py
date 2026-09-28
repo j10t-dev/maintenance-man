@@ -16,6 +16,7 @@ from maintenance_man.dependency_age import (
 )
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
+from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GradleError,
@@ -63,22 +64,19 @@ from maintenance_man.storage import (
     save_scan_results,
 )
 from maintenance_man.vcs import (
-    BookmarkLookupError,
+    ExpectedRevisions,
     RevisionError,
-    create_or_reset_bookmark,
+    workspace_path_for_project,
+)
+from maintenance_man.vcs_workflow import (
+    VcsServices,
     create_workspace,
-    current_change_has_changes,
-    edit_new_change,
     ensure_main_bookmark,
-    exact_commit_id,
-    promote_bookmark_to_main,
+    make_vcs_services,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
-    reset_verified_gradle_bookmark,
-    revision_tree_id,
-    workspace_path_for_project,
 )
 
 
@@ -103,6 +101,7 @@ def _prepare_gradle_run(
     discovered: list[UpdateFinding] | None = None,
     *,
     interaction: GradleInteraction,
+    vcs: VcsServices,
 ) -> GradleRun | ExitCode:
     # Resolve current security findings even when discovery produces no proposals.
     vulnerabilities, resolution = _run_gradle_scan(project)
@@ -157,7 +156,14 @@ def _prepare_gradle_run(
         # The first durable record is a complete plan and checked baseline.
         # Failures before this point have no candidate effects and retry from scratch.
         run = gradle_updater.start_gradle_run(
-            project_name, project, flow, base, context, (), persist=False
+            project_name,
+            project,
+            flow,
+            base,
+            context,
+            (),
+            persist=False,
+            vcs=vcs,
         )
         run = GradleRun.model_validate(
             dict(run) | {"attempts": attempts, "selection_blocks": plan.withheld}
@@ -193,8 +199,11 @@ def _publish_verified_gradle_scan(
     results_dir: Path,
     publication: PublicationLookupContext,
     minimum_age_days: int,
+    *,
+    vcs: VcsServices,
 ) -> None:
-    if revision_tree_id(project.path) != run.accepted_snapshot.tree_id:
+    repo = vcs.repository(Path(project.path))
+    if repo.tree_id() != run.accepted_snapshot.tree_id:
         raise GradleError("Refreshed working tree differs from verified tree")
     discovered = filter_gradle_updates_by_age(
         discover_gradle_updates(project),
@@ -220,26 +229,28 @@ def _publish_verified_gradle_scan(
             mode="json"
         ),
     )
-    if revision_tree_id(project.path) != run.accepted_snapshot.tree_id:
+    if repo.tree_id() != run.accepted_snapshot.tree_id:
         raise GradleError("Source changed while publishing verified findings")
     results_dir.mkdir(parents=True, exist_ok=True)
     save_scan_results(run.project, results_dir, fresh)
 
 
-def _require_gradle_accepted_workspace(run: GradleRun, project: ProjectConfig) -> None:
-    if current_change_has_changes(project.path):
+def _require_gradle_accepted_workspace(
+    run: GradleRun, project: ProjectConfig, *, vcs: VcsServices
+) -> None:
+    repo = vcs.repository(Path(project.path))
+    if repo.has_changes():
         raise GradleError(
             "Automatic Gradle processing requires an empty working change"
         )
-    if exact_commit_id(project.path, "@-") != run.managed_tip_id:
+    if repo.resolve_revision(revision="@-") != run.managed_tip_id:
         raise GradleError(
             "Working change is not an empty child of the recorded accepted tip"
         )
     if (
-        exact_commit_id(project.path, run.managed_bookmark) != run.managed_tip_id
-        or revision_tree_id(project.path, run.managed_tip_id)
-        != run.accepted_snapshot.tree_id
-        or revision_tree_id(project.path) != run.accepted_snapshot.tree_id
+        repo.resolve_revision(revision=run.managed_bookmark) != run.managed_tip_id
+        or repo.tree_id(revision=run.managed_tip_id) != run.accepted_snapshot.tree_id
+        or repo.tree_id() != run.accepted_snapshot.tree_id
     ):
         raise GradleError(
             "Working revision differs from the recorded accepted snapshot"
@@ -252,45 +263,46 @@ def _finish_verified_gradle_run(
     results_dir: Path,
     publication: PublicationLookupContext,
     minimum_age_days: int,
+    *,
+    vcs: VcsServices,
 ) -> GradleRun:
     # Verification reads the accepted revision, not the source workspace's old tree.
-    with gradle_updater._gradle_evidence_workspace(
-        project, run.managed_tip_id
+    with gradle_updater.gradle_evidence_workspace(
+        project, run.managed_tip_id, vcs=vcs
     ) as verified:
         if not context_inputs_valid(run.context, verified, datetime.now(UTC)):
             run = gradle_updater.rebuild_gradle_run_evidence(
-                run, verified, publication, minimum_age_days
+                run, verified, publication, minimum_age_days, vcs=vcs
             )
         gradle_updater.gradle_run_finalization_check(
-            run, verified, publication, minimum_age_days
+            run, verified, publication, minimum_age_days, vcs=vcs
         )
     path = gradle_updater.gradle_run_path(run.project)
     if run.flow == Workflow.RESOLVE:
         if not run.submitted:
-            ok, output = push_bookmark_and_create_pr(
-                project.path,
-                run.managed_bookmark,
-                expected_base=run.base_commit_id,
-                expected_tip=run.managed_tip_id,
+            output = push_bookmark_and_create_pr(
+                repo=vcs.repository(Path(project.path)),
+                host=vcs.code_host(Path(project.path)),
+                bookmark=run.managed_bookmark,
+                expected=ExpectedRevisions(
+                    base=run.base_commit_id, tip=run.managed_tip_id
+                ),
             )
             if output:
                 rprint(output)
-            if not ok:
-                raise GradleError(
-                    "Verified Gradle submission failed; retained for retry"
-                )
             run = _complete_gradle_attempts(run.model_copy(update={"submitted": True}))
             gradle_updater.save_gradle_run(path, run)
         return run
-    main = exact_commit_id(project.path, "main")
+    repo = vcs.repository(Path(project.path))
+    main = repo.resolve_revision(revision="main")
     if run.promoted_commit_id is None:
-        if main != run.managed_tip_id and not promote_bookmark_to_main(
-            project.path,
-            run.managed_bookmark,
-            expected_base=run.base_commit_id,
-            expected_tip=run.managed_tip_id,
-        ):
-            raise GradleError("Main or managed tip changed; promotion refused")
+        if main != run.managed_tip_id:
+            repo.promote_bookmark_to_main(
+                bookmark=run.managed_bookmark,
+                expected=ExpectedRevisions(
+                    base=run.base_commit_id, tip=run.managed_tip_id
+                ),
+            )
         # main already equals verified tip also covers crash after promotion but
         # before this durable record. Finalization above still checks exact tip.
         run = run.model_copy(update={"promoted_commit_id": run.managed_tip_id})
@@ -298,21 +310,30 @@ def _finish_verified_gradle_run(
     elif run.promoted_commit_id != run.managed_tip_id or main != run.promoted_commit_id:
         raise GradleError("Main moved after recorded Gradle promotion")
     if not run.refreshed:
-        if not refresh_working_copy_from_main(project.path):
+        try:
+            refresh_working_copy_from_main(repo=repo)
+        except RevisionError as exc:
             raise GradleError(
                 "Promotion recorded; working-copy refresh failed, retry update"
-            )
-        if exact_commit_id(project.path, "main") != run.managed_tip_id:
+            ) from exc
+        if repo.resolve_revision(revision="main") != run.managed_tip_id:
             raise GradleError("Main moved during refresh")
         _publish_verified_gradle_scan(
-            run, project, results_dir, publication, minimum_age_days
+            run,
+            project,
+            results_dir,
+            publication,
+            minimum_age_days,
+            vcs=vcs,
         )
         run = _complete_gradle_attempts(run.model_copy(update={"refreshed": True}))
         gradle_updater.save_gradle_run(path, run)
     return run
 
 
-def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> None:
+def _archive_rolled_back_gradle_run(
+    run: GradleRun, project: ProjectConfig, *, vcs: VcsServices
+) -> None:
     if (
         run.flow != Workflow.UPDATE
         or run.promoted_commit_id is not None
@@ -327,18 +348,23 @@ def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> N
         )
     # Repeat guarded rollback after a crash between saving Failed and restoring.
     gradle_updater.rollback_failed_gradle_update(
-        run, project.model_copy(update={"path": workspace})
+        run,
+        project.model_copy(update={"path": workspace}),
+        vcs=vcs,
     )
-    if current_change_has_changes(workspace):
+    workspace_repo = vcs.repository(workspace)
+    source_repo = vcs.repository(Path(project.path))
+    if workspace_repo.has_changes():
         raise GradleError(
             "Uncommitted or missing failed workspace requires manual review"
         )
     if (
-        exact_commit_id(project.path, "main") != run.base_commit_id
-        or exact_commit_id(workspace, run.managed_bookmark) != run.managed_tip_id
-        or exact_commit_id(workspace, "@-") != run.managed_tip_id
-        or revision_tree_id(workspace) != run.accepted_snapshot.tree_id
-        or revision_tree_id(workspace, run.managed_tip_id)
+        source_repo.resolve_revision(revision="main") != run.base_commit_id
+        or workspace_repo.resolve_revision(revision=run.managed_bookmark)
+        != run.managed_tip_id
+        or workspace_repo.resolve_revision(revision="@-") != run.managed_tip_id
+        or workspace_repo.tree_id() != run.accepted_snapshot.tree_id
+        or workspace_repo.tree_id(revision=run.managed_tip_id)
         != run.accepted_snapshot.tree_id
     ):
         raise GradleError(
@@ -347,13 +373,15 @@ def _archive_rolled_back_gradle_run(run: GradleRun, project: ProjectConfig) -> N
     path = gradle_updater.gradle_run_path(run.project)
     archive = path.parent / "history" / f"{path.stem}-{uuid.uuid4().hex}.json"
     gradle_updater.save_gradle_run(archive, run)
-    if not reset_verified_gradle_bookmark(
-        project.path,
-        run.managed_bookmark,
-        expected_base=run.base_commit_id,
-        expected_tip=run.managed_tip_id,
-    ):
-        raise GradleError("Revisions changed during restart; original ledger retained")
+    try:
+        source_repo.reset_verified_bookmark(
+            bookmark=run.managed_bookmark,
+            expected=ExpectedRevisions(base=run.base_commit_id, tip=run.managed_tip_id),
+        )
+    except RevisionError as exc:
+        raise GradleError(
+            "Revisions changed during restart; original ledger retained"
+        ) from exc
     path.unlink()
     fsync_dir(path.parent)
     gradle_updater.retire_gradle_context(run.context)
@@ -366,6 +394,8 @@ def _new_gradle_workspace(
     results_dir: Path,
     flow: Workflow,
     interaction: GradleInteraction,
+    *,
+    vcs: VcsServices,
 ) -> tuple[ProjectConfig, str]:
     try:
         scan_result = load_scan_results(project_name, results_dir)
@@ -387,34 +417,36 @@ def _new_gradle_workspace(
         )
     if flow == Workflow.UPDATE:
         interaction.workspace_revision(project_name, project, "main")
-    if not prune_stale_bookmarks(project.path) or not ensure_main_bookmark(
-        project.path
-    ):
-        raise GradleError("Cannot prepare main")
-    base = exact_commit_id(project.path, "main")
+    source_repo = vcs.repository(Path(project.path))
+    prune_stale_bookmarks(repo=source_repo, host=vcs.code_host(Path(project.path)))
+    ensure_main_bookmark(repo=source_repo)
+    base = source_repo.resolve_revision(revision="main")
     bookmark = WORKFLOW_BOOKMARKS[flow]
     if flow == Workflow.UPDATE:
         interaction.workspace_revision(project_name, project, base)
-        remove_workspace(project.path, project_name)
-        if not create_workspace(project.path, project_name, base):
-            raise GradleError("Cannot prepare Gradle workspace")
-        work = project.model_copy(
-            update={"path": workspace_path_for_project(project_name)}
+        remove_workspace(repo=source_repo, project=project_name)
+        workspace = create_workspace(
+            repo=source_repo, project=project_name, revision=base
         )
+        work = project.model_copy(update={"path": workspace})
     else:
-        if current_change_has_changes(project.path):
+        if source_repo.has_changes():
             raise GradleError("Commit or discard source edits before resolve")
         work = project
-    if not edit_new_change(work.path, base):
-        raise GradleError("Cannot prepare empty Gradle change")
-    if not create_or_reset_bookmark(bookmark, work.path, base):
-        raise GradleError("Cannot create managed Gradle bookmark")
+    work_repo = vcs.repository(Path(work.path))
+    work_repo.new_change(revision=base)
+    if work_repo.bookmark_exists(bookmark=bookmark):
+        work_repo.set_bookmark(bookmark=bookmark, revision=base)
+    else:
+        work_repo.create_bookmark(bookmark=bookmark, revision=base)
     return work, base
 
 
 def _resume_gradle_workspace(
     run: GradleRun,
     project: ProjectConfig,
+    *,
+    vcs: VcsServices,
 ) -> ProjectConfig:
     project_name, flow = run.project, run.flow
     if flow == Workflow.UPDATE:
@@ -424,20 +456,25 @@ def _resume_gradle_workspace(
                 raise GradleError(
                     "Interrupted workspace missing; manual review required"
                 )
-            if not create_workspace(project.path, project_name, run.managed_tip_id):
-                raise GradleError("Cannot resume verified workspace")
-            if not edit_new_change(workspace, run.managed_tip_id):
-                raise GradleError("Cannot create resumed empty change")
+            create_workspace(
+                repo=vcs.repository(Path(project.path)),
+                project=project_name,
+                revision=run.managed_tip_id,
+            )
+            vcs.repository(workspace).new_change(revision=run.managed_tip_id)
         work = project.model_copy(update={"path": workspace})
     else:
         work = project
     expected_main = run.promoted_commit_id or run.base_commit_id
-    main = exact_commit_id(project.path, "main")
+    main = vcs.repository(Path(project.path)).resolve_revision(revision="main")
     if main not in {expected_main, run.managed_tip_id}:
         raise GradleError("Main moved outside the recorded Gradle run")
     if (
         not run.has(ApplyingAttempt)
-        and exact_commit_id(work.path, run.managed_bookmark) != run.managed_tip_id
+        and vcs.repository(Path(work.path)).resolve_revision(
+            revision=run.managed_bookmark
+        )
+        != run.managed_tip_id
     ):
         raise GradleError("Managed Gradle bookmark changed")
     return work
@@ -464,7 +501,9 @@ def run_gradle_flow(
     minimum_age_days: int,
     continue_: bool = False,
     interaction: GradleInteraction,
+    vcs: VcsServices | None = None,
 ) -> int:
+    services = vcs or make_vcs_services()
     try:
         path = gradle_updater.gradle_run_path(project_name)
         run = gradle_updater.load_gradle_run(path)
@@ -479,7 +518,7 @@ def run_gradle_flow(
             and not continue_
             and run.has(FailedAttempt)
         ):
-            _archive_rolled_back_gradle_run(run, project)
+            _archive_rolled_back_gradle_run(run, project, vcs=services)
             run = None
         if run is not None and (run.project != project_name or run.flow != flow):
             raise GradleError("Another Gradle workflow owns the unfinished ledger")
@@ -487,15 +526,20 @@ def run_gradle_flow(
             if continue_:
                 raise GradleError("No preserved Gradle resolve attempt to continue")
             work, base = _new_gradle_workspace(
-                project_name, project, results_dir, flow, interaction
+                project_name,
+                project,
+                results_dir,
+                flow,
+                interaction,
+                vcs=services,
             )
         else:
-            work = _resume_gradle_workspace(run, project)
+            work = _resume_gradle_workspace(run, project, vcs=services)
             base = run.base_commit_id
         with PublicationLookupContext(paths.gradle_publications_dir()) as publication:
             unfinished = run is not None and _gradle_run_needs_replanning(run)
             if unfinished:
-                _require_gradle_accepted_workspace(run, work)
+                _require_gradle_accepted_workspace(run, work, vcs=services)
             if run is None or unfinished:
                 previous = run
                 prepared = _prepare_gradle_run(
@@ -507,13 +551,17 @@ def run_gradle_flow(
                     minimum_age_days,
                     interactive,
                     interaction=interaction,
+                    vcs=services,
                 )
                 if isinstance(prepared, ExitCode):
                     if previous is not None:
                         path.unlink()
                         gradle_updater.retire_gradle_context(previous.context)
                     if flow == Workflow.UPDATE:
-                        remove_workspace(project.path, project_name)
+                        remove_workspace(
+                            repo=services.repository(Path(project.path)),
+                            project=project_name,
+                        )
                     return prepared
                 run = prepared
                 if (
@@ -524,11 +572,11 @@ def run_gradle_flow(
                     gradle_updater.retire_gradle_context(previous.context)
             if run.has(ApplyingAttempt):
                 run = gradle_updater.reconcile_gradle_applying(
-                    run, work, publication, minimum_age_days
+                    run, work, publication, minimum_age_days, vcs=services
                 )
             if continue_:
                 run = gradle_updater.continue_gradle_resolve(
-                    run, work, publication, minimum_age_days
+                    run, work, publication, minimum_age_days, vcs=services
                 )
             elif run.has(FailedAttempt):
                 raise GradleError(
@@ -537,13 +585,13 @@ def run_gradle_flow(
                 )
             # Committed resolve repair is separately verified above and becomes
             # the new accepted tip before automatic processing can resume.
-            _require_gradle_accepted_workspace(run, work)
+            _require_gradle_accepted_workspace(run, work, vcs=services)
             if not context_inputs_valid(run.context, work, datetime.now(UTC)):
                 run = gradle_updater.rebuild_gradle_run_evidence(
-                    run, work, publication, minimum_age_days
+                    run, work, publication, minimum_age_days, vcs=services
                 )
             run = gradle_updater.process_gradle_run(
-                run, work, publication, minimum_age_days
+                run, work, publication, minimum_age_days, vcs=services
             )
             if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
                 interaction.report(run, project, results_dir)
@@ -555,7 +603,10 @@ def run_gradle_flow(
                 path.unlink(missing_ok=True)
                 release_comparison_context(run.context)
                 if flow == Workflow.UPDATE:
-                    remove_workspace(project.path, project_name)
+                    remove_workspace(
+                        repo=services.repository(Path(project.path)),
+                        project=project_name,
+                    )
                 return (
                     ExitCode.UPDATE_FAILED
                     if run.attempts
@@ -564,19 +615,26 @@ def run_gradle_flow(
                     else ExitCode.OK
                 )
             run = _finish_verified_gradle_run(
-                run, project, results_dir, publication, minimum_age_days
+                run,
+                project,
+                results_dir,
+                publication,
+                minimum_age_days,
+                vcs=services,
             )
             gradle_updater.retire_gradle_context(run.context)
             interaction.report(run, project, results_dir)
         if flow == Workflow.UPDATE and run.refreshed:
-            remove_workspace(project.path, project_name)
+            remove_workspace(
+                repo=services.repository(Path(project.path)), project=project_name
+            )
         return ExitCode.OK
     except (
         GradleError,
         ScanError,
         _UpdateSetupError,
-        BookmarkLookupError,
         RevisionError,
+        CodeHostError,
         ToolNotFoundError,
         OSError,
     ) as exc:

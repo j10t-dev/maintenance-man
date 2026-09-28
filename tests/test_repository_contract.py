@@ -10,17 +10,21 @@ import pytest
 
 from maintenance_man import paths, vcs
 from maintenance_man.github import CodeHostError
+from maintenance_man.gradle_updates import gradle_evidence_workspace
 from maintenance_man.vcs import ExpectedRevisions, Repository, RevisionError
 from maintenance_man.vcs_workflow import (
     SyncAction,
+    VcsServices,
     create_workspace,
     current_label,
+    ensure_main_bookmark,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
     sync_main,
 )
+from tests.conftest import make_project
 from tests.fake_vcs import FakeCall, FakeCodeHost, FakeJjState
 
 MANAGED = "mm/update-dependencies"
@@ -409,6 +413,17 @@ def test_changed_paths_reports_add_edit_and_delete(repository_case: RepositoryCa
     assert c.repo.changed_paths() == frozenset({"new.txt", "dep.txt", "gone.txt"})
 
 
+def test_discard_restores_the_parent_tree(repository_case: RepositoryCase) -> None:
+    c = repository_case
+    c.write_file("dep.txt", "dirty\n")
+    assert c.repo.has_changes() is True
+
+    c.repo.discard()
+
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=1\n"
+    assert c.repo.has_changes() is False
+
+
 def test_repository_case_exposes_complete_remote_harness(
     repository_case: RepositoryCase,
 ):
@@ -417,6 +432,32 @@ def test_repository_case_exposes_complete_remote_harness(
     assert callable(c.track_main)
     assert callable(c.after_push)
     assert c.origin_peer.repo.path != c.repo.path
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, RevisionError])
+def test_proof_preserves_body_exception(
+    repository_case: RepositoryCase, error_type: type[BaseException]
+):
+    c = repository_case
+    project = make_project(c.repo.path)
+    original = error_type("proof body failed")
+
+    def no_host(path: Path):
+        raise AssertionError(f"unexpected host for {path}")
+
+    services = VcsServices(repository=c.bind, code_host=no_host)
+    before_names = c.repo.workspace_names()
+    proof_path = None
+    with (
+        pytest.raises(error_type) as caught,
+        gradle_evidence_workspace(project, "main", vcs=services) as proof,
+    ):
+        proof_path = proof.path
+        assert proof.path != project.path
+        raise original
+    assert caught.value is original
+    assert c.repo.workspace_names() == before_names
+    assert proof_path is not None and not proof_path.exists()
 
 
 def test_bind_rejects_unknown_repository_view(
@@ -775,6 +816,87 @@ def test_sync_equal_revisions_refreshes_and_reports_unchanged(
     assert c.repo.same_revision(left="main", right="main@origin") is True
 
 
+def test_ensure_main_creates_missing_local_bookmark_from_origin(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    origin = c.repo.resolve_revision(revision="main@origin")
+    c.repo.delete_bookmark(bookmark="main")
+
+    ensure_main_bookmark(repo=c.repo)
+
+    assert c.repo.resolve_revision(revision="main") == origin
+
+
+def test_ensure_main_leaves_existing_local_bookmark_unchanged(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    main = repo.resolve_revision(revision="main")
+    state.clear_calls()
+
+    ensure_main_bookmark(repo=repo)
+
+    assert repo.resolve_revision(revision="main") == main
+    assert not any(
+        call.method in {"create_bookmark", "set_bookmark"} for call in state.attempts
+    )
+
+
+def test_ensure_main_preserves_local_bookmark_inspection_failure(
+    tmp_path: Path,
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    state.clear_calls()
+    failure = RevisionError("local bookmark inspection failed")
+    state.fail("bookmark_exists", error=failure, path=path)
+
+    with pytest.raises(RevisionError) as caught:
+        ensure_main_bookmark(repo=repo)
+
+    assert caught.value is failure
+    assert not any(
+        call.method in {"create_bookmark", "set_bookmark"} for call in state.effects
+    )
+
+
+def test_ensure_main_refuses_when_local_and_origin_are_absent(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    state.seed_bookmark(path, bookmark="main", targets=())
+    state.seed_tracking(path, bookmark="main", targets=())
+    state.seed_remote(path, bookmark="main", targets=())
+    state.clear_calls()
+
+    with pytest.raises(RevisionError, match=r"main@origin.*exactly one"):
+        ensure_main_bookmark(repo=repo)
+
+    assert not any(
+        call.method in {"create_bookmark", "set_bookmark"} for call in state.effects
+    )
+
+
+def test_ensure_main_preserves_origin_inspection_failure(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    state.seed_bookmark(path, bookmark="main", targets=())
+    state.clear_calls()
+    failure = RevisionError("origin inspection failed")
+    state.fail("resolve_revision", error=failure, path=path)
+
+    with pytest.raises(RevisionError) as caught:
+        ensure_main_bookmark(repo=repo)
+
+    assert caught.value is failure
+    assert not any(
+        call.method in {"create_bookmark", "set_bookmark"} for call in state.effects
+    )
+
+
 def test_fake_services_bind_repository_and_shared_code_host(tmp_path: Path) -> None:
     state = FakeJjState()
     source = tmp_path / "source"
@@ -795,6 +917,30 @@ def test_fake_services_bind_repository_and_shared_code_host(tmp_path: Path) -> N
     assert workspace_host.pr_bookmarks(state="merged") == frozenset({MANAGED})
 
 
+@pytest.mark.parametrize("method", ["fetch", "bookmark_conflicted", "same_revision"])
+def test_sync_inspection_failure_preserves_the_repository(
+    tmp_path: Path, method: str
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / method
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    before = repo.resolve_revision(revision="@")
+    failure = RevisionError(f"{method} failed")
+    state.clear_calls()
+    state.fail(method, error=failure, path=path)
+
+    with pytest.raises(RevisionError) as caught:
+        sync_main(repo=repo)
+
+    assert caught.value is failure
+    assert repo.resolve_revision(revision="@") == before
+    assert not any(
+        call.method
+        in {"set_bookmark", "push_bookmark", "rebase_working_copy", "new_change"}
+        for call in state.effects
+    )
+
+
 def test_sync_pulls_remote_advance_when_main_is_untracked(
     repository_case: RepositoryCase,
 ) -> None:
@@ -807,6 +953,32 @@ def test_sync_pulls_remote_advance_when_main_is_untracked(
     assert sync_main(repo=c.repo) is SyncAction.PULLED
     assert c.repo.resolve_revision(revision="main") == peer_tip
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
+
+
+def test_sync_remote_advance_move_failure_preserves_local_main(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    base = repo.resolve_revision(revision="main")
+    tip = state.seed_commit(
+        path,
+        parent=base,
+        files={"dep.txt": "version=2\n"},
+        description="remote advance",
+    )
+    state.seed_remote(path, bookmark="main", targets=(tip,))
+    state.seed_tracking(path, bookmark="main", targets=())
+    state.track_main(path, enabled=False)
+    state.clear_calls()
+    failure = RevisionError("cannot move local main")
+    state.fail("set_bookmark", error=failure, path=path)
+
+    with pytest.raises(RevisionError) as caught:
+        sync_main(repo=repo)
+
+    assert caught.value is failure
+    assert repo.resolve_revision(revision="main") == base
+    assert (path / "dep.txt").read_text(encoding="utf-8") == "version=1\n"
 
 
 def test_sync_tracked_main_remote_advance_is_already_reconciled_by_fetch(
@@ -896,6 +1068,31 @@ def test_sync_fetch_failure_after_push_prevents_refresh(tmp_path: Path) -> None:
     )
 
 
+def test_sync_post_push_comparison_failure_prevents_refresh(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    tip = state.seed_commit(
+        path,
+        parent=repo.resolve_revision(revision="main"),
+        files={"dep.txt": "version=2\n"},
+        description="local advance",
+    )
+    state.seed_bookmark(path, bookmark="main", targets=(tip,))
+    state.clear_calls()
+    failure = RevisionError("post-push comparison failed")
+    state.fail("same_revision", ordinal=2, error=failure, path=path)
+
+    with pytest.raises(RevisionError) as caught:
+        sync_main(repo=repo)
+
+    assert caught.value is failure
+    assert any(call.method == "push_bookmark" for call in state.effects)
+    assert not any(
+        call.method in {"rebase_working_copy", "new_change"} for call in state.attempts
+    )
+
+
 def test_sync_refuses_divergent_main_without_refresh(
     repository_case: RepositoryCase,
 ) -> None:
@@ -953,6 +1150,20 @@ def test_refresh_empty_change_preserves_change_identity(
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
 
 
+def test_refresh_dirty_descendant_is_left_unchanged(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    c.write_file("dep.txt", "local dirty\n")
+    change = c.repo.change_id()
+
+    refresh_working_copy_from_main(repo=c.repo)
+
+    assert c.repo.change_id() == change
+    assert c.repo.has_changes() is True
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "local dirty\n"
+
+
 @pytest.mark.parametrize("protected_state", ["dirty", "described", "bookmarked"])
 def test_refresh_protected_change_starts_new_child_and_preserves_old_content(
     repository_case: RepositoryCase, protected_state: str
@@ -1003,6 +1214,35 @@ def test_refresh_inspection_failure_has_no_mutation(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("failure_method", ["is_ancestor", "rebase_working_copy"])
+def test_refresh_relationship_or_rebase_failure_has_no_completed_mutation(
+    tmp_path: Path, failure_method: str
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / failure_method
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    base = repo.resolve_revision(revision="main")
+    tip = state.seed_commit(
+        path,
+        parent=base,
+        files={"dep.txt": "version=2\n"},
+        description="advance main",
+    )
+    state.seed_bookmark(path, bookmark="main", targets=(tip,))
+    change = repo.change_id()
+    failure = RevisionError(f"{failure_method} failed")
+    state.clear_calls()
+    state.fail(failure_method, error=failure, path=path)
+
+    with pytest.raises(RevisionError) as caught:
+        refresh_working_copy_from_main(repo=repo)
+
+    assert caught.value is failure
+    assert repo.change_id() == change
+    assert (path / "dep.txt").read_text(encoding="utf-8") == "version=1\n"
+    assert not any(call.method == "new_change" for call in state.effects)
+
+
 @pytest.mark.parametrize("failed_listing", ["merged", "closed", "local"])
 def test_prune_finishes_all_listings_before_deletion(
     tmp_path: Path, failed_listing: str
@@ -1024,6 +1264,23 @@ def test_prune_finishes_all_listings_before_deletion(
 
     with pytest.raises((CodeHostError, RevisionError)):
         prune_stale_bookmarks(repo=repo, host=host)
+    assert not any(call.method == "delete_bookmark" for call in state.attempts)
+
+
+def test_prune_fetch_failure_stops_before_host_or_deletion(tmp_path: Path) -> None:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    host = state.code_host(path)
+    failure = RevisionError("fetch failed")
+    state.clear_calls()
+    state.fail("fetch", error=failure, path=path)
+
+    with pytest.raises(RevisionError) as caught:
+        prune_stale_bookmarks(repo=repo, host=host)
+
+    assert caught.value is failure
+    assert host.attempts == []
     assert not any(call.method == "delete_bookmark" for call in state.attempts)
 
 

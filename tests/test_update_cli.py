@@ -1312,10 +1312,13 @@ def gradle_update_cli(
         lambda *args: mock_update_cli_deps["scan_result"],
     )
     mock_update_cli_deps["vcs_state"].seed_repository(
-        gradle_project.path, files={"gradlew": "#!/bin/sh\n"}
-    )
-    monkeypatch.setattr(
-        "maintenance_man.updater.discard_current_change", lambda path: None
+        gradle_project.path,
+        files={
+            "gradlew": (gradle_project.path / "gradlew").read_text(),
+            "gradle/libs.versions.toml": (
+                gradle_project.path / "gradle/libs.versions.toml"
+            ).read_text(),
+        },
     )
     spies: dict[str, list] = {
         "workspaces": [],
@@ -1324,10 +1327,6 @@ def gradle_update_cli(
         "commits": [],
         "promotions": [],
     }
-    monkeypatch.setattr(
-        "maintenance_man.gradle_workflow.create_workspace",
-        lambda repo, project, rev: spies["workspaces"].append(project) or True,
-    )
     monkeypatch.setattr(
         "maintenance_man.updater.run_test_phases",
         lambda cfg, path: (spies["tests"].append(1), (True, None))[1],
@@ -1339,16 +1338,6 @@ def gradle_update_cli(
     monkeypatch.setattr(
         "maintenance_man.gradle_updates.validate_gradle_target",
         lambda project, target: None,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.updater.current_change_has_changes", lambda path: True
-    )
-    monkeypatch.setattr(
-        "maintenance_man.updater.commit_current_change",
-        lambda path, msg: spies["commits"].append(msg) or True,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.updater.create_or_reset_bookmark", lambda b, p, r: True
     )
     # `mm update <one project>` is the interactive single-project path, so every
     # test here must answer the selection prompt; individual tests override this.

@@ -30,10 +30,8 @@ class PrivateAccessSite:
 ALLOWED_PRIVATE_ACCESS: frozenset[PrivateAccess] = frozenset(
     {
         ("gradle_resolution", "gradle", "_validate_inventory"),  # D
-        ("gradle_updates", "vcs", "_run"),  # C
         ("gradle_workflow", "scanner", "_run_gradle_scan"),  # D
         ("gradle_workflow", "scanner", "_run_trivy_secret_scan"),  # D
-        ("gradle_workflow", "gradle_updates", "_gradle_evidence_workspace"),  # C
     }
 )
 

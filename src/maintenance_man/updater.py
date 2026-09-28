@@ -8,7 +8,6 @@ from typing import Literal, Protocol
 
 from rich import print as rprint
 
-from maintenance_man import vcs as _legacy_vcs
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
@@ -29,12 +28,6 @@ from maintenance_man.process import ProcessError, run_captured, run_live
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import Repository, RevisionError
 from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
-
-# Gradle still imports these legacy boundaries until its Task 5 migration.
-commit_current_change = _legacy_vcs.commit_current_change
-create_or_reset_bookmark = _legacy_vcs.create_or_reset_bookmark
-current_change_has_changes = _legacy_vcs.current_change_has_changes
-discard_current_change = _legacy_vcs.discard_current_change
 
 type UpdateKind = Literal["vuln", "update"]
 

@@ -39,7 +39,7 @@ def ensure_main_bookmark(*, repo: Repository) -> None:
     if repo.bookmark_exists(bookmark="main"):
         return
     repo.resolve_revision(revision="main@origin")
-    repo.create_bookmark(bookmark="main", revision="main@origin")
+    repo.set_bookmark(bookmark="main", revision="main@origin")
 
 
 def refresh_working_copy_from_main(*, repo: Repository) -> None:
