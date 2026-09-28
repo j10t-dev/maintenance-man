@@ -48,7 +48,7 @@ from maintenance_man.models.scan import (
 from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
 from maintenance_man.process import require_tool, run_captured
 from maintenance_man.storage import save_scan_results
-from maintenance_man.vcs import revision_tree_id
+from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
 
 
 class ScanError(Exception):
@@ -56,7 +56,11 @@ class ScanError(Exception):
 
 
 def scan_project(
-    name: str, project: ProjectConfig, min_version_age_days: int = 7
+    name: str,
+    project: ProjectConfig,
+    min_version_age_days: int = 7,
+    *,
+    vcs: VcsServices | None = None,
 ) -> ScanResult:
     """Run Trivy and outdated checks against a project and return parsed results.
 
@@ -521,8 +525,12 @@ def _read_inventory(bom: Path) -> bytes:
 
 
 def capture_gradle_snapshot(
-    project: ProjectConfig, context: ComparisonContext
+    project: ProjectConfig,
+    context: ComparisonContext,
+    *,
+    vcs: VcsServices | None = None,
 ) -> GradleSnapshot | IncompleteResolution:
+    services = vcs or make_vcs_services()
     if not context_inputs_valid(context, project, datetime.now(UTC)):
         raise GradleError(
             "Comparison context expired or inputs changed; rebuild baseline and tip"
@@ -609,7 +617,7 @@ def capture_gradle_snapshot(
     if not context_inputs_valid(context, project, datetime.now(UTC)):
         raise GradleError("Comparison inputs changed during capture")
     return GradleSnapshot(
-        tree_id=revision_tree_id(Path(project.path)),
+        tree_id=services.repository(Path(project.path)).tree_id(),
         resolution=resolution,
         context_identity=context.identity,
         findings=findings,

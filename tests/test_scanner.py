@@ -36,7 +36,14 @@ from maintenance_man.scanner import (
     scan_project,
 )
 from maintenance_man.storage import load_scan_results
-from tests.conftest import GRADLE_FIXTURES, make_update, make_vuln, ops_with_outdated
+from tests.conftest import (
+    GRADLE_FIXTURES,
+    completed,
+    make_update,
+    make_vuln,
+    ops_with_outdated,
+)
+from tests.fakes import FakeCommands
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -98,16 +105,17 @@ def test_outdated_failure_fails_the_scan_and_keeps_the_saved_result(
 
 def test_uv_audit_runs_isolated_and_accepts_findings_status(tmp_path, monkeypatch):
     monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
-    calls = []
-
-    def run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(cmd, 1, "", "")
-
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    commands = FakeCommands()
+    commands.add(
+        ("uv", "audit", "--locked"),
+        cwd=tmp_path,
+        result=completed(("uv", "audit", "--locked"), returncode=1),
+    )
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", commands)
     assert scanner._run_uv_audit(tmp_path) == []
-    ((cmd, kwargs),) = calls
-    assert cmd == ["uv", "audit", "--locked"]
+    ((cmd, cwd, kwargs),) = commands.calls
+    assert cmd == ("uv", "audit", "--locked")
+    assert cwd == tmp_path
     assert kwargs["timeout"] == 300
     assert "VIRTUAL_ENV" not in kwargs["env"]
 

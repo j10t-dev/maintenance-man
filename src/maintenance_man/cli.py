@@ -32,6 +32,7 @@ from maintenance_man.deployer import (
 )
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
+from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import (
     GradleError,
     workspace_environment_reason,
@@ -88,11 +89,9 @@ from maintenance_man.vcs import (
     create_or_reset_bookmark,
     create_workspace,
     current_change_has_changes,
-    current_label,
     delete_bookmark,
     edit_new_change,
     ensure_main_bookmark,
-    main_commit_id,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
     push_bookmark_and_create_pr,
@@ -102,7 +101,17 @@ from maintenance_man.vcs import (
     revision_file,
     workspace_path_for_project,
 )
-from maintenance_man.vcs_workflow import make_vcs_services, sync_main
+from maintenance_man.vcs_workflow import (
+    VcsServices,
+    make_vcs_services,
+    sync_main,
+)
+from maintenance_man.vcs_workflow import (
+    current_label as repository_current_label,
+)
+from maintenance_man.vcs_workflow import (
+    prune_stale_bookmarks as prune_repository_bookmarks,
+)
 
 # Errors that fail one project's scan without stopping a batch.
 _SCAN_ERRORS: tuple[type[Exception], ...] = (
@@ -133,6 +142,7 @@ def should_deploy(
     activity: dict[str, ProjectActivity],
     *,
     force: bool,
+    vcs: VcsServices,
 ) -> tuple[GateDecision, str | None]:
     """Decide whether a project needs deploying.
 
@@ -140,12 +150,14 @@ def should_deploy(
     unresolvable). The caller records this id rather than re-resolving, so the
     recorded identity matches what was gated even if main moves concurrently.
     """
-    resolved = main_commit_id(project_path)
-    current_id = resolved.commit_id if resolved.ok else None
+    try:
+        current_id = vcs.repository(project_path).resolve_revision(revision="main")
+    except RevisionError:
+        current_id = None
 
     if force:
         return GateDecision.DEPLOY, current_id
-    if not resolved.ok:
+    if current_id is None:
         return GateDecision.SKIP_BLOCKED, None
 
     proj = activity.get(name)
@@ -205,10 +217,14 @@ def scan(
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
+    vcs = make_vcs_services()
+
     if project:
         proj_config = _resolve_proj(cfg, project)
         try:
-            result = _scan_one(project, proj_config, cfg.defaults.min_version_age_days)
+            result = _scan_one(
+                project, proj_config, cfg.defaults.min_version_age_days, vcs=vcs
+            )
         except _SCAN_ERRORS as e:
             _fatal(str(e))
 
@@ -228,7 +244,9 @@ def scan(
             )
             continue
         try:
-            result = _scan_one(name, proj_config, cfg.defaults.min_version_age_days)
+            result = _scan_one(
+                name, proj_config, cfg.defaults.min_version_age_days, vcs=vcs
+            )
         except _SCAN_ERRORS as e:
             console.print(f"[bold red]Error:[/] {name} — {e}")
             had_error = True
@@ -938,6 +956,7 @@ def _deploy_one(
     commit_id: str | None,
     *,
     check: bool = False,
+    vcs: VcsServices,
 ) -> DeployResult:
     """Build and deploy a single project. Returns result, never raises."""
     build_status = "skip"
@@ -946,7 +965,7 @@ def _deploy_one(
     if proj_config.build_command:
         console.print("  [bold]Building...[/]")
         try:
-            _run_build_step(name, proj_config)
+            _run_build_step(name, proj_config, vcs=vcs)
         except BuildError as e:
             console.print(f"  [bold red]Build failed:[/] {e}")
             build_status = "fail"
@@ -959,7 +978,7 @@ def _deploy_one(
 
     console.print("  [bold]Deploying...[/]")
     try:
-        _run_deploy_step(name, proj_config, commit_id)
+        _run_deploy_step(name, proj_config, commit_id, vcs=vcs)
     except DeployError as e:
         console.print(f"  [bold red]Deploy failed:[/] {e}")
         deploy_status = "fail"
@@ -980,7 +999,13 @@ def _deploy_one(
     )
 
 
-def _deploy_all(cfg: MmConfig, *, check: bool = False, force: bool = False) -> NoReturn:
+def _deploy_all(
+    cfg: MmConfig,
+    *,
+    check: bool = False,
+    force: bool = False,
+    vcs: VcsServices,
+) -> NoReturn:
     """Deploy all configured projects that have a deploy_command."""
     if not cfg.projects:
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
@@ -1008,7 +1033,7 @@ def _deploy_all(cfg: MmConfig, *, check: bool = False, force: bool = False) -> N
             continue
 
         decision, current_id = should_deploy(
-            name, proj_config.path, activity, force=force
+            name, proj_config.path, activity, force=force, vcs=vcs
         )
         if decision is GateDecision.SKIP_UNCHANGED:
             console.print(f"[dim]{name} — unchanged since last deploy[/]")
@@ -1032,7 +1057,9 @@ def _deploy_all(cfg: MmConfig, *, check: bool = False, force: bool = False) -> N
         console.print(f"[bold]{name}[/]")
         console.print("═" * 40)
 
-        results.append(_deploy_one(name, proj_config, cfg, current_id, check=check))
+        results.append(
+            _deploy_one(name, proj_config, cfg, current_id, check=check, vcs=vcs)
+        )
 
     _print_deploy_summary(results)
 
@@ -1085,10 +1112,11 @@ def _record_deploy_activity(
     success: bool,
     project_path: Path,
     commit_id: str | None = None,
+    vcs: VcsServices,
 ) -> None:
     """Record build/deploy activity for a project."""
     activity_path = paths.activity_path()
-    branch = current_label(project_path)
+    branch = repository_current_label(repo=vcs.repository(project_path))
     record_activity(
         activity_path,
         project,
@@ -1099,7 +1127,9 @@ def _record_deploy_activity(
     )
 
 
-def _run_build_step(project: str, proj_config: ProjectConfig) -> None:
+def _run_build_step(
+    project: str, proj_config: ProjectConfig, *, vcs: VcsServices
+) -> None:
     """Run build and record activity, raising BuildError on failure."""
     assert proj_config.build_command is not None
     try:
@@ -1110,6 +1140,7 @@ def _run_build_step(project: str, proj_config: ProjectConfig) -> None:
             "build",
             success=False,
             project_path=proj_config.path,
+            vcs=vcs,
         )
         raise
     _record_deploy_activity(
@@ -1117,11 +1148,16 @@ def _run_build_step(project: str, proj_config: ProjectConfig) -> None:
         "build",
         success=True,
         project_path=proj_config.path,
+        vcs=vcs,
     )
 
 
 def _run_deploy_step(
-    project: str, proj_config: ProjectConfig, commit_id: str | None
+    project: str,
+    proj_config: ProjectConfig,
+    commit_id: str | None,
+    *,
+    vcs: VcsServices,
 ) -> None:
     """Run deploy and record activity, raising DeployError on failure."""
     assert proj_config.deploy_command is not None
@@ -1134,6 +1170,7 @@ def _run_deploy_step(
             success=False,
             project_path=proj_config.path,
             commit_id=None,
+            vcs=vcs,
         )
         raise
     _record_deploy_activity(
@@ -1142,6 +1179,7 @@ def _run_deploy_step(
         success=True,
         project_path=proj_config.path,
         commit_id=commit_id,
+        vcs=vcs,
     )
 
 
@@ -1188,11 +1226,12 @@ def deploy(
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
+    vcs = make_vcs_services()
 
     if not project:
         if check and not cfg.defaults.healthcheck_url:
             _warn_missing_healthcheck_url()
-        _deploy_all(cfg, check=check, force=force)
+        _deploy_all(cfg, check=check, force=force, vcs=vcs)
         return  # _deploy_all calls sys.exit(); guard against refactors
 
     proj_config = _resolve_proj(cfg, project)
@@ -1209,7 +1248,7 @@ def deploy(
 
     activity = load_activity(paths.activity_path())
     decision, current_id = should_deploy(
-        project, proj_config.path, activity, force=force
+        project, proj_config.path, activity, force=force, vcs=vcs
     )
     if decision is GateDecision.SKIP_UNCHANGED:
         console.print(
@@ -1227,7 +1266,7 @@ def deploy(
     if build and proj_config.build_command:
         console.print(f"[bold]Building {project}[/]\n")
         try:
-            _run_build_step(project, proj_config)
+            _run_build_step(project, proj_config, vcs=vcs)
         except BuildError as e:
             _fatal(str(e), code=ExitCode.BUILD_FAILED)
         console.print("\n[bold green]Build succeeded.[/]\n")
@@ -1235,7 +1274,7 @@ def deploy(
     console.print(f"[bold]Deploying {project}[/]\n")
 
     try:
-        _run_deploy_step(project, proj_config, current_id)
+        _run_deploy_step(project, proj_config, current_id, vcs=vcs)
     except DeployError as e:
         _fatal(str(e), code=ExitCode.DEPLOY_FAILED)
 
@@ -1302,6 +1341,7 @@ def build(
     """
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
+    vcs = make_vcs_services()
 
     if not proj_config.build_command:
         _fatal(
@@ -1311,15 +1351,11 @@ def build(
 
     console.print(f"[bold]Building {project}[/]\n")
 
-    activity_path = paths.activity_path()
-    branch = current_label(proj_config.path)
     try:
-        run_build(project, proj_config.build_command, proj_config.path)
+        _run_build_step(project, proj_config, vcs=vcs)
     except BuildError as e:
-        record_activity(activity_path, project, "build", success=False, branch=branch)
         _fatal(str(e), code=ExitCode.BUILD_FAILED)
 
-    record_activity(activity_path, project, "build", success=True, branch=branch)
     console.print("\n[bold green]Build succeeded.[/]")
     sys.exit(ExitCode.OK)
 
@@ -1529,16 +1565,25 @@ def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -
     return time_str
 
 
-def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
+def _scan_one(
+    name: str,
+    proj_config: ProjectConfig,
+    min_age_days: int,
+    *,
+    vcs: VcsServices,
+) -> ScanResult:
     """Scan a single project with timing output."""
     try:
         _require_vcs_tools()
-        prune_stale_bookmarks(proj_config.path)
-    except (ToolNotFoundError, RevisionError) as exc:
+        prune_repository_bookmarks(
+            repo=vcs.repository(proj_config.path),
+            host=vcs.code_host(proj_config.path),
+        )
+    except (ToolNotFoundError, RevisionError, CodeHostError) as exc:
         console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
 
     t0 = time.monotonic()
-    result = scan_project(name, proj_config, min_age_days)
+    result = scan_project(name, proj_config, min_age_days, vcs=vcs)
     elapsed = time.monotonic() - t0
     _print_scan_result(result, elapsed_s=elapsed)
     return result

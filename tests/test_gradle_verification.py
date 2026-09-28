@@ -56,6 +56,7 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.vcs import RevisionCheck, RevisionError
+from tests.fake_vcs import FakeJjState
 
 
 def test_saved_ledger_is_private(workflow, tmp_path):
@@ -379,6 +380,22 @@ def test_capture_reads_before_cleanup_and_never_discovers(
     frozen_context, resolution, monkeypatch, match, expected
 ):
     project, context, _ = frozen_context
+    source_path = project.path
+    update_path = source_path.parent / "update-workspace"
+    shutil.copytree(source_path, update_path)
+    state = FakeJjState()
+    source_repo = state.seed_repository(source_path, files={"dep.txt": "version=1\n"})
+    source_tree = source_repo.tree_id()
+    source_repo.add_workspace(name="update", path=update_path, revision="main")
+    state.seed_working_copy(
+        update_path,
+        parent=source_repo.resolve_revision(revision="main"),
+        files={"dep.txt": "version=2\n"},
+    )
+    update_repo = state.repository(update_path)
+    expected_tree = update_repo.tree_id()
+    assert expected_tree != source_tree
+    project = project.model_copy(update={"path": update_path})
     bom = project.path / "temporary-bom.json"
 
     @contextmanager
@@ -410,11 +427,10 @@ def test_capture_reads_before_cleanup_and_never_discovers(
         lambda *args: pytest.fail("discovery during verification"),
     )
 
-    def tree(path):
+    def tree() -> None:
         assert not bom.exists()
-        return "checked-tree"
 
-    monkeypatch.setattr(scanner, "revision_tree_id", tree)
+    state.hook("tree_id", phase="before", action=tree, path=project.path)
     scan_calls = []
 
     def trivy(command, **kwargs):
@@ -446,14 +462,14 @@ def test_capture_reads_before_cleanup_and_never_discovers(
         )
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", trivy)
-    result = scanner.capture_gradle_snapshot(project, context)
+    result = scanner.capture_gradle_snapshot(project, context, vcs=state.services())
     if expected == "incomplete":
         assert isinstance(result, IncompleteResolution)
         assert result.kind == "incomplete"
         assert not scan_calls
     else:
         assert isinstance(result, GradleSnapshot)
-        assert result.tree_id == "checked-tree"
+        assert result.tree_id == expected_tree
         assert len(result.findings) == 1
         assert result.findings[0].key.scope == resolution.report.selected_scopes[0]
         assert result.findings[0].rows[0].update_status is None
@@ -2267,7 +2283,8 @@ def test_snapshot_checks_local_project_provenance(
             bom.unlink()
 
     monkeypatch.setattr(scanner, "generate_gradle_report", generate)
-    monkeypatch.setattr(scanner, "revision_tree_id", lambda *args: "checked-tree")
+    state = FakeJjState()
+    state.seed_repository(project.path, files={})
     rows = (
         [
             {
@@ -2291,9 +2308,9 @@ def test_snapshot_checks_local_project_provenance(
     )
     if variant in {"unknown-path", "wrong-coordinate", "undeclared"}:
         with pytest.raises(scanner.GradleError, match="local project"):
-            scanner.capture_gradle_snapshot(project, context)
+            scanner.capture_gradle_snapshot(project, context, vcs=state.services())
     else:
-        result = scanner.capture_gradle_snapshot(project, context)
+        result = scanner.capture_gradle_snapshot(project, context, vcs=state.services())
         if variant == "local":
             assert isinstance(result, GradleSnapshot)
             assert result.inventory_modules == (
@@ -2499,7 +2516,6 @@ def test_snapshot_refuses_inventory_missing_a_resolved_module(
             bom.unlink()
 
     monkeypatch.setattr(scanner, "generate_gradle_report", generate)
-    monkeypatch.setattr(scanner, "revision_tree_id", lambda *args: "tree")
     scans = []
 
     def scan(command, **kwargs):

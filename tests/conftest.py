@@ -9,12 +9,14 @@ from typing import Any
 
 import pytest
 
+from maintenance_man.cli import app
+from maintenance_man.config import load_config
 from maintenance_man.gradle import (
     GRADLE_INVENTORY_BOM_RELPATH,
     GRADLE_INVENTORY_MARKER_RELPATH,
     GRADLE_INVENTORY_RELPATH,
 )
-from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
@@ -25,6 +27,68 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
+from tests.fake_vcs import FakeJjState
+
+
+def completed(
+    argv: tuple[str, ...] = (),
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+
+def make_project(path: Path, **overrides: Any) -> ProjectConfig:
+    return ProjectConfig.model_validate(
+        {"path": path, "package_manager": "uv"} | overrides
+    )
+
+
+def make_config(**overrides: Any) -> MmConfig:
+    return MmConfig.model_validate({"projects": {}} | overrides)
+
+
+def write_config(home: Path, text: str) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def run_mm(*argv: str) -> int:
+    try:
+        result = app(list(argv), exit_on_error=False)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    assert result is None
+    return 0
+
+
+def configure_fake_vcs(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[FakeJjState, dict[str, Path]]:
+    config_path = home / "config.toml"
+    configured = load_config(config_path)
+    replacements: dict[Path, Path] = {}
+    state = FakeJjState()
+    for project in configured.projects.values():
+        if project.path in replacements:
+            continue
+        target = tmp_path / "repositories" / f"repo-{len(replacements)}"
+        replacements[project.path] = target
+        state.seed_repository(target, files={"dep.txt": "version=1\n"})
+    text = config_path.read_text(encoding="utf-8")
+    for source, target in replacements.items():
+        text = text.replace(str(source), str(target))
+    config_path.write_text(text, encoding="utf-8")
+    paths_by_name = {
+        name: replacements[project.path]
+        for name, project in configured.projects.items()
+    }
+    monkeypatch.setattr("maintenance_man.cli.make_vcs_services", state.services)
+    return state, paths_by_name
 
 
 @pytest.fixture(autouse=True)

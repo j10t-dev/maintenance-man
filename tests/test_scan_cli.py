@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from rich.console import Console
 
-from maintenance_man import cli, scanner
+from maintenance_man import cli, scanner, vcs_workflow
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
@@ -31,8 +31,57 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
+from maintenance_man.storage import load_scan_results
 from maintenance_man.vcs import RevisionError
-from tests.conftest import make_scan_result, make_update, ops_with_outdated
+from tests.conftest import (
+    make_scan_result,
+    make_update,
+    ops_with_outdated,
+    run_mm,
+    write_config,
+)
+from tests.fake_vcs import FakeJjState
+
+
+@pytest.mark.parametrize("failure", ["fetch", "local_bookmarks", "delete_bookmark"])
+def test_housekeeping_failure_still_saves_scan(
+    mm_home, tmp_path, monkeypatch, capsys, failure
+):
+    project_path = tmp_path / "project"
+    state = FakeJjState()
+    repo = state.seed_repository(project_path, files={"dep.txt": "version=1\n"})
+    repo.set_bookmark(bookmark="mm/update-dependencies", revision="main")
+    state.code_host(project_path).seed_pr(
+        bookmark="mm/update-dependencies", state="merged"
+    )
+    write_config(
+        mm_home,
+        f'[projects.demo]\npath = "{project_path}"\npackage_manager = "uv"\n'
+        "scan_secrets = false\n",
+    )
+    monkeypatch.setattr(cli, "make_vcs_services", state.services)
+    monkeypatch.setattr(
+        cli, "prune_repository_bookmarks", vcs_workflow.prune_stale_bookmarks
+    )
+    monkeypatch.setattr(cli, "scan_project", scanner.scan_project)
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
+    monkeypatch.setattr(
+        scanner, "package_manager_ops", ops_with_outdated(lambda project: [])
+    )
+    state.fail(
+        failure,
+        error=RevisionError(f"{failure} unavailable"),
+        path=project_path,
+    )
+
+    assert run_mm("scan", "demo") == 0
+
+    assert f"{failure} unavailable" in capsys.readouterr().out
+    assert repo.bookmark_exists(bookmark="mm/update-dependencies")
+    saved = load_scan_results("demo", mm_home / "scan-results")
+    assert saved.project == "demo"
+    assert saved.vulnerabilities == []
+    assert saved.updates == []
 
 
 def _make_vulnerable_result() -> ScanResult:
@@ -82,10 +131,15 @@ def _make_updates_only_result() -> ScanResult:
 @pytest.fixture(autouse=True)
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda _path: True)
+    monkeypatch.setattr(
+        "maintenance_man.cli.prune_repository_bookmarks", lambda **kwargs: None
+    )
 
     def _fake_scan(
-        name: str, project_config: object, min_version_age_days: int = 7
+        name: str,
+        project_config: object,
+        min_version_age_days: int = 7,
+        **kwargs: object,
     ) -> ScanResult:
         match name:
             case "vulnerable":
@@ -157,7 +211,7 @@ def test_scan_warns_and_continues_without_housekeeping_tools(
 ):
     monkeypatch.setattr("maintenance_man.cli.require_tool", _missing(tool))
     prune = MagicMock(return_value=True)
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", prune)
+    monkeypatch.setattr("maintenance_man.cli.prune_repository_bookmarks", prune)
     with pytest.raises(SystemExit) as exc:
         app(["scan", "clean"])
     assert exc.value.code == 0
@@ -218,10 +272,10 @@ def test_failed_project_scan_keeps_its_result_and_exits_error(
 def test_scan_warns_and_continues_when_bookmark_pruning_cannot_run(
     mm_home_with_projects, monkeypatch, capsys
 ):
-    def fail(path):
+    def fail(**kwargs):
         raise RevisionError("Could not run jj git fetch: missing jj")
 
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", fail)
+    monkeypatch.setattr("maintenance_man.cli.prune_repository_bookmarks", fail)
     with pytest.raises(SystemExit) as exc:
         app(["scan", "clean"])
     assert exc.value.code == 0
@@ -430,7 +484,7 @@ def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
 
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
-    def _boom(name, proj_config, min_age_days):
+    def _boom(name, proj_config, min_age_days, *, vcs):
         raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
 
     monkeypatch.setattr("maintenance_man.cli._scan_one", _boom)
@@ -446,7 +500,7 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
 ):
     scanned: list[str] = []
 
-    def _scan(name, proj_config, min_age_days):
+    def _scan(name, proj_config, min_age_days, *, vcs):
         scanned.append(name)
         if proj_config.package_manager == "gradle":
             raise GradleError("boom")
@@ -503,7 +557,9 @@ def test_scan_blocked_no_fix_vulnerability_exit(
         else [],
     )
     assert not result.has_actionable_vulns
-    monkeypatch.setattr("maintenance_man.cli.scan_project", lambda *args: result)
+    monkeypatch.setattr(
+        "maintenance_man.cli.scan_project", lambda *args, **kwargs: result
+    )
     with pytest.raises(SystemExit) as exc:
         app(["scan"] if all_projects else ["scan", "sample"])
     expected = (
@@ -828,7 +884,7 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
 
 
 @pytest.mark.parametrize("manager", ["gradle", "uv", "bun", "mvn"])
-def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager):
+def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_path):
     output = StringIO()
     monkeypatch.setattr(
         cli, "console", Console(file=output, width=180, color_system=None)
@@ -854,9 +910,15 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager):
         trivy_target="/fixture",
         vulnerabilities=findings,
     )
-    monkeypatch.setattr(cli, "scan_project", lambda *args: result)
+    state = FakeJjState()
+    project_path = tmp_path / "project"
+    state.seed_repository(project_path, files={})
+    monkeypatch.setattr(cli, "scan_project", lambda *args, **kwargs: result)
     cli._scan_one(
-        "android", ProjectConfig(path=Path("/fixture"), package_manager=manager), 7
+        "android",
+        ProjectConfig(path=project_path, package_manager=manager),
+        7,
+        vcs=state.services(),
     )
     rendered = output.getvalue()
     assert rendered.count("org.example:shared") == 2
