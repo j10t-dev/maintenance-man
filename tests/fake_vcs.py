@@ -393,6 +393,11 @@ class FakeJjState:
         else:
             origin.bookmarks.pop(bookmark, None)
 
+    def remote_bookmark_targets(self, path: Path, *, bookmark: str) -> tuple[str, ...]:
+        """Inspect an actual-origin bookmark for workflow outcome assertions."""
+        data, _ = self._view(path)
+        return self._origins[data.origin_key].bookmarks.get(bookmark, ())
+
     def seed_tracking(
         self, path: Path, *, bookmark: str, targets: tuple[str, ...]
     ) -> None:

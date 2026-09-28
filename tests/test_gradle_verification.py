@@ -59,6 +59,12 @@ from maintenance_man.vcs import RevisionCheck, RevisionError
 from tests.fake_vcs import FakeJjState
 
 
+def _workflow_vcs(path: Path, *, files: dict[str, str] | None = None):
+    state = FakeJjState()
+    state.seed_repository(path, files=files or {})
+    return state.services()
+
+
 def test_saved_ledger_is_private(workflow, tmp_path):
     run = begin_workflow(workflow)
     path = tmp_path / "ledger" / "run.json"
@@ -740,6 +746,7 @@ def test_gradle_flow_reports_revision_failures(
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
+            vcs=_workflow_vcs(workflow.project.path),
         )
         == cli.ExitCode.UPDATE_FAILED
     )
@@ -903,7 +910,9 @@ def test_gradle_no_updates_does_not_require_build_hooks(
     monkeypatch.setattr(workflow_service, "prune_stale_bookmarks", lambda *args: True)
     monkeypatch.setattr(workflow_service, "ensure_main_bookmark", lambda *args: True)
     monkeypatch.setattr(workflow_service, "exact_commit_id", lambda *args: "base")
-    monkeypatch.setattr(cli, "_gradle_workspace_revision", lambda *args: "base")
+    monkeypatch.setattr(
+        cli, "_gradle_workspace_revision", lambda *args, **kwargs: "base"
+    )
     monkeypatch.setattr(
         workflow_service, "workspace_path_for_project", lambda *args: project.path
     )
@@ -932,6 +941,7 @@ def test_gradle_no_updates_does_not_require_build_hooks(
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
+            vcs=_workflow_vcs(project.path),
         )
         == cli.ExitCode.OK
     )
@@ -1040,7 +1050,9 @@ def driver(workflow, resolution, monkeypatch, tmp_path):
     monkeypatch.setattr(workflow_service, "prune_stale_bookmarks", lambda *args: True)
     monkeypatch.setattr(workflow_service, "ensure_main_bookmark", lambda *args: True)
     monkeypatch.setattr(
-        cli, "_gradle_workspace_revision", lambda _name, _project, revision: revision
+        cli,
+        "_gradle_workspace_revision",
+        lambda _name, _project, revision, *, vcs: revision,
     )
     monkeypatch.setattr(
         workflow_service, "workspace_path_for_project", lambda *args: project.path
@@ -1081,7 +1093,7 @@ def driver(workflow, resolution, monkeypatch, tmp_path):
     return state
 
 
-def invoke_driver(driver, *, interactive=False, minimum_age_days=7):
+def invoke_driver(driver, *, interactive=False, minimum_age_days=7, vcs=None):
     from maintenance_man import cli
 
     return cli._run_gradle_flow(
@@ -1091,6 +1103,7 @@ def invoke_driver(driver, *, interactive=False, minimum_age_days=7):
         Workflow.UPDATE,
         interactive=interactive,
         minimum_age_days=minimum_age_days,
+        vcs=vcs or _workflow_vcs(driver.project.path),
     )
 
 
@@ -1199,7 +1212,6 @@ def test_gradle_driver_refuses_sdk_before_sync_or_workspace_effects(
     driver, monkeypatch
 ):
     from maintenance_man import cli
-    from maintenance_man.vcs import RevisionFileCheck
 
     monkeypatch.setattr(
         cli, "_gradle_workspace_revision", real_gradle_workspace_revision
@@ -1207,11 +1219,6 @@ def test_gradle_driver_refuses_sdk_before_sync_or_workspace_effects(
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     (driver.project.path / "local.properties").write_text("sdk.dir=/unavailable\n")
-    monkeypatch.setattr(
-        cli,
-        "revision_file",
-        lambda *args: RevisionFileCheck(ok=True, value=False, commit_id="base"),
-    )
     monkeypatch.setattr(
         workflow_service,
         "prune_stale_bookmarks",
@@ -1233,7 +1240,6 @@ def test_gradle_driver_rechecks_sdk_at_pinned_base_before_workspace_effects(
     post_sync_tracked,
 ):
     from maintenance_man import cli
-    from maintenance_man.vcs import RevisionFileCheck
 
     monkeypatch.setattr(
         cli, "_gradle_workspace_revision", real_gradle_workspace_revision
@@ -1241,23 +1247,46 @@ def test_gradle_driver_rechecks_sdk_at_pinned_base_before_workspace_effects(
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     (driver.project.path / "local.properties").write_text("sdk.dir=/android\n")
-    inspections = []
-    synced = False
+    vcs_state = FakeJjState()
+    repo = vcs_state.seed_repository(
+        driver.project.path, files={"local.properties": "sdk.dir=/android\n"}
+    )
+    original_main = repo.resolve_revision(revision="main")
+    post_sync_files = (
+        {"local.properties": "sdk.dir=/android\n"} if post_sync_tracked else {}
+    )
+    post_sync_main = vcs_state.seed_commit(
+        driver.project.path,
+        parent=original_main,
+        files=post_sync_files,
+        description="synced main",
+    )
 
     def sync(*args):
-        nonlocal synced
-        synced = True
+        vcs_state.seed_bookmark(
+            driver.project.path, bookmark="main", targets=(post_sync_main,)
+        )
         return True
 
-    def inspect(path, revision, filename):
-        inspections.append((synced, revision, filename))
-        return RevisionFileCheck(
-            ok=True, value=post_sync_tracked if synced else True, commit_id="base"
-        )
-
     workspace_effects = []
+    current_main = [post_sync_main]
     monkeypatch.setattr(workflow_service, "prune_stale_bookmarks", sync)
-    monkeypatch.setattr(cli, "revision_file", inspect)
+    monkeypatch.setattr(
+        workflow_service,
+        "exact_commit_id",
+        lambda *_args: current_main[0],
+    )
+
+    def promote(*_args, expected_tip, **_kwargs):
+        current_main[0] = expected_tip
+        driver.effects.append("promote")
+        return True
+
+    monkeypatch.setattr(
+        workflow_service,
+        "promote_bookmark_to_main",
+        promote,
+    )
     monkeypatch.setattr(
         workflow_service,
         "remove_workspace",
@@ -1270,13 +1299,20 @@ def test_gradle_driver_rechecks_sdk_at_pinned_base_before_workspace_effects(
             workspace_effects.append(("workspace", revision)) or True
         ),
     )
-    assert invoke_driver(driver) == (0 if post_sync_tracked else 4)
+    assert invoke_driver(driver, vcs=vcs_state.services()) == (
+        0 if post_sync_tracked else 4
+    )
+    inspections = [
+        dict(call.arguments)
+        for call in vcs_state.attempts
+        if call.method == "revision_file"
+    ]
     assert inspections == [
-        (False, "main", "local.properties"),
-        (True, "base", "local.properties"),
+        {"revision": "main", "filename": "local.properties"},
+        {"revision": post_sync_main, "filename": "local.properties"},
     ]
     if post_sync_tracked:
-        assert ("workspace", "base") in workspace_effects
+        assert ("workspace", post_sync_main) in workspace_effects
     else:
         assert workspace_effects == []
         assert driver.effects == []
@@ -1297,10 +1333,14 @@ def test_gradle_driver_skips_unneeded_sdk_revision_inspection(
         monkeypatch.setenv("ANDROID_HOME", "/android")
     if properties:
         (driver.project.path / "local.properties").write_text("sdk.dir=/android\n")
-    monkeypatch.setattr(
-        cli, "revision_file", lambda *args: pytest.fail("SDK inspection unnecessary")
+    vcs_state = FakeJjState()
+    vcs_state.seed_repository(driver.project.path, files={})
+    vcs_state.fail(
+        "revision_file",
+        error=RevisionError("SDK inspection unnecessary"),
+        path=driver.project.path,
     )
-    assert invoke_driver(driver) == 0
+    assert invoke_driver(driver, vcs=vcs_state.services()) == 0
 
 
 @pytest.mark.parametrize("failure", ["promotion", "refresh"])
@@ -1848,6 +1888,7 @@ def test_gradle_cli_uses_ledger_even_without_scan_results(
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
+            vcs=_workflow_vcs(workflow.project.path),
         )
         == cli.ExitCode.OK
     )
@@ -1884,6 +1925,7 @@ def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
+            vcs=_workflow_vcs(workflow.project.path),
         )
         == cli.ExitCode.UPDATE_FAILED
     )
@@ -2021,6 +2063,7 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
         Workflow.UPDATE,
         interactive=False,
         minimum_age_days=7,
+        vcs=_workflow_vcs(workflow.project.path),
     )
     assert result == (
         cli.ExitCode.OK if mutation == "none" else cli.ExitCode.UPDATE_FAILED
@@ -2079,6 +2122,7 @@ def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
             interactive=False,
             minimum_age_days=7,
             continue_=True,
+            vcs=_workflow_vcs(workflow.project.path),
         )
         == cli.ExitCode.OK
     )
@@ -2325,7 +2369,9 @@ def test_batch_output_retains_verified_gradle_progress(driver, capsys):
 
     cfg = MmConfig(projects={"sample": driver.project})
     with pytest.raises(SystemExit) as exit_info:
-        cli._update_batch_targets(cfg, target_names=["sample"])
+        cli._update_batch_targets(
+            cfg, target_names=["sample"], vcs=_workflow_vcs(driver.project.path)
+        )
     assert exit_info.value.code == 0
     run = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert run is not None and run.refreshed

@@ -3,6 +3,7 @@ import hashlib
 import json
 import subprocess
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,10 +25,14 @@ from maintenance_man.models.scan import (
     SemverTier,
     Severity,
     UpdateFinding,
+    UpdateStatus,
     VulnFinding,
+    Workflow,
 )
 from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
+from maintenance_man.storage import save_scan_results
 from tests.fake_vcs import FakeJjState
+from tests.fakes import FakeFindingProcessor
 
 
 def completed(
@@ -252,52 +257,120 @@ def scan_results_dir(mm_home: Path) -> Path:
 
 
 @pytest.fixture()
-def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Patch all update-CLI boundaries so tests focus on orchestration.
-
-    Returns a dict holding the live scan_result object (key: ``scan_result``)
-    so individual tests can mutate lifecycle state before ``app(...)`` runs.
-    """
+def mock_update_cli_deps(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Provide real storage and one shared fake repository graph to update CLI."""
     scan_result = make_scan_result()
-    state: dict[str, object] = {"scan_result": scan_result}
+    vcs_state, project_paths = configure_fake_vcs(
+        mm_home_with_projects, tmp_path, monkeypatch
+    )
+    for project_path in set(project_paths.values()):
+        vcs_state.register_files(
+            project_path,
+            "mm-fixture-some-pkg.txt",
+            "mm-fixture-pkg-a.txt",
+            "mm-fixture-pkg-b.txt",
+            "mm-fixture-pkg-c.txt",
+        )
+    results_dir = mm_home_with_projects / "scan-results"
 
-    monkeypatch.setattr(
-        "maintenance_man.cli.load_scan_results",
-        lambda name, d: state["scan_result"],
+    def save_scan() -> None:
+        save_scan_results("vulnerable", results_dir, scan_result)
+
+    save_scan()
+    for project_name in project_paths:
+        if project_name == "vulnerable":
+            continue
+        project_scan = deepcopy(scan_result)
+        project_scan.project = project_name
+        save_scan_results(project_name, results_dir, project_scan)
+    processor = FakeFindingProcessor(
+        {
+            "some-pkg": (True, None),
+            "pkg-a": (True, None),
+            "pkg-b": (True, None),
+            "pkg-c": (True, None),
+        }
     )
-    monkeypatch.setattr(
-        "maintenance_man.cli.save_scan_results",
-        lambda name, d, sr: None,
+    monkeypatch.setattr("maintenance_man.cli.process_vulns", processor)
+    monkeypatch.setattr("maintenance_man.cli.process_updates", processor)
+    monkeypatch.setattr("maintenance_man.cli.process_findings", processor)
+    return {
+        "vcs_state": vcs_state,
+        "services": vcs_state.services(),
+        "scan_result": scan_result,
+        "save_scan": save_scan,
+        "project_paths": project_paths,
+    }
+
+
+@pytest.fixture()
+def mock_resolve_cli_deps(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Provide real storage and one shared fake repository graph to resolve CLI."""
+    scan_result = make_scan_result(
+        vulns=[
+            make_vuln(
+                update_status=UpdateStatus.FAILED,
+                flow=Workflow.RESOLVE,
+                failed_phase="unit",
+            ),
+        ],
+        updates=[
+            make_update(
+                update_status=UpdateStatus.FAILED,
+                flow=Workflow.RESOLVE,
+                failed_phase="unit",
+            ),
+        ],
     )
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda p: True)
-    monkeypatch.setattr("maintenance_man.cli.ensure_main_bookmark", lambda p: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.create_workspace",
-        lambda repo_path, project, revision: True,
+    vcs_state, project_paths = configure_fake_vcs(
+        mm_home_with_projects, tmp_path, monkeypatch
     )
-    monkeypatch.setattr(
-        "maintenance_man.cli.remove_workspace",
-        lambda repo_path, project: None,
+    for project_path in set(project_paths.values()):
+        vcs_state.register_files(
+            project_path,
+            "mm-fixture-some-pkg.txt",
+            "mm-fixture-pkg-a.txt",
+        )
+    vcs_state.repository(project_paths["vulnerable"]).set_bookmark(
+        bookmark="mm/resolve-dependencies", revision="@-"
     )
-    monkeypatch.setattr(
-        "maintenance_man.cli.workspace_path_for_project",
-        lambda project: Path("/tmp/mm-workspaces") / project,
+    results_dir = mm_home_with_projects / "scan-results"
+    fixture: dict[str, object] = {}
+
+    def save_scan() -> None:
+        save_scan_results(
+            "vulnerable",
+            results_dir,
+            fixture["scan_result"],  # ty:ignore[invalid-argument-type]
+        )
+
+    fixture.update(
+        {
+            "vcs_state": vcs_state,
+            "services": vcs_state.services(),
+            "scan_result": scan_result,
+            "save_scan": save_scan,
+            "project_paths": project_paths,
+        }
     )
-    monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: False)
-    monkeypatch.setattr(
-        "maintenance_man.cli.create_or_reset_bookmark",
-        lambda b, p, r: True,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.promote_bookmark_to_main",
-        lambda p, b: True,
-    )
-    monkeypatch.setattr("maintenance_man.cli.delete_bookmark", lambda b, p: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.refresh_working_copy_from_main", lambda p: True
-    )
-    monkeypatch.setattr("maintenance_man.cli.edit_new_change", lambda p, r: True)
-    return state
+    save_scan()
+    for project_name in project_paths:
+        if project_name == "vulnerable":
+            continue
+        project_scan = scan_result.model_copy(deep=True)
+        project_scan.project = project_name
+        save_scan_results(project_name, results_dir, project_scan)
+    processor = FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)})
+    monkeypatch.setattr("maintenance_man.cli.process_findings", processor)
+    return fixture
 
 
 def make_gradle_member(**overrides: Any) -> GradleMember:

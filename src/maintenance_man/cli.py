@@ -83,27 +83,17 @@ from maintenance_man.updater import (
 from maintenance_man.vcs import (
     GH_INSTALL_HINT,
     JJ_INSTALL_HINT,
-    BookmarkLookupError,
     RevisionError,
-    bookmark_exists,
-    create_or_reset_bookmark,
-    create_workspace,
-    current_change_has_changes,
-    delete_bookmark,
-    edit_new_change,
-    ensure_main_bookmark,
-    promote_bookmark_to_main,
-    prune_stale_bookmarks,
-    push_bookmark_and_create_pr,
-    refresh_working_copy_from_main,
-    remove_workspace,
-    resolve_bookmark_contains_current_change,
-    revision_file,
     workspace_path_for_project,
 )
 from maintenance_man.vcs_workflow import (
     VcsServices,
+    create_workspace,
+    ensure_main_bookmark,
     make_vcs_services,
+    push_bookmark_and_create_pr,
+    refresh_working_copy_from_main,
+    remove_workspace,
     sync_main,
 )
 from maintenance_man.vcs_workflow import (
@@ -353,10 +343,11 @@ def update(
     except ToolNotFoundError as e:
         _fatal(str(e))
 
+    vcs = make_vcs_services()
     if mode == "single":
-        _update_interactive(cfg, targets[0])
+        _update_interactive(cfg, targets[0], vcs=vcs)
 
-    _update_batch_targets(cfg, target_names=targets)
+    _update_batch_targets(cfg, target_names=targets, vcs=vcs)
 
 
 @app.command
@@ -409,6 +400,7 @@ def _update_batch_targets(
     cfg: MmConfig,
     *,
     target_names: list[str],
+    vcs: VcsServices,
 ) -> NoReturn:
     """Update an explicit ordered set of projects, auto-selecting all findings."""
     _exit_if_no_update_targets(cfg, target_names)
@@ -433,7 +425,11 @@ def _update_batch_targets(
         console.print("═" * 40)
 
         outcome = _update_batch(
-            name, proj_config, results_dir, cfg.defaults.min_version_age_days
+            name,
+            proj_config,
+            results_dir,
+            cfg.defaults.min_version_age_days,
+            vcs=vcs,
         )
         if outcome is None:
             had_errors = True
@@ -456,7 +452,11 @@ def _update_batch_targets(
 
 
 def _gradle_workspace_revision(
-    project: str, proj_config: ProjectConfig, revision: str
+    project: str,
+    proj_config: ProjectConfig,
+    revision: str,
+    *,
+    vcs: VcsServices,
 ) -> str:
     """Verify SDK file availability and pin the revision inspected."""
     reason = workspace_environment_reason(
@@ -464,50 +464,52 @@ def _gradle_workspace_revision(
     )
     if reason is None:
         return revision
-    inspection = revision_file(proj_config.path, revision, "local.properties")
-    if not inspection.ok:
-        raise _UpdateSetupError(
-            f"Cannot inspect local.properties in {revision}: "
-            f"{inspection.error or 'revision inspection failed'}"
+    try:
+        inspection = vcs.repository(proj_config.path).revision_file(
+            revision=revision, filename="local.properties"
         )
-    if not inspection.value:
+    except RevisionError as exc:
+        raise _UpdateSetupError(
+            f"Cannot inspect local.properties in {revision}: {exc}"
+        ) from exc
+    if not inspection.is_regular:
         raise _UpdateSetupError(reason)
     return inspection.commit_id
 
 
 def _enter_update_workspace(
-    project: str, proj_config: ProjectConfig, scan_result: ScanResult
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    *,
+    vcs: VcsServices,
 ) -> Path:
     """Create a fresh or resumed update jj workspace. Returns its path."""
     bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    remove_workspace(proj_config.path, project)
-    workspace_path = workspace_path_for_project(project)
+    repo = vcs.repository(proj_config.path)
+    remove_workspace(repo=repo, project=project)
 
     if _has_update_progress(scan_result):
-        if not bookmark_exists(bookmark, proj_config.path):
+        if not repo.bookmark_exists(bookmark=bookmark):
             raise _UpdateSetupError(
                 f"update bookmark '{bookmark}' is missing but in-progress "
                 f"state exists — rescan required"
             )
-        if not create_workspace(proj_config.path, project, bookmark):
-            raise _UpdateSetupError("could not attach workspace to update bookmark")
-        if not edit_new_change(workspace_path, bookmark):
-            raise _UpdateSetupError("could not create clean change on update bookmark")
+        workspace_path = create_workspace(repo=repo, project=project, revision=bookmark)
+        vcs.repository(workspace_path).new_change(revision=bookmark)
         return workspace_path
 
-    if not prune_stale_bookmarks(proj_config.path):
-        raise _UpdateSetupError("failed to sync trunk")
-    if not ensure_main_bookmark(proj_config.path):
-        raise _UpdateSetupError("main bookmark not found")
-    if bookmark_exists(bookmark, proj_config.path):
-        delete_bookmark(bookmark, proj_config.path)
-    if not create_or_reset_bookmark(bookmark, proj_config.path, "main"):
-        raise _UpdateSetupError("could not create update bookmark")
-    if not create_workspace(proj_config.path, project, "main"):
-        raise _UpdateSetupError("could not create workspace")
-    if not edit_new_change(workspace_path, bookmark):
-        remove_workspace(proj_config.path, project)
-        raise _UpdateSetupError("could not create update change")
+    prune_repository_bookmarks(repo=repo, host=vcs.code_host(proj_config.path))
+    ensure_main_bookmark(repo=repo)
+    if repo.bookmark_exists(bookmark=bookmark):
+        repo.delete_bookmark(bookmark=bookmark)
+    repo.create_bookmark(bookmark=bookmark, revision="main")
+    workspace_path = create_workspace(repo=repo, project=project, revision="main")
+    try:
+        vcs.repository(workspace_path).new_change(revision=bookmark)
+    except RevisionError:
+        remove_workspace(repo=repo, project=project)
+        raise
     return workspace_path
 
 
@@ -558,6 +560,8 @@ def _process_selected_vulns(
     scan_result: ScanResult,
     project: str,
     results_dir: Path,
+    *,
+    vcs: VcsServices,
 ) -> list[UpdateResult]:
     if not selected:
         return []
@@ -569,6 +573,7 @@ def _process_selected_vulns(
         scan_result=scan_result,
         project_name=project,
         results_dir=results_dir,
+        vcs=vcs,
     )
 
 
@@ -578,6 +583,8 @@ def _process_selected_updates(
     scan_result: ScanResult,
     project: str,
     results_dir: Path,
+    *,
+    vcs: VcsServices,
 ) -> list[UpdateResult]:
     if not selected:
         return []
@@ -589,6 +596,40 @@ def _process_selected_updates(
         scan_result=scan_result,
         project_name=project,
         results_dir=results_dir,
+        vcs=vcs,
+    )
+
+
+def _process_selected_findings(
+    selected_vulns: list[VulnFinding],
+    selected_updates: list[UpdateFinding],
+    work_config: ProjectConfig,
+    scan_result: ScanResult,
+    project: str,
+    results_dir: Path,
+    *,
+    vcs: VcsServices,
+) -> list[UpdateResult]:
+    """Process both update categories in one failure-policy sequence."""
+    if selected_vulns:
+        console.print(f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]")
+    if selected_updates:
+        console.print(f"\n[bold]Processing {len(selected_updates)} update(s)...[/]")
+    findings: list[Finding] = [
+        *consolidate_vulns(selected_vulns),
+        *sort_updates_by_risk(selected_updates),
+    ]
+    if not findings:
+        return []
+    return process_findings(
+        findings,
+        work_config,
+        cfg=None,
+        flow=Workflow.UPDATE,
+        scan_result=scan_result,
+        project_name=project,
+        results_dir=results_dir,
+        vcs=vcs,
     )
 
 
@@ -680,6 +721,8 @@ def _finalise_local_update(
     scan_result: ScanResult,
     project_name: str,
     results_dir: Path,
+    *,
+    vcs: VcsServices,
 ) -> bool:
     """Promote the update bookmark to main and promote READY findings.
 
@@ -687,17 +730,17 @@ def _finalise_local_update(
     isolated jj workspace, then only the managed bookmark is promoted.
     """
     bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    if not promote_bookmark_to_main(orig_path, bookmark):
-        console.print(
-            f"[bold red]Promotion failed:[/] {bookmark} could not be promoted to main"
-        )
+    repo = vcs.repository(orig_path)
+    try:
+        repo.promote_bookmark_to_main(bookmark=bookmark)
+    except RevisionError as exc:
+        console.print(f"[bold red]Promotion failed:[/] {exc}")
         return False
 
-    if not refresh_working_copy_from_main(orig_path):
-        console.print(
-            f"[bold red]Workspace refresh failed:[/] {project_name} could not be "
-            "updated to the promoted main bookmark"
-        )
+    try:
+        refresh_working_copy_from_main(repo=repo)
+    except RevisionError as exc:
+        console.print(f"[bold red]Workspace refresh failed:[/] {project_name}: {exc}")
         return False
 
     for v in scan_result.vulnerabilities:
@@ -829,24 +872,31 @@ def _prepare_resolve_bookmark(
     project_path: Path,
     scan_result: ScanResult,
     candidates: list[Finding],
+    *,
+    vcs: VcsServices,
 ) -> bool:
     """Create or resume the resolve bookmark without dropping committed progress."""
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    if _has_ready_resolve_progress(scan_result):
-        if not bookmark_exists(bookmark, project_path):
-            _fatal(
-                f"resolve bookmark '{bookmark}' is missing but "
-                "in-progress state exists — rescan or recover the bookmark manually"
-            )
-        if candidates:
-            return edit_new_change(project_path, bookmark)
-        return True
+    repo = vcs.repository(project_path)
+    try:
+        if _has_ready_resolve_progress(scan_result):
+            if not repo.bookmark_exists(bookmark=bookmark):
+                _fatal(
+                    f"resolve bookmark '{bookmark}' is missing but "
+                    "in-progress state exists — rescan or recover the bookmark manually"
+                )
+            if candidates:
+                repo.new_change(revision=bookmark)
+            return True
 
-    if bookmark_exists(bookmark, project_path):
-        delete_bookmark(bookmark, project_path)
-    if not create_or_reset_bookmark(bookmark, project_path, "main"):
+        if repo.bookmark_exists(bookmark=bookmark):
+            repo.delete_bookmark(bookmark=bookmark)
+        repo.create_bookmark(bookmark=bookmark, revision="main")
+        repo.new_change(revision=bookmark)
+    except RevisionError as exc:
+        console.print(f"  [bold red]Resolve setup failed:[/] {exc}")
         return False
-    return edit_new_change(project_path, bookmark)
+    return True
 
 
 def _run_resolve_findings(
@@ -855,6 +905,8 @@ def _run_resolve_findings(
     scan_result: ScanResult,
     results_dir: Path,
     findings: list[Finding],
+    *,
+    vcs: VcsServices,
 ) -> int:
     """Process resolve candidates; stop on first failure, submit when all READY."""
     results = process_findings(
@@ -865,6 +917,7 @@ def _run_resolve_findings(
         project_name=project,
         results_dir=results_dir,
         on_failure="stop",
+        vcs=vcs,
     )
     if any(not r.passed for r in results) or _ordered_failed_findings(scan_result):
         console.print(
@@ -881,7 +934,12 @@ def _run_resolve_findings(
     if not ready_findings:
         return ExitCode.OK
     return _submit_resolve_bookmark(
-        project, proj_config.path, results_dir, scan_result, ready_findings
+        project,
+        proj_config.path,
+        results_dir,
+        scan_result,
+        ready_findings,
+        vcs=vcs,
     )
 
 
@@ -891,6 +949,8 @@ def _submit_resolve_bookmark(
     results_dir: Path,
     scan_result: ScanResult,
     ready_findings: list[Finding],
+    *,
+    vcs: VcsServices,
 ) -> int:
     """Push the resolve bookmark, open a PR, and promote READY findings on success."""
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
@@ -905,15 +965,21 @@ def _submit_resolve_bookmark(
     for f in ready_findings:
         f.failed_phase = None
 
-    ok, output = push_bookmark_and_create_pr(project_path, bookmark)
-    if output:
-        console.print(f"  [dim]{output}[/]")
-    if not ok:
+    try:
+        output = push_bookmark_and_create_pr(
+            repo=vcs.repository(project_path),
+            host=vcs.code_host(project_path),
+            bookmark=bookmark,
+        )
+    except (RevisionError, CodeHostError) as exc:
         save_scan_results(project, results_dir, scan_result)
+        console.print(f"  [dim]{exc}[/]")
         console.print(
             f"  [bold yellow]Submit failed.[/] Keeping {bookmark} for manual recovery."
         )
         return ExitCode.UPDATE_FAILED
+    if output:
+        console.print(f"  [dim]{output}[/]")
 
     for f in ready_findings:
         f.update_status = UpdateStatus.COMPLETED
@@ -1699,11 +1765,12 @@ def _run_update_flow(
     updates: list[UpdateFinding],
     *,
     interactive: bool,
+    vcs: VcsServices,
 ) -> int:
     """Set up the workspace, process findings, finalise. Returns exit code."""
     try:
-        wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except (_UpdateSetupError, BookmarkLookupError) as e:
+        wt_path = _enter_update_workspace(project, proj_config, scan_result, vcs=vcs)
+    except (_UpdateSetupError, RevisionError, CodeHostError) as e:
         _fatal(str(e))
     work_config = proj_config.model_copy(update={"path": wt_path})
     finalised = False
@@ -1717,10 +1784,14 @@ def _run_update_flow(
             )
         else:
             selected_vulns, selected_updates = (selectable_vulns, selectable_updates)
-        all_results = _process_selected_vulns(
-            selected_vulns, work_config, scan_result, project, results_dir
-        ) + _process_selected_updates(
-            selected_updates, work_config, scan_result, project, results_dir
+        all_results = _process_selected_findings(
+            selected_vulns,
+            selected_updates,
+            work_config,
+            scan_result,
+            project,
+            results_dir,
+            vcs=vcs,
         )
         _print_update_summary(all_results)
         if (
@@ -1730,18 +1801,29 @@ def _run_update_flow(
         ):
             return ExitCode.UPDATE_FAILED
         finalised = _finalise_local_update(
-            proj_config.path, scan_result, project, results_dir
+            proj_config.path, scan_result, project, results_dir, vcs=vcs
         )
     finally:
-        remove_workspace(proj_config.path, project)
+        try:
+            remove_workspace(repo=vcs.repository(proj_config.path), project=project)
+        except RevisionError as exc:
+            console.print(f"[bold red]Workspace cleanup failed:[/] {exc}")
+            finalised = False
     if not finalised:
         return ExitCode.UPDATE_FAILED
-    delete_bookmark(WORKFLOW_BOOKMARKS[Workflow.UPDATE], proj_config.path)
+    vcs.repository(proj_config.path).delete_bookmark(
+        bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
+    )
     return ExitCode.OK
 
 
 def _update_batch(
-    project: str, proj_config: ProjectConfig, results_dir: Path, minimum_age_days: int
+    project: str,
+    proj_config: ProjectConfig,
+    results_dir: Path,
+    minimum_age_days: int,
+    *,
+    vcs: VcsServices,
 ) -> tuple[list[UpdateResult], bool] | None:
     """Process all actionable findings for a single project (batch mode).
 
@@ -1758,6 +1840,7 @@ def _update_batch(
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=minimum_age_days,
+            vcs=vcs,
         )
         return ([], code != ExitCode.OK)
     try:
@@ -1777,8 +1860,8 @@ def _update_batch(
         return ([], False)
     _warn_missing_test_config(project, proj_config)
     try:
-        wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except (_UpdateSetupError, BookmarkLookupError) as e:
+        wt_path = _enter_update_workspace(project, proj_config, scan_result, vcs=vcs)
+    except (_UpdateSetupError, RevisionError, CodeHostError) as e:
         console.print(f"  [bold red]Error:[/] {project} — {e}")
         return None
     work_config = proj_config.model_copy(update={"path": wt_path})
@@ -1786,14 +1869,14 @@ def _update_batch(
     promotion_attempted = False
     try:
         _print_scan_result(scan_result)
-        all_results = _process_selected_vulns(
+        all_results = _process_selected_findings(
             _selectable_vulns(actionable_vulns),
+            _selectable_updates(updates),
             work_config,
             scan_result,
             project,
             results_dir,
-        ) + _process_selected_updates(
-            _selectable_updates(updates), work_config, scan_result, project, results_dir
+            vcs=vcs,
         )
         any_failed_result = any(not r.passed for r in all_results)
         any_failed_finding = _has_update_failures(scan_result)
@@ -1802,19 +1885,26 @@ def _update_batch(
         ):
             promotion_attempted = True
             finalised = _finalise_local_update(
-                proj_config.path, scan_result, project, results_dir
+                proj_config.path, scan_result, project, results_dir, vcs=vcs
             )
     finally:
-        remove_workspace(proj_config.path, project)
+        try:
+            remove_workspace(repo=vcs.repository(proj_config.path), project=project)
+        except RevisionError as exc:
+            console.print(f"  [bold red]Workspace cleanup failed:[/] {exc}")
+            finalised = False
+            promotion_attempted = True
     if finalised:
-        delete_bookmark(WORKFLOW_BOOKMARKS[Workflow.UPDATE], proj_config.path)
+        vcs.repository(proj_config.path).delete_bookmark(
+            bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
+        )
     return (
         all_results,
         bool(scan_result.blocked_findings) or (promotion_attempted and (not finalised)),
     )
 
 
-def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
+def _update_interactive(cfg: MmConfig, project: str, *, vcs: VcsServices) -> NoReturn:
     """Update a single project with interactive selection."""
     proj_config = _resolve_proj(cfg, project)
     results_dir = paths.scan_results_dir()
@@ -1827,6 +1917,7 @@ def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
                 Workflow.UPDATE,
                 interactive=True,
                 minimum_age_days=cfg.defaults.min_version_age_days,
+                vcs=vcs,
             )
         )
     scan_result, actionable_vulns, updates = _load_validated_scan(
@@ -1840,6 +1931,7 @@ def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
         actionable_vulns,
         updates,
         interactive=True,
+        vcs=vcs,
     )
     sys.exit(exit_code)
 
@@ -1874,6 +1966,7 @@ def resolve(
         _require_vcs_tools()
     except ToolNotFoundError as e:
         _fatal(str(e))
+    vcs = make_vcs_services()
     if proj_config.package_manager == "gradle":
         sys.exit(
             _run_gradle_flow(
@@ -1884,6 +1977,7 @@ def resolve(
                 interactive=False,
                 minimum_age_days=minimum_age_days,
                 continue_=continue_,
+                vcs=vcs,
             )
         )
     scan_result, _, _ = _load_validated_scan(
@@ -1891,25 +1985,33 @@ def resolve(
     )
     if continue_:
         sys.exit(
-            _handle_resolve_continue(project, proj_config, scan_result, results_dir)
+            _handle_resolve_continue(
+                project, proj_config, scan_result, results_dir, vcs=vcs
+            )
         )
     candidates = _ordered_resolve_candidates(scan_result)
-    if not prune_stale_bookmarks(proj_config.path):
-        _fatal("failed to sync trunk")
     try:
-        if not ensure_main_bookmark(proj_config.path):
-            _fatal("main bookmark not found")
+        repo = vcs.repository(proj_config.path)
+        prune_repository_bookmarks(repo=repo, host=vcs.code_host(proj_config.path))
+        ensure_main_bookmark(repo=repo)
         if _ordered_failed_findings(scan_result):
             _fatal(
                 f"resolve already paused for [bold]{project}[/] — rerun with --continue"
             )
-        if not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
+        if not _prepare_resolve_bookmark(
+            proj_config.path, scan_result, candidates, vcs=vcs
+        ):
             _fatal(f"aborted resolve for [bold]{project}[/]")
-    except BookmarkLookupError as exc:
+    except (RevisionError, CodeHostError) as exc:
         _fatal(str(exc))
     sys.exit(
         _run_resolve_findings(
-            project, proj_config, scan_result, results_dir, candidates
+            project,
+            proj_config,
+            scan_result,
+            results_dir,
+            candidates,
+            vcs=vcs,
         )
     )
 
@@ -1919,12 +2021,19 @@ def _handle_resolve_continue(
     proj_config: ProjectConfig,
     scan_result: ScanResult,
     results_dir: Path,
+    *,
+    vcs: VcsServices,
 ) -> int:
     """Retest the paused blocker on the resolve bookmark."""
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    if not resolve_bookmark_contains_current_change(proj_config.path, bookmark):
-        _fatal(f"--continue requires current jj change to descend from {bookmark}")
-    if current_change_has_changes(proj_config.path):
+    repo = vcs.repository(proj_config.path)
+    try:
+        if not repo.is_ancestor(ancestor=bookmark, descendant="@"):
+            _fatal(f"--continue requires current jj change to descend from {bookmark}")
+        has_changes = repo.has_changes()
+    except RevisionError as exc:
+        _fatal(f"Cannot inspect resolve work: {exc}")
+    if has_changes:
         _fatal(
             "--continue requires an empty current jj change — commit or discard "
             "manual changes first"
@@ -1944,7 +2053,9 @@ def _handle_resolve_continue(
                 f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
             )
             return ExitCode.UPDATE_FAILED
-        if not create_or_reset_bookmark(bookmark, proj_config.path, "@-"):
+        try:
+            repo.set_bookmark(bookmark=bookmark, revision="@-")
+        except RevisionError:
             save_scan_results(project, results_dir, scan_result)
             _fatal(f"could not move {bookmark} to the committed manual fix")
         for blocker in failed:
@@ -1959,6 +2070,7 @@ def _handle_resolve_continue(
         scan_result,
         results_dir,
         _ordered_resolve_candidates(scan_result),
+        vcs=vcs,
     )
 
 
@@ -2153,6 +2265,7 @@ def _run_gradle_flow(
     interactive: bool,
     minimum_age_days: int,
     continue_: bool = False,
+    vcs: VcsServices,
 ) -> int:
     return gradle_workflow.run_gradle_flow(
         project_name,
@@ -2166,6 +2279,8 @@ def _run_gradle_flow(
             choose=_choose_gradle_candidates,
             report=_print_gradle_run_result,
             report_scan=_print_scan_result,
-            workspace_revision=_gradle_workspace_revision,
+            workspace_revision=lambda name, config, revision: (
+                _gradle_workspace_revision(name, config, revision, vcs=vcs)
+            ),
         ),
     )

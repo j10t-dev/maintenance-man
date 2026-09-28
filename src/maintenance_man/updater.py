@@ -8,6 +8,7 @@ from typing import Literal, Protocol
 
 from rich import print as rprint
 
+from maintenance_man import vcs as _legacy_vcs
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
@@ -26,12 +27,14 @@ from maintenance_man.package_managers import (
 )
 from maintenance_man.process import ProcessError, run_captured, run_live
 from maintenance_man.storage import save_scan_results
-from maintenance_man.vcs import (
-    commit_current_change,
-    create_or_reset_bookmark,
-    current_change_has_changes,
-    discard_current_change,
-)
+from maintenance_man.vcs import Repository, RevisionError
+from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
+
+# Gradle still imports these legacy boundaries until its Task 5 migration.
+commit_current_change = _legacy_vcs.commit_current_change
+create_or_reset_bookmark = _legacy_vcs.create_or_reset_bookmark
+current_change_has_changes = _legacy_vcs.current_change_has_changes
+discard_current_change = _legacy_vcs.discard_current_change
 
 type UpdateKind = Literal["vuln", "update"]
 
@@ -232,8 +235,10 @@ def process_vulns(
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
+    vcs: VcsServices | None = None,
 ) -> list[UpdateResult]:
     """Process vuln fixes in the single-bookmark update flow."""
+    vcs_services = vcs or make_vcs_services()
     actionable = [v for v in vulns if v.actionable]
     consolidated = consolidate_vulns(actionable)
     return process_findings(
@@ -244,6 +249,7 @@ def process_vulns(
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
+        vcs=vcs_services,
     )
 
 
@@ -255,8 +261,10 @@ def process_updates(
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
+    vcs: VcsServices | None = None,
 ) -> list[UpdateResult]:
     """Process updates in the single-bookmark update flow, risk-ascending."""
+    vcs_services = vcs or make_vcs_services()
     sorted_updates = sort_updates_by_risk(updates)
     return process_findings(
         sorted_updates,
@@ -266,6 +274,7 @@ def process_updates(
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
+        vcs=vcs_services,
     )
 
 
@@ -312,6 +321,7 @@ def process_findings(
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
+    vcs: VcsServices | None = None,
 ) -> list[UpdateResult]:
     """Process findings on the current jj change.
 
@@ -324,6 +334,8 @@ def process_findings(
     """
     results: list[UpdateResult] = []
     project_path = Path(project_config.path)
+    vcs_services = vcs or make_vcs_services()
+    repo = vcs_services.repository(project_path)
     has_tests = bool(project_config.test_phases)
 
     for f in findings:
@@ -341,20 +353,21 @@ def process_findings(
         )
 
         if not applied:
-            results.append(
-                _record_failure(
-                    f,
-                    flow_cfg.kind,
-                    "apply",
-                    project_path,
-                    scan_result,
-                    flow,
-                    project_name,
-                    results_dir,
-                    discard=on_failure == "continue",
-                )
+            result, discarded = _record_failure(
+                f,
+                flow_cfg.kind,
+                "apply",
+                project_path,
+                scan_result,
+                flow,
+                project_name,
+                results_dir,
+                vcs=vcs_services,
+                repo=repo,
+                discard=on_failure == "continue",
             )
-            if on_failure == "stop":
+            results.append(result)
+            if on_failure == "stop" or not discarded:
                 break
             continue
 
@@ -363,7 +376,26 @@ def process_findings(
             passed, failed_phase = run_test_phases(project_config, project_path)
 
         if passed:
-            if not current_change_has_changes(project_path):
+            try:
+                has_changes = repo.has_changes()
+            except RevisionError as exc:
+                rprint(f"  [bold red]FAIL[/] {exc}")
+                result, _ = _record_failure(
+                    f,
+                    flow_cfg.kind,
+                    "commit",
+                    project_path,
+                    scan_result,
+                    flow,
+                    project_name,
+                    results_dir,
+                    vcs=vcs_services,
+                    repo=repo,
+                    discard=False,
+                )
+                results.append(result)
+                break
+            if not has_changes:
                 rprint(f"  [bold green]PASS[/] {f.pkg_name} [dim](already applied)[/]")
                 f.update_status = UpdateStatus.READY
                 f.failed_phase = None
@@ -375,39 +407,45 @@ def process_findings(
                     new=f.target_version,
                     detail=f.detail,
                 )
-                if not commit_current_change(project_path, msg):
-                    results.append(
-                        _record_failure(
-                            f,
-                            flow_cfg.kind,
-                            "commit",
-                            project_path,
-                            scan_result,
-                            flow,
-                            project_name,
-                            results_dir,
-                            discard=on_failure == "continue",
-                        )
+                try:
+                    repo.commit(message=msg)
+                except RevisionError as exc:
+                    rprint(f"  [bold red]FAIL[/] {exc}")
+                    result, discarded = _record_failure(
+                        f,
+                        flow_cfg.kind,
+                        "commit",
+                        project_path,
+                        scan_result,
+                        flow,
+                        project_name,
+                        results_dir,
+                        vcs=vcs_services,
+                        repo=repo,
+                        discard=on_failure == "continue",
                     )
-                    if on_failure == "stop":
+                    results.append(result)
+                    if on_failure == "stop" or not discarded:
                         break
                     continue
-                if not create_or_reset_bookmark(
-                    WORKFLOW_BOOKMARKS[flow], project_path, "@-"
-                ):
-                    results.append(
-                        _record_failure(
-                            f,
-                            flow_cfg.kind,
-                            "commit",
-                            project_path,
-                            scan_result,
-                            flow,
-                            project_name,
-                            results_dir,
-                            discard=False,
-                        )
+                try:
+                    repo.set_bookmark(bookmark=WORKFLOW_BOOKMARKS[flow], revision="@-")
+                except RevisionError as exc:
+                    rprint(f"  [bold red]FAIL[/] {exc}")
+                    result, _ = _record_failure(
+                        f,
+                        flow_cfg.kind,
+                        "commit",
+                        project_path,
+                        scan_result,
+                        flow,
+                        project_name,
+                        results_dir,
+                        vcs=vcs_services,
+                        repo=repo,
+                        discard=False,
                     )
+                    results.append(result)
                     break
                 rprint(f"  [bold green]PASS[/] {f.pkg_name}")
                 f.update_status = UpdateStatus.READY
@@ -415,11 +453,25 @@ def process_findings(
                 f.flow = flow
         else:
             rprint(f"  [bold red]FAIL[/] {f.pkg_name} — {failed_phase} failed")
-            if on_failure == "continue":
-                discard_current_change(project_path)
-            f.update_status = UpdateStatus.FAILED
-            f.failed_phase = failed_phase
-            f.flow = flow
+            result, discarded = _record_failure(
+                f,
+                flow_cfg.kind,
+                failed_phase or "test",
+                project_path,
+                scan_result,
+                flow,
+                project_name,
+                results_dir,
+                vcs=vcs_services,
+                repo=repo,
+                discard=on_failure == "continue",
+            )
+            results.append(result)
+            if not discarded:
+                break
+            if on_failure == "stop":
+                break
+            continue
 
         _persist_status(scan_result, project_name, results_dir)
         results.append(
@@ -458,21 +510,28 @@ def _record_failure(
     project_name: str,
     results_dir: Path | None,
     *,
+    vcs: VcsServices,
+    repo: Repository,
     discard: bool = True,
-) -> UpdateResult:
+) -> tuple[UpdateResult, bool]:
     """Mark finding as failed, optionally discard changes, persist and return."""
-    if discard:
-        discard_current_change(project_path)
     finding.update_status = UpdateStatus.FAILED
     finding.failed_phase = phase
     finding.flow = flow
     _persist_status(scan_result, project_name, results_dir)
-    return UpdateResult(
+    result = UpdateResult(
         pkg_name=finding.pkg_name,
         kind=kind,
         passed=False,
         failed_phase=phase,
     )
+    if discard:
+        try:
+            repo.discard()
+        except RevisionError as exc:
+            rprint(f"  [bold red]FAIL[/] {exc}")
+            return result, False
+    return result, True
 
 
 def _persist_status(

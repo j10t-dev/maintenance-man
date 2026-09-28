@@ -1,7 +1,7 @@
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +20,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
+from maintenance_man.process import ProcessError
 from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
     _apply_update,
@@ -35,7 +36,9 @@ from maintenance_man.uv_dependencies import (
     UvDependencyLocation,
     get_uv_dependency_locations,
 )
+from maintenance_man.vcs_workflow import VcsServices
 from tests.conftest import make_gradle_target
+from tests.fake_vcs import FakeJj, FakeJjState
 
 # -- Factory helpers --
 
@@ -82,42 +85,50 @@ def project_config(tmp_path: Path) -> ProjectConfig:
     )
 
 
-@pytest.fixture()
-def mock_local_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    """Mock VCS and updater calls for single-bookmark update processing."""
-    mocks = {}
-    for name, default in [
-        ("commit_current_change", True),
-        ("current_change_has_changes", True),
-        ("create_or_reset_bookmark", True),
-        ("_apply_update", True),
-        ("run_test_phases", (True, None)),
-    ]:
-        mock = MagicMock(return_value=default)
-        monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
-        mocks[name] = mock
-    mock_discard = MagicMock()
-    monkeypatch.setattr("maintenance_man.updater.discard_current_change", mock_discard)
-    mocks["discard_current_change"] = mock_discard
-    return mocks
+class ProcessorDeps(TypedDict):
+    state: FakeJjState
+    repo: FakeJj
+    services: VcsServices
+    package: MagicMock
+    phase: MagicMock
 
 
 @pytest.fixture()
-def mock_resolve_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    """Mock VCS and updater calls for single-bookmark resolve processing."""
-    mocks = {}
-    for name, default in [
-        ("commit_current_change", True),
-        ("current_change_has_changes", True),
-        ("create_or_reset_bookmark", True),
-        ("_apply_update", True),
-        ("run_test_phases", (True, None)),
-        ("discard_current_change", None),
-    ]:
-        mock = MagicMock(return_value=default)
-        monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
-        mocks[name] = mock
-    return mocks
+def processor_vcs(
+    monkeypatch: pytest.MonkeyPatch, project_config: ProjectConfig
+) -> ProcessorDeps:
+    """Use real repository transitions while substituting package/test commands."""
+    path = Path(project_config.path)
+    state = FakeJjState()
+    repo = state.seed_repository(
+        path,
+        files={"dep.txt": "version=1\n", "package.json": "{}\n"},
+    )
+
+    def run_package(cmd, cwd, **kwargs):
+        assert cmd[:2] == ["bun", "add"]
+        assert cwd == path
+        assert kwargs == {"timeout": 300, "label": " ".join(cmd)}
+        current = (path / "dep.txt").read_text(encoding="utf-8")
+        (path / "dep.txt").write_text(f"{current}{cmd[-1]}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def run_phase(command, cwd, **kwargs):
+        assert command == "bun test"
+        assert cwd == path
+        assert kwargs == {"timeout": 600, "label": "unit tests"}
+
+    package = MagicMock(side_effect=run_package)
+    phase = MagicMock(side_effect=run_phase)
+    monkeypatch.setattr("maintenance_man.updater.run_captured", package)
+    monkeypatch.setattr("maintenance_man.updater.run_live", phase)
+    return {
+        "state": state,
+        "repo": repo,
+        "services": state.services(),
+        "package": package,
+        "phase": phase,
+    }
 
 
 class TestGetUvDependencyLocations:
@@ -285,16 +296,10 @@ def test_maven_finalisation_does_not_run_after_a_failed_update(tmp_path, monkeyp
     ]
 
 
-def test_package_timeout_is_persisted_as_a_failed_apply(
-    mock_local_vcs, project_config, tmp_path, monkeypatch
+def test_package_boundary_failure_is_persisted_as_a_failed_apply(
+    processor_vcs, project_config, tmp_path
 ):
-    monkeypatch.setattr("maintenance_man.updater._apply_update", _apply_update)
-    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
-
-    def timeout(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", timeout)
+    processor_vcs["package"].side_effect = ProcessError("package command timed out")
     scan_result = ScanResult(
         project="demo",
         scanned_at=datetime.now(UTC),
@@ -312,6 +317,7 @@ def test_package_timeout_is_persisted_as_a_failed_apply(
         scan_result=scan_result,
         project_name="demo",
         results_dir=results_dir,
+        vcs=_services(processor_vcs),
     )
 
     assert results[0].failed_phase == "apply"
@@ -602,475 +608,469 @@ class TestRemoveCompletedFindings:
         assert len(scan.updates) == 1
 
 
-# -- process_findings (on_failure="continue") --
+# -- process_findings --
 
 
-class TestProcessFindingsLocal:
-    def test_success_sets_ready_and_update_flow(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        update = make_update(SemverTier.PATCH)
+def _services(bundle: ProcessorDeps) -> VcsServices:
+    return bundle["services"]
 
-        results = process_findings([update], project_config, flow=Workflow.UPDATE)
 
+@pytest.mark.parametrize(
+    "flow,bookmark",
+    [
+        (Workflow.UPDATE, "mm/update-dependencies"),
+        (Workflow.RESOLVE, "mm/resolve-dependencies"),
+    ],
+)
+def test_success_commits_and_advances_the_flow_bookmark(
+    flow: Workflow,
+    bookmark: str,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    update = make_update()
+
+    results = process_findings(
+        [update], project_config, flow=flow, vcs=_services(processor_vcs)
+    )
+
+    state = processor_vcs["state"]
+    assert results[0].passed is True
+    assert update.update_status == UpdateStatus.READY
+    assert update.failed_phase is None
+    assert update.flow == flow
+    assert [call.method for call in state.effects] == ["commit", "set_bookmark"]
+    repo = processor_vcs["repo"]
+    assert repo.same_revision(left=bookmark, right="@-")
+
+
+@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
+def test_already_applied_is_ready_without_a_commit(
+    flow: Workflow,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    processor_vcs["package"].side_effect = lambda cmd, cwd, **kwargs: (
+        subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    update = make_update()
+
+    results = process_findings(
+        [update],
+        project_config,
+        flow=flow,
+        on_failure="stop" if flow == Workflow.RESOLVE else "continue",
+        vcs=_services(processor_vcs),
+    )
+
+    assert results[0].passed is True
+    assert update.update_status == UpdateStatus.READY
+    assert update.flow == flow
+    assert not any(call.method == "commit" for call in processor_vcs["state"].attempts)
+
+
+def test_update_failure_discards_then_attempts_the_next_finding(
+    processor_vcs: ProcessorDeps, project_config: ProjectConfig
+):
+    phase = processor_vcs["phase"]
+    phase.side_effect = [ProcessError("unit failed"), None]
+    findings = [make_update(), make_update(SemverTier.MINOR)]
+
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.UPDATE,
+        vcs=_services(processor_vcs),
+    )
+
+    assert [result.passed for result in results] == [False, True]
+    assert findings[0].update_status == UpdateStatus.FAILED
+    assert findings[0].failed_phase == "unit"
+    assert findings[0].flow == Workflow.UPDATE
+    assert processor_vcs["package"].call_count == 2
+    assert "discard" in [call.method for call in processor_vcs["state"].effects]
+
+
+@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
+def test_all_successful_findings_commit_without_discard(
+    flow: Workflow,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    findings = [make_update(), make_update(SemverTier.MINOR)]
+
+    results = process_findings(
+        findings,
+        project_config,
+        flow=flow,
+        on_failure="stop" if flow == Workflow.RESOLVE else "continue",
+        vcs=_services(processor_vcs),
+    )
+
+    assert len(results) == 2
+    assert all(result.passed for result in results)
+    assert processor_vcs["package"].call_count == 2
+    assert processor_vcs["phase"].call_count == 2
+    methods = [call.method for call in processor_vcs["state"].effects]
+    assert methods.count("commit") == 2
+    assert "discard" not in methods
+
+
+def test_update_success_failure_success_sequence_continues_after_discard(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    processor_vcs["phase"].side_effect = [
+        None,
+        ProcessError("unit failed"),
+        None,
+    ]
+    findings = [
+        make_update(),
+        make_update(SemverTier.MINOR),
+        make_update(SemverTier.MAJOR),
+    ]
+
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.UPDATE,
+        vcs=_services(processor_vcs),
+    )
+
+    assert [result.passed for result in results] == [True, False, True]
+    methods = [call.method for call in processor_vcs["state"].effects]
+    assert methods.count("commit") == 2
+    assert methods.count("discard") == 1
+
+
+def test_resolve_failure_preserves_changes_and_stops(
+    processor_vcs: ProcessorDeps, project_config: ProjectConfig
+):
+    processor_vcs["phase"].side_effect = ProcessError("unit failed")
+    findings = [make_update(), make_update(SemverTier.MINOR)]
+
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.RESOLVE,
+        on_failure="stop",
+        vcs=_services(processor_vcs),
+    )
+
+    assert len(results) == 1
+    assert results[0].failed_phase == "unit"
+    assert findings[0].update_status == UpdateStatus.FAILED
+    assert findings[0].flow == Workflow.RESOLVE
+    assert processor_vcs["package"].call_count == 1
+    assert "discard" not in [call.method for call in processor_vcs["state"].attempts]
+
+
+def test_resolve_apply_failure_stops_without_attempting_the_next_finding(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    processor_vcs["package"].side_effect = ProcessError("package failed")
+    findings = [make_update(), make_update(SemverTier.MINOR)]
+
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.RESOLVE,
+        on_failure="stop",
+        vcs=_services(processor_vcs),
+    )
+
+    assert len(results) == 1
+    assert results[0].failed_phase == "apply"
+    assert processor_vcs["package"].call_count == 1
+    assert findings[1].update_status is None
+    assert not any(call.method == "discard" for call in processor_vcs["state"].attempts)
+
+
+def test_resolve_success_then_failure_leaves_later_finding_unattempted(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    processor_vcs["phase"].side_effect = [None, ProcessError("unit failed")]
+    findings = [
+        make_update(),
+        make_update(SemverTier.MINOR),
+        make_update(SemverTier.MAJOR),
+    ]
+
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.RESOLVE,
+        on_failure="stop",
+        vcs=_services(processor_vcs),
+    )
+
+    assert [result.passed for result in results] == [True, False]
+    assert processor_vcs["package"].call_count == 2
+    assert findings[2].update_status is None
+    methods = [call.method for call in processor_vcs["state"].effects]
+    assert methods.count("commit") == 1
+    assert "discard" not in methods
+
+
+@pytest.mark.parametrize("method", ["has_changes", "commit", "set_bookmark"])
+def test_repository_failure_never_saves_ready(
+    method: str,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+    tmp_path: Path,
+):
+    from maintenance_man.vcs import RevisionError
+
+    state = processor_vcs["state"]
+    state.fail(method, error=RevisionError("injected"), path=project_config.path)
+    finding = make_update()
+    second = make_update(SemverTier.MINOR)
+    scan = ScanResult(
+        project="demo",
+        scanned_at=datetime.now(tz=UTC),
+        trivy_target=str(project_config.path),
+        updates=[finding, second],
+    )
+    results_dir = tmp_path / "results"
+
+    results = process_findings(
+        [finding, second],
+        project_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        project_name="demo",
+        results_dir=results_dir,
+        vcs=_services(processor_vcs),
+    )
+
+    saved = load_scan_results("demo", results_dir)
+    assert saved.updates[0].update_status == UpdateStatus.FAILED
+    assert saved.updates[0].failed_phase == "commit"
+    if method == "has_changes":
         assert len(results) == 1
-        assert results[0].passed is True
-        assert update.update_status == UpdateStatus.READY
-        assert update.failed_phase is None
-        assert update.flow == "update"
-
-    def test_success_moves_update_bookmark_to_finished_commit(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        update = make_update(SemverTier.PATCH)
-
-        process_findings([update], project_config, flow=Workflow.UPDATE)
-
-        mock_local_vcs["commit_current_change"].assert_called_once()
-        mock_local_vcs["create_or_reset_bookmark"].assert_called_once_with(
-            "mm/update-dependencies",
-            project_config.path,
-            "@-",
-        )
-
-    def test_already_applied_sets_ready_and_update_flow(
-        self,
-        mock_local_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
-    ):
-        mock_has_changes = MagicMock(return_value=False)
-        monkeypatch.setattr(
-            "maintenance_man.updater.current_change_has_changes",
-            mock_has_changes,
-            raising=False,
-        )
-        update = make_update(SemverTier.PATCH)
-
-        results = process_findings([update], project_config, flow=Workflow.UPDATE)
-
+        assert processor_vcs["package"].call_count == 1
+        assert not any(call.method in {"commit", "discard"} for call in state.attempts)
+    if method == "commit":
+        assert [result.passed for result in results] == [False, True]
+        assert processor_vcs["package"].call_count == 2
+        assert any(call.method == "discard" for call in state.effects)
+    if method == "set_bookmark":
         assert len(results) == 1
-        assert results[0].passed is True
-        assert update.update_status == UpdateStatus.READY
-        assert update.failed_phase is None
-        assert update.flow == "update"
-        mock_local_vcs["commit_current_change"].assert_not_called()
+        assert processor_vcs["package"].call_count == 1
+        assert any(call.method == "commit" for call in state.effects)
+        assert not any(call.method == "discard" for call in state.attempts)
 
-    def test_failure_sets_failed_and_active_flow(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_local_vcs["run_test_phases"].return_value = (False, "unit")
-        update = make_update(SemverTier.PATCH)
 
-        results = process_findings([update], project_config, flow=Workflow.UPDATE)
+def test_resolve_commit_failure_preserves_changes_and_stops(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    from maintenance_man.vcs import RevisionError
 
-        assert len(results) == 1
-        assert results[0].passed is False
-        assert results[0].failed_phase == "unit"
-        assert update.update_status == UpdateStatus.FAILED
-        assert update.failed_phase == "unit"
-        assert update.flow == "update"
+    state = processor_vcs["state"]
+    state.fail("commit", error=RevisionError("injected"), path=project_config.path)
+    findings = [make_update(), make_update(SemverTier.MINOR)]
 
-    def test_failure_discards_current_change_and_continues(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_local_vcs["run_test_phases"].return_value = (False, "unit")
-        update = make_update(SemverTier.PATCH)
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.RESOLVE,
+        on_failure="stop",
+        vcs=_services(processor_vcs),
+    )
 
-        results = process_findings([update], project_config, flow=Workflow.UPDATE)
+    assert len(results) == 1
+    assert results[0].failed_phase == "commit"
+    assert findings[0].flow == Workflow.RESOLVE
+    assert processor_vcs["package"].call_count == 1
+    assert not any(call.method == "discard" for call in state.attempts)
 
-        assert results[0].passed is False
-        mock_local_vcs["discard_current_change"].assert_called_once_with(
-            project_config.path
-        )
 
-    def test_all_pass(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
+def test_apply_failure_discards_and_continues(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    processor_vcs["package"].side_effect = [
+        ProcessError("package failed"),
+        subprocess.CompletedProcess([], 0, "", ""),
+    ]
+    findings = [make_update(), make_update(SemverTier.MINOR)]
 
-        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.UPDATE,
+        vcs=_services(processor_vcs),
+    )
 
-        assert len(results) == 2
-        assert all(r.passed for r in results)
-        assert mock_local_vcs["_apply_update"].call_count == 2
-        assert mock_local_vcs["run_test_phases"].call_count == 2
-        assert mock_local_vcs["commit_current_change"].call_count == 2
-        mock_local_vcs["discard_current_change"].assert_not_called()
+    assert [result.passed for result in results] == [False, True]
+    assert results[0].failed_phase == "apply"
+    assert any(call.method == "discard" for call in processor_vcs["state"].effects)
 
-    def test_failure_discards_and_continues(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_local_vcs["run_test_phases"].side_effect = [
-            (True, None),
-            (False, "unit"),
-            (True, None),
-        ]
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-            make_update(SemverTier.MAJOR),
-        ]
 
-        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
+@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
+def test_no_test_config_skips_tests_and_commits(
+    flow: Workflow,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    config = project_config.model_copy(update={"test_unit": None})
 
-        assert len(results) == 3
-        assert results[0].passed is True
-        assert results[1].passed is False
-        assert results[2].passed is True
-        mock_local_vcs["discard_current_change"].assert_called_once()
-        assert mock_local_vcs["commit_current_change"].call_count == 2
+    results = process_findings(
+        [make_update()],
+        config,
+        flow=flow,
+        on_failure="stop" if flow == Workflow.RESOLVE else "continue",
+        vcs=_services(processor_vcs),
+    )
 
-    def test_apply_failure_continues(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_local_vcs["_apply_update"].side_effect = [False, True]
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
+    assert results[0].passed is True
+    processor_vcs["phase"].assert_not_called()
+    assert any(call.method == "commit" for call in processor_vcs["state"].effects)
 
-        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
 
-        assert len(results) == 2
-        assert results[0].passed is False
-        assert results[0].failed_phase == "apply"
-        assert results[1].passed is True
-
-    def test_no_test_config_treats_update_as_pass(
-        self, mock_local_vcs: dict[str, MagicMock], tmp_path: Path
-    ):
-        project_config = ProjectConfig(path=tmp_path, package_manager="bun")
-
-        results = process_findings(
-            [make_update(SemverTier.PATCH)],
+def test_empty_findings_have_no_repository_effects(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    assert (
+        process_findings(
+            [],
             project_config,
             flow=Workflow.UPDATE,
+            vcs=_services(processor_vcs),
         )
-
-        assert len(results) == 1
-        assert results[0].passed is True
-        mock_local_vcs["run_test_phases"].assert_not_called()
-        mock_local_vcs["commit_current_change"].assert_called_once()
-
-    def test_commit_failure_marks_finding_failed_and_continues(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_local_vcs["commit_current_change"].side_effect = [False, True]
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
-
-        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
-
-        assert len(results) == 2
-        assert results[0].passed is False
-        assert results[0].failed_phase == "commit"
-        assert results[1].passed is True
-
-    def test_bookmark_advancement_failure_stops_after_successful_commit(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_local_vcs["create_or_reset_bookmark"].return_value = False
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
-
-        results = process_findings(updates, project_config, flow=Workflow.UPDATE)
-
-        assert len(results) == 1
-        assert results[0].passed is False
-        assert results[0].failed_phase == "commit"
-        mock_local_vcs["commit_current_change"].assert_called_once()
-        mock_local_vcs["_apply_update"].assert_called_once()
-        mock_local_vcs["discard_current_change"].assert_not_called()
-
-    def test_noop_update_without_changes_counts_as_pass(
-        self,
-        mock_local_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
-    ):
-        mock_local_vcs["commit_current_change"].return_value = False
-        mock_has_changes = MagicMock(return_value=False)
-        monkeypatch.setattr(
-            "maintenance_man.updater.current_change_has_changes",
-            mock_has_changes,
-            raising=False,
-        )
-        update = make_update(SemverTier.PATCH)
-
-        results = process_findings([update], project_config, flow=Workflow.UPDATE)
-
-        assert len(results) == 1
-        assert results[0].passed is True
-        assert results[0].failed_phase is None
-        assert update.update_status == UpdateStatus.READY
-        mock_local_vcs["commit_current_change"].assert_not_called()
-
-    def test_status_tracking(
-        self,
-        mock_local_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
-    ):
-        mock_local_vcs["run_test_phases"].side_effect = [
-            (True, None),
-            (False, "unit"),
-        ]
-        mock_save = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
-        upd_pass = make_update(SemverTier.PATCH)
-        upd_fail = make_update(SemverTier.MINOR)
-        scan = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-            updates=[upd_pass, upd_fail],
-        )
-
-        process_findings(
-            [upd_pass, upd_fail],
-            project_config,
-            flow=Workflow.UPDATE,
-            scan_result=scan,
-            project_name="myapp",
-            results_dir=Path("/tmp/fake"),
-        )
-
-        assert upd_pass.update_status == UpdateStatus.READY
-        assert upd_fail.update_status == UpdateStatus.FAILED
-        mock_save.assert_called()
-
-    def test_empty_findings(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        results = process_findings([], project_config, flow=Workflow.UPDATE)
-        assert results == []
+        == []
+    )
+    assert processor_vcs["state"].effects == []
 
 
-# -- process_findings (on_failure="stop") --
+def test_failed_discard_persists_original_failure_and_stops(
+    processor_vcs: ProcessorDeps, project_config: ProjectConfig, tmp_path: Path
+):
+    from maintenance_man.vcs import RevisionError
+
+    state = processor_vcs["state"]
+    state.fail(
+        "discard", error=RevisionError("cannot discard"), path=project_config.path
+    )
+    processor_vcs["phase"].side_effect = ProcessError("unit failed")
+    findings = [make_update(), make_update(SemverTier.MINOR)]
+    scan = ScanResult(
+        project="demo",
+        scanned_at=datetime.now(tz=UTC),
+        trivy_target=str(project_config.path),
+        updates=findings,
+    )
+    results_dir = tmp_path / "results"
+
+    results = process_findings(
+        findings,
+        project_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        project_name="demo",
+        results_dir=results_dir,
+        vcs=_services(processor_vcs),
+    )
+
+    assert len(results) == 1
+    saved = load_scan_results("demo", results_dir)
+    assert saved.updates[0].failed_phase == "unit"
+    assert saved.updates[0].update_status == UpdateStatus.FAILED
 
 
-class TestProcessFindingsResolve:
-    def test_success_sets_ready_and_resolve_flow(
-        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        update = make_update(SemverTier.PATCH)
+def test_update_statuses_are_persisted_after_each_finding(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+    tmp_path: Path,
+):
+    processor_vcs["phase"].side_effect = [None, ProcessError("unit failed")]
+    findings = [make_update(), make_update(SemverTier.MINOR)]
+    scan = ScanResult(
+        project="demo",
+        scanned_at=datetime.now(tz=UTC),
+        trivy_target=str(project_config.path),
+        updates=findings,
+    )
+    results_dir = tmp_path / "results"
 
-        results = process_findings(
-            [update],
-            project_config,
-            flow=Workflow.RESOLVE,
-            on_failure="stop",
-        )
+    process_findings(
+        findings,
+        project_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        project_name="demo",
+        results_dir=results_dir,
+        vcs=_services(processor_vcs),
+    )
 
-        assert len(results) == 1
-        assert results[0].passed is True
-        assert update.update_status == UpdateStatus.READY
-        assert update.failed_phase is None
-        assert update.flow == "resolve"
-
-    def test_success_moves_resolve_bookmark_to_finished_commit(
-        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        update = make_update(SemverTier.PATCH)
-
-        process_findings(
-            [update],
-            project_config,
-            flow=Workflow.RESOLVE,
-            on_failure="stop",
-        )
-
-        mock_resolve_vcs["create_or_reset_bookmark"].assert_called_once_with(
-            "mm/resolve-dependencies",
-            project_config.path,
-            "@-",
-        )
-
-    def test_failure_sets_failed_and_resolve_flow(
-        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_resolve_vcs["_apply_update"].return_value = False
-        update = make_update(SemverTier.PATCH)
-
-        results = process_findings(
-            [update],
-            project_config,
-            flow=Workflow.RESOLVE,
-            on_failure="stop",
-        )
-
-        assert len(results) == 1
-        assert results[0].passed is False
-        assert results[0].failed_phase == "apply"
-        assert update.update_status == UpdateStatus.FAILED
-        assert update.failed_phase == "apply"
-        assert update.flow == "resolve"
-
-    def test_all_pass(
-        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
-
-        results = process_findings(
-            updates,
-            project_config,
-            flow=Workflow.RESOLVE,
-            on_failure="stop",
-        )
-
-        assert len(results) == 2
-        assert all(r.passed for r in results)
-        assert mock_resolve_vcs["_apply_update"].call_count == 2
-        assert mock_resolve_vcs["commit_current_change"].call_count == 2
-        assert mock_resolve_vcs["run_test_phases"].call_count == 2
-
-    def test_failure_stops_and_preserves_change_state(
-        self, mock_resolve_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        mock_resolve_vcs["run_test_phases"].side_effect = [
-            (True, None),
-            (False, "unit"),
-        ]
-        updates = [
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-            make_update(SemverTier.MAJOR),
-        ]
-
-        results = process_findings(
-            updates,
-            project_config,
-            flow=Workflow.RESOLVE,
-            on_failure="stop",
-        )
-
-        assert len(results) == 2
-        assert results[0].passed is True
-        assert results[1].passed is False
-        assert results[1].failed_phase == "unit"
-        assert mock_resolve_vcs["_apply_update"].call_count == 2
-        assert mock_resolve_vcs["commit_current_change"].call_count == 1
-        mock_resolve_vcs["discard_current_change"].assert_not_called()
-
-    def test_no_test_config_treats_update_as_pass(
-        self, mock_resolve_vcs: dict[str, MagicMock], tmp_path: Path
-    ):
-        project_config = ProjectConfig(path=tmp_path, package_manager="bun")
-
-        results = process_findings(
-            [make_update(SemverTier.PATCH)],
-            project_config,
-            flow=Workflow.RESOLVE,
-            on_failure="stop",
-        )
-
-        assert len(results) == 1
-        assert results[0].passed is True
-        mock_resolve_vcs["run_test_phases"].assert_not_called()
-
-    def test_status_tracking(
-        self,
-        mock_resolve_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
-    ):
-        mock_resolve_vcs["run_test_phases"].side_effect = [
-            (False, "unit"),
-        ]
-        mock_save = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.save_scan_results", mock_save)
-        upd_fail = make_update(SemverTier.PATCH, update_status=UpdateStatus.FAILED)
-        scan = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-            updates=[upd_fail],
-        )
-
-        process_findings(
-            [upd_fail],
-            project_config,
-            flow=Workflow.RESOLVE,
-            scan_result=scan,
-            project_name="myapp",
-            results_dir=Path("/tmp/fake"),
-            on_failure="stop",
-        )
-
-        assert upd_fail.update_status == UpdateStatus.FAILED
-        mock_save.assert_called()
-
-    def test_noop_update_without_changes_counts_as_pass(
-        self,
-        mock_resolve_vcs: dict[str, MagicMock],
-        monkeypatch: pytest.MonkeyPatch,
-        project_config: ProjectConfig,
-    ):
-        mock_resolve_vcs["commit_current_change"].return_value = False
-        mock_has_changes = MagicMock(return_value=False)
-        monkeypatch.setattr(
-            "maintenance_man.updater.current_change_has_changes",
-            mock_has_changes,
-            raising=False,
-        )
-        update = make_update(SemverTier.PATCH)
-
-        results = process_findings(
-            [update],
-            project_config,
-            flow=Workflow.RESOLVE,
-            on_failure="stop",
-        )
-
-        assert len(results) == 1
-        assert results[0].passed is True
-        assert results[0].failed_phase is None
-        assert update.update_status == UpdateStatus.READY
-        mock_resolve_vcs["commit_current_change"].assert_not_called()
+    saved = load_scan_results("demo", results_dir)
+    assert [finding.update_status for finding in saved.updates] == [
+        UpdateStatus.READY,
+        UpdateStatus.FAILED,
+    ]
+    assert saved.updates[1].failed_phase == "unit"
 
 
-# -- process_vulns / process_updates --
+def test_resolve_failure_status_is_persisted_before_stopping(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+    tmp_path: Path,
+):
+    processor_vcs["phase"].side_effect = ProcessError("unit failed")
+    finding = make_update(update_status=UpdateStatus.FAILED)
+    scan = ScanResult(
+        project="demo",
+        scanned_at=datetime.now(tz=UTC),
+        trivy_target=str(project_config.path),
+        updates=[finding],
+    )
+    results_dir = tmp_path / "results"
+
+    process_findings(
+        [finding],
+        project_config,
+        flow=Workflow.RESOLVE,
+        on_failure="stop",
+        scan_result=scan,
+        project_name="demo",
+        results_dir=results_dir,
+        vcs=_services(processor_vcs),
+    )
+
+    saved = load_scan_results("demo", results_dir)
+    assert saved.updates[0].update_status == UpdateStatus.FAILED
+    assert saved.updates[0].failed_phase == "unit"
+    assert saved.updates[0].flow == Workflow.RESOLVE
 
 
-class TestProcessVulnsLocal:
-    def test_consolidates_and_processes(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="requests", fixed_version="2.31.0")
-        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="requests", fixed_version="2.32.4")
+def test_process_vulns_consolidates_and_processes(
+    processor_vcs: ProcessorDeps, project_config: ProjectConfig
+):
+    vulns = [
+        make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.31.0"),
+        make_vuln(vuln_id="CVE-2", pkg_name="requests", fixed_version="2.32.4"),
+    ]
+    results = process_vulns(
+        vulns, project_config, flow=Workflow.UPDATE, vcs=_services(processor_vcs)
+    )
+    assert [(result.kind, result.passed) for result in results] == [("vuln", True)]
 
-        results = process_vulns([v1, v2], project_config, flow=Workflow.UPDATE)
 
-        assert len(results) == 1
-        assert results[0].passed is True
-        assert results[0].kind == "vuln"
-
-
-class TestProcessUpdatesLocal:
-    def test_sorts_by_risk(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
-    ):
-        updates = [
-            make_update(SemverTier.MAJOR),
-            make_update(SemverTier.PATCH),
-        ]
-
-        results = process_updates(updates, project_config, flow=Workflow.UPDATE)
-
-        assert len(results) == 2
-        assert results[0].pkg_name == "pkg-a"
-        assert results[1].pkg_name == "pkg-c"
+def test_process_updates_sorts_by_risk(
+    processor_vcs: ProcessorDeps, project_config: ProjectConfig
+):
+    results = process_updates(
+        [make_update(SemverTier.MAJOR), make_update(SemverTier.PATCH)],
+        project_config,
+        flow=Workflow.UPDATE,
+        vcs=_services(processor_vcs),
+    )
+    assert [result.pkg_name for result in results] == ["pkg-a", "pkg-c"]
 
 
 def test_gradle_config_records_a_failed_apply_not_a_crash(tmp_path, capsys):
