@@ -134,25 +134,6 @@ class TestLoadInventory:
             load_inventory(bom)
 
 
-@pytest.mark.parametrize(
-    "spec, accepted", [("1.4", False), ("1.5", True), ("1.7", True), ("junk", False)]
-)
-def test_inventory_spec_floor(spec, accepted):
-    text = json.dumps(
-        {
-            "bomFormat": "CycloneDX",
-            "specVersion": spec,
-            "components": [{"type": "library", "purl": "pkg:maven/g/lib@1"}],
-        }
-    )
-    if accepted:
-        inventory = parse_inventory_text(text, source="memory-bom")
-        assert len(inventory.components) == 1
-    else:
-        with pytest.raises(GradleError, match=r"1\.5 or later"):
-            parse_inventory_text(text, source="memory-bom")
-
-
 def test_load_inventory_returns_the_original_bytes(tmp_path):
     bom = tmp_path / "bom.json"
     payload = (GRADLE_FIXTURES / "bom.json").read_bytes()

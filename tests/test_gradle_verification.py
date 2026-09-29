@@ -2491,11 +2491,8 @@ def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
     assert workflow.effects.count("apply") == 1
 
 
-@pytest.mark.parametrize("stale", [False, True])
-def test_gradle_checked_commit_recovery_does_not_apply_twice(
-    workflow, monkeypatch, stale
-):
-    run = begin_workflow(workflow)
+def _interrupt_after_checked_commit(workflow, monkeypatch, *, clock=None):
+    run = begin_workflow(workflow, **({"clock": clock} if clock is not None else {}))
     original_save = updater.save_gradle_run
     crashed = False
 
@@ -2515,7 +2512,12 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
     monkeypatch.setattr(updater, "save_gradle_run", crash_after_commit)
     with pytest.raises(updater.GradleError, match="commit crash"):
         updater.process_gradle_run(
-            run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+            run,
+            workflow.project,
+            workflow.publication,
+            7,
+            emit=RecordingEmit(),
+            **({"clock": clock} if clock is not None else {}),
         )
     interrupted = updater.load_gradle_run(updater.gradle_run_path(run.project))
     assert interrupted is not None
@@ -2524,6 +2526,16 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
     assert interrupted.attempts[0].accepted_commit_id is None
     repo = workflow.vcs.repository(workflow.project.path)
     accepted_commit = repo.resolve_revision(revision="@-")
+    return run, interrupted, accepted_commit, original_save
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_gradle_checked_commit_recovery_does_not_apply_twice(
+    workflow, monkeypatch, stale
+):
+    run, interrupted, accepted_commit, _original_save = _interrupt_after_checked_commit(
+        workflow, monkeypatch
+    )
     workflow.vcs_state.seed_bookmark(
         workflow.project.path,
         bookmark=run.managed_bookmark,
@@ -2590,37 +2602,9 @@ def test_gradle_recovery_sees_the_clock_advanced_by_an_effect(
     from tests.conftest import FakeClock
 
     clock = FakeClock(workflow.context.created_at + timedelta(hours=23, minutes=59))
-    run = begin_workflow(workflow, clock=clock)
-    original_save = updater.save_gradle_run
-    crashed = False
-
-    def crash_after_commit(path, value):
-        nonlocal crashed
-        item = value.attempts[0]
-        if (
-            isinstance(item, ApplyingAttempt)
-            and item.accepted_commit_id is not None
-            and not crashed
-        ):
-            crashed = True
-            msg = "simulated commit crash"
-            raise updater.GradleError(msg)
-        original_save(path, value)
-
-    monkeypatch.setattr(updater, "save_gradle_run", crash_after_commit)
-    with pytest.raises(updater.GradleError, match="commit crash"):
-        updater.process_gradle_run(
-            run,
-            workflow.project,
-            workflow.publication,
-            7,
-            emit=RecordingEmit(),
-            clock=clock,
-        )
-    interrupted = updater.load_gradle_run(updater.gradle_run_path(run.project))
-    assert interrupted is not None
-    repo = workflow.vcs.repository(workflow.project.path)
-    accepted_commit = repo.resolve_revision(revision="@-")
+    run, interrupted, accepted_commit, original_save = _interrupt_after_checked_commit(
+        workflow, monkeypatch, clock=clock
+    )
     workflow.vcs_state.seed_bookmark(
         workflow.project.path,
         bookmark=run.managed_bookmark,

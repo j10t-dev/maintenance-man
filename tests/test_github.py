@@ -65,19 +65,12 @@ def test_pr_bookmarks_returns_every_head_name(
     ]
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        CodeHostError("rejected status"),
-        CodeHostError("launch failed"),
-        CodeHostError("timed out"),
-    ],
-)
 def test_pr_bookmarks_propagates_normalized_boundary_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    error: CodeHostError,
 ) -> None:
+    error = CodeHostError("normalized boundary failure")
+
     def fail(*_args, **_kwargs):
         raise error
 

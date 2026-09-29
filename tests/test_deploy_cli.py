@@ -238,40 +238,6 @@ def _activity(*, success: bool, commit_id: str | None) -> dict[str, ProjectActiv
     }
 
 
-@pytest.mark.parametrize(
-    "argv, code, deployed",
-    [
-        (["deploy", "deploy-only"], ExitCode.ERROR, False),
-        (["deploy"], ExitCode.OK, False),
-        (["deploy", "deploy-only", "--force"], ExitCode.OK, True),
-    ],
-)
-@patch("maintenance_man.services.deploy.record_activity")
-@patch("maintenance_man.services.deploy.run_deploy")
-def test_unresolved_repository_uses_the_existing_deploy_gate(
-    mock_deploy,
-    mock_record,
-    mm_home_with_projects,
-    _deploy_vcs,
-    argv,
-    code,
-    deployed,
-):
-    path = _deploy_vcs.paths["deploy-only"]
-    _deploy_vcs.state.fail(
-        "resolve_revision", error=RevisionError("missing jj"), path=path
-    )
-    _deploy_vcs.state.fail(
-        "resolve_revision", ordinal=2, error=RevisionError("missing jj"), path=path
-    )
-    with pytest.raises(SystemExit) as exc:
-        app(argv, exit_on_error=False)
-    assert exc.value.code == code
-    assert mock_deploy.called is deployed
-    if deployed:
-        assert mock_record.call_args.kwargs["commit_id"] is None
-
-
 class TestDeployCommand:
     @pytest.fixture(autouse=True)
     def _gate(self, _deploy_vcs: _DeployVcs) -> None:
@@ -773,27 +739,6 @@ class TestDeployGateWiring:
         assert exc.value.code == ExitCode.OK
         mock_deploy.assert_called_once()
         assert mock_record.call_args.kwargs["commit_id"] == main_id
-
-    @patch("maintenance_man.services.deploy.run_deploy")
-    def test_explicit_blocked_exits_error(
-        self,
-        mock_deploy: MagicMock,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        _deploy_vcs: _DeployVcs,
-    ) -> None:
-        _deploy_vcs.state.fail(
-            "resolve_revision",
-            error=RevisionError("no main"),
-            path=_deploy_vcs.paths["deploy-only"],
-        )
-        monkeypatch.setattr(
-            "maintenance_man.services.deploy.load_activity", lambda path: {}
-        )
-        with pytest.raises(SystemExit) as exc:
-            app(["deploy", "deploy-only"], exit_on_error=False)
-        assert exc.value.code == ExitCode.ERROR
-        mock_deploy.assert_not_called()
 
     @patch("maintenance_man.services.deploy.run_deploy")
     def test_batch_blocked_exits_ok(

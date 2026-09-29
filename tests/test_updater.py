@@ -815,34 +815,22 @@ def test_update_success_failure_success_sequence_continues_after_discard(
     assert methods.count("discard") == 1
 
 
+@pytest.mark.parametrize("failed_phase", ["unit", "apply", "commit"])
 def test_resolve_failure_preserves_changes_and_stops(
-    processor_vcs: ProcessorDeps, project_config: ProjectConfig
-):
-    processor_vcs["phase"].side_effect = ProcessError("unit failed")
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.RESOLVE,
-        on_failure="stop",
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert len(results) == 1
-    assert results[0].failed_phase == "unit"
-    assert findings[0].update_status == UpdateStatus.FAILED
-    assert findings[0].flow == Workflow.RESOLVE
-    assert processor_vcs["package"].call_count == 1
-    assert "discard" not in [call.method for call in processor_vcs["state"].attempts]
-
-
-def test_resolve_apply_failure_stops_without_attempting_the_next_finding(
+    failed_phase: str,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
-    processor_vcs["package"].side_effect = ProcessError("package failed")
+    if failed_phase == "unit":
+        processor_vcs["phase"].side_effect = ProcessError("unit failed")
+    elif failed_phase == "apply":
+        processor_vcs["package"].side_effect = ProcessError("package failed")
+    else:
+        from maintenance_man.vcs import RevisionError
+
+        processor_vcs["state"].fail(
+            "commit", error=RevisionError("injected"), path=project_config.path
+        )
     findings = [make_update(), make_update(SemverTier.MINOR)]
 
     results = process_findings(
@@ -855,7 +843,9 @@ def test_resolve_apply_failure_stops_without_attempting_the_next_finding(
     )
 
     assert len(results) == 1
-    assert results[0].failed_phase == "apply"
+    assert results[0].failed_phase == failed_phase
+    assert findings[0].update_status == UpdateStatus.FAILED
+    assert findings[0].flow == Workflow.RESOLVE
     assert processor_vcs["package"].call_count == 1
     assert findings[1].update_status is None
     assert not any(call.method == "discard" for call in processor_vcs["state"].attempts)
@@ -933,32 +923,6 @@ def test_repository_failure_never_saves_ready(
         assert processor_vcs["package"].call_count == 1
         assert sum(call.method == "commit" for call in state.effects) == 1
         assert not any(call.method == "discard" for call in state.attempts)
-
-
-def test_resolve_commit_failure_preserves_changes_and_stops(
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    from maintenance_man.vcs import RevisionError
-
-    state = processor_vcs["state"]
-    state.fail("commit", error=RevisionError("injected"), path=project_config.path)
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.RESOLVE,
-        on_failure="stop",
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert len(results) == 1
-    assert results[0].failed_phase == "commit"
-    assert findings[0].flow == Workflow.RESOLVE
-    assert processor_vcs["package"].call_count == 1
-    assert not any(call.method == "discard" for call in state.attempts)
 
 
 def test_apply_failure_discards_and_continues(
@@ -1130,10 +1094,24 @@ def test_resolve_failure_status_is_persisted_before_stopping(
     assert saved.updates[0].flow == Workflow.RESOLVE
 
 
-def test_grouped_vulnerability_failure_is_persisted_for_every_original(
-    processor_vcs: ProcessorDeps, project_config: ProjectConfig
+@pytest.mark.parametrize(
+    ("failure", "passed", "status", "failed_phase"),
+    [
+        (True, False, UpdateStatus.FAILED, "unit"),
+        (False, True, UpdateStatus.READY, None),
+    ],
+    ids=["failure", "success"],
+)
+def test_grouped_vulnerability_result_is_persisted_for_every_original(
+    failure: bool,
+    passed: bool,
+    status: UpdateStatus,
+    failed_phase: str | None,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
 ):
-    processor_vcs["phase"].side_effect = ProcessError("unit failed")
+    if failure:
+        processor_vcs["phase"].side_effect = ProcessError("unit failed")
     vulns = [
         make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.31.0"),
         make_vuln(vuln_id="CVE-2", pkg_name="requests", fixed_version="2.32.4"),
@@ -1155,49 +1133,14 @@ def test_grouped_vulnerability_failure_is_persisted_for_every_original(
         emit=RecordingEmit(),
     )
 
-    assert [(result.kind, result.passed) for result in results] == [("vuln", False)]
+    assert [(result.kind, result.passed) for result in results] == [("vuln", passed)]
     saved = load_scan_results("demo")
     assert [
         (finding.update_status, finding.failed_phase, finding.flow)
         for finding in saved.vulnerabilities
     ] == [
-        (UpdateStatus.FAILED, "unit", Workflow.UPDATE),
-        (UpdateStatus.FAILED, "unit", Workflow.UPDATE),
-    ]
-
-
-def test_successful_consolidated_vulnerability_persists_every_original(
-    processor_vcs: ProcessorDeps, project_config: ProjectConfig
-):
-    vulns = [
-        make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.31.0"),
-        make_vuln(vuln_id="CVE-2", pkg_name="requests", fixed_version="2.32.4"),
-    ]
-    scan = ScanResult(
-        project="demo",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target=str(project_config.path),
-        vulnerabilities=vulns,
-    )
-
-    results = process_findings(
-        consolidate_vulns(vulns),
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        project_name="demo",
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert [(result.kind, result.passed) for result in results] == [("vuln", True)]
-    saved = load_scan_results("demo")
-    assert [
-        (finding.update_status, finding.failed_phase, finding.flow)
-        for finding in saved.vulnerabilities
-    ] == [
-        (UpdateStatus.READY, None, Workflow.UPDATE),
-        (UpdateStatus.READY, None, Workflow.UPDATE),
+        (status, failed_phase, Workflow.UPDATE),
+        (status, failed_phase, Workflow.UPDATE),
     ]
 
 

@@ -1057,16 +1057,7 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
     from tests.conftest import GRADLE_FIXTURES
 
     root = Path(gradle_project.path)
-    mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
-        f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
-        "scan_secrets = false\n"
-        f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n"
-    )
-    results = mm_home / "scan-results"
-    results.mkdir()
-    (results / "android.json").write_bytes(b"old result bytes")
+    results = _seed_scan_filesystem_error_config(mm_home, root)
     monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr(

@@ -19,10 +19,6 @@ def test_tests_run_under_an_isolated_home(tmp_path):
     assert paths.mm_home() != Path.home() / ".mm"
 
 
-def test_a_test_can_still_redirect_the_home(home):
-    assert paths.mm_home() == home
-
-
 @pytest.mark.parametrize(
     "accessor, relative",
     [

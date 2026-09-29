@@ -237,7 +237,10 @@ def test_deploy_all_build_failure_stops_project_and_records_failure(
         "run_build",
         lambda *args: (_ for _ in ()).throw(BuildError("build failed")),
     )
-    monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
+    deployed: list[str] = []
+    monkeypatch.setattr(
+        deploy_service, "run_deploy", lambda name, *args: deployed.append(name)
+    )
     emit = RecordingEmit()
 
     results = deploy_service.deploy_all(
@@ -249,6 +252,7 @@ def test_deploy_all_build_failure_stops_project_and_records_failure(
     )
 
     assert results == (deploy_service.DeployResult("a", "fail", "skip"),)
+    assert deployed == []
     assert emit.events[-1] == DeployStepFailed("a", DeployStep.BUILD, "build failed")
     recorded = load_activity(paths.activity_path())["a"].last_build
     assert recorded is not None

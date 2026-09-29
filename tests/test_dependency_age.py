@@ -223,7 +223,7 @@ def test_publication_candidate_age_allows_unknown_routing(
     )
     candidate = SimpleNamespace(publication_requests=(request,))
     with context:
-        result = evaluate_gradle_candidate_age(candidate, 0, context, _PUB_NOW)
+        result = evaluate_gradle_candidate_age(candidate, 7, context, _PUB_NOW)
     assert result is None
     assert calls == []
 

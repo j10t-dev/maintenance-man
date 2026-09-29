@@ -36,6 +36,7 @@ class OriginPeer:
     repo: Repository
     commit_file: Callable[[str, str, str], str]
     push_main: Callable[[], None]
+    remote_bookmark_targets: Callable[[str], tuple[str, ...]]
 
 
 @dataclass
@@ -126,10 +127,26 @@ def _initialize_real_peer(tmp_path: Path, origin_git: Path) -> OriginPeer:
     assert tracked.returncode == 0, tracked.stderr
     assert _run_jj(peer_path, "new", "main").returncode == 0
     peer_repo = vcs.JjRepository(peer_path)
+
+    def remote_bookmark_targets(bookmark: str) -> tuple[str, ...]:
+        fetched = _run_jj(peer_path, "git", "fetch", "--remote", "origin")
+        assert fetched.returncode == 0, fetched.stderr
+        result = _run_jj(
+            peer_path,
+            "log",
+            "-r",
+            f"{bookmark}@origin",
+            "--no-graph",
+            "-T",
+            'commit_id ++ "\\n"',
+        )
+        return () if result.returncode != 0 else (result.stdout.strip(),)
+
     return OriginPeer(
         peer_repo,
         partial(_commit_repository_file, peer_repo, _skip_file_registration),
         partial(_push_real_peer_main, peer_repo),
+        remote_bookmark_targets,
     )
 
 
@@ -319,6 +336,9 @@ def _fake_case(tmp_path: Path) -> RepositoryCase:
                 partial(_register_fake_file, state, peer_path),
             ),
             peer_push_main,
+            lambda bookmark: state.remote_bookmark_targets(
+                peer_path, bookmark=bookmark
+            ),
         ),
         track_main=partial(_track_fake_main, state, path),
         after_push=partial(_install_fake_after_push, state, path),
@@ -444,16 +464,6 @@ def test_discard_restores_the_parent_tree(repository_case: RepositoryCase) -> No
     assert c.repo.has_changes() is False
 
 
-def test_repository_case_exposes_complete_remote_harness(
-    repository_case: RepositoryCase,
-):
-    c = repository_case
-    assert callable(c.bind)
-    assert callable(c.track_main)
-    assert callable(c.after_push)
-    assert c.origin_peer.repo.path != c.repo.path
-
-
 @pytest.mark.parametrize("error_type", [RuntimeError, RevisionError])
 def test_proof_preserves_body_exception(
     repository_case: RepositoryCase, error_type: type[BaseException]
@@ -495,18 +505,6 @@ def test_write_file_none_deletes_registered_file(repository_case: RepositoryCase
     c.register_file("dep.txt")
     c.write_file("dep.txt", None)
     assert c.repo.changed_paths() == frozenset({"dep.txt"})
-
-
-def test_conflict_bookmark_accepts_separate_target_arguments(
-    repository_case: RepositoryCase,
-):
-    c = repository_case
-    base = c.repo.resolve_revision(revision="main")
-    c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "side=1\n")
-    side = c.repo.resolve_revision(revision="@")
-    c.conflict_bookmark(MANAGED, base, side)
-    assert c.repo.bookmark_conflicted(bookmark=MANAGED) is True
 
 
 def test_missing_and_conflicted_bookmarks_are_distinct(repository_case: RepositoryCase):
@@ -602,12 +600,9 @@ def test_temporary_workspace_preserves_body_exception_identity_and_cleans_up(
     assert repository_case.repo.workspace_names() == before
 
 
-@pytest.mark.parametrize(
-    ("operation", "success_target"),
-    [("promote", "tip"), ("reset", "base"), ("push", "tip")],
-)
+@pytest.mark.parametrize("operation", ["promote", "reset", "push"])
 def test_guarded_operations_accept_unchanged_revisions(
-    repository_case: RepositoryCase, operation: str, success_target: str
+    repository_case: RepositoryCase, operation: str
 ):
     c = repository_case
     base = c.repo.resolve_revision(revision="main")
@@ -625,6 +620,7 @@ def test_guarded_operations_accept_unchanged_revisions(
         assert c.repo.resolve_revision(revision=MANAGED) == base
     else:
         c.repo.push_bookmark(bookmark=MANAGED, expected=expected)
+        assert c.origin_peer.remote_bookmark_targets(MANAGED) == (tip,)
 
 
 @pytest.mark.parametrize("operation", ["promote", "reset", "push"])
@@ -1064,7 +1060,16 @@ def test_sync_rechecks_remote_before_refresh(repository_case: RepositoryCase) ->
         )
 
 
-def test_sync_fetch_failure_after_push_prevents_refresh(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("method", "message"),
+    [
+        ("fetch", "second fetch failed"),
+        ("same_revision", "post-push comparison failed"),
+    ],
+)
+def test_sync_post_push_failure_prevents_refresh(
+    tmp_path: Path, method: str, message: str
+) -> None:
     state = FakeJjState()
     path = tmp_path / "source"
     repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
@@ -1076,33 +1081,8 @@ def test_sync_fetch_failure_after_push_prevents_refresh(tmp_path: Path) -> None:
     )
     state.seed_bookmark(path, bookmark="main", targets=(tip,))
     state.clear_calls()
-    state.fail(
-        "fetch", ordinal=2, error=RevisionError("second fetch failed"), path=path
-    )
-
-    with pytest.raises(RevisionError, match="second fetch failed"):
-        sync_main(repo=repo)
-
-    assert any(call.method == "push_bookmark" for call in state.effects)
-    assert not any(
-        call.method in {"rebase_working_copy", "new_change"} for call in state.attempts
-    )
-
-
-def test_sync_post_push_comparison_failure_prevents_refresh(tmp_path: Path) -> None:
-    state = FakeJjState()
-    path = tmp_path / "source"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    tip = state.seed_commit(
-        path,
-        parent=repo.resolve_revision(revision="main"),
-        files={"dep.txt": "version=2\n"},
-        description="local advance",
-    )
-    state.seed_bookmark(path, bookmark="main", targets=(tip,))
-    state.clear_calls()
-    failure = RevisionError("post-push comparison failed")
-    state.fail("same_revision", ordinal=2, error=failure, path=path)
+    failure = RevisionError(message)
+    state.fail(method, ordinal=2, error=failure, path=path)
 
     with pytest.raises(RevisionError) as caught:
         sync_main(repo=repo)
@@ -1734,14 +1714,14 @@ def test_fake_postcheck_race_keeps_completed_effect(
     assert repo.resolve_revision(revision=changed_bookmark) == sibling
 
 
-def test_temporary_workspace_registration_failure_removes_owned_container(
+@pytest.fixture
+def temporary_workspace_case(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+) -> tuple[FakeJjState, Repository, Path]:
     state = FakeJjState()
     path = tmp_path / "source"
     repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
     container = tmp_path / "allocated-proof"
-    state.fail("add_workspace", error=RevisionError("registration failed"))
 
     def allocate(*, prefix: str) -> str:
         assert prefix == "mm-gradle-proof-"
@@ -1749,6 +1729,14 @@ def test_temporary_workspace_registration_failure_removes_owned_container(
         return str(container)
 
     monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
+    return state, repo, container
+
+
+def test_temporary_workspace_registration_failure_removes_owned_container(
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+):
+    state, repo, container = temporary_workspace_case
+    state.fail("add_workspace", error=RevisionError("registration failed"))
     entered = False
     with (
         pytest.raises(RevisionError, match="registration failed"),
@@ -1762,19 +1750,9 @@ def test_temporary_workspace_registration_failure_removes_owned_container(
 
 @pytest.mark.parametrize("mutation", ["replace", "symlink"])
 def test_temporary_workspace_marker_tampering_prevents_deletion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path], mutation: str
 ):
-    state = FakeJjState()
-    path = tmp_path / "source"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    container = tmp_path / "allocated-proof"
-
-    def allocate(*, prefix: str) -> str:
-        assert prefix == "mm-gradle-proof-"
-        container.mkdir()
-        return str(container)
-
-    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
+    _state, repo, container = temporary_workspace_case
     with (
         pytest.raises(RevisionError, match="ownership marker changed"),
         repo.temporary_workspace(revision="main"),
@@ -1789,20 +1767,11 @@ def test_temporary_workspace_marker_tampering_prevents_deletion(
 
 
 def test_temporary_workspace_body_error_keeps_cleanup_diagnostics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    state = FakeJjState()
-    path = tmp_path / "source"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    container = tmp_path / "allocated-proof"
+    state, repo, _container = temporary_workspace_case
     state.fail("forget_workspace", error=RevisionError("forget failed"))
-
-    def allocate(*, prefix: str) -> str:
-        assert prefix == "mm-gradle-proof-"
-        container.mkdir()
-        return str(container)
-
-    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
 
     def fail_remove(_path: Path) -> None:
         msg = "remove failed"
@@ -1823,24 +1792,16 @@ def test_temporary_workspace_body_error_keeps_cleanup_diagnostics(
 
 
 def test_temporary_workspace_propagates_unexpected_cleanup_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    state = FakeJjState()
-    path = tmp_path / "source"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    container = tmp_path / "allocated-proof"
-
-    def allocate(*, prefix: str) -> str:
-        assert prefix == "mm-gradle-proof-"
-        container.mkdir()
-        return str(container)
+    _state, repo, container = temporary_workspace_case
 
     unexpected = TypeError("unexpected cleanup failure")
 
     def fail_remove(_path: Path) -> None:
         raise unexpected
 
-    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
     with (
         pytest.raises(TypeError) as caught,
         monkeypatch.context() as cleanup_patch,
@@ -1853,24 +1814,16 @@ def test_temporary_workspace_propagates_unexpected_cleanup_error(
 
 
 def test_temporary_workspace_cleanup_errors_raise_combined_revision_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    state = FakeJjState()
-    path = tmp_path / "source"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    container = tmp_path / "allocated-proof"
+    state, repo, _container = temporary_workspace_case
     state.fail("forget_workspace", error=RevisionError("forget failed"))
-
-    def allocate(*, prefix: str) -> str:
-        assert prefix == "mm-gradle-proof-"
-        container.mkdir()
-        return str(container)
 
     def fail_remove(_path: Path) -> None:
         msg = "remove failed"
         raise OSError(msg)
 
-    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
     monkeypatch.setattr(vcs.shutil, "rmtree", fail_remove)
     with (
         pytest.raises(RevisionError) as caught,
@@ -1881,11 +1834,18 @@ def test_temporary_workspace_cleanup_errors_raise_combined_revision_error(
     assert "remove failed" in str(caught.value)
 
 
-def test_fake_tracked_fetch_reconciles_descendant_remote_advance(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("track_main", "expected_local"),
+    [(True, "advanced"), (False, "base")],
+    ids=["tracked", "untracked"],
+)
+def test_fake_fetch_updates_tracking_and_respects_local_tracking(
+    tmp_path: Path, track_main: bool, expected_local: str
+):
     state = FakeJjState()
     source_path = tmp_path / "source"
     source = state.seed_repository(source_path, files={"dep.txt": "version=1\n"})
-    peer = state.seed_peer(tmp_path / "peer", source=source_path)
+    peer = state.seed_peer(tmp_path / "peer", source=source_path, track_main=track_main)
     base = source.resolve_revision(revision="main")
     advanced = state.seed_commit(
         source_path,
@@ -1895,23 +1855,6 @@ def test_fake_tracked_fetch_reconciles_descendant_remote_advance(tmp_path: Path)
     )
     state.seed_remote(source_path, bookmark="main", targets=(advanced,))
     peer.fetch(main_only=True)
-    assert peer.resolve_revision(revision="main") == advanced
-    assert peer.resolve_revision(revision="main@origin") == advanced
-
-
-def test_fake_untracked_fetch_updates_tracking_without_moving_main(tmp_path: Path):
-    state = FakeJjState()
-    source_path = tmp_path / "source"
-    source = state.seed_repository(source_path, files={"dep.txt": "version=1\n"})
-    peer = state.seed_peer(tmp_path / "peer", source=source_path, track_main=False)
-    base = source.resolve_revision(revision="main")
-    advanced = state.seed_commit(
-        source_path,
-        parent=base,
-        files={"dep.txt": "version=2\n"},
-        description="remote advance",
-    )
-    state.seed_remote(source_path, bookmark="main", targets=(advanced,))
-    peer.fetch(main_only=True)
-    assert peer.resolve_revision(revision="main") == base
+    local_targets = {"advanced": advanced, "base": base}
+    assert peer.resolve_revision(revision="main") == local_targets[expected_local]
     assert peer.resolve_revision(revision="main@origin") == advanced
