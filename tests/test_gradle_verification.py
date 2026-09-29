@@ -846,9 +846,7 @@ def test_gradle_continue_revision_failure_after_checked_intent_is_preserved(
         ToolNotFoundError("trivy is not installed or not on PATH. hint"),
     ],
 )
-def test_gradle_flow_reports_revision_failures(
-    workflow, monkeypatch, tmp_path, capsys, error
-):
+def test_gradle_flow_reports_revision_failures(workflow, monkeypatch, capsys, error):
     monkeypatch.setattr(
         workflow_service.gradle_updater,
         "load_gradle_run",
@@ -858,7 +856,6 @@ def test_gradle_flow_reports_revision_failures(
         cli._run_gradle_flow(
             "sample",
             workflow.project,
-            tmp_path,
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
@@ -1003,9 +1000,7 @@ def test_missing_routing_declaration_allows_checked_update(workflow, minimum_age
     )
 
 
-def test_gradle_no_updates_does_not_require_build_hooks(
-    workflow, monkeypatch, tmp_path
-):
+def test_gradle_no_updates_does_not_require_build_hooks(workflow, monkeypatch):
     from maintenance_man import cli
     from maintenance_man.models.scan import ScanResult
 
@@ -1038,7 +1033,6 @@ def test_gradle_no_updates_does_not_require_build_hooks(
         cli._run_gradle_flow(
             "sample",
             project,
-            tmp_path,
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
@@ -1051,7 +1045,7 @@ def test_gradle_no_updates_does_not_require_build_hooks(
 
 
 @pytest.fixture
-def driver(workflow, resolution, monkeypatch, tmp_path):
+def driver(workflow, resolution, monkeypatch):
     from maintenance_man import cli
     from maintenance_man.models.gradle import (
         CandidateValidation,
@@ -1109,7 +1103,6 @@ def driver(workflow, resolution, monkeypatch, tmp_path):
         selection="all",
         refs={"main": base, "@-": base, "mm/update-dependencies": base},
         effects=workflow.effects,
-        results=tmp_path / "results",
         workflow=workflow,
     )
     monkeypatch.setattr(
@@ -1198,7 +1191,6 @@ def invoke_driver(driver, *, interactive=False, minimum_age_days=7, vcs=None):
     return cli._run_gradle_flow(
         "sample",
         driver.project,
-        driver.results,
         Workflow.UPDATE,
         interactive=interactive,
         minimum_age_days=minimum_age_days,
@@ -1222,7 +1214,7 @@ def test_gradle_driver_promotes_verified_update_with_residual_advisory(driver):
         "refresh",
     ]
     fresh = ScanResult.model_validate_json(
-        (driver.results / "sample.json").read_bytes()
+        (paths.scan_results_dir() / "sample.json").read_bytes()
     )
     assert len(fresh.vulnerabilities) == 1
     assert fresh.vulnerabilities[0].installed_version == "2"
@@ -1488,7 +1480,7 @@ def test_gradle_driver_retains_verified_ledger_when_final_effect_fails(
     assert not run.refreshed
     assert driver.effects.count("apply") == 1
     assert driver.effects.count("commit") == 1
-    assert not (driver.results / "sample.json").exists()
+    assert not (paths.scan_results_dir() / "sample.json").exists()
 
 
 def test_gradle_failed_attempt_prevents_finalization_after_another_group_passes(
@@ -1810,16 +1802,13 @@ def finalizer_effects(workflow, monkeypatch, run):
     return state
 
 
-def test_gradle_retry_refresh_never_reapplies_or_repromotes(
-    workflow, monkeypatch, tmp_path
-):
+def test_gradle_retry_refresh_never_reapplies_or_repromotes(workflow, monkeypatch):
     run = ready_workflow(workflow)
     state = finalizer_effects(workflow, monkeypatch, run)
     with pytest.raises(updater.GradleError, match="refresh failed"):
         workflow_service._finish_verified_gradle_run(
             run,
             workflow.project,
-            tmp_path,
             workflow.publication,
             7,
             vcs=workflow.vcs,
@@ -1831,7 +1820,6 @@ def test_gradle_retry_refresh_never_reapplies_or_repromotes(
     finished = workflow_service._finish_verified_gradle_run(
         saved,
         workflow.project,
-        tmp_path,
         workflow.publication,
         7,
         vcs=workflow.vcs,
@@ -1855,7 +1843,7 @@ def test_gradle_retry_refresh_never_reapplies_or_repromotes(
 
 
 def test_gradle_crash_after_promotion_before_ledger_is_recognized(
-    workflow, monkeypatch, tmp_path
+    workflow, monkeypatch
 ):
     run = ready_workflow(workflow)
     state = finalizer_effects(workflow, monkeypatch, run)
@@ -1874,7 +1862,6 @@ def test_gradle_crash_after_promotion_before_ledger_is_recognized(
         workflow_service._finish_verified_gradle_run(
             run,
             workflow.project,
-            tmp_path,
             workflow.publication,
             7,
             vcs=workflow.vcs,
@@ -1886,7 +1873,6 @@ def test_gradle_crash_after_promotion_before_ledger_is_recognized(
     finished = workflow_service._finish_verified_gradle_run(
         stored,
         workflow.project,
-        tmp_path,
         workflow.publication,
         7,
         vcs=workflow.vcs,
@@ -1897,7 +1883,7 @@ def test_gradle_crash_after_promotion_before_ledger_is_recognized(
 
 @pytest.mark.parametrize("mutation", ["base", "tip", "base-conflict", "tip-conflict"])
 def test_gradle_resolve_submission_guard_failure_keeps_recoverable_ledger(
-    workflow, tmp_path, mutation
+    workflow, mutation
 ):
     run = updater.process_gradle_run(
         begin_workflow(workflow, Workflow.RESOLVE),
@@ -1941,7 +1927,6 @@ def test_gradle_resolve_submission_guard_failure_keeps_recoverable_ledger(
         workflow_service._finish_verified_gradle_run(
             run,
             workflow.project,
-            tmp_path,
             workflow.publication,
             7,
             vcs=workflow.vcs,
@@ -1955,7 +1940,7 @@ def test_gradle_resolve_submission_guard_failure_keeps_recoverable_ledger(
 
 
 def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
-    workflow, tmp_path
+    workflow,
 ):
     run = updater.process_gradle_run(
         begin_workflow(workflow, Workflow.RESOLVE),
@@ -1973,7 +1958,6 @@ def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
         workflow_service._finish_verified_gradle_run(
             run,
             workflow.project,
-            tmp_path,
             workflow.publication,
             7,
             vcs=workflow.vcs,
@@ -1988,7 +1972,6 @@ def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
     finished = workflow_service._finish_verified_gradle_run(
         stored,
         workflow.project,
-        tmp_path,
         workflow.publication,
         7,
         vcs=workflow.vcs,
@@ -2100,9 +2083,7 @@ def test_gradle_rejected_snapshot_survives_resolve_retry(workflow, monkeypatch):
     assert workflow.effects.count("apply") == applies_before_retry == 1
 
 
-def test_gradle_cli_uses_ledger_even_without_scan_results(
-    workflow, monkeypatch, tmp_path
-):
+def test_gradle_cli_uses_ledger_even_without_scan_results(workflow, monkeypatch):
     run = ready_workflow(workflow)
     source_repo = workflow.vcs.repository(workflow.project.path)
     workspace = workflow_service.workspace_path_for_project("sample")
@@ -2133,7 +2114,6 @@ def test_gradle_cli_uses_ledger_even_without_scan_results(
         cli._run_gradle_flow(
             "sample",
             workflow.project,
-            tmp_path,
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
@@ -2145,7 +2125,7 @@ def test_gradle_cli_uses_ledger_even_without_scan_results(
 
 
 def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
-    workflow, monkeypatch, tmp_path
+    workflow, monkeypatch
 ):
     from maintenance_man.models.scan import ScanResult, UpdateStatus
 
@@ -2166,7 +2146,6 @@ def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
         cli._run_gradle_flow(
             "sample",
             workflow.project,
-            tmp_path,
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=7,
@@ -2313,7 +2292,7 @@ def test_gradle_failed_update_restart_refuses_uncertain_dirty_state(
     "mutation", ["none", "dirty", "unrelated-parent", "working-tree", "accepted-tree"]
 )
 def test_gradle_resume_requires_exact_empty_accepted_child(
-    workflow, monkeypatch, tmp_path, mutation
+    workflow, monkeypatch, mutation
 ):
     run = ready_workflow(workflow)
     source_repo = workflow.vcs.repository(workflow.project.path)
@@ -2377,7 +2356,6 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
     result = cli._run_gradle_flow(
         "sample",
         workflow.project,
-        tmp_path,
         Workflow.UPDATE,
         interactive=False,
         minimum_age_days=7,
@@ -2392,7 +2370,7 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
 
 
 def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
-    workflow, monkeypatch, tmp_path
+    workflow, monkeypatch
 ):
     failed = updater.process_gradle_run(
         begin_workflow(workflow, Workflow.RESOLVE),
@@ -2437,7 +2415,6 @@ def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
         cli._run_gradle_flow(
             "sample",
             workflow.project,
-            tmp_path,
             Workflow.RESOLVE,
             interactive=False,
             minimum_age_days=7,
@@ -2539,7 +2516,7 @@ def test_gradle_fresh_scan_does_not_clear_unfinished_ledger(driver, monkeypatch)
     "refreshed,published_exists", [(False, False), (True, False), (True, True)]
 )
 def test_gradle_result_render_uses_durable_or_published_evidence(
-    workflow, monkeypatch, tmp_path, refreshed, published_exists
+    workflow, monkeypatch, refreshed, published_exists
 ):
     from maintenance_man.models.scan import ScanResult
 
@@ -2572,7 +2549,7 @@ def test_gradle_result_render_uses_durable_or_published_evidence(
     summaries = []
     monkeypatch.setattr(cli, "_print_gradle_run_summary", summaries.append)
     before = run.model_dump_json()
-    cli._print_gradle_run_result(run, workflow.project, tmp_path)
+    cli._print_gradle_run_result(run, workflow.project)
     assert len(rendered) == 1
     result, options = rendered[0]
     assert options == {}

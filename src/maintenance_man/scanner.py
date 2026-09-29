@@ -117,7 +117,7 @@ def scan_project(
             else None
         ),
     )
-    save_scan_results(name, paths.scan_results_dir(), scan_result)
+    save_scan_results(name, scan_result)
     return scan_result
 
 

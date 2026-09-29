@@ -35,7 +35,6 @@ class FakeFindingProcessor:
         on_failure: str = "continue",
         scan_result: ScanResult | None = None,
         project_name: str = "",
-        results_dir: Path | None = None,
         vcs: VcsServices | None = None,
     ) -> list[UpdateResult]:
         del cfg
@@ -59,8 +58,8 @@ class FakeFindingProcessor:
                 finding.update_status = UpdateStatus.FAILED
                 finding.failed_phase = failed_phase
             finding.flow = flow
-            if scan_result is not None and results_dir is not None:
-                save_scan_results(project_name, results_dir, scan_result)
+            if scan_result is not None:
+                save_scan_results(project_name, scan_result)
             results.append(
                 UpdateResult(
                     pkg_name=finding.pkg_name,

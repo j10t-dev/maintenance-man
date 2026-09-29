@@ -59,7 +59,7 @@ def test_scan_project_saves_through_storage(mm_home, tmp_path, monkeypatch):
     _quiet_uv_scan(monkeypatch)
     project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
     result = scanner.scan_project("demo", project)
-    assert load_scan_results("demo", mm_home / "scan-results") == result
+    assert load_scan_results("demo") == result
 
 
 def test_scan_project_replaces_results_symlink(mm_home, tmp_path, monkeypatch):

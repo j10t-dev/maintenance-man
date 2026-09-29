@@ -405,7 +405,6 @@ def _update_batch_targets(
     """Update an explicit ordered set of projects, auto-selecting all findings."""
     _exit_if_no_update_targets(cfg, target_names)
 
-    results_dir = paths.scan_results_dir()
     all_project_results: list[tuple[str, list[UpdateResult]]] = []
     had_errors = False
     gradle_reported = False
@@ -427,7 +426,6 @@ def _update_batch_targets(
         outcome = _update_batch(
             name,
             proj_config,
-            results_dir,
             cfg.defaults.min_version_age_days,
             vcs=vcs,
         )
@@ -559,7 +557,6 @@ def _process_selected_vulns(
     work_config: ProjectConfig,
     scan_result: ScanResult,
     project: str,
-    results_dir: Path,
     *,
     vcs: VcsServices,
 ) -> list[UpdateResult]:
@@ -572,7 +569,6 @@ def _process_selected_vulns(
         flow=Workflow.UPDATE,
         scan_result=scan_result,
         project_name=project,
-        results_dir=results_dir,
         vcs=vcs,
     )
 
@@ -582,7 +578,6 @@ def _process_selected_updates(
     work_config: ProjectConfig,
     scan_result: ScanResult,
     project: str,
-    results_dir: Path,
     *,
     vcs: VcsServices,
 ) -> list[UpdateResult]:
@@ -595,7 +590,6 @@ def _process_selected_updates(
         flow=Workflow.UPDATE,
         scan_result=scan_result,
         project_name=project,
-        results_dir=results_dir,
         vcs=vcs,
     )
 
@@ -606,7 +600,6 @@ def _process_selected_findings(
     work_config: ProjectConfig,
     scan_result: ScanResult,
     project: str,
-    results_dir: Path,
     *,
     vcs: VcsServices,
 ) -> list[UpdateResult]:
@@ -628,7 +621,6 @@ def _process_selected_findings(
         flow=Workflow.UPDATE,
         scan_result=scan_result,
         project_name=project,
-        results_dir=results_dir,
         vcs=vcs,
     )
 
@@ -720,7 +712,6 @@ def _finalise_local_update(
     orig_path: Path,
     scan_result: ScanResult,
     project_name: str,
-    results_dir: Path,
     *,
     vcs: VcsServices,
 ) -> bool:
@@ -751,7 +742,7 @@ def _finalise_local_update(
             u.update_status = UpdateStatus.COMPLETED
 
     remove_completed_findings(scan_result)
-    save_scan_results(project_name, results_dir, scan_result)
+    save_scan_results(project_name, scan_result)
     console.print(f"[bold green]Promoted {bookmark} to main.[/]")
     return True
 
@@ -766,12 +757,11 @@ def _warn_missing_test_config(project: str, proj_config: ProjectConfig) -> None:
 
 def _load_validated_scan(
     project: str,
-    results_dir: Path,
     proj_config: ProjectConfig,
     workflow: Workflow,
 ) -> tuple[ScanResult, list[VulnFinding], list[UpdateFinding]]:
     try:
-        scan_result = load_scan_results(project, results_dir)
+        scan_result = load_scan_results(project)
     except NoScanResultsError:
         console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
         sys.exit(ExitCode.OK)
@@ -903,7 +893,6 @@ def _run_resolve_findings(
     project: str,
     proj_config: ProjectConfig,
     scan_result: ScanResult,
-    results_dir: Path,
     findings: list[Finding],
     *,
     vcs: VcsServices,
@@ -915,7 +904,6 @@ def _run_resolve_findings(
         flow=Workflow.RESOLVE,
         scan_result=scan_result,
         project_name=project,
-        results_dir=results_dir,
         on_failure="stop",
         vcs=vcs,
     )
@@ -929,14 +917,13 @@ def _run_resolve_findings(
     ready_findings = _ordered_ready_findings(scan_result, flow=Workflow.RESOLVE)
     if scan_result.blocked_findings:
         _print_blocked_findings(scan_result)
-        save_scan_results(project, results_dir, scan_result)
+        save_scan_results(project, scan_result)
         return ExitCode.UPDATE_FAILED
     if not ready_findings:
         return ExitCode.OK
     return _submit_resolve_bookmark(
         project,
         proj_config.path,
-        results_dir,
         scan_result,
         ready_findings,
         vcs=vcs,
@@ -946,7 +933,6 @@ def _run_resolve_findings(
 def _submit_resolve_bookmark(
     project: str,
     project_path: Path,
-    results_dir: Path,
     scan_result: ScanResult,
     ready_findings: list[Finding],
     *,
@@ -960,7 +946,7 @@ def _submit_resolve_bookmark(
             "  [bold yellow]Not submitting:[/] blocked findings remain. "
             "Rescan or resolve them manually."
         )
-        save_scan_results(project, results_dir, scan_result)
+        save_scan_results(project, scan_result)
         return ExitCode.UPDATE_FAILED
     for f in ready_findings:
         f.failed_phase = None
@@ -972,7 +958,7 @@ def _submit_resolve_bookmark(
             bookmark=bookmark,
         )
     except (RevisionError, CodeHostError) as exc:
-        save_scan_results(project, results_dir, scan_result)
+        save_scan_results(project, scan_result)
         console.print(f"  [dim]{exc}[/]")
         console.print(
             f"  [bold yellow]Submit failed.[/] Keeping {bookmark} for manual recovery."
@@ -986,7 +972,7 @@ def _submit_resolve_bookmark(
         f.failed_phase = None
         f.flow = None
     remove_completed_findings(scan_result)
-    save_scan_results(project, results_dir, scan_result)
+    save_scan_results(project, scan_result)
     return ExitCode.OK
 
 
@@ -1450,11 +1436,10 @@ def list_projects(
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         return
 
-    results_dir = paths.scan_results_dir()
     scan_results: dict[str, ScanResult] = {}
     for name in cfg.projects:
         try:
-            scan_results[name] = load_scan_results(name, results_dir)
+            scan_results[name] = load_scan_results(name)
         except NoScanResultsError:
             pass
         except Exception:
@@ -1760,7 +1745,6 @@ def _run_update_flow(
     project: str,
     proj_config: ProjectConfig,
     scan_result: ScanResult,
-    results_dir: Path,
     actionable_vulns: list[VulnFinding],
     updates: list[UpdateFinding],
     *,
@@ -1790,7 +1774,6 @@ def _run_update_flow(
             work_config,
             scan_result,
             project,
-            results_dir,
             vcs=vcs,
         )
         _print_update_summary(all_results)
@@ -1801,7 +1784,7 @@ def _run_update_flow(
         ):
             return ExitCode.UPDATE_FAILED
         finalised = _finalise_local_update(
-            proj_config.path, scan_result, project, results_dir, vcs=vcs
+            proj_config.path, scan_result, project, vcs=vcs
         )
     finally:
         try:
@@ -1824,7 +1807,6 @@ def _run_update_flow(
 def _update_batch(
     project: str,
     proj_config: ProjectConfig,
-    results_dir: Path,
     minimum_age_days: int,
     *,
     vcs: VcsServices,
@@ -1840,7 +1822,6 @@ def _update_batch(
         code = _run_gradle_flow(
             project,
             proj_config,
-            results_dir,
             Workflow.UPDATE,
             interactive=False,
             minimum_age_days=minimum_age_days,
@@ -1848,7 +1829,7 @@ def _update_batch(
         )
         return ([], code != ExitCode.OK)
     try:
-        scan_result = load_scan_results(project, results_dir)
+        scan_result = load_scan_results(project)
     except NoScanResultsError:
         return ([], False)
     try:
@@ -1879,7 +1860,6 @@ def _update_batch(
             work_config,
             scan_result,
             project,
-            results_dir,
             vcs=vcs,
         )
         any_failed_result = any(not r.passed for r in all_results)
@@ -1889,7 +1869,7 @@ def _update_batch(
         ):
             promotion_attempted = True
             finalised = _finalise_local_update(
-                proj_config.path, scan_result, project, results_dir, vcs=vcs
+                proj_config.path, scan_result, project, vcs=vcs
             )
     finally:
         try:
@@ -1915,13 +1895,11 @@ def _update_batch(
 def _update_interactive(cfg: MmConfig, project: str, *, vcs: VcsServices) -> NoReturn:
     """Update a single project with interactive selection."""
     proj_config = _resolve_proj(cfg, project)
-    results_dir = paths.scan_results_dir()
     if proj_config.package_manager == "gradle":
         sys.exit(
             _run_gradle_flow(
                 project,
                 proj_config,
-                results_dir,
                 Workflow.UPDATE,
                 interactive=True,
                 minimum_age_days=cfg.defaults.min_version_age_days,
@@ -1929,13 +1907,12 @@ def _update_interactive(cfg: MmConfig, project: str, *, vcs: VcsServices) -> NoR
             )
         )
     scan_result, actionable_vulns, updates = _load_validated_scan(
-        project, results_dir, proj_config, Workflow.UPDATE
+        project, proj_config, Workflow.UPDATE
     )
     exit_code = _run_update_flow(
         project,
         proj_config,
         scan_result,
-        results_dir,
         actionable_vulns,
         updates,
         interactive=True,
@@ -1968,7 +1945,6 @@ def resolve(
     """
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
-    results_dir = paths.scan_results_dir()
     minimum_age_days = cfg.defaults.min_version_age_days
     try:
         _require_vcs_tools()
@@ -1980,7 +1956,6 @@ def resolve(
             _run_gradle_flow(
                 project,
                 proj_config,
-                results_dir,
                 Workflow.RESOLVE,
                 interactive=False,
                 minimum_age_days=minimum_age_days,
@@ -1988,15 +1963,9 @@ def resolve(
                 vcs=vcs,
             )
         )
-    scan_result, _, _ = _load_validated_scan(
-        project, results_dir, proj_config, Workflow.RESOLVE
-    )
+    scan_result, _, _ = _load_validated_scan(project, proj_config, Workflow.RESOLVE)
     if continue_:
-        sys.exit(
-            _handle_resolve_continue(
-                project, proj_config, scan_result, results_dir, vcs=vcs
-            )
-        )
+        sys.exit(_handle_resolve_continue(project, proj_config, scan_result, vcs=vcs))
     candidates = _ordered_resolve_candidates(scan_result)
     try:
         repo = vcs.repository(proj_config.path)
@@ -2017,7 +1986,6 @@ def resolve(
             project,
             proj_config,
             scan_result,
-            results_dir,
             candidates,
             vcs=vcs,
         )
@@ -2028,7 +1996,6 @@ def _handle_resolve_continue(
     project: str,
     proj_config: ProjectConfig,
     scan_result: ScanResult,
-    results_dir: Path,
     *,
     vcs: VcsServices,
 ) -> int:
@@ -2055,7 +2022,7 @@ def _handle_resolve_continue(
                 blocker.update_status = UpdateStatus.FAILED
                 blocker.failed_phase = failed_phase
         if not passed:
-            save_scan_results(project, results_dir, scan_result)
+            save_scan_results(project, scan_result)
             names = ", ".join(b.pkg_name for b in failed)
             console.print(
                 f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
@@ -2064,19 +2031,18 @@ def _handle_resolve_continue(
         try:
             repo.set_bookmark(bookmark=bookmark, revision="@-")
         except RevisionError:
-            save_scan_results(project, results_dir, scan_result)
+            save_scan_results(project, scan_result)
             _fatal(f"could not move {bookmark} to the committed manual fix")
         for blocker in failed:
             blocker.update_status = UpdateStatus.READY
             blocker.failed_phase = None
-        save_scan_results(project, results_dir, scan_result)
+        save_scan_results(project, scan_result)
         for blocker in failed:
             console.print(f"  [bold green]PASS[/] {blocker.pkg_name}")
     return _run_resolve_findings(
         project,
         proj_config,
         scan_result,
-        results_dir,
         _ordered_resolve_candidates(scan_result),
         vcs=vcs,
     )
@@ -2242,14 +2208,12 @@ def _print_blocked_findings(scan_result: ScanResult) -> None:
         )
 
 
-def _print_gradle_run_result(
-    run: GradleRun, project: ProjectConfig, results_dir: Path
-) -> None:
+def _print_gradle_run_result(run: GradleRun, project: ProjectConfig) -> None:
     result = None
     if run.refreshed:
         # A removed results file must not hide durable residual evidence.
         with contextlib.suppress(NoScanResultsError):
-            result = load_scan_results(run.project, results_dir)
+            result = load_scan_results(run.project)
     if result is None:
         result = ScanResult(
             project=run.project,
@@ -2267,7 +2231,6 @@ def _print_gradle_run_result(
 def _run_gradle_flow(
     project_name: str,
     project: ProjectConfig,
-    results_dir: Path,
     flow: Workflow,
     *,
     interactive: bool,
@@ -2278,7 +2241,6 @@ def _run_gradle_flow(
     return gradle_workflow.run_gradle_flow(
         project_name,
         project,
-        results_dir,
         flow,
         interactive=interactive,
         minimum_age_days=minimum_age_days,

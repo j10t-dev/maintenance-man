@@ -364,7 +364,7 @@ class TestResolveSubmit:
             app(["resolve", "vulnerable"])
 
         assert exc_info.value.code == 0
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities == []
         assert saved.updates == []
 
@@ -388,7 +388,7 @@ class TestResolveSubmit:
             app(["resolve", "vulnerable"])
 
         assert exc_info.value.code == 4
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities[0].update_status == UpdateStatus.READY
         assert saved.vulnerabilities[0].flow == Workflow.RESOLVE
         assert saved.vulnerabilities[0].failed_phase is None
@@ -413,9 +413,7 @@ class TestResolveSubmit:
 
         assert retry.value.code == 0
         assert [call.method for call in host.attempts].count("create_pr") == 2
-        completed = load_scan_results(
-            "vulnerable", mm_home_with_projects / "scan-results"
-        )
+        completed = load_scan_results("vulnerable")
         assert [finding.pkg_name for finding in completed.findings] == ["unrelated"]
 
     def test_push_failure_never_calls_host_and_retains_ready_state(
@@ -437,7 +435,7 @@ class TestResolveSubmit:
 
         assert exc_info.value.code == ExitCode.UPDATE_FAILED
         assert not any(call.method == "create_pr" for call in host.attempts)
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert all(
             finding.update_status == UpdateStatus.READY for finding in saved.findings
         )
@@ -608,7 +606,7 @@ class TestResolveContinue:
         assert state.remote_bookmark_targets(path, bookmark=_RESOLVE_BOOKMARK) == (
             manual_tip,
         )
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert not saved.findings
 
     def test_continue_passing_tests_promotes_blocker_to_ready(
@@ -636,7 +634,7 @@ class TestResolveContinue:
             call.method == "set_bookmark"
             for call in mock_resolve_cli_deps["vcs_state"].effects
         )
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities == []
 
     def test_continue_bookmark_move_failure_does_not_save_ready_state(
@@ -665,7 +663,7 @@ class TestResolveContinue:
             app(["resolve", "vulnerable", "--continue"])
 
         assert exc_info.value.code == 1
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities[0].update_status == UpdateStatus.FAILED
         assert saved.vulnerabilities[0].flow == Workflow.RESOLVE
         assert blocker.update_status == UpdateStatus.FAILED
@@ -713,7 +711,7 @@ class TestResolveContinue:
             app(["resolve", "vulnerable", "--continue"])
 
         assert exc_info.value.code == 4
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities[0].update_status == UpdateStatus.FAILED
         assert saved.vulnerabilities[0].failed_phase == "unit"
         assert saved.vulnerabilities[0].flow == Workflow.RESOLVE
@@ -745,7 +743,7 @@ class TestResolveContinue:
             app(["resolve", "vulnerable", "--continue"])
 
         assert exc_info.value.code == 0
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities == []
 
     def test_continue_with_no_failed_blockers_exits_noop(

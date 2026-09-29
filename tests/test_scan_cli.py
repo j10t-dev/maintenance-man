@@ -78,7 +78,7 @@ def test_housekeeping_failure_still_saves_scan(
 
     assert f"{failure} unavailable" in capsys.readouterr().out
     assert repo.bookmark_exists(bookmark="mm/update-dependencies")
-    saved = load_scan_results("demo", mm_home / "scan-results")
+    saved = load_scan_results("demo")
     assert saved.project == "demo"
     assert saved.vulnerabilities == []
     assert saved.updates == []

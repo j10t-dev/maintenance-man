@@ -47,7 +47,7 @@ def _use_real_mixed_processor(
 ) -> tuple[MagicMock, MagicMock]:
     from maintenance_man import updater
 
-    save_scan_results("outdated", home / "scan-results", make_scan_result())
+    save_scan_results("outdated", make_scan_result())
     project_path = deps["project_paths"]["outdated"]
     state = deps["vcs_state"]
     state.register_files(project_path, "package.json")
@@ -180,9 +180,7 @@ class TestSharedCommandPrerequisites:
                 finding.flow = None
         from maintenance_man.storage import save_scan_results
 
-        save_scan_results(
-            "no-tests", mm_home_with_projects / "scan-results", scan_result
-        )
+        save_scan_results("no-tests", scan_result)
         monkeypatch.setattr(
             "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
@@ -243,7 +241,7 @@ def test_batch_reports_bookmark_access_error_without_requesting_rescan(
     from maintenance_man.storage import save_scan_results
     from maintenance_man.vcs import RevisionError
 
-    save_scan_results("example", tmp_path, scan)
+    save_scan_results("example", scan)
     project = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
     state = FakeJjState()
     state.seed_repository(tmp_path, files={"dep.txt": "version=1\n"})
@@ -252,9 +250,7 @@ def test_batch_reports_bookmark_access_error_without_requesting_rescan(
         error=RevisionError("permission denied"),
         path=tmp_path,
     )
-    assert (
-        cli._update_batch("example", project, tmp_path, 7, vcs=state.services()) is None
-    )
+    assert cli._update_batch("example", project, 7, vcs=state.services()) is None
     output = " ".join(capsys.readouterr().out.split())
     assert "permission denied" in output
     assert "rescan required" not in output
@@ -332,7 +328,7 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable", "clean"])
 
         assert exc_info.value.code == ExitCode.UPDATE_FAILED
-        clean = load_scan_results("clean", mm_home_with_projects / "scan-results")
+        clean = load_scan_results("clean")
         assert not clean.findings
 
 
@@ -435,7 +431,7 @@ class TestUpdateCrossCategoryStops:
 
         assert exc_info.value.code == ExitCode.UPDATE_FAILED
         assert package.call_count == 1
-        saved = load_scan_results("outdated", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("outdated")
         assert saved.vulnerabilities[0].update_status == UpdateStatus.FAILED
         assert saved.updates[0].update_status is None
 
@@ -455,7 +451,7 @@ class TestUpdateCrossCategoryStops:
 
         assert exc_info.value.code == ExitCode.UPDATE_FAILED
         assert package.call_count == 2
-        saved = load_scan_results("outdated", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("outdated")
         assert saved.vulnerabilities[0].update_status == UpdateStatus.FAILED
         assert saved.updates[0].update_status == UpdateStatus.READY
 
@@ -636,9 +632,7 @@ class TestUpdateResume:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
         mock_prompt.assert_not_called()
-        assert not load_scan_results(
-            "vulnerable", mm_home_with_projects / "scan-results"
-        ).findings
+        assert not load_scan_results("vulnerable").findings
 
     def test_resume_shows_only_failed_findings(
         self,
@@ -687,9 +681,7 @@ class TestUpdateResume:
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
-        assert not load_scan_results(
-            "vulnerable", mm_home_with_projects / "scan-results"
-        ).findings
+        assert not load_scan_results("vulnerable").findings
 
     def test_resume_does_not_sync_or_rebase(
         self,
@@ -751,7 +743,7 @@ class TestUpdateFinalise:
 
         assert exc_info.value.code == 0
         # remove_completed_findings removes promoted findings from the result
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities == []
         assert saved.updates == []
 
@@ -788,7 +780,7 @@ class TestUpdateFinalise:
         output = capsys.readouterr().out
         assert expected_message in output
         assert exc_info.value.code == 4
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities[0].update_status == UpdateStatus.READY
         assert saved.vulnerabilities[0].flow == Workflow.UPDATE
         assert saved.vulnerabilities[0].failed_phase is None
@@ -819,7 +811,7 @@ class TestUpdateFinalise:
         assert not any(
             call.method == "promote_bookmark_to_main" for call in state.attempts
         )
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities[0].update_status == UpdateStatus.FAILED
 
     def test_promote_removes_workspace_before_deleting_bookmark(
@@ -873,7 +865,7 @@ class TestUpdateFinalise:
         repo = mock_update_cli_deps["services"].repository(project_path)
         assert repo.same_revision(left="main", right="mm/update-dependencies")
         assert (project_path / "mm-fixture-some-pkg.txt").read_text() == "1.0.1"
-        saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("vulnerable")
         assert not saved.findings
 
     def test_failed_workspace_removal_retains_directory_and_reports_failure(
@@ -951,7 +943,7 @@ class TestUpdateAll:
             app(["update"])
         assert exc_info.value.code == 0
         for project in mock_update_cli_deps["project_paths"]:
-            saved = load_scan_results(project, mm_home_with_projects / "scan-results")
+            saved = load_scan_results(project)
             assert not saved.findings
 
     def test_any_failure_exits_4(
@@ -1008,7 +1000,7 @@ class TestUpdateAll:
         assert not clean_repo.bookmark_exists(bookmark="mm/update-dependencies")
         assert (clean_path / "mm-fixture-some-pkg.txt").read_text() == "1.0.1"
         for project in ("vulnerable", "clean"):
-            saved = load_scan_results(project, mm_home_with_projects / "scan-results")
+            saved = load_scan_results(project)
             assert not saved.findings
 
     def test_batch_no_test_config_does_not_abort(
@@ -1026,7 +1018,7 @@ class TestUpdateAll:
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "no-tests"])
         assert exc_info.value.code == 0
-        saved = load_scan_results("no-tests", mm_home_with_projects / "scan-results")
+        saved = load_scan_results("no-tests")
         assert not saved.findings
 
 
@@ -1070,7 +1062,7 @@ def test_update_end_to_end_uses_one_graph_and_persists_completion(
     assert not repo.bookmark_exists(bookmark="mm/update-dependencies")
     assert "mm-vulnerable" not in repo.workspace_names()
     assert not (mm_home_with_projects / "workspaces" / "vulnerable").exists()
-    saved = load_scan_results("vulnerable", mm_home_with_projects / "scan-results")
+    saved = load_scan_results("vulnerable")
     assert [finding.pkg_name for finding in saved.findings] == ["unrelated"]
     effects = [call.method for call in state.effects]
     assert effects.index("promote_bookmark_to_main") < effects.index(

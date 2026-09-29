@@ -227,7 +227,6 @@ def process_vulns(
     flow: Workflow,
     scan_result: ScanResult | None = None,
     project_name: str = "",
-    results_dir: Path | None = None,
     vcs: VcsServices | None = None,
 ) -> list[UpdateResult]:
     """Process vuln fixes in the single-bookmark update flow."""
@@ -241,7 +240,6 @@ def process_vulns(
         flow=flow,
         scan_result=scan_result,
         project_name=project_name,
-        results_dir=results_dir,
         vcs=vcs_services,
     )
 
@@ -253,7 +251,6 @@ def process_updates(
     flow: Workflow,
     scan_result: ScanResult | None = None,
     project_name: str = "",
-    results_dir: Path | None = None,
     vcs: VcsServices | None = None,
 ) -> list[UpdateResult]:
     """Process updates in the single-bookmark update flow, risk-ascending."""
@@ -266,7 +263,6 @@ def process_updates(
         flow=flow,
         scan_result=scan_result,
         project_name=project_name,
-        results_dir=results_dir,
         vcs=vcs_services,
     )
 
@@ -313,7 +309,6 @@ def process_findings(
     on_failure: FailureStrategy = "continue",
     scan_result: ScanResult | None = None,
     project_name: str = "",
-    results_dir: Path | None = None,
     vcs: VcsServices | None = None,
 ) -> list[UpdateResult]:
     """Process findings on the current jj change.
@@ -354,7 +349,6 @@ def process_findings(
                 scan_result,
                 flow,
                 project_name,
-                results_dir,
                 vcs=vcs_services,
                 repo=repo,
                 discard=on_failure == "continue",
@@ -381,7 +375,6 @@ def process_findings(
                     scan_result,
                     flow,
                     project_name,
-                    results_dir,
                     vcs=vcs_services,
                     repo=repo,
                     discard=False,
@@ -412,7 +405,6 @@ def process_findings(
                         scan_result,
                         flow,
                         project_name,
-                        results_dir,
                         vcs=vcs_services,
                         repo=repo,
                         discard=on_failure == "continue",
@@ -433,7 +425,6 @@ def process_findings(
                         scan_result,
                         flow,
                         project_name,
-                        results_dir,
                         vcs=vcs_services,
                         repo=repo,
                         discard=False,
@@ -454,7 +445,6 @@ def process_findings(
                 scan_result,
                 flow,
                 project_name,
-                results_dir,
                 vcs=vcs_services,
                 repo=repo,
                 discard=on_failure == "continue",
@@ -466,7 +456,7 @@ def process_findings(
                 break
             continue
 
-        _persist_status(scan_result, project_name, results_dir)
+        _persist_status(scan_result, project_name)
         results.append(
             UpdateResult(
                 pkg_name=f.pkg_name,
@@ -501,7 +491,6 @@ def _record_failure(
     scan_result: ScanResult | None,
     flow: Workflow,
     project_name: str,
-    results_dir: Path | None,
     *,
     vcs: VcsServices,
     repo: Repository,
@@ -511,7 +500,7 @@ def _record_failure(
     finding.update_status = UpdateStatus.FAILED
     finding.failed_phase = phase
     finding.flow = flow
-    _persist_status(scan_result, project_name, results_dir)
+    _persist_status(scan_result, project_name)
     result = UpdateResult(
         pkg_name=finding.pkg_name,
         kind=kind,
@@ -530,11 +519,10 @@ def _record_failure(
 def _persist_status(
     scan_result: ScanResult | None,
     project_name: str,
-    results_dir: Path | None,
 ) -> None:
-    """Save scan results if tracking args are provided."""
-    if scan_result is not None and results_dir is not None:
-        save_scan_results(project_name, results_dir, scan_result)
+    """Save scan results when a scan result is provided."""
+    if scan_result is not None:
+        save_scan_results(project_name, scan_result)
 
 
 def _apply_update(

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man import storage
+from maintenance_man import paths, storage
 from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,
@@ -84,28 +84,27 @@ def test_new_file_mode_follows_umask(tmp_path, kwargs, expected):
     assert stat.S_IMODE((tmp_path / "state.json").stat().st_mode) == expected
 
 
-def test_save_creates_directory_and_round_trips(tmp_path):
-    results_dir = tmp_path / "missing" / "scan-results"
+def test_save_creates_directory_and_round_trips():
     result = make_scan_result()
-    save_scan_results("vulnerable", results_dir, result)
-    assert load_scan_results("vulnerable", results_dir) == result
+    save_scan_results("vulnerable", result)
+    assert load_scan_results("vulnerable") == result
 
 
-def test_scan_results_reject_empty_name(tmp_path):
+def test_scan_results_reject_empty_name():
     with pytest.raises(ValueError):
-        save_scan_results("", tmp_path, make_scan_result())
+        save_scan_results("", make_scan_result())
     with pytest.raises(ValueError):
-        load_scan_results("", tmp_path)
+        load_scan_results("")
 
 
 def test_save_replaces_symlink_and_leaves_target(tmp_path):
-    results_dir = tmp_path / "scan-results"
-    results_dir.mkdir()
+    scan_dir = paths.scan_results_dir()
+    scan_dir.mkdir(parents=True)
     outside = tmp_path / "outside.json"
     outside.write_text("keep")
-    (results_dir / "vulnerable.json").symlink_to(outside)
-    save_scan_results("vulnerable", results_dir, make_scan_result())
-    assert not (results_dir / "vulnerable.json").is_symlink()
+    (scan_dir / "vulnerable.json").symlink_to(outside)
+    save_scan_results("vulnerable", make_scan_result())
+    assert not (scan_dir / "vulnerable.json").is_symlink()
     assert outside.read_text() == "keep"
 
 
@@ -124,7 +123,7 @@ def test_record_activity_replaces_symlink_and_leaves_target(tmp_path):
 
 class TestSaveScanResults:
     def test_writes_json_to_disk(self, scan_results_dir: Path, scan_result: ScanResult):
-        save_scan_results("myapp", scan_results_dir, scan_result)
+        save_scan_results("myapp", scan_result)
 
         data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
         assert data["project"] == "myapp"
@@ -144,7 +143,7 @@ class TestSaveScanResults:
                 ),
             ],
         )
-        save_scan_results("myapp", scan_results_dir, result)
+        save_scan_results("myapp", result)
 
         data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
         assert data["updates"][0]["update_status"] == "completed"
@@ -163,9 +162,9 @@ class TestLoadScanResults:
         (scan_results_dir / "myapp.json").write_text(
             result.model_dump_json(indent=2), encoding="utf-8"
         )
-        loaded = load_scan_results("myapp", scan_results_dir)
+        loaded = load_scan_results("myapp")
         assert loaded.project == "myapp"
 
     def test_load_missing(self, scan_results_dir: Path):
         with pytest.raises(NoScanResultsError, match="nonexistent"):
-            load_scan_results("nonexistent", scan_results_dir)
+            load_scan_results("nonexistent")

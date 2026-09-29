@@ -85,7 +85,7 @@ class GradleInteraction:
     """Presentation and environment checks supplied by the CLI."""
 
     choose: Callable[[tuple[GradleCandidate, ...]], tuple[GradleCandidate, ...]]
-    report: Callable[[GradleRun, ProjectConfig, Path], None]
+    report: Callable[[GradleRun, ProjectConfig], None]
     report_scan: Callable[[ScanResult], None]
     workspace_revision: Callable[[str, ProjectConfig, str], str]
 
@@ -196,7 +196,6 @@ def _complete_gradle_attempts(run: GradleRun) -> GradleRun:
 def _publish_verified_gradle_scan(
     run: GradleRun,
     project: ProjectConfig,
-    results_dir: Path,
     publication: PublicationLookupContext,
     minimum_age_days: int,
     *,
@@ -231,8 +230,7 @@ def _publish_verified_gradle_scan(
     )
     if repo.tree_id() != run.accepted_snapshot.tree_id:
         raise GradleError("Source changed while publishing verified findings")
-    results_dir.mkdir(parents=True, exist_ok=True)
-    save_scan_results(run.project, results_dir, fresh)
+    save_scan_results(run.project, fresh)
 
 
 def _require_gradle_accepted_workspace(
@@ -260,7 +258,6 @@ def _require_gradle_accepted_workspace(
 def _finish_verified_gradle_run(
     run: GradleRun,
     project: ProjectConfig,
-    results_dir: Path,
     publication: PublicationLookupContext,
     minimum_age_days: int,
     *,
@@ -321,7 +318,6 @@ def _finish_verified_gradle_run(
         _publish_verified_gradle_scan(
             run,
             project,
-            results_dir,
             publication,
             minimum_age_days,
             vcs=vcs,
@@ -391,14 +387,13 @@ def _archive_rolled_back_gradle_run(
 def _new_gradle_workspace(
     project_name: str,
     project: ProjectConfig,
-    results_dir: Path,
     flow: Workflow,
     interaction: GradleInteraction,
     *,
     vcs: VcsServices,
 ) -> tuple[ProjectConfig, str]:
     try:
-        scan_result = load_scan_results(project_name, results_dir)
+        scan_result = load_scan_results(project_name)
     except NoScanResultsError:
         scan_result = ScanResult(
             project=project_name,
@@ -494,7 +489,6 @@ def _gradle_run_needs_replanning(run: GradleRun) -> bool:
 def run_gradle_flow(
     project_name: str,
     project: ProjectConfig,
-    results_dir: Path,
     flow: Workflow,
     *,
     interactive: bool,
@@ -528,7 +522,6 @@ def run_gradle_flow(
             work, base = _new_gradle_workspace(
                 project_name,
                 project,
-                results_dir,
                 flow,
                 interaction,
                 vcs=services,
@@ -594,10 +587,10 @@ def run_gradle_flow(
                 run, work, publication, minimum_age_days, vcs=services
             )
             if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
-                interaction.report(run, project, results_dir)
+                interaction.report(run, project)
                 return ExitCode.UPDATE_FAILED
             if not run.has(ReadyAttempt, CompletedAttempt):
-                interaction.report(run, project, results_dir)
+                interaction.report(run, project)
                 rprint("No eligible Gradle changes")
                 # A clean/withheld-only run has no effects requiring recovery.
                 path.unlink(missing_ok=True)
@@ -617,13 +610,12 @@ def run_gradle_flow(
             run = _finish_verified_gradle_run(
                 run,
                 project,
-                results_dir,
                 publication,
                 minimum_age_days,
                 vcs=services,
             )
             gradle_updater.retire_gradle_context(run.context)
-            interaction.report(run, project, results_dir)
+            interaction.report(run, project)
         if flow == Workflow.UPDATE and run.refreshed:
             remove_workspace(
                 repo=services.repository(Path(project.path)), project=project_name

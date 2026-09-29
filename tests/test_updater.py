@@ -307,21 +307,17 @@ def test_package_boundary_failure_is_persisted_as_a_failed_apply(
         updates=[make_update(SemverTier.PATCH)],
     )
     update = scan_result.updates[0]
-    results_dir = tmp_path / "results"
-    results_dir.mkdir()
-
     results = process_findings(
         [update],
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan_result,
         project_name="demo",
-        results_dir=results_dir,
         vcs=_services(processor_vcs),
     )
 
     assert results[0].failed_phase == "apply"
-    saved = load_scan_results("demo", results_dir)
+    saved = load_scan_results("demo")
     assert saved.updates[0].update_status == UpdateStatus.FAILED
     assert saved.updates[0].failed_phase == "apply"
 
@@ -820,7 +816,6 @@ def test_repository_failure_never_saves_ready(
     method: str,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
-    tmp_path: Path,
 ):
     from maintenance_man.vcs import RevisionError
 
@@ -834,19 +829,16 @@ def test_repository_failure_never_saves_ready(
         trivy_target=str(project_config.path),
         updates=[finding, second],
     )
-    results_dir = tmp_path / "results"
-
     results = process_findings(
         [finding, second],
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
         project_name="demo",
-        results_dir=results_dir,
         vcs=_services(processor_vcs),
     )
 
-    saved = load_scan_results("demo", results_dir)
+    saved = load_scan_results("demo")
     assert saved.updates[0].update_status == UpdateStatus.FAILED
     assert saved.updates[0].failed_phase == "commit"
     if method == "has_changes":
@@ -949,7 +941,7 @@ def test_empty_findings_have_no_repository_effects(
 
 
 def test_failed_discard_persists_original_failure_and_stops(
-    processor_vcs: ProcessorDeps, project_config: ProjectConfig, tmp_path: Path
+    processor_vcs: ProcessorDeps, project_config: ProjectConfig
 ):
     from maintenance_man.vcs import RevisionError
 
@@ -965,20 +957,17 @@ def test_failed_discard_persists_original_failure_and_stops(
         trivy_target=str(project_config.path),
         updates=findings,
     )
-    results_dir = tmp_path / "results"
-
     results = process_findings(
         findings,
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
         project_name="demo",
-        results_dir=results_dir,
         vcs=_services(processor_vcs),
     )
 
     assert len(results) == 1
-    saved = load_scan_results("demo", results_dir)
+    saved = load_scan_results("demo")
     assert saved.updates[0].failed_phase == "unit"
     assert saved.updates[0].update_status == UpdateStatus.FAILED
 
@@ -986,7 +975,6 @@ def test_failed_discard_persists_original_failure_and_stops(
 def test_update_statuses_are_persisted_after_each_finding(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
-    tmp_path: Path,
 ):
     processor_vcs["phase"].side_effect = [None, ProcessError("unit failed")]
     findings = [make_update(), make_update(SemverTier.MINOR)]
@@ -996,19 +984,16 @@ def test_update_statuses_are_persisted_after_each_finding(
         trivy_target=str(project_config.path),
         updates=findings,
     )
-    results_dir = tmp_path / "results"
-
     process_findings(
         findings,
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
         project_name="demo",
-        results_dir=results_dir,
         vcs=_services(processor_vcs),
     )
 
-    saved = load_scan_results("demo", results_dir)
+    saved = load_scan_results("demo")
     assert [finding.update_status for finding in saved.updates] == [
         UpdateStatus.READY,
         UpdateStatus.FAILED,
@@ -1019,7 +1004,6 @@ def test_update_statuses_are_persisted_after_each_finding(
 def test_resolve_failure_status_is_persisted_before_stopping(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
-    tmp_path: Path,
 ):
     processor_vcs["phase"].side_effect = ProcessError("unit failed")
     finding = make_update(update_status=UpdateStatus.FAILED)
@@ -1029,8 +1013,6 @@ def test_resolve_failure_status_is_persisted_before_stopping(
         trivy_target=str(project_config.path),
         updates=[finding],
     )
-    results_dir = tmp_path / "results"
-
     process_findings(
         [finding],
         project_config,
@@ -1038,11 +1020,10 @@ def test_resolve_failure_status_is_persisted_before_stopping(
         on_failure="stop",
         scan_result=scan,
         project_name="demo",
-        results_dir=results_dir,
         vcs=_services(processor_vcs),
     )
 
-    saved = load_scan_results("demo", results_dir)
+    saved = load_scan_results("demo")
     assert saved.updates[0].update_status == UpdateStatus.FAILED
     assert saved.updates[0].failed_phase == "unit"
     assert saved.updates[0].flow == Workflow.RESOLVE

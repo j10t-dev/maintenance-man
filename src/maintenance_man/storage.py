@@ -49,9 +49,9 @@ def fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def load_scan_results(project_name: str, results_dir: Path) -> ScanResult:
+def load_scan_results(project_name: str) -> ScanResult:
     """Load scan results JSON for a project. Raises NoScanResultsError if missing."""
-    results_file = paths.project_file(results_dir, project_name, ".json")
+    results_file = paths.project_file(paths.scan_results_dir(), project_name, ".json")
     try:
         data = json.loads(results_file.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -62,12 +62,10 @@ def load_scan_results(project_name: str, results_dir: Path) -> ScanResult:
     return ScanResult.model_validate(data)
 
 
-def save_scan_results(
-    project_name: str, results_dir: Path, scan_result: ScanResult
-) -> None:
+def save_scan_results(project_name: str, scan_result: ScanResult) -> None:
     """Write scan results (with update statuses) back to disk."""
-    results_dir.mkdir(parents=True, exist_ok=True)
-    results_file = paths.project_file(results_dir, project_name, ".json")
+    paths.scan_results_dir().mkdir(parents=True, exist_ok=True)
+    results_file = paths.project_file(paths.scan_results_dir(), project_name, ".json")
     atomic_write_text(results_file, scan_result.model_dump_json(indent=2))
 
 

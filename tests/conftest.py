@@ -184,12 +184,18 @@ def make_scan_result(
     )
 
 
-@pytest.fixture()
-def mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect MM_HOME to a temp directory (not yet created on disk)."""
+@pytest.fixture(autouse=True)
+def _isolated_mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every test gets its own mm home; nothing reaches the real ~/.mm."""
     home = tmp_path / ".mm"
     monkeypatch.setattr("maintenance_man.paths.MM_HOME", home)
     return home
+
+
+@pytest.fixture()
+def mm_home(_isolated_mm_home: Path) -> Path:
+    """Return the per-test MM_HOME without creating it."""
+    return _isolated_mm_home
 
 
 @pytest.fixture()
@@ -275,10 +281,9 @@ def mock_update_cli_deps(
             "mm-fixture-pkg-b.txt",
             "mm-fixture-pkg-c.txt",
         )
-    results_dir = mm_home_with_projects / "scan-results"
 
     def save_scan() -> None:
-        save_scan_results("vulnerable", results_dir, scan_result)
+        save_scan_results("vulnerable", scan_result)
 
     save_scan()
     for project_name in project_paths:
@@ -286,7 +291,7 @@ def mock_update_cli_deps(
             continue
         project_scan = deepcopy(scan_result)
         project_scan.project = project_name
-        save_scan_results(project_name, results_dir, project_scan)
+        save_scan_results(project_name, project_scan)
     processor = FakeFindingProcessor(
         {
             "some-pkg": (True, None),
@@ -342,13 +347,11 @@ def mock_resolve_cli_deps(
     vcs_state.repository(project_paths["vulnerable"]).set_bookmark(
         bookmark="mm/resolve-dependencies", revision="@-"
     )
-    results_dir = mm_home_with_projects / "scan-results"
     fixture: dict[str, object] = {}
 
     def save_scan() -> None:
         save_scan_results(
             "vulnerable",
-            results_dir,
             fixture["scan_result"],  # ty:ignore[invalid-argument-type]
         )
 
@@ -367,7 +370,7 @@ def mock_resolve_cli_deps(
             continue
         project_scan = scan_result.model_copy(deep=True)
         project_scan.project = project_name
-        save_scan_results(project_name, results_dir, project_scan)
+        save_scan_results(project_name, project_scan)
     processor = FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)})
     monkeypatch.setattr("maintenance_man.cli.process_findings", processor)
     return fixture
