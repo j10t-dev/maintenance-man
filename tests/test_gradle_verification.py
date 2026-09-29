@@ -20,6 +20,7 @@ from maintenance_man import gradle_verification as verification
 from maintenance_man import gradle_workflow as workflow_service
 from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import GradleError
+from maintenance_man.gradle import parse_catalogue as real_parse_catalogue
 from maintenance_man.gradle_updates import run_gradle_checks as real_run_gradle_checks
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
@@ -2873,6 +2874,42 @@ def rebuild_evidence(workflow, monkeypatch):
         base_commit_id=run.base_commit_id,
         accepted_commit_id=accepted.receipt.accepted_commit_id,
     )
+
+
+def test_rebuild_validates_the_base_catalogue_before_collection(
+    rebuild_evidence, monkeypatch
+):
+    state = rebuild_evidence
+    real_workspace = updater.gradle_evidence_workspace
+    collected = []
+
+    @contextmanager
+    def corrupt_workspace(project, revision, *, vcs):
+        with real_workspace(project, revision, vcs=vcs) as base:
+            (base.path / "gradle/libs.versions.toml").write_text("[versions\nv = ")
+            yield base
+
+    monkeypatch.setattr(updater, "gradle_evidence_workspace", corrupt_workspace)
+    monkeypatch.setattr(updater, "parse_catalogue", real_parse_catalogue)
+    monkeypatch.setattr(
+        updater, "collect_gradle_resolution", lambda *args: collected.append(args)
+    )
+    monkeypatch.setattr(
+        updater,
+        "initialize_comparison_context",
+        lambda *args: pytest.fail("context must not be created"),
+    )
+    with pytest.raises(updater.GradleError, match="Failed to parse version catalogue"):
+        updater.rebuild_gradle_run_evidence(
+            state.run,
+            state.workflow.project,
+            state.workflow.publication,
+            7,
+            vcs=state.workflow.vcs,
+            emit=RecordingEmit(),
+        )
+    assert collected == []
+    assert state.ledger.read_bytes() == state.before
 
 
 @pytest.mark.parametrize("revision", ["base", "accepted"])

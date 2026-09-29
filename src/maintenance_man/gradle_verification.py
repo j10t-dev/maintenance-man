@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from maintenance_man.gradle import GradleError
+from maintenance_man.gradle import GradleError, file_digest
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     ComparisonContext,
@@ -29,7 +29,7 @@ TRIVY_INSTALL_HINT = "Install it from https://trivy.dev/"
 def _digest(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise GradleError(f"Comparison input is not a regular file: {path}")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return file_digest(path)
 
 
 def _policy(project: ProjectConfig) -> bytes:

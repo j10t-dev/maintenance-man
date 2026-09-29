@@ -103,9 +103,7 @@ def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):
             assert bom.is_file()
             assert isinstance(resolution, CompleteResolution)
         assert not (tmp_path / ".mm-gradle-inventory").exists()
-        result = collect_gradle_resolution(
-            project, parse_catalogue(tmp_path / "gradle/libs.versions.toml")
-        )
+        result = collect_gradle_resolution(project)
     assert isinstance(result, CompleteResolution)
     assert result.report.scopes[0].components[0].kind == "root"
 
@@ -1063,6 +1061,53 @@ def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
         validate_gradle_candidates(
             project, [candidate()], _resolution_with_repositories(())
         )
+
+
+@pytest.mark.parametrize("task", ["mmGradleReport", "mmGradleValidateCandidates"])
+def test_both_report_tasks_use_the_shared_init_script_command(tmp_path, task):
+    from maintenance_man.gradle_resolution import _report_command
+
+    project = make_project(tmp_path)
+    script = tmp_path / ".mm-gradle-inventory" / "gradle-report.gradle"
+    expected = [
+        task,
+        "--init-script",
+        str(script),
+        "--no-daemon",
+        "--console=plain",
+        "--rerun-tasks",
+        "--no-build-cache",
+    ]
+    assert _report_command(task, script) == expected
+    seen = []
+
+    def report(root, args, *, label):
+        seen.append((label, args))
+        return fixture_runner(root, args, label=label)
+
+    def respond(root, directory, requests):
+        (directory / "candidate-validation.json").write_text(
+            json.dumps({"schema_version": 1, "results": [_success_row(requests[0])]})
+        )
+
+    def validate(root, args, *, label):
+        seen.append((label, args))
+        return _validation_runner(respond)(root, args, label=label)
+
+    if task == "mmGradleReport":
+        with (
+            patch("maintenance_man.gradle_resolution.run_gradle", side_effect=report),
+            generate_gradle_report(project),
+        ):
+            pass
+    else:
+        with patch(
+            "maintenance_man.gradle_resolution.run_gradle", side_effect=validate
+        ):
+            validate_gradle_candidates(
+                project, [candidate()], _resolution_with_repositories(())
+            )
+    assert seen == [(task, expected)]
 
 
 def test_mixed_library_plugin_alias_keeps_member_validation_separate():

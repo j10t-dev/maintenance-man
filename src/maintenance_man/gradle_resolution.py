@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -33,8 +32,10 @@ from maintenance_man.gradle import (
     ReportProposal,
     _validate_inventory,
     build_update_findings,
+    file_digest,
     normalise_alias,
     owned_gradle_inventory,
+    require_catalogue_unchanged,
     run_gradle,
 )
 from maintenance_man.models.config import ProjectConfig
@@ -110,6 +111,18 @@ def parse_resolution_report(text: str) -> ResolutionOutcome:
     return CompleteResolution(report=report)
 
 
+def _report_command(task: str, script: Path) -> list[str]:
+    return [
+        task,
+        "--init-script",
+        str(script),
+        "--no-daemon",
+        "--console=plain",
+        "--rerun-tasks",
+        "--no-build-cache",
+    ]
+
+
 def _script(directory: Path) -> Path:
     script = directory / "gradle-report.gradle"
     script.write_bytes(
@@ -123,22 +136,14 @@ def generate_gradle_report(
     project: ProjectConfig,
 ) -> Iterator[tuple[Path, ResolutionOutcome]]:
     root = Path(project.path)
-    before = hashlib.sha256((root / GRADLE_CATALOGUE_RELPATH).read_bytes()).hexdigest()
+    before = file_digest(root / GRADLE_CATALOGUE_RELPATH)
     with owned_gradle_inventory(project) as directory:
         try:
             script = _script(directory)
             report_started = time.monotonic()
             run_gradle(
                 root,
-                [
-                    "mmGradleReport",
-                    "--init-script",
-                    str(script),
-                    "--no-daemon",
-                    "--console=plain",
-                    "--rerun-tasks",
-                    "--no-build-cache",
-                ],
+                _report_command("mmGradleReport", script),
                 label="mmGradleReport",
             )
             logging.getLogger(__name__).info(
@@ -150,21 +155,20 @@ def generate_gradle_report(
                 raise GradleError("Gradle report output is a symlink")
             _validate_inventory(bom)
             outcome = parse_resolution_report(report_path.read_text(encoding="utf-8"))
-            after = hashlib.sha256(
-                (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
-            ).hexdigest()
-            if before != after or outcome.report.catalogue_digest != before:
-                raise GradleError("Catalogue changed during report generation")
+            require_catalogue_unchanged(
+                before,
+                file_digest(root / GRADLE_CATALOGUE_RELPATH),
+                message="Catalogue changed during report generation",
+                reported_digest=outcome.report.catalogue_digest,
+            )
         except (OSError, UnicodeError) as exc:
             raise GradleError(f"Could not capture Gradle resolution: {exc}") from exc
         yield bom, outcome
 
 
-def collect_gradle_resolution(
-    project: ProjectConfig, catalogue: Catalogue
-) -> ResolutionOutcome:
-    # The caller's catalogue participates in selection; digest validation binds
-    # this report to the source file. No graph is reconstructed from TOML.
+def collect_gradle_resolution(project: ProjectConfig) -> ResolutionOutcome:
+    # Digest validation binds this report to the source file. No graph is
+    # reconstructed from TOML.
     with generate_gradle_report(project) as (_, outcome):
         return outcome
 
@@ -333,7 +337,7 @@ def exact_fix_candidate(installed: str, fixes: str | None) -> str | None:
 
 
 def _candidate_scopes(
-    catalogue: Catalogue, resolution: CompleteResolution, target: GradleUpdateTarget
+    resolution: CompleteResolution, target: GradleUpdateTarget
 ) -> tuple[ScopeId, ...]:
     coordinates = {
         member.coordinate for member in target.members if member.kind == "library"
@@ -389,7 +393,7 @@ def select_gradle_candidates(
             target=target,
             origins=frozenset({"ordinary"}),
             owner_keys=(key,),
-            scopes=_candidate_scopes(catalogue, resolution, target),
+            scopes=_candidate_scopes(resolution, target),
         )
     linked = {}
     for finding in vulnerabilities:
@@ -567,7 +571,7 @@ def validate_gradle_candidates(
     if not requests:
         return CandidateValidationBatch(schema_version=1, results=())
     root = Path(project.path)
-    before = (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
+    before = file_digest(root / GRADLE_CATALOGUE_RELPATH)
     with owned_gradle_inventory(project) as directory:
         try:
             script = _script(directory)
@@ -577,15 +581,7 @@ def validate_gradle_candidates(
             )
             run_gradle(
                 root,
-                [
-                    "mmGradleValidateCandidates",
-                    "--init-script",
-                    str(script),
-                    "--no-daemon",
-                    "--console=plain",
-                    "--rerun-tasks",
-                    "--no-build-cache",
-                ],
+                _report_command("mmGradleValidateCandidates", script),
                 label="mmGradleValidateCandidates",
             )
             logging.getLogger(__name__).info(
@@ -626,10 +622,11 @@ def validate_gradle_candidates(
                     and result.implementation is None
                 ):
                     raise GradleError("Candidate marker success lacks implementation")
-            if (root / GRADLE_CATALOGUE_RELPATH).read_bytes() != before:
-                raise GradleError(
-                    "Candidate metadata resolution modified the catalogue"
-                )
+            require_catalogue_unchanged(
+                before,
+                file_digest(root / GRADLE_CATALOGUE_RELPATH),
+                message="Candidate metadata resolution modified the catalogue",
+            )
             return batch
         except (OSError, UnicodeError, ValidationError) as exc:
             raise GradleError(f"Invalid candidate validation output: {exc}") from exc

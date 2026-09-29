@@ -258,26 +258,38 @@ def discover_gradle_updates(project: ProjectConfig) -> list[UpdateFinding]:
         else:
             proposals = parse_update_report(report_path)
 
-    if _digest(catalogue_path) != before:
-        raise GradleError(
+    require_catalogue_unchanged(
+        before,
+        _digest(catalogue_path),
+        message=(
             f"versionCatalogUpdate modified {GRADLE_CATALOGUE_RELPATH}; "
             "discovery must leave the source catalogue unchanged"
-        )
+        ),
+    )
 
     return build_update_findings(catalogue, proposals)
 
 
 def parse_catalogue(path: Path) -> Catalogue:
-    """Parse the supported subset of a Gradle version catalogue."""
+    """Parse the supported subset of a Gradle version catalogue file."""
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError as e:
         raise GradleError(f"Version catalogue not found: {path}") from e
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
+    except (UnicodeDecodeError, OSError) as e:
         raise GradleError(f"Failed to parse version catalogue {path}: {e}") from e
+    return parse_catalogue_text(text, source=str(path))
+
+
+def parse_catalogue_text(text: str, *, source: str = "<catalogue>") -> Catalogue:
+    """Parse the supported subset of a Gradle version catalogue."""
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise GradleError(f"Failed to parse version catalogue {source}: {e}") from e
 
     versions: dict[str, CatalogueVersion] = {}
-    for name, value in _table(raw, "versions", path).items():
+    for name, value in _table(raw, "versions", source).items():
         if isinstance(value, str):
             versions[normalise_alias(name)] = CatalogueVersion(name=name, value=value)
         else:
@@ -291,10 +303,10 @@ def parse_catalogue(path: Path) -> Catalogue:
             )
 
     entries: dict[tuple[str, str], CatalogueEntry] = {}
-    for alias, value in _table(raw, "libraries", path).items():
+    for alias, value in _table(raw, "libraries", source).items():
         entry = _parse_library(alias, value)
         entries[entry.key] = entry
-    for alias, value in _table(raw, "plugins", path).items():
+    for alias, value in _table(raw, "plugins", source).items():
         entry = _parse_plugin(alias, value)
         entries[entry.key] = entry
 
@@ -306,32 +318,45 @@ def parse_catalogue(path: Path) -> Catalogue:
     preserved = {"sections": preserved}
     preserved["rich_versions"] = {
         normalise_alias(name): value
-        for name, value in _table(raw, "versions", path).items()
+        for name, value in _table(raw, "versions", source).items()
         if not isinstance(value, str)
     }
     preserved["rich_entries"] = {
         entry.key: value
         for heading, kind in (("libraries", "library"), ("plugins", "plugin"))
-        for alias, value in _table(raw, heading, path).items()
+        for alias, value in _table(raw, heading, source).items()
         if (entry := entries[(kind, normalise_alias(alias))]).unsupported is not None
     }
     return Catalogue(versions=versions, entries=entries, preserved_semantics=preserved)
 
 
 def parse_update_report(path: Path) -> list[ReportProposal]:
-    """Parse a plugin-generated update report. Comments are not data."""
+    """Parse a plugin-generated update report file. Comments are not data."""
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
         raise GradleError(
             f"malformed version catalogue update report {path}: {e}"
         ) from e
+    return parse_update_report_text(text, source=str(path))
+
+
+def parse_update_report_text(
+    text: str, *, source: str = "<update report>"
+) -> list[ReportProposal]:
+    """Parse a plugin-generated update report. Comments are not data."""
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise GradleError(
+            f"malformed version catalogue update report {source}: {e}"
+        ) from e
 
     proposals: list[ReportProposal] = []
-    for alias, value in _table(raw, "libraries", path).items():
+    for alias, value in _table(raw, "libraries", source).items():
         if not isinstance(value, str) or value.count(":") != 2:
             raise GradleError(
-                f"malformed library entry '{alias}' in {path}: expected "
+                f"malformed library entry '{alias}' in {source}: expected "
                 f"'group:artifact:version', got {value!r}"
             )
         group, name, version = value.split(":")
@@ -343,10 +368,10 @@ def parse_update_report(path: Path) -> list[ReportProposal]:
                 version=assert_safe_text(version, "report version"),
             )
         )
-    for alias, value in _table(raw, "plugins", path).items():
+    for alias, value in _table(raw, "plugins", source).items():
         if not isinstance(value, str) or value.count(":") != 1:
             raise GradleError(
-                f"malformed plugin entry '{alias}' in {path}: expected "
+                f"malformed plugin entry '{alias}' in {source}: expected "
                 f"'plugin.id:version', got {value!r}"
             )
         plugin_id, version = value.split(":")
@@ -822,16 +847,29 @@ def _unsupported_entry(kind: GradleKind, alias: str, reason: str) -> CatalogueEn
     return CatalogueEntry(kind, alias, alias, None, None, reason)
 
 
-def _table(raw: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
+def _table(raw: dict[str, Any], name: str, source: str) -> dict[str, Any]:
     table = raw.get(name, {})
     if not isinstance(table, dict):
-        raise GradleError(f"malformed [{name}] table in {path}")
+        raise GradleError(f"malformed [{name}] table in {source}")
     return table
+
+
+def file_digest(path: Path) -> str:
+    """SHA-256 of *path*'s bytes; the original OSError escapes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def require_catalogue_unchanged(
+    before: str, after: str, *, message: str, reported_digest: str | None = None
+) -> None:
+    """Refuse with *message* when the catalogue digest moved or disagrees."""
+    if before != after or (reported_digest is not None and reported_digest != before):
+        raise GradleError(message)
 
 
 def _digest(path: Path) -> str:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return file_digest(path)
     except OSError as e:
         raise GradleError(f"Could not read Gradle catalogue {path}: {e}") from e
 

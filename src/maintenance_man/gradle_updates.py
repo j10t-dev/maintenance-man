@@ -541,8 +541,8 @@ def rebuild_gradle_run_evidence(
         project, run.base_commit_id, vcs=services
     ) as base_project:
         base_repo = services.repository(Path(base_project.path))
-        catalogue = parse_catalogue(base_project.path / GRADLE_CATALOGUE_RELPATH)
-        resolution = collect_gradle_resolution(base_project, catalogue)
+        parse_catalogue(base_project.path / GRADLE_CATALOGUE_RELPATH)
+        resolution = collect_gradle_resolution(base_project)
         if isinstance(resolution, IncompleteResolution):
             raise GradleError("Recorded baseline cannot produce complete coverage")
         context = initialize_comparison_context(

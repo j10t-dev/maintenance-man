@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,16 @@ def _clean_report() -> str:
 _NO_UPDATES_OUTPUT = "There are no updates available\n"
 
 
+def _parse_fixture_catalogue(mode: str):
+    from maintenance_man.gradle import parse_catalogue_text
+
+    path = GRADLE_FIXTURES / "libs.versions.toml"
+    if mode == "file":
+        return parse_catalogue(path)
+    return parse_catalogue_text(path.read_text(encoding="utf-8"), source=str(path))
+
+
+@pytest.mark.parametrize("mode", ["file", "text"])
 class TestParseCatalogue:
     @pytest.mark.parametrize(
         "kind, alias, coordinate, version_ref, inline_version, unsupported",
@@ -102,9 +113,9 @@ class TestParseCatalogue:
         ],
     )
     def test_supported_declarations(
-        self, kind, alias, coordinate, version_ref, inline_version, unsupported
+        self, mode, kind, alias, coordinate, version_ref, inline_version, unsupported
     ):
-        catalogue = parse_catalogue(GRADLE_FIXTURES / "libs.versions.toml")
+        catalogue = _parse_fixture_catalogue(mode)
         entry = catalogue.entries[(kind, normalise_alias(alias))]
 
         assert entry.coordinate == coordinate
@@ -112,22 +123,107 @@ class TestParseCatalogue:
         assert entry.inline_version == inline_version
         assert entry.unsupported == unsupported
 
-    def test_rich_version_reference_is_unsupported(self):
-        catalogue = parse_catalogue(GRADLE_FIXTURES / "libs.versions.toml")
+    def test_rich_version_reference_is_unsupported(self, mode):
+        catalogue = _parse_fixture_catalogue(mode)
 
         assert catalogue.versions["okhttp"].value is None
         assert "rich version" in (catalogue.versions["okhttp"].unsupported or "")
 
-    def test_missing_catalogue_raises(self, tmp_path):
-        with pytest.raises(GradleError, match="not found"):
-            parse_catalogue(tmp_path / "gradle" / "libs.versions.toml")
+    def test_malformed_catalogue_raises(self, mode, tmp_path):
+        from maintenance_man.gradle import parse_catalogue_text
 
-    def test_malformed_catalogue_raises(self, tmp_path):
         bad = tmp_path / "libs.versions.toml"
         bad.write_text("[versions\nroom = ", encoding="utf-8")
 
-        with pytest.raises(GradleError, match="Failed to parse"):
-            parse_catalogue(bad)
+        with pytest.raises(GradleError, match="Failed to parse") as caught:
+            if mode == "file":
+                parse_catalogue(bad)
+            else:
+                parse_catalogue_text(bad.read_text(encoding="utf-8"), source=str(bad))
+        assert isinstance(caught.value.__cause__, tomllib.TOMLDecodeError)
+
+
+@pytest.mark.parametrize("version", ['"1.2"', '{ strictly = "1.2" }'])
+def test_catalogue_text_preserves_supported_and_rich_versions(tmp_path, version):
+    from maintenance_man.gradle import parse_catalogue_text
+
+    text = (
+        f"[versions]\nv = {version}\n[libraries]\n"
+        'lib = { module = "g:lib", version.ref = "v" }\n'
+    )
+    path = tmp_path / "libs.versions.toml"
+    path.write_text(text, encoding="utf-8")
+    parsed = parse_catalogue_text(text, source=str(path))
+    assert parsed == parse_catalogue(path)
+    entry = parsed.entry("library", "lib")
+    assert entry is not None and entry.coordinate == "g:lib"
+    value = parsed.version_of(entry)
+    assert value is not None
+    assert value.value == ("1.2" if version == '"1.2"' else None)
+    assert (value.unsupported is not None) is (version != '"1.2"')
+
+
+@pytest.mark.parametrize(
+    "parser, text",
+    [
+        ("catalogue", "[versions]\nv =\n"),
+        ("catalogue", "libraries = []\n"),
+        ("report", '[libraries]\nlib = "g:a"\n'),
+        ("report", '[plugins]\np = "id:1:extra"\n'),
+    ],
+)
+def test_malformed_text_names_its_source(parser, text):
+    from maintenance_man.gradle import parse_catalogue_text, parse_update_report_text
+
+    parse = parse_catalogue_text if parser == "catalogue" else parse_update_report_text
+    with pytest.raises(GradleError, match="<test-source>"):
+        parse(text, source="<test-source>")
+
+
+def test_report_text_yields_library_and_plugin_proposals():
+    from maintenance_man.gradle import ReportProposal, parse_update_report_text
+
+    proposals = parse_update_report_text(
+        '[libraries]\nlib = "g:lib:2"\n[plugins]\np = "org.example:3"\n'
+    )
+    assert proposals == [
+        ReportProposal("library", "lib", "g:lib", "2"),
+        ReportProposal("plugin", "p", "org.example", "3"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "before, after, reported, raises",
+    [
+        ("a", "a", None, False),
+        ("a", "a", "a", False),
+        ("a", "b", None, True),
+        ("a", "a", "b", True),
+    ],
+)
+def test_require_catalogue_unchanged(before, after, reported, raises):
+    from maintenance_man.gradle import require_catalogue_unchanged
+
+    def call():
+        require_catalogue_unchanged(
+            before, after, message="catalogue moved", reported_digest=reported
+        )
+
+    if raises:
+        with pytest.raises(GradleError, match=r"^catalogue moved$"):
+            call()
+    else:
+        call()
+
+
+def test_file_digest_is_sha256_and_lets_oserror_escape(tmp_path):
+    from maintenance_man.gradle import file_digest
+
+    path = tmp_path / "f"
+    path.write_bytes(b"abc")
+    assert file_digest(path) == hashlib.sha256(b"abc").hexdigest()
+    with pytest.raises(FileNotFoundError):
+        file_digest(tmp_path / "missing")
 
 
 class TestDiscoverGradleUpdates:
@@ -622,6 +718,24 @@ class TestGradleReportInventory:
             raise error
         assert caught.value is error
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
+
+
+def test_report_generation_refuses_catalogue_mutation(gradle_project, monkeypatch):
+    root = Path(gradle_project.path)
+
+    def mutating(root_arg, args, *, label):
+        completed = fixture_runner(root_arg, args, label=label)
+        catalogue = root / GRADLE_CATALOGUE_RELPATH
+        catalogue.write_text(catalogue.read_text() + "# drift\n")
+        return completed
+
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", mutating)
+    with (
+        pytest.raises(GradleError, match="Catalogue changed during report generation"),
+        generate_gradle_report(gradle_project),
+    ):
+        pytest.fail("mutated catalogue must not yield a report")
+    assert not (root / GRADLE_INVENTORY_RELPATH).exists()
 
 
 class TestValidateInventory:
@@ -1458,11 +1572,34 @@ def test_wrapper_output_decode_failure_is_gradle_error(gradle_project, monkeypat
     assert not (Path(gradle_project.path) / GRADLE_REPORT_MARKER_RELPATH).exists()
 
 
-@pytest.mark.parametrize("parser", ["catalogue", "report"])
-def test_toml_invalid_utf8_is_gradle_error(tmp_path, parser):
+@pytest.mark.parametrize(
+    "parser, message",
+    [
+        ("catalogue", "Failed to parse version catalogue"),
+        ("report", "malformed version catalogue update report"),
+    ],
+)
+def test_toml_invalid_utf8_is_gradle_error(tmp_path, parser, message):
     from maintenance_man.gradle import parse_update_report
 
     path = tmp_path / "invalid.toml"
     path.write_bytes(b"\xff")
-    with pytest.raises(GradleError):
+    with pytest.raises(GradleError, match=message) as caught:
         (parse_catalogue if parser == "catalogue" else parse_update_report)(path)
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+def test_missing_catalogue_is_gradle_error_with_cause(tmp_path):
+    with pytest.raises(GradleError, match="not found") as caught:
+        parse_catalogue(tmp_path / "gradle" / "libs.versions.toml")
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+
+
+def test_missing_update_report_is_gradle_error_with_cause(tmp_path):
+    from maintenance_man.gradle import parse_update_report
+
+    with pytest.raises(
+        GradleError, match="malformed version catalogue update report"
+    ) as caught:
+        parse_update_report(tmp_path / "missing.toml")
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
