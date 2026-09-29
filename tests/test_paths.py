@@ -33,7 +33,7 @@ def test_a_test_can_still_redirect_the_home(home):
         ("workspaces_dir", "workspaces"),
         ("gradle_runs_dir", "gradle-runs"),
         ("gradle_contexts_dir", "gradle-contexts"),
-        ("gradle_publications_dir", "gradle-publications"),
+        ("publications_dir", "publications"),
     ],
 )
 def test_accessors_follow_redirected_home(home, accessor, relative):

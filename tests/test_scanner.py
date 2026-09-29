@@ -678,7 +678,7 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         scanner,
         "PublicationLookupContext",
         lambda path: PublicationLookupContext(
-            path, transport=transport, now=lambda: now
+            path, transport=transport, clock=lambda: now
         ),
     )
     monkeypatch.setattr(
@@ -691,6 +691,21 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         update={"scan_secrets": False, "gradle_repository_routing": "standard-public"}
     )
     return state
+
+
+def test_gradle_scan_opens_publications_in_the_shared_cache(
+    scoped_publication_scan, monkeypatch
+):
+    opened = []
+    factory = scanner.PublicationLookupContext
+
+    def recording(path):
+        opened.append(path)
+        return factory(path)
+
+    monkeypatch.setattr(scanner, "PublicationLookupContext", recording)
+    scan_project("android", scoped_publication_scan.project, 7)
+    assert opened == [paths.publications_dir()]
 
 
 @pytest.mark.parametrize("failure", [None, TimeoutError("unavailable")])

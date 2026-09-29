@@ -449,7 +449,7 @@ def test_publication_cache_and_current_policy(tmp_path):
         assert second_calls == []
         assert second.cache_hits == 1
     _, _, expired_calls, expired = _publication_fixture(tmp_path)
-    expired.now = lambda: _PUB_NOW + timedelta(hours=24)
+    expired.clock = lambda: _PUB_NOW + timedelta(hours=24)
     with expired:
         lookup_gradle_publication(request, expired)
         assert len(expired_calls) == 1
@@ -459,6 +459,16 @@ def test_publication_cache_and_current_policy(tmp_path):
     with corrupt:
         lookup_gradle_publication(request, corrupt)
         assert len(corrupt_calls) == 1
+
+
+def test_publication_context_logs_a_manager_neutral_label(tmp_path, caplog):
+    with (
+        caplog.at_level("INFO", logger="maintenance_man.dependency_age"),
+        PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW),
+    ):
+        pass
+    assert "Publication lookup " in caplog.text
+    assert "Gradle publication" not in caplog.text
 
 
 def test_publication_negative_results_retry_next_command(tmp_path):
@@ -1432,7 +1442,7 @@ def test_gradle_group_age_assesses_known_facts(
         def result(self):
             return self.value
 
-    context = PublicationLookupContext(tmp_path, now=lambda: _PUB_NOW)
+    context = PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW)
     outcomes = iter(values)
     monkeypatch.setattr(context, "submit", lambda *_: Future(next(outcomes)))
     with context:
@@ -1466,7 +1476,7 @@ def test_gradle_scan_submits_every_update_before_waiting(tmp_path, monkeypatch):
             _publication_fact(module, repository, datetime(2026, 9, 1, tzinfo=UTC))
         )
 
-    context = PublicationLookupContext(tmp_path, now=lambda: _PUB_NOW)
+    context = PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW)
     monkeypatch.setattr(context, "submit", submit)
     with context:
         result = filter_gradle_updates_by_age(

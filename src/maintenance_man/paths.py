@@ -33,8 +33,8 @@ def gradle_contexts_dir() -> Path:
     return mm_home() / "gradle-contexts"
 
 
-def gradle_publications_dir() -> Path:
-    return mm_home() / "gradle-publications"
+def publications_dir() -> Path:
+    return mm_home() / "publications"
 
 
 def sanitise_project_name(name: str) -> str:

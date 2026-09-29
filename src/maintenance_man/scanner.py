@@ -118,7 +118,7 @@ def _scan_gradle_project(
 ]:
     vulns, resolution = scan_gradle(project)
     updates = discover_gradle_updates(project)
-    with PublicationLookupContext(paths.gradle_publications_dir()) as context:
+    with PublicationLookupContext(paths.publications_dir()) as context:
         updates = filter_gradle_updates_by_age(
             updates, project, resolution, min_version_age_days, context
         )

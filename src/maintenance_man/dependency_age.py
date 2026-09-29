@@ -19,6 +19,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from maintenance_man.clock import Clock, utc_now
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     AgeBlock,
@@ -418,10 +419,10 @@ def _parse_central_timestamp(body, module):
 class PublicationLookupContext:
     """Command-scoped cache, shared pool and disk cache for publication facts."""
 
-    def __init__(self, cache_dir, transport=None, now=_utcnow):
+    def __init__(self, cache_dir, transport=None, clock: Clock = utc_now):
         self.cache_dir = Path(cache_dir)
         self.transport = transport or _publication_http
-        self.now = now
+        self.clock = clock
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.lock = threading.Lock()
         self.inflight = {}
@@ -437,7 +438,7 @@ class PublicationLookupContext:
     def __exit__(self, *args):
         self.pool.shutdown(wait=True, cancel_futures=True)
         logging.getLogger(__name__).info(
-            "Gradle publication %.3fs; requests=%d cache_hits=%d worker_seconds=%.3f",
+            "Publication lookup %.3fs; requests=%d cache_hits=%d worker_seconds=%.3f",
             time.monotonic() - self.started,
             self.requests,
             self.cache_hits,
@@ -455,6 +456,9 @@ class PublicationLookupContext:
         digest = hashlib.sha256(json.dumps((1, *key, method)).encode()).hexdigest()
         return self.cache_dir / (digest + ".json")
 
+    def _fresh(self, checked_at):
+        return timedelta(0) <= self.clock() - checked_at < timedelta(hours=24)
+
     def _cached(self, key):
         repository, group, artifact, version = key
         module = ModuleId(group=group, artifact=artifact, version=version)
@@ -465,15 +469,12 @@ class PublicationLookupContext:
                 )
                 suffix = _artifact_suffix(module)
                 _public_url(fact.source_url, repository, suffix)
-                fresh = (
-                    timedelta(0) <= self.now() - fact.checked_at < timedelta(hours=24)
-                )
                 if (
                     fact.repository != repository
                     or fact.module != module
                     or fact.method != method
-                    or fact.timestamp > self.now()
-                    or not fresh
+                    or fact.timestamp > self.clock()
+                    or not self._fresh(fact.checked_at)
                 ):
                     continue
                 with self.lock:
@@ -491,8 +492,8 @@ class PublicationLookupContext:
                 if not prior.done():
                     return prior
                 value = prior.result()
-                if not isinstance(value, PublicationFact) or (
-                    timedelta(0) <= self.now() - value.checked_at < timedelta(hours=24)
+                if not isinstance(value, PublicationFact) or self._fresh(
+                    value.checked_at
                 ):
                     return prior
             future = self.pool.submit(self._fetch, key, module)
@@ -559,7 +560,7 @@ class PublicationLookupContext:
             headers = {k.lower(): v for k, v in headers.items()}
             method, timestamp = self._publication_timestamp(repository, module, headers)
             timestamp = timestamp.astimezone(UTC)
-            if timestamp > self.now():
+            if timestamp > self.clock():
                 msg = "future publication timestamp"
                 raise PublicationError(msg)
             fact = PublicationFact(
@@ -569,7 +570,7 @@ class PublicationLookupContext:
                 method=method,
                 artifact_digest=hashlib.sha256(body).hexdigest(),
                 timestamp=timestamp,
-                checked_at=self.now(),
+                checked_at=self.clock(),
                 implementation=implementation,
             )
             try:
@@ -777,7 +778,7 @@ def filter_gradle_updates_by_age(
         or project.gradle_repository_routing != "standard-public"
     ):
         return list(updates)
-    cutoff = context.now() - timedelta(days=min_age_days)
+    cutoff = context.clock() - timedelta(days=min_age_days)
     pending = [
         (update, _scan_publication_futures(update, resolution, context))
         for update in updates

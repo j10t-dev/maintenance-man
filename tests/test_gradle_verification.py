@@ -1519,7 +1519,7 @@ def driver(workflow, resolution, monkeypatch):
     monkeypatch.setattr(candidates, "evaluate_gradle_candidate_age", lambda *args: None)
 
     @contextmanager
-    def publication(*args):
+    def publication(*args, **kwargs):
         yield SimpleNamespace(
             prefetch=lambda requests: tuple(requests),
             evidence_for=workflow.publication.evidence_for,
@@ -1584,6 +1584,22 @@ def test_gradle_driver_promotes_verified_update_with_residual_advisory(driver):
     assert reported.run == run
     assert len(reported.scan.vulnerabilities) == 1
     assert reported.scan.vulnerabilities[0].vuln_id == "CVE-1"
+
+
+def test_gradle_flow_opens_publications_with_its_clock(driver, monkeypatch):
+    opened = []
+    fake = workflow_service.PublicationLookupContext
+
+    def clock():
+        return datetime.now(UTC)
+
+    def recording(*args, **kwargs):
+        opened.append((args, kwargs))
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_service, "PublicationLookupContext", recording)
+    invoke_driver(driver, clock=clock)
+    assert opened == [((paths.publications_dir(),), {"clock": clock})]
 
 
 def test_gradle_driver_stamps_evidence_with_the_injected_clock(driver, monkeypatch):
@@ -3170,7 +3186,9 @@ def test_gradle_cli_uses_ledger_even_without_scan_results(workflow, monkeypatch)
     monkeypatch.setattr(
         workflow_service,
         "PublicationLookupContext",
-        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+        lambda *args, **kwargs: __import__("contextlib").nullcontext(
+            workflow.publication
+        ),
     )
     finalized = False
 
@@ -3414,7 +3432,9 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
     monkeypatch.setattr(
         workflow_service,
         "PublicationLookupContext",
-        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+        lambda *args, **kwargs: __import__("contextlib").nullcontext(
+            workflow.publication
+        ),
     )
     monkeypatch.setattr(workflow_service, "context_inputs_valid", lambda *args: True)
     effects = []
@@ -3471,7 +3491,9 @@ def test_gradle_flow_forwards_one_clock_to_recovery_and_processing(
     monkeypatch.setattr(
         workflow_service,
         "PublicationLookupContext",
-        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+        lambda *args, **kwargs: __import__("contextlib").nullcontext(
+            workflow.publication
+        ),
     )
     monkeypatch.setattr(workflow_service, "context_inputs_valid", lambda *args: False)
     monkeypatch.setattr(
@@ -3577,7 +3599,9 @@ def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
     monkeypatch.setattr(
         workflow_service,
         "PublicationLookupContext",
-        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+        lambda *args, **kwargs: __import__("contextlib").nullcontext(
+            workflow.publication
+        ),
     )
     monkeypatch.setattr(workflow_service, "context_inputs_valid", lambda *args: True)
     effects = []

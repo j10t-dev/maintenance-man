@@ -758,7 +758,9 @@ def run_gradle_flow(
             emit=emit,
             clock=clock,
         )
-        with PublicationLookupContext(paths.gradle_publications_dir()) as publication:
+        with PublicationLookupContext(
+            paths.publications_dir(), clock=clock
+        ) as publication:
             prepared = _prepare_or_replan(
                 project_name,
                 project,
