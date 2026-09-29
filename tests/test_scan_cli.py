@@ -882,19 +882,41 @@ def _gradle_report_json_for_fixture_bom(root: Path) -> str:
 def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaining(
     mm_home, gradle_project, monkeypatch, phase
 ):
-    import subprocess
-
     from maintenance_man.gradle import (
         GRADLE_INVENTORY_MARKER_RELPATH,
         GRADLE_INVENTORY_RELPATH,
         GRADLE_REPORT_MARKER_RELPATH,
-        GRADLE_UPDATE_REPORT_RELPATH,
     )
     from maintenance_man.scanner import _check_outdated, scan_project
-    from tests.conftest import GRADLE_FIXTURES
 
     monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
     root = Path(gradle_project.path)
+    results = _seed_scan_filesystem_error_config(mm_home, root)
+    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner._check_outdated",
+        lambda project, *args: (
+            [] if project.package_manager == "uv" else _check_outdated(project, *args)
+        ),
+    )
+    _inject_scan_filesystem_failure(monkeypatch, phase, root)
+    commands = _prepare_scan_filesystem_error_commands(monkeypatch, phase, root)
+    with pytest.raises(SystemExit) as exc:
+        app(["scan"])
+    assert exc.value.code == ExitCode.ERROR
+    assert (results / "android.json").read_bytes() == b"old result bytes"
+    assert (results / "remaining.json").is_file()
+    if phase == "inventory-cleanup":
+        assert (root / GRADLE_INVENTORY_MARKER_RELPATH).is_file()
+    else:
+        assert not (root / GRADLE_INVENTORY_RELPATH).exists()
+    if phase == "report-cleanup":
+        assert (root / GRADLE_REPORT_MARKER_RELPATH).is_file()
+    elif phase != "inventory-cleanup":
+        assert commands == []
+
+
+def _seed_scan_filesystem_error_config(mm_home: Path, root: Path) -> Path:
     mm_home.mkdir(parents=True, exist_ok=True)
     (mm_home / "config.toml").write_text(
         f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
@@ -905,13 +927,17 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
     results = mm_home / "scan-results"
     results.mkdir()
     (results / "android.json").write_bytes(b"old result bytes")
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
-    monkeypatch.setattr(
-        "maintenance_man.scanner._check_outdated",
-        lambda project, *args: (
-            [] if project.package_manager == "uv" else _check_outdated(project, *args)
-        ),
+    return results
+
+
+def _inject_scan_filesystem_failure(monkeypatch, phase: str, root: Path) -> None:
+    from maintenance_man.gradle import (
+        GRADLE_INVENTORY_MARKER_RELPATH,
+        GRADLE_INVENTORY_RELPATH,
+        GRADLE_UPDATE_REPORT_RELPATH,
     )
+    from tests.conftest import GRADLE_FIXTURES
+
     if phase == "inventory-mkdir":
         mkdir = Path.mkdir
 
@@ -940,25 +966,41 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
 
         monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
     else:
-        from maintenance_man.gradle_resolution import parse_resolution_report
-
-        resolution = parse_resolution_report(
-            (GRADLE_FIXTURES / "resolution/empty.json").read_text()
+        _inject_report_cleanup_failure(
+            monkeypatch, root, GRADLE_UPDATE_REPORT_RELPATH, GRADLE_FIXTURES
         )
-        monkeypatch.setattr(
-            "maintenance_man.scanner.scan_gradle",
-            lambda *args: ([], resolution),
-        )
-        unlink = Path.unlink
 
-        def fail(path, *args, **kwargs):
-            if path == root / GRADLE_UPDATE_REPORT_RELPATH:
-                msg = "cleanup denied"
-                raise PermissionError(msg)
-            return unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", fail)
-    commands = []
+def _inject_report_cleanup_failure(monkeypatch, root, report_path, fixtures) -> None:
+    from maintenance_man.gradle_resolution import parse_resolution_report
+
+    resolution = parse_resolution_report(
+        (fixtures / "resolution/empty.json").read_text()
+    )
+    monkeypatch.setattr(
+        "maintenance_man.scanner.scan_gradle",
+        lambda *args: ([], resolution),
+    )
+    unlink = Path.unlink
+
+    def fail(path, *args, **kwargs):
+        if path == root / report_path:
+            msg = "cleanup denied"
+            raise PermissionError(msg)
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail)
+
+
+def _prepare_scan_filesystem_error_commands(
+    monkeypatch, phase: str, root: Path
+) -> list[list[str]]:
+    import subprocess
+
+    from maintenance_man.gradle import GRADLE_UPDATE_REPORT_RELPATH
+    from tests.conftest import GRADLE_FIXTURES
+
+    commands: list[list[str]] = []
 
     def run(cmd, **kwargs):
         commands.append(cmd)
@@ -986,19 +1028,7 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
-    assert (results / "android.json").read_bytes() == b"old result bytes"
-    assert (results / "remaining.json").is_file()
-    if phase == "inventory-cleanup":
-        assert (root / GRADLE_INVENTORY_MARKER_RELPATH).is_file()
-    else:
-        assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-    if phase == "report-cleanup":
-        assert (root / GRADLE_REPORT_MARKER_RELPATH).is_file()
-    elif phase != "inventory-cleanup":
-        assert commands == []
+    return commands
 
 
 @pytest.mark.parametrize(

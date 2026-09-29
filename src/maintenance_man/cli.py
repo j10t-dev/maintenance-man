@@ -1077,19 +1077,21 @@ def _print_numbered_findings(
     return numbered
 
 
-type _Selection = Literal["all", "none", "vulns", "updates"] | tuple[int, ...]
+type _KeywordSelection = Literal["all", "none", "vulns", "updates"]
+type _Selection = _KeywordSelection | tuple[int, ...]
+
+_KEYWORD_SELECTIONS: dict[str, _KeywordSelection] = {
+    "all": "all",
+    "none": "none",
+    "vulns": "vulns",
+    "updates": "updates",
+}
 
 
 def _parse_selection(text: str, count: int) -> _Selection | None:
     choice = text.strip().lower()
-    if choice == "all":
-        return "all"
-    if choice == "none":
-        return "none"
-    if choice == "vulns":
-        return "vulns"
-    if choice == "updates":
-        return "updates"
+    if selection := _KEYWORD_SELECTIONS.get(choice):
+        return selection
     try:
         indices = [int(part) for part in choice.split(",")]
     except ValueError:

@@ -825,3 +825,24 @@ def test_gradle_continuation_without_ledger_preserves_interrupted_outputs(
     assert exc.value.code == 4
     assert report.read_bytes() == b"preserved output"
     assert marker.exists() is owned
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (" ALL ", "all"),
+        ("none", "none"),
+        ("VuLnS", "vulns"),
+        (" updates ", "updates"),
+        ("2,1,2", (2, 1)),
+        ("0", None),
+        ("3", None),
+        ("1,x", None),
+        ("", None),
+        ("1,", None),
+    ],
+)
+def test_selection_contract(text, expected):
+    from maintenance_man.cli import _parse_selection
+
+    assert _parse_selection(text, 2) == expected

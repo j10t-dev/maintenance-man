@@ -31,7 +31,15 @@ line-length = 88
 extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N", "TRY002", "TRY201", "TRY203", "TRY400", "TRY401", "TID251", "EM101", "EM102", "EM103"]
+select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N", "TRY002", "TRY201", "TRY203", "TRY400", "TRY401", "TID251", "EM101", "EM102", "EM103", "C901", "PLR0911", "PLR0912", "PLR0915"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-returns = 6
+max-branches = 12
+max-statements = 50
 
 [tool.ruff.lint.per-file-ignores]
 "src/maintenance_man/process.py" = ["TID251"]

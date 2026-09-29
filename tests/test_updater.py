@@ -931,7 +931,7 @@ def test_repository_failure_never_saves_ready(
     if method == "set_bookmark":
         assert len(results) == 1
         assert processor_vcs["package"].call_count == 1
-        assert any(call.method == "commit" for call in state.effects)
+        assert sum(call.method == "commit" for call in state.effects) == 1
         assert not any(call.method == "discard" for call in state.attempts)
 
 

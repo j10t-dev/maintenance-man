@@ -230,4 +230,34 @@ Configured projects are expected to be colocated jj/Git repositories with a GitH
 
 ## Contributing 
 
+Run the default test suite and each static check directly before submitting a
+change:
+
+```sh
+UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline pytest -q
+UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline ruff check .
+UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline ruff format --check .
+UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline ty check
+UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline lint-imports
+```
+
+Repository functions are limited to a McCabe complexity of 10, six returns,
+12 branches, and 50 statements. Process launches must go through
+`maintenance_man.process`; that owner module and tests are exempt from the
+direct-process import ban so the adapter can be implemented and test fixtures
+can exercise subprocess boundaries. Parameter-count rule PLR0913 stays off
+because the codebase preserves explicit dependency injection. TRY003, TRY004,
+TRY300, and TRY301 stay off because they would change established exception
+boundaries and message contracts. Ruff preview rules are disabled. Deptry is
+deferred until dependency ownership policy is designed.
+
+The local real-jj contract can be checked separately:
+
+```sh
+UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline pytest tests/test_repository_contract.py tests/test_jj_integration.py -m integration -q
+```
+
+Optional real-Gradle integration tests are separate from the default suite and
+require the documented local Gradle wrapper or executable environment.
+
 Put bluntly - I probably don't want your contribution. This is primarily a personal tool and I have no aspirations of trying to expand it to support every language, tool chain or use-case. You are encouraged to fork the project if you want to use tools I don't. I offer no guarantee of reading your issues or responding to your PRs. I do not wish to interact with your LLM agents or humans regurgitating LLM output. Please communicate in your own words or don't contact me at all.

@@ -542,10 +542,9 @@ def test_local_exception_message_is_allowed() -> None:
     assert {"EM101", "EM102", "EM103"}.isdisjoint(codes)
 
 
-def test_staged_ruff_policy_configuration() -> None:
-    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["ruff"][
-        "lint"
-    ]
+def test_ruff_policy_configuration() -> None:
+    ruff = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["ruff"]
+    config = ruff["lint"]
     assert set(config["select"]) == {
         "E",
         "F",
@@ -574,6 +573,10 @@ def test_staged_ruff_policy_configuration() -> None:
         "EM101",
         "EM102",
         "EM103",
+        "C901",
+        "PLR0911",
+        "PLR0912",
+        "PLR0915",
     }
     assert {
         "PLR0913",
@@ -591,6 +594,15 @@ def test_staged_ruff_policy_configuration() -> None:
         "src/maintenance_man/process.py": ["TID251"],
         "tests/**": ["TID251"],
     }
+    assert "ignore" not in config
+    assert ruff["extend-exclude"] == ["tests/fixtures"]
+    assert ruff.get("preview", False) is False
+    assert config["mccabe"] == {"max-complexity": 10}
+    assert config["pylint"] == {
+        "max-returns": 6,
+        "max-branches": 12,
+        "max-statements": 50,
+    }
     launch_message = "Use maintenance_man.process.run_captured or run_live instead."
     which_message = "Use maintenance_man.process.require_tool instead."
     assert config["flake8-tidy-imports"]["banned-api"] == {
@@ -607,6 +619,72 @@ def test_staged_ruff_policy_configuration() -> None:
         "os.posix_spawnp": {"msg": launch_message},
         "shutil.which": {"msg": which_message},
     }
+
+
+def _if_source(count: int) -> str:
+    conditions = "".join("    if flag:\n        pass\n" for _ in range(count))
+    return f"def probe(flag):\n{conditions}"
+
+
+def _return_source(count: int) -> str:
+    cases = "".join(
+        f"        case {case}:\n            return {case}\n" for case in range(count)
+    )
+    return (
+        f"def probe(value):\n    match value:\n{cases}"
+        "        case _:\n            return -1\n"
+    )
+
+
+def _branch_source(count: int) -> str:
+    cases = "".join(
+        f"        case {case}:\n            value = {case}\n" for case in range(count)
+    )
+    return (
+        f"def probe(value):\n    match value:\n{cases}"
+        "        case _:\n            value = -1\n    return value\n"
+    )
+
+
+def _statement_source(count: int) -> str:
+    assignments = "".join(f"    value_{index} = value\n" for index in range(count))
+    values = ", ".join(f"value_{index}" for index in range(count))
+    return f"def probe(value):\n{assignments}    return ({values})\n"
+
+
+@pytest.mark.parametrize(
+    "code, source",
+    [
+        ("C901", _if_source(9)),
+        ("PLR0911", _return_source(5)),
+        ("PLR0912", _branch_source(11)),
+        ("PLR0915", _statement_source(50)),
+    ],
+)
+def test_complexity_rule_allows_configured_boundary(code: str, source: str) -> None:
+    _, codes = _ruff_codes(source)
+    assert code not in codes
+
+
+@pytest.mark.parametrize(
+    "code, source",
+    [
+        ("C901", _if_source(10)),
+        ("PLR0911", _return_source(6)),
+        ("PLR0912", _branch_source(12)),
+        ("PLR0915", _statement_source(51)),
+    ],
+)
+@pytest.mark.parametrize(
+    "filename",
+    ["src/maintenance_man/_lint_probe.py", "tests/test_lint_probe.py"],
+)
+def test_complexity_rule_rejects_over_limit(
+    code: str, source: str, filename: str
+) -> None:
+    status, codes = _ruff_codes(source, filename=filename)
+    assert status == 1
+    assert code in codes
 
 
 def test_import_contracts() -> None:
@@ -637,31 +715,6 @@ def test_rich_contract_has_no_exceptions() -> None:
     contracts = config["tool"]["importlinter"]["contracts"]
     (rich_cli_only,) = [c for c in contracts if c.get("id") == "rich-cli-only"]
     assert "ignore_imports" not in rich_cli_only
-
-
-def test_workflow_code_passes_complexity_limit() -> None:
-    result = run_tool(
-        "ruff",
-        "check",
-        "--no-cache",
-        "--no-fix",
-        "--select",
-        "C901",
-        "src/maintenance_man/cli.py",
-        "src/maintenance_man/services",
-        "src/maintenance_man/updater.py",
-        "src/maintenance_man/gradle_inventory.py",
-        "src/maintenance_man/gradle_updates.py",
-        "src/maintenance_man/gradle_workflow.py",
-        "src/maintenance_man/dependency_age.py",
-        "src/maintenance_man/gradle.py",
-        "src/maintenance_man/gradle_resolution.py",
-        "src/maintenance_man/scanner.py",
-        "src/maintenance_man/gradle_verification.py",
-        "src/maintenance_man/models/gradle.py",
-        "src/maintenance_man/vcs.py",
-    )
-    assert result.returncode == 0, result.stdout
 
 
 _WORKFLOW_OPERATIONS = frozenset(

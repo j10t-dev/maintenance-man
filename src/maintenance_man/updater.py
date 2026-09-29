@@ -359,6 +359,16 @@ def _attempt_finding(
         emit(FindingPassed(finding.pkg_name, True))
         return FindingStep(None, already_applied=True)
 
+    return _commit_finding(finding, kind, repo, flow, emit)
+
+
+def _commit_finding(
+    finding: Finding,
+    kind: UpdateKind,
+    repo: Repository,
+    flow: Workflow,
+    emit: Emit,
+) -> FindingStep:
     message = _COMMIT_FORMATS[kind].format(
         pkg=finding.pkg_name,
         old=finding.installed_version,
