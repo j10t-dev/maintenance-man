@@ -303,27 +303,49 @@ def _publication_http(url, repository, suffix, count):
         with response:
             if response.status != 200:
                 raise PublicationError(f"publication HTTP {response.status}")
-            chunks = []
-            size = 0
-            while size <= _MAX_BYTES:
-                if response.fp is None:
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise PublicationError("publication lookup timed out")
-                # HTTPResponse.read1 performs at most one underlying read.
-                # Bound that read by the remaining operation deadline.
-                response.fp.raw._sock.settimeout(remaining)
-                chunk = response.read1(min(65536, _MAX_BYTES + 1 - size))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-            body = b"".join(chunks)
-            if len(body) > _MAX_BYTES or time.monotonic() > deadline:
-                raise PublicationError("publication response exceeds limit")
+            body = _read_publication_body(response, deadline)
             return body, dict(response.headers.items()), url
     raise PublicationError("publication redirect limit")
+
+
+def _read_publication_body(response, deadline):
+    chunks = []
+    size = 0
+    while size <= _MAX_BYTES:
+        if response.fp is None:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PublicationError("publication lookup timed out")
+        # HTTPResponse.read1 performs at most one underlying read.
+        # Bound that read by the remaining operation deadline.
+        response.fp.raw._sock.settimeout(remaining)
+        chunk = response.read1(min(65536, _MAX_BYTES + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    body = b"".join(chunks)
+    if len(body) > _MAX_BYTES or time.monotonic() > deadline:
+        raise PublicationError("publication response exceeds limit")
+    return body
+
+
+def _pom_coordinate(node, namespace, *, inherit=False):
+    values = []
+    for field in ("groupId", "artifactId", "version"):
+        matches = node.findall(namespace + field)
+        if not matches and inherit and field in {"groupId", "version"}:
+            parents = node.findall(namespace + "parent")
+            if len(parents) == 1:
+                parent = _pom_coordinate(parents[0], namespace)
+                values.append(parent.group if field == "groupId" else parent.version)
+                continue
+        value = (matches[0].text or "").strip() if len(matches) == 1 else ""
+        if not value or "${" in value:
+            raise PublicationError("unresolved or ambiguous POM identity")
+        values.append(value)
+    return ModuleId(group=values[0], artifact=values[1], version=values[2])
 
 
 def _pom_identity(body, module):
@@ -342,33 +364,39 @@ def _pom_identity(body, module):
         raise PublicationError("invalid POM root")
     ns = "{http://maven.apache.org/POM/4.0.0}" if root.tag.startswith("{") else ""
 
-    def identity(node, *, inherit=False):
-        values = []
-        for field in ("groupId", "artifactId", "version"):
-            matches = node.findall(ns + field)
-            if not matches and inherit and field in {"groupId", "version"}:
-                parents = node.findall(ns + "parent")
-                if len(parents) == 1:
-                    parent = identity(parents[0])
-                    values.append(
-                        parent.group if field == "groupId" else parent.version
-                    )
-                    continue
-            value = (matches[0].text or "").strip() if len(matches) == 1 else ""
-            if not value or "${" in value:
-                raise PublicationError("unresolved or ambiguous POM identity")
-            values.append(value)
-        return ModuleId(group=values[0], artifact=values[1], version=values[2])
-
-    if identity(root, inherit=True) != module:
+    if _pom_coordinate(root, ns, inherit=True) != module:
         raise PublicationError("POM identity mismatch")
     implementation = None
     if module.artifact.endswith(".gradle.plugin"):
         dependencies = root.findall(ns + "dependencies/" + ns + "dependency")
         if len(dependencies) != 1:
             raise PublicationError("unsupported plugin marker mapping")
-        implementation = identity(dependencies[0])
+        implementation = _pom_coordinate(dependencies[0], ns)
     return implementation
+
+
+def _parse_central_timestamp(body, module):
+    data = json.loads(body)
+    docs = data["response"]["docs"]
+    if not isinstance(docs, list) or not docs:
+        raise PublicationError("Central timestamp missing")
+    dates = []
+    for doc in docs:
+        if (doc["g"], doc["a"], doc["v"]) != (
+            module.group,
+            module.artifact,
+            module.version,
+        ):
+            raise PublicationError("Central timestamp identity mismatch")
+        milliseconds = doc["timestamp"]
+        if (
+            isinstance(milliseconds, bool)
+            or not isinstance(milliseconds, int)
+            or not 0 < milliseconds <= _MAX_EPOCH_MS
+        ):
+            raise PublicationError("invalid Central timestamp")
+        dates.append(datetime.fromtimestamp(milliseconds / 1000, UTC))
+    return max(dates)
 
 
 class PublicationLookupContext:
@@ -463,6 +491,35 @@ class PublicationLookupContext:
                 for repository in request.repositories:
                     self.submit(repository, module)
 
+    def _publication_timestamp(self, repository, module, headers):
+        raw = headers.get("last-modified")
+        if raw is not None:
+            timestamp = parsedate_to_datetime(raw)
+            if timestamp.tzinfo is None:
+                raise PublicationError("publication timestamp lacks timezone")
+            return "last_modified", timestamp
+        if repository != "central":
+            raise PublicationError("publication timestamp missing")
+        query = urllib.parse.urlencode(
+            {
+                "q": (
+                    f'g:"{module.group}" AND a:"{module.artifact}" '
+                    f'AND v:"{module.version}"'
+                ),
+                "rows": 20,
+                "wt": "json",
+            }
+        )
+        result = self.transport(
+            "https://search.maven.org/solrsearch/select?" + query,
+            repository,
+            None,
+            self._count,
+        )
+        if result is None:
+            raise PublicationError("Central timestamp unavailable")
+        return "central_timestamp", _parse_central_timestamp(result[0], module)
+
     def _fetch(self, key, module):
         started = time.monotonic()
         try:
@@ -480,55 +537,7 @@ class PublicationLookupContext:
                 raise PublicationError("POM exceeds size limit")
             implementation = _pom_identity(body, module)
             headers = {k.lower(): v for k, v in headers.items()}
-            method = "last_modified"
-            raw = headers.get("last-modified")
-            if raw is not None:
-                timestamp = parsedate_to_datetime(raw)
-                if timestamp.tzinfo is None:
-                    raise PublicationError("publication timestamp lacks timezone")
-            elif repository == "central":
-                method = "central_timestamp"
-                query = urllib.parse.urlencode(
-                    {
-                        "q": (
-                            f'g:"{module.group}" AND a:"{module.artifact}" '
-                            f'AND v:"{module.version}"'
-                        ),
-                        "rows": 20,
-                        "wt": "json",
-                    }
-                )
-                result = self.transport(
-                    "https://search.maven.org/solrsearch/select?" + query,
-                    repository,
-                    None,
-                    self._count,
-                )
-                if result is None:
-                    raise PublicationError("Central timestamp unavailable")
-                data = json.loads(result[0])
-                docs = data["response"]["docs"]
-                if not isinstance(docs, list) or not docs:
-                    raise PublicationError("Central timestamp missing")
-                dates = []
-                for doc in docs:
-                    if (doc["g"], doc["a"], doc["v"]) != (
-                        module.group,
-                        module.artifact,
-                        module.version,
-                    ):
-                        raise PublicationError("Central timestamp identity mismatch")
-                    ms = doc["timestamp"]
-                    if (
-                        isinstance(ms, bool)
-                        or not isinstance(ms, int)
-                        or not 0 < ms <= _MAX_EPOCH_MS
-                    ):
-                        raise PublicationError("invalid Central timestamp")
-                    dates.append(datetime.fromtimestamp(ms / 1000, UTC))
-                timestamp = max(dates)
-            else:
-                raise PublicationError("publication timestamp missing")
+            method, timestamp = self._publication_timestamp(repository, module, headers)
             timestamp = timestamp.astimezone(UTC)
             if timestamp > self.now():
                 raise PublicationError("future publication timestamp")
@@ -671,6 +680,62 @@ def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
     return None
 
 
+def _scan_publication_futures(update, resolution, context):
+    requests = []
+    if update.gradle_target is None:
+        return requests
+    for member in update.gradle_target.members:
+        if member.kind == "plugin":
+            module = ModuleId(
+                group=member.coordinate,
+                artifact=member.coordinate + ".gradle.plugin",
+                version=update.latest_version,
+            )
+        else:
+            parts = member.coordinate.split(":")
+            if len(parts) != 2:
+                continue
+            module = ModuleId(
+                group=parts[0], artifact=parts[1], version=update.latest_version
+            )
+        repositories = tuple(
+            repository
+            for repository in resolution.report.repositories
+            if repository.domain == member.kind
+        )
+        request = publication_request(module, repositories)
+        if request.routing_supported:
+            requests.append(
+                tuple(
+                    context.submit(repository, module)
+                    for repository in request.repositories
+                )
+            )
+    return requests
+
+
+def _assess_scan_publication(update, requests, cutoff):
+    dates = []
+    complete = (
+        bool(requests)
+        and update.gradle_target is not None
+        and len(requests) == len(update.gradle_target.members)
+    )
+    for futures in requests:
+        facts = [future.result() for future in futures]
+        known = [fact for fact in facts if isinstance(fact, PublicationFact)]
+        dates.extend(fact.timestamp for fact in known)
+        if (
+            any(isinstance(fact, AgeBlock) for fact in facts)
+            or len({fact.artifact_digest for fact in known}) != 1
+        ):
+            complete = False
+    if dates and max(dates) >= cutoff:
+        return None
+    published = max(dates) if complete else None
+    return update.model_copy(update={"published_date": published})
+
+
 def filter_gradle_updates_by_age(
     updates: list[UpdateFinding],
     project: ProjectConfig,
@@ -690,57 +755,12 @@ def filter_gradle_updates_by_age(
     ):
         return list(updates)
     cutoff = context.now() - timedelta(days=min_age_days)
-    pending = []
-    for update in updates:
-        requests = []
-        if update.gradle_target is not None:
-            for member in update.gradle_target.members:
-                if member.kind == "plugin":
-                    module = ModuleId(
-                        group=member.coordinate,
-                        artifact=member.coordinate + ".gradle.plugin",
-                        version=update.latest_version,
-                    )
-                else:
-                    parts = member.coordinate.split(":")
-                    if len(parts) != 2:
-                        continue
-                    module = ModuleId(
-                        group=parts[0], artifact=parts[1], version=update.latest_version
-                    )
-                repositories = tuple(
-                    repository
-                    for repository in resolution.report.repositories
-                    if repository.domain == member.kind
-                )
-                request = publication_request(module, repositories)
-                if request.routing_supported:
-                    requests.append(
-                        tuple(
-                            context.submit(repository, module)
-                            for repository in request.repositories
-                        )
-                    )
-        pending.append((update, requests))
-    result = []
-    for update, requests in pending:
-        dates = []
-        complete = (
-            bool(requests)
-            and update.gradle_target is not None
-            and len(requests) == len(update.gradle_target.members)
-        )
-        for futures in requests:
-            facts = [future.result() for future in futures]
-            known = [fact for fact in facts if isinstance(fact, PublicationFact)]
-            dates.extend(fact.timestamp for fact in known)
-            if (
-                any(isinstance(fact, AgeBlock) for fact in facts)
-                or len({fact.artifact_digest for fact in known}) != 1
-            ):
-                complete = False
-        if dates and max(dates) >= cutoff:
-            continue
-        published = max(dates) if complete else None
-        result.append(update.model_copy(update={"published_date": published}))
-    return result
+    pending = [
+        (update, _scan_publication_futures(update, resolution, context))
+        for update in updates
+    ]
+    assessed = (
+        _assess_scan_publication(update, requests, cutoff)
+        for update, requests in pending
+    )
+    return [update for update in assessed if update is not None]

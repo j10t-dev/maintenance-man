@@ -682,6 +682,61 @@ def test_publication_transport_redirect_bound(
     assert len(calls) == expected_calls
 
 
+def test_publication_redirect_and_read_share_deadline(monkeypatch):
+    from email.message import Message
+    from types import SimpleNamespace
+    from urllib.error import HTTPError
+
+    from maintenance_man import dependency_age as age
+
+    now = [100.0]
+    timeouts = []
+    closed = []
+    url = "https://repo.maven.apache.org/maven2/a/b/2/b-2.pom"
+    headers = Message()
+    headers["Location"] = url
+    redirect = HTTPError(url, 302, "redirect", headers, None)
+    original_close = redirect.close
+
+    def close_redirect():
+        closed.append("redirect")
+        original_close()
+
+    monkeypatch.setattr(redirect, "close", close_redirect)
+
+    class Response:
+        status = 200
+        fp = SimpleNamespace(
+            raw=SimpleNamespace(_sock=SimpleNamespace(settimeout=lambda _: None))
+        )
+
+        def read1(self, count):
+            now[0] = 116.0
+            return b"chunk"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            closed.append("response")
+
+    class Opener:
+        def open(self, request, timeout):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                now[0] = 114.0
+                raise redirect
+            assert closed == ["redirect"]
+            return Response()
+
+    monkeypatch.setattr(age.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
+    with pytest.raises(PublicationError, match=r"^publication lookup timed out$"):
+        age._publication_http(url, "central", "a/b/2/b-2.pom", lambda: None)
+    assert timeouts == [15.0, 1.0]
+    assert closed == ["redirect", "response"]
+
+
 @pytest.mark.parametrize("transfer", ["content-length", "chunked"])
 def test_publication_http_response_eof(monkeypatch, transfer):
     import http.client
@@ -734,14 +789,17 @@ def test_publication_http_response_eof(monkeypatch, transfer):
         assert final_url == url
         assert calls == [url]
         assert response.fp is None
+        assert response.isclosed()
     finally:
         receiver.close()
         sender.close()
 
 
-def test_publication_http_response_oversized_body_is_refused(monkeypatch):
-    """The streaming 1 MiB bound in the real read loop must refuse an
-    oversized body over a live socket.
+@pytest.mark.parametrize(
+    "extra_byte,accepted", [(False, True), (True, False)], ids=["limit", "over-limit"]
+)
+def test_publication_http_response_size_bound(monkeypatch, extra_byte, accepted):
+    """The live read loop accepts 1 MiB and refuses one byte more.
 
     ``test_publication_rejects_unproven_pom``'s oversized case goes through a
     fake transport and only exercises the post-hoc length check; this drives
@@ -753,8 +811,8 @@ def test_publication_http_response_oversized_body_is_refused(monkeypatch):
 
     from maintenance_man import dependency_age as age
 
-    oversized = b"x" * (age._MAX_BYTES + 1)
-    transfer_header = f"Content-Length: {len(oversized)}\r\n".encode()
+    body = b"x" * (age._MAX_BYTES + extra_byte)
+    transfer_header = f"Content-Length: {len(body)}\r\n".encode()
     receiver, sender = socket.socketpair()
 
     def produce():
@@ -763,7 +821,7 @@ def test_publication_http_response_oversized_body_is_refused(monkeypatch):
                 b"HTTP/1.1 200 OK\r\n"
                 + transfer_header
                 + b"Last-Modified: Tue, 01 Sep 2026 00:00:00 GMT\r\n\r\n"
-                + oversized
+                + body
             )
             sender.shutdown(socket.SHUT_WR)
         except OSError:
@@ -783,8 +841,12 @@ def test_publication_http_response_oversized_body_is_refused(monkeypatch):
         monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
         suffix = "org/example/lib/2.0/lib-2.0.pom"
         url = "https://repo.maven.apache.org/maven2/" + suffix
-        with pytest.raises(PublicationError):
-            _publication_http(url, "central", suffix, lambda: None)
+        if accepted:
+            assert _publication_http(url, "central", suffix, lambda: None)[0] == body
+        else:
+            with pytest.raises(PublicationError):
+                _publication_http(url, "central", suffix, lambda: None)
+        assert response.isclosed()
     finally:
         producer.join(5)
         receiver.close()
@@ -1192,65 +1254,23 @@ def test_gradle_scan_age_filter_keeps_unknown_and_filters_known_young(
 )
 def test_gradle_group_age_requires_every_member_date(tmp_path, case, kept, dated):
     from maintenance_man.dependency_age import filter_gradle_updates_by_age
-    from maintenance_man.models.config import ProjectConfig
-    from maintenance_man.models.gradle import (
-        CompleteResolution,
-        RepositoryDeclaration,
-        ResolutionReport,
-    )
-    from maintenance_man.models.scan import GradleMember, GradleUpdateTarget
 
-    members = [
-        GradleMember(
-            kind="library", alias="one", coordinate="g:one", installed_version="1"
-        )
-    ]
-    repositories = [
-        RepositoryDeclaration(
-            project_path=":",
-            domain="library",
-            url="https://repo.maven.apache.org/maven2",
-        )
-    ]
+    member_specs = [("library", "one", "g:one")]
+    repository_specs = [("library", "https://repo.maven.apache.org/maven2")]
     if "repository" in case:
-        repositories.append(
-            RepositoryDeclaration(
-                project_path=":",
-                domain="library",
-                url="https://dl.google.com/dl/android/maven2",
-            )
-        )
+        repository_specs.append(("library", "https://dl.google.com/dl/android/maven2"))
     else:
-        members.append(
-            GradleMember(
-                kind="plugin" if case == "member-routing" else "library",
-                alias="two",
-                coordinate="g.two" if case == "member-routing" else "g:two",
-                installed_version="1",
+        member_specs.append(
+            (
+                "plugin" if case == "member-routing" else "library",
+                "two",
+                "g.two" if case == "member-routing" else "g:two",
             )
         )
-    row = _make_update("shared", "2").model_copy(
-        update={
-            "gradle_target": GradleUpdateTarget(
-                version_ref="shared", target_version="2", members=members
-            )
-        }
-    )
-    project = ProjectConfig(
-        path=tmp_path,
-        package_manager="gradle",
-        gradle_repository_routing="standard-public",
-    )
-    resolution = CompleteResolution(
-        report=ResolutionReport(
-            schema_version=1,
-            root_project=":",
-            producer_versions={"gradle": "9", "cyclonedx": "3", "report": "1"},
-            catalogue_digest="catalogue",
-            repositories=tuple(repositories),
-            selected_scopes=(),
-            scopes=(),
-        )
+    row, project, resolution = _scan_age_inputs(
+        tmp_path,
+        member_specs=member_specs,
+        repository_specs=repository_specs,
     )
 
     def transport(url, repository, suffix, count):
@@ -1273,3 +1293,183 @@ def test_gradle_group_age_requires_every_member_date(tmp_path, case, kept, dated
     assert bool(result) is kept
     if kept:
         assert (result[0].published_date is not None) is dated
+
+
+def _scan_age_inputs(
+    tmp_path,
+    *,
+    member_specs=(("library", "one", "g:one"),),
+    repository_specs=(
+        ("library", "https://repo.maven.apache.org/maven2"),
+        ("library", "https://dl.google.com/dl/android/maven2"),
+    ),
+):
+    from maintenance_man.models.config import ProjectConfig
+    from maintenance_man.models.gradle import (
+        CompleteResolution,
+        RepositoryDeclaration,
+        ResolutionReport,
+    )
+    from maintenance_man.models.scan import GradleMember, GradleUpdateTarget
+
+    target = GradleUpdateTarget(
+        version_ref="shared",
+        target_version="2",
+        members=[
+            GradleMember(
+                kind=kind,
+                alias=alias,
+                coordinate=coordinate,
+                installed_version="1",
+            )
+            for kind, alias, coordinate in member_specs
+        ],
+    )
+    update = _make_update("shared", "2").model_copy(update={"gradle_target": target})
+    project = ProjectConfig(
+        path=tmp_path,
+        package_manager="gradle",
+        gradle_repository_routing="standard-public",
+    )
+    resolution = CompleteResolution(
+        report=ResolutionReport(
+            schema_version=1,
+            root_project=":",
+            producer_versions={"gradle": "9", "cyclonedx": "3", "report": "1"},
+            catalogue_digest="catalogue",
+            repositories=tuple(
+                RepositoryDeclaration(
+                    project_path=":",
+                    domain=domain,
+                    url=url,
+                )
+                for domain, url in repository_specs
+            ),
+            selected_scopes=(),
+            scopes=(),
+        )
+    )
+    return update, project, resolution
+
+
+def _publication_fact(module, repository, timestamp, digest="0" * 64):
+    from maintenance_man.models.gradle import PublicationFact
+
+    root = {
+        "central": "https://repo.maven.apache.org/maven2",
+        "google": "https://dl.google.com/dl/android/maven2",
+    }[repository]
+    path = "/".join(
+        (
+            module.group.replace(".", "/"),
+            module.artifact,
+            module.version,
+            f"{module.artifact}-{module.version}.pom",
+        )
+    )
+    return PublicationFact(
+        repository=repository,
+        module=module,
+        source_url=f"{root}/{path}",
+        method="last_modified",
+        artifact_digest=digest,
+        timestamp=timestamp,
+        checked_at=_PUB_NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "case,kept,expected_date",
+    [
+        ("unknown", True, None),
+        ("absent-repository", True, datetime(2026, 9, 1, tzinfo=UTC)),
+        ("old", True, datetime(2026, 9, 1, tzinfo=UTC)),
+        ("young", False, None),
+        ("equal-cutoff", False, None),
+        ("conflicting-digest", True, None),
+    ],
+)
+def test_gradle_group_age_assesses_known_facts(
+    tmp_path, monkeypatch, case, kept, expected_date
+):
+    from maintenance_man.dependency_age import filter_gradle_updates_by_age
+
+    update, project, resolution = _scan_age_inputs(tmp_path)
+    module = ModuleId(group="g", artifact="one", version="2")
+    old = datetime(2026, 9, 1, tzinfo=UTC)
+    dates = {
+        "young": datetime(2026, 9, 17, tzinfo=UTC),
+        "equal-cutoff": datetime(2026, 9, 11, tzinfo=UTC),
+    }
+    values = {
+        "unknown": (
+            _publication_fact(module, "central", old),
+            AgeBlock(reason="publication lookup failed"),
+        ),
+        "absent-repository": (_publication_fact(module, "central", old), None),
+        "old": (
+            _publication_fact(module, "central", old),
+            _publication_fact(module, "google", old),
+        ),
+        "young": (_publication_fact(module, "central", dates["young"]), None),
+        "equal-cutoff": (
+            _publication_fact(module, "central", dates["equal-cutoff"]),
+            None,
+        ),
+        "conflicting-digest": (
+            _publication_fact(module, "central", old),
+            _publication_fact(module, "google", old, "1" * 64),
+        ),
+    }[case]
+
+    class Future:
+        def __init__(self, value):
+            self.value = value
+
+        def result(self):
+            return self.value
+
+    context = PublicationLookupContext(tmp_path, now=lambda: _PUB_NOW)
+    outcomes = iter(values)
+    monkeypatch.setattr(context, "submit", lambda *_: Future(next(outcomes)))
+    with context:
+        result = filter_gradle_updates_by_age([update], project, resolution, 7, context)
+    assert bool(result) is kept
+    if kept:
+        assert result[0].published_date == expected_date
+
+
+def test_gradle_scan_submits_every_update_before_waiting(tmp_path, monkeypatch):
+    from maintenance_man.dependency_age import filter_gradle_updates_by_age
+
+    first, project, resolution = _scan_age_inputs(tmp_path)
+    second, _, _ = _scan_age_inputs(
+        tmp_path, member_specs=(("library", "two", "g:two"),)
+    )
+    expected_submissions = 4
+    submitted = []
+
+    class Future:
+        def __init__(self, fact):
+            self.fact = fact
+
+        def result(self):
+            assert len(submitted) == expected_submissions
+            return self.fact
+
+    def submit(repository, module):
+        submitted.append((repository, module))
+        return Future(
+            _publication_fact(module, repository, datetime(2026, 9, 1, tzinfo=UTC))
+        )
+
+    context = PublicationLookupContext(tmp_path, now=lambda: _PUB_NOW)
+    monkeypatch.setattr(context, "submit", submit)
+    with context:
+        result = filter_gradle_updates_by_age(
+            [first, second], project, resolution, 7, context
+        )
+    assert [update.gradle_target for update in result] == [
+        first.gradle_target,
+        second.gradle_target,
+    ]
