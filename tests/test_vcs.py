@@ -351,7 +351,8 @@ def test_proof_body_stays_primary_with_both_cleanup_diagnostics(
 
     def fail_proof_remove(path: Path):
         if path.name.startswith("mm-gradle-proof-"):
-            raise OSError("remove denied")
+            msg = "remove denied"
+            raise OSError(msg)
         return original_remove(path)
 
     monkeypatch.setattr(vcs.shutil, "rmtree", fail_proof_remove)

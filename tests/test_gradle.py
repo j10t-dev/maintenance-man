@@ -705,7 +705,8 @@ class TestGradleReportInventory:
         )
 
         with pytest.raises(ValueError), generate_gradle_report(gradle_project):
-            raise ValueError("caller failed")
+            msg = "caller failed"
+            raise ValueError(msg)
 
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
@@ -743,7 +744,8 @@ def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
 
     def _cannot_remove(*args, **kwargs):
         if not kwargs.get("ignore_errors"):
-            raise PermissionError("cleanup denied")
+            msg = "cleanup denied"
+            raise PermissionError(msg)
 
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
     with (
@@ -1147,7 +1149,8 @@ def test_application_preserves_bundles_and_rich_declarations(
 
 def test_apply_execution_oserror_is_an_adapter_error(gradle_project, monkeypatch):
     def unavailable(cmd, **kwargs):
-        raise OSError("wrapper unavailable")
+        msg = "wrapper unavailable"
+        raise OSError(msg)
 
     monkeypatch.setattr(subprocess, "run", unavailable)
     with pytest.raises(GradleError, match="wrapper unavailable"):
@@ -1356,7 +1359,8 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
         (inventory / "bom.json").write_bytes(b"old inventory")
 
         def fail(*args, **kwargs):
-            raise PermissionError("claim denied")
+            msg = "claim denied"
+            raise PermissionError(msg)
 
         monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
     elif phase == "mkdir":
@@ -1364,7 +1368,8 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
 
         def fail(path, *args, **kwargs):
             if path == inventory:
-                raise PermissionError("mkdir denied")
+                msg = "mkdir denied"
+                raise PermissionError(msg)
             return mkdir(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "mkdir", fail)
@@ -1373,7 +1378,8 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
 
         def fail(path, content):
             if path == marker:
-                raise PermissionError("marker denied")
+                msg = "marker denied"
+                raise PermissionError(msg)
             return write(path, content)
 
         monkeypatch.setattr(Path, "write_bytes", fail)
@@ -1409,7 +1415,8 @@ def test_report_lifecycle_filesystem_errors_are_gradle_errors(
 
         def fail(path, content):
             if path == marker:
-                raise PermissionError("report marker denied")
+                msg = "report marker denied"
+                raise PermissionError(msg)
             return write(path, content)
 
         monkeypatch.setattr(Path, "write_bytes", fail)
@@ -1423,7 +1430,8 @@ def test_report_lifecycle_filesystem_errors_are_gradle_errors(
 
         def fail(path, *args, **kwargs):
             if path == report:
-                raise PermissionError("report unlink denied")
+                msg = "report unlink denied"
+                raise PermissionError(msg)
             return unlink(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "unlink", fail)
@@ -1493,7 +1501,8 @@ def test_adapter_filesystem_read_failure_is_actionable_and_releases_outputs(
 
     def fail(path, *args, **kwargs):
         if path == blocked:
-            raise PermissionError("read denied")
+            msg = "read denied"
+            raise PermissionError(msg)
         return method(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_bytes" if reads_bytes else "read_text", fail)
@@ -1595,7 +1604,8 @@ def test_present_falsey_report_table_is_not_a_clean_discovery(
 
 def test_wrapper_output_decode_failure_is_gradle_error(gradle_project, monkeypatch):
     def run(*args, **kwargs):
-        raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
+        msg = "utf8"
+        raise UnicodeDecodeError(msg, b"\xff", 0, 1, "invalid")
 
     monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(GradleError, match="gradlew"):

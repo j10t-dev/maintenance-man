@@ -227,7 +227,8 @@ class FakeJjState:
     ) -> FakeJj:
         root = path.resolve()
         if root in self._repositories:
-            raise AssertionError(f"repository already seeded: {root}")
+            msg = f"repository already seeded: {root}"
+            raise AssertionError(msg)
         root.mkdir(parents=True, exist_ok=True)
         encoded = {name: value.encode() for name, value in files.items()}
         baseline = _commit(
@@ -269,7 +270,8 @@ class FakeJjState:
     def repository(self, path: Path) -> FakeJj:
         resolved = path.resolve()
         if resolved not in self._bindings:
-            raise AssertionError(f"unknown fake repository path: {resolved}")
+            msg = f"unknown fake repository path: {resolved}"
+            raise AssertionError(msg)
         return FakeJj(resolved)
 
     def code_host(self, path: Path) -> FakeCodeHost:
@@ -278,7 +280,8 @@ class FakeJjState:
             root, _workspace = self._bindings[resolved]
             data = self._hosts[root]
         except KeyError as exc:
-            raise AssertionError(f"unknown fake repository path: {resolved}") from exc
+            msg = f"unknown fake repository path: {resolved}"
+            raise AssertionError(msg) from exc
         return FakeCodeHost(resolved, _data=data)
 
     def services(self) -> VcsServices:
@@ -339,7 +342,8 @@ class FakeJjState:
     ) -> str:
         data, _ = self._view(path)
         if parent not in data.graph:
-            raise AssertionError(f"unknown parent: {parent}")
+            msg = f"unknown parent: {parent}"
+            raise AssertionError(msg)
         record = _commit(
             change_id=self._identity("change"),
             parent=parent,
@@ -504,14 +508,16 @@ class FakeJjState:
             data = self._repositories[root]
             return data, self._workspace(data, name)
         except KeyError as exc:
-            raise AssertionError(f"unknown fake repository path: {resolved}") from exc
+            msg = f"unknown fake repository path: {resolved}"
+            raise AssertionError(msg) from exc
 
     @staticmethod
     def _workspace(data: _RepositoryData, name: str) -> _Workspace:
         try:
             return data.workspaces[name]
         except KeyError as exc:
-            raise RevisionError(f"Unknown workspace: {name}") from exc
+            msg = f"Unknown workspace: {name}"
+            raise RevisionError(msg) from exc
 
     @staticmethod
     def _replace_workspace(
@@ -524,16 +530,16 @@ class FakeJjState:
     @staticmethod
     def _single(targets: tuple[str, ...], revision: str) -> str:
         if len(targets) != 1:
-            raise RevisionError(
-                f"{revision} must resolve to exactly one commit, got {len(targets)}"
-            )
+            msg = f"{revision} must resolve to exactly one commit, got {len(targets)}"
+            raise RevisionError(msg)
         return targets[0]
 
     @staticmethod
     def _validate_targets(data: _RepositoryData, targets: tuple[str, ...]) -> None:
         unknown = set(targets) - data.graph.keys()
         if unknown:
-            raise AssertionError(f"unknown fake commit targets: {sorted(unknown)}")
+            msg = f"unknown fake commit targets: {sorted(unknown)}"
+            raise AssertionError(msg)
 
     def _project(self, data: _RepositoryData, workspace: _Workspace) -> None:
         files = dict(data.graph[workspace.current].files)
@@ -623,7 +629,8 @@ class FakeJj:
         try:
             self._state = FakeJjState._owners[resolved]
         except KeyError as exc:
-            raise AssertionError(f"unknown fake repository path: {resolved}") from exc
+            msg = f"unknown fake repository path: {resolved}"
+            raise AssertionError(msg) from exc
         self._path = resolved
         self._state._view(resolved)
 
@@ -649,7 +656,8 @@ class FakeJj:
         data, _ = self._data()
         targets = data.bookmarks.get(bookmark, ())
         if not targets:
-            raise RevisionError(f"Cannot inspect bookmark conflict for {bookmark}")
+            msg = f"Cannot inspect bookmark conflict for {bookmark}"
+            raise RevisionError(msg)
         return len(targets) > 1
 
     def resolve_revision(self, *, revision: str, read_only: bool = False) -> str:
@@ -667,7 +675,8 @@ class FakeJj:
         if revision == "@-":
             parent = data.graph[current].parent
             if parent is None:
-                raise RevisionError("@- must resolve to exactly one commit, got 0")
+                msg = "@- must resolve to exactly one commit, got 0"
+                raise RevisionError(msg)
             return parent
         if revision == "main@origin":
             return self._state._single(data.tracking.get("main", ()), revision)
@@ -769,7 +778,8 @@ class FakeJj:
         )
         data, _ = self._data()
         if data.bookmarks.get(bookmark):
-            raise RevisionError(f"Bookmark already exists: {bookmark}")
+            msg = f"Bookmark already exists: {bookmark}"
+            raise RevisionError(msg)
         target = self.resolve_revision(revision=revision)
         data.bookmarks[bookmark] = (target,)
         self._state._effect(
@@ -791,7 +801,8 @@ class FakeJj:
         self._state._begin(self.path, "delete_bookmark", bookmark=bookmark)
         data, _ = self._data()
         if not data.bookmarks.pop(bookmark, None):
-            raise RevisionError(f"Bookmark does not exist: {bookmark}")
+            msg = f"Bookmark does not exist: {bookmark}"
+            raise RevisionError(msg)
         self._state._effect(self.path, "delete_bookmark", bookmark=bookmark)
 
     def new_change(self, *, revision: str) -> None:
@@ -849,7 +860,8 @@ class FakeJj:
         self._state._begin(self.path, "discard")
         current = self._state._snapshot(self.path)
         if current.parent is None:
-            raise RevisionError("Working copy has no parent")
+            msg = "Working copy has no parent"
+            raise RevisionError(msg)
         data, workspace = self._data()
         parent = data.graph[current.parent]
         restored = _commit(
@@ -891,14 +903,17 @@ class FakeJj:
 
     def _guard(self, bookmark: str, expected: ExpectedRevisions) -> None:
         if bookmark not in tuple(WORKFLOW_BOOKMARKS.values()):
-            raise RevisionError("Unexpected managed Gradle bookmark")
+            msg = "Unexpected managed Gradle bookmark"
+            raise RevisionError(msg)
         data, _ = self._data()
         if data.bookmarks.get("main", ()) != (expected.base,) or data.bookmarks.get(
             bookmark, ()
         ) != (expected.tip,):
-            raise RevisionError("Guarded revisions changed")
+            msg = "Guarded revisions changed"
+            raise RevisionError(msg)
         if not self._state._is_ancestor(data, expected.base, expected.tip):
-            raise RevisionError("Guarded tip is not descended from its base")
+            msg = "Guarded tip is not descended from its base"
+            raise RevisionError(msg)
 
     def promote_bookmark_to_main(
         self, *, bookmark: str, expected: ExpectedRevisions | None = None
@@ -918,7 +933,8 @@ class FakeJj:
             data.bookmarks.get("main") != (expected.tip,)
             or data.bookmarks.get(bookmark) != (expected.tip,)
         ):
-            raise RevisionError("Local revisions changed during promotion")
+            msg = "Local revisions changed during promotion"
+            raise RevisionError(msg)
 
     def reset_verified_bookmark(
         self, *, bookmark: str, expected: ExpectedRevisions
@@ -931,7 +947,8 @@ class FakeJj:
         self._state._effect(self.path, method, bookmark=bookmark, expected=expected)
         self._state._run_hooks(self.path, method, "postcheck")
         if data.bookmarks.get(bookmark) != (expected.base,):
-            raise RevisionError("Local revisions changed during reset")
+            msg = "Local revisions changed during reset"
+            raise RevisionError(msg)
 
     def fetch(self, *, main_only: bool = False) -> None:
         self._state._begin(self.path, "fetch", main_only=main_only)
@@ -972,7 +989,8 @@ class FakeJj:
             and not data.tracks_main
             and origin.bookmarks.get(bookmark)
         ):
-            raise RevisionError("Non-tracking remote bookmark main@origin exists")
+            msg = "Non-tracking remote bookmark main@origin exists"
+            raise RevisionError(msg)
         if expected is not None:
             self._guard(bookmark, expected)
             target = expected.tip
@@ -989,7 +1007,8 @@ class FakeJj:
             data.bookmarks.get("main") != (expected.base,)
             or data.bookmarks.get(bookmark) != (expected.tip,)
         ):
-            raise RevisionError("Local revisions changed during submission")
+            msg = "Local revisions changed during submission"
+            raise RevisionError(msg)
 
     def workspace_names(self) -> frozenset[str]:
         self._state._begin(self.path, "workspace_names")
@@ -1002,7 +1021,8 @@ class FakeJj:
         )
         data, _ = self._data()
         if name in data.workspaces or path.resolve() in self._state._bindings:
-            raise RevisionError(f"Workspace already exists: {name}")
+            msg = f"Workspace already exists: {name}"
+            raise RevisionError(msg)
         target = self.resolve_revision(revision=revision)
         workspace = _Workspace(name, path.resolve(), target)
         data.workspaces[name] = workspace
@@ -1019,7 +1039,8 @@ class FakeJj:
         try:
             workspace = data.workspaces.pop(name)
         except KeyError as exc:
-            raise RevisionError(f"Unknown workspace: {name}") from exc
+            msg = f"Unknown workspace: {name}"
+            raise RevisionError(msg) from exc
         self._state._bindings.pop(workspace.path, None)
         self._state._owners.pop(workspace.path, None)
         self._state._effect(self.path, "forget_workspace", name=name)

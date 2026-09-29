@@ -264,9 +264,11 @@ def _public_url(url, repository, suffix=None):
         or parsed.query
         or parsed.fragment
     ):
-        raise PublicationError("untrusted publication redirect")
+        msg = "untrusted publication redirect"
+        raise PublicationError(msg)
     if suffix is not None and not parsed.path.endswith("/" + suffix):
-        raise PublicationError("redirect changed exact artifact path")
+        msg = "redirect changed exact artifact path"
+        raise PublicationError(msg)
 
 
 def _publication_http(url, repository, suffix, count):
@@ -277,10 +279,12 @@ def _publication_http(url, repository, suffix, count):
         if suffix is not None:
             _public_url(url, repository, suffix)
         elif urllib.parse.urlsplit(url).netloc != "search.maven.org":
-            raise PublicationError("untrusted Central timestamp endpoint")
+            msg = "untrusted Central timestamp endpoint"
+            raise PublicationError(msg)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise PublicationError("publication lookup timed out")
+            msg = "publication lookup timed out"
+            raise PublicationError(msg)
         count()
         try:
             response = opener.open(urllib.request.Request(url), timeout=remaining)
@@ -292,20 +296,22 @@ def _publication_http(url, repository, suffix, count):
                 location = error.headers.get("Location")
                 error.close()
                 if suffix is None or redirects == 5 or not location:
-                    raise PublicationError(
-                        "publication redirect limit or invalid redirect"
-                    ) from error
+                    msg = "publication redirect limit or invalid redirect"
+                    raise PublicationError(msg) from error
                 url = urllib.parse.urljoin(url, location)
                 _public_url(url, repository, suffix)
                 continue
             error.close()
-            raise PublicationError(f"publication HTTP {error.code}") from error
+            msg = f"publication HTTP {error.code}"
+            raise PublicationError(msg) from error
         with response:
             if response.status != 200:
-                raise PublicationError(f"publication HTTP {response.status}")
+                msg = f"publication HTTP {response.status}"
+                raise PublicationError(msg)
             body = _read_publication_body(response, deadline)
             return body, dict(response.headers.items()), url
-    raise PublicationError("publication redirect limit")
+    msg = "publication redirect limit"
+    raise PublicationError(msg)
 
 
 def _read_publication_body(response, deadline):
@@ -316,7 +322,8 @@ def _read_publication_body(response, deadline):
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise PublicationError("publication lookup timed out")
+            msg = "publication lookup timed out"
+            raise PublicationError(msg)
         # HTTPResponse.read1 performs at most one underlying read.
         # Bound that read by the remaining operation deadline.
         response.fp.raw._sock.settimeout(remaining)
@@ -327,7 +334,8 @@ def _read_publication_body(response, deadline):
         size += len(chunk)
     body = b"".join(chunks)
     if len(body) > _MAX_BYTES or time.monotonic() > deadline:
-        raise PublicationError("publication response exceeds limit")
+        msg = "publication response exceeds limit"
+        raise PublicationError(msg)
     return body
 
 
@@ -343,7 +351,8 @@ def _pom_coordinate(node, namespace, *, inherit=False):
                 continue
         value = (matches[0].text or "").strip() if len(matches) == 1 else ""
         if not value or "${" in value:
-            raise PublicationError("unresolved or ambiguous POM identity")
+            msg = "unresolved or ambiguous POM identity"
+            raise PublicationError(msg)
         values.append(value)
     return ModuleId(group=values[0], artifact=values[1], version=values[2])
 
@@ -358,19 +367,23 @@ def _pom_identity(body, module):
     # fail closed before parsing. UTF-8 POMs are the supported trust-v1 format.
     text = body.decode("utf-8-sig")
     if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
-        raise PublicationError("POM entity declarations are unsupported")
+        msg = "POM entity declarations are unsupported"
+        raise PublicationError(msg)
     root = ET.fromstring(text)
     if root.tag not in ("project", "{http://maven.apache.org/POM/4.0.0}project"):
-        raise PublicationError("invalid POM root")
+        msg = "invalid POM root"
+        raise PublicationError(msg)
     ns = "{http://maven.apache.org/POM/4.0.0}" if root.tag.startswith("{") else ""
 
     if _pom_coordinate(root, ns, inherit=True) != module:
-        raise PublicationError("POM identity mismatch")
+        msg = "POM identity mismatch"
+        raise PublicationError(msg)
     implementation = None
     if module.artifact.endswith(".gradle.plugin"):
         dependencies = root.findall(ns + "dependencies/" + ns + "dependency")
         if len(dependencies) != 1:
-            raise PublicationError("unsupported plugin marker mapping")
+            msg = "unsupported plugin marker mapping"
+            raise PublicationError(msg)
         implementation = _pom_coordinate(dependencies[0], ns)
     return implementation
 
@@ -379,7 +392,8 @@ def _parse_central_timestamp(body, module):
     data = json.loads(body)
     docs = data["response"]["docs"]
     if not isinstance(docs, list) or not docs:
-        raise PublicationError("Central timestamp missing")
+        msg = "Central timestamp missing"
+        raise PublicationError(msg)
     dates = []
     for doc in docs:
         if (doc["g"], doc["a"], doc["v"]) != (
@@ -387,14 +401,16 @@ def _parse_central_timestamp(body, module):
             module.artifact,
             module.version,
         ):
-            raise PublicationError("Central timestamp identity mismatch")
+            msg = "Central timestamp identity mismatch"
+            raise PublicationError(msg)
         milliseconds = doc["timestamp"]
         if (
             isinstance(milliseconds, bool)
             or not isinstance(milliseconds, int)
             or not 0 < milliseconds <= _MAX_EPOCH_MS
         ):
-            raise PublicationError("invalid Central timestamp")
+            msg = "invalid Central timestamp"
+            raise PublicationError(msg)
         dates.append(datetime.fromtimestamp(milliseconds / 1000, UTC))
     return max(dates)
 
@@ -496,10 +512,12 @@ class PublicationLookupContext:
         if raw is not None:
             timestamp = parsedate_to_datetime(raw)
             if timestamp.tzinfo is None:
-                raise PublicationError("publication timestamp lacks timezone")
+                msg = "publication timestamp lacks timezone"
+                raise PublicationError(msg)
             return "last_modified", timestamp
         if repository != "central":
-            raise PublicationError("publication timestamp missing")
+            msg = "publication timestamp missing"
+            raise PublicationError(msg)
         query = urllib.parse.urlencode(
             {
                 "q": (
@@ -517,7 +535,8 @@ class PublicationLookupContext:
             self._count,
         )
         if result is None:
-            raise PublicationError("Central timestamp unavailable")
+            msg = "Central timestamp unavailable"
+            raise PublicationError(msg)
         return "central_timestamp", _parse_central_timestamp(result[0], module)
 
     def _fetch(self, key, module):
@@ -534,13 +553,15 @@ class PublicationLookupContext:
             body, headers, final_url = response
             _public_url(final_url, repository, suffix)
             if len(body) > _MAX_BYTES:
-                raise PublicationError("POM exceeds size limit")
+                msg = "POM exceeds size limit"
+                raise PublicationError(msg)
             implementation = _pom_identity(body, module)
             headers = {k.lower(): v for k, v in headers.items()}
             method, timestamp = self._publication_timestamp(repository, module, headers)
             timestamp = timestamp.astimezone(UTC)
             if timestamp > self.now():
-                raise PublicationError("future publication timestamp")
+                msg = "future publication timestamp"
+                raise PublicationError(msg)
             fact = PublicationFact(
                 repository=repository,
                 module=module,
@@ -605,7 +626,8 @@ def _artifact_suffix(module):
     if any(
         not p or "/" in p or "\\" in p or "${" in p or p in (".", "..") for p in parts
     ):
-        raise PublicationError("unsupported artifact identity")
+        msg = "unsupported artifact identity"
+        raise PublicationError(msg)
     quote = functools.partial(urllib.parse.quote, safe="")
     return "/".join(
         [
@@ -664,7 +686,8 @@ def lookup_gradle_publication(request, context):
 def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
     """Withhold only releases with a known date inside the waiting period."""
     if now.tzinfo is None or minimum_age_days < 0:
-        raise ValueError("current UTC date and nonnegative minimum age required")
+        msg = "current UTC date and nonnegative minimum age required"
+        raise ValueError(msg)
     if minimum_age_days == 0:
         return None
     requests = candidate.publication_requests

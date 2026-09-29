@@ -70,28 +70,33 @@ def gradle_run_path(project: str) -> Path:
     try:
         return paths.project_file(paths.gradle_runs_dir(), project, ".json")
     except ValueError as exc:
-        raise GradleError("Invalid Gradle run path") from exc
+        msg = "Invalid Gradle run path"
+        raise GradleError(msg) from exc
 
 
 def save_gradle_run(path: Path, run: GradleRun) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
-        raise GradleError("Refusing symlinked Gradle run ledger")
+        msg = "Refusing symlinked Gradle run ledger"
+        raise GradleError(msg)
     try:
         atomic_write_text(path, run.model_dump_json(indent=2), durable=True, mode=0o600)
     except OSError as exc:
-        raise GradleError(f"Cannot persist Gradle run: {exc}") from exc
+        msg = f"Cannot persist Gradle run: {exc}"
+        raise GradleError(msg) from exc
 
 
 def load_gradle_run(path: Path) -> GradleRun | None:
     if path.is_symlink():
-        raise GradleError("Refusing symlinked Gradle run ledger")
+        msg = "Refusing symlinked Gradle run ledger"
+        raise GradleError(msg)
     try:
         return GradleRun.model_validate_json(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
-        raise GradleError(f"Invalid Gradle run ledger: {exc}") from exc
+        msg = f"Invalid Gradle run ledger: {exc}"
+        raise GradleError(msg) from exc
 
 
 def retire_gradle_context(context: ComparisonContext) -> None:
@@ -223,21 +228,18 @@ def _restore_accepted_baseline(
     try:
         repo.discard()
     except RevisionError as restore_exc:
-        raise GradleError(
-            "Could not restore the latest accepted Gradle baseline"
-        ) from restore_exc
+        msg = "Could not restore the latest accepted Gradle baseline"
+        raise GradleError(msg) from restore_exc
     if repo.tree_id() != run.accepted_snapshot.tree_id:
-        raise GradleError(
-            "Could not restore the latest accepted Gradle baseline"
-        ) from cause
+        msg = "Could not restore the latest accepted Gradle baseline"
+        raise GradleError(msg) from cause
 
 
 def gradle_check_commands(project: ProjectConfig) -> tuple[str, ...]:
     tests = tuple(command for _, command in project.test_phases)
     if not project.build_command or not tests:
-        raise GradleError(
-            "Setup prerequisite: configure build_command and at least one test phase"
-        )
+        msg = "Setup prerequisite: configure build_command and at least one test phase"
+        raise GradleError(msg)
     return (project.build_command, *tests)
 
 
@@ -253,10 +255,11 @@ def run_gradle_checks(
     try:
         run_build(project_name, commands[0], project.path)
     except BuildError as exc:
-        raise GradleError(
+        msg = (
             f"Build prerequisite/failure: {exc}; "
             "SDK and wrapper repairs require manual preparation"
-        ) from exc
+        )
+        raise GradleError(msg) from exc
     logging.getLogger(__name__).info(
         "Gradle baseline/update build %.3fs", time.monotonic() - checks_started
     )
@@ -266,7 +269,8 @@ def run_gradle_checks(
         "Gradle configured tests %.3fs", time.monotonic() - tests_started
     )
     if not passed:
-        raise GradleError(f"Gradle test phase failed: {phase}")
+        msg = f"Gradle test phase failed: {phase}"
+        raise GradleError(msg)
     return CheckEvidence(
         commands=commands,
         command_digests=tuple(
@@ -293,19 +297,22 @@ def capture_checked_gradle_snapshot(
     repo = services.repository(Path(project.path))
     tree = expected_tree or repo.tree_id()
     if repo.tree_id() != tree:
-        raise GradleError("Working tree differs from the verification revision")
+        msg = "Working tree differs from the verification revision"
+        raise GradleError(msg)
     if target is not None:
         block = validate_gradle_recovery(project, target)
         if block is not None:
             raise GradleError(block.reason)
     checks = run_gradle_checks(project, project_name, emit=emit, clock=clock)
     if repo.tree_id() != tree:
-        raise GradleError("Source tree changed during build or tests")
+        msg = "Source tree changed during build or tests"
+        raise GradleError(msg)
     snapshot = capture_gradle_snapshot(project, context, vcs=services, clock=clock)
     if isinstance(snapshot, IncompleteResolution):
         raise GradleError("Coverage incomplete: " + "; ".join(snapshot.reasons))
     if snapshot.tree_id != tree or repo.tree_id() != tree:
-        raise GradleError("Source tree changed during security capture")
+        msg = "Source tree changed during security capture"
+        raise GradleError(msg)
     return checks, snapshot
 
 
@@ -393,7 +400,8 @@ def verify_applied_gradle_attempt(
     _require_publication_age(candidate, minimum_age_days, publication, clock=clock)
     checked_tree = repo.tree_id()
     if checked_tree != after.tree_id:
-        raise GradleError("Tree changed after security verification")
+        msg = "Tree changed after security verification"
+        raise GradleError(msg)
     prepared = ApplyingAttempt(
         candidate=candidate,
         baseline=run.accepted_snapshot,
@@ -407,11 +415,11 @@ def verify_applied_gradle_attempt(
         try:
             dirty = repo.has_changes()
         except RevisionError as exc:
-            raise GradleError(
-                "Could not inspect tracked changes before Gradle commit"
-            ) from exc
+            msg = "Could not inspect tracked changes before Gradle commit"
+            raise GradleError(msg) from exc
         if not dirty:
-            raise GradleError("Candidate made no tracked source change")
+            msg = "Candidate made no tracked source change"
+            raise GradleError(msg)
         target = candidate.target
         repo.commit(
             message=f"chore: bump {target.display_name} to {target.target_version}"
@@ -420,7 +428,8 @@ def verify_applied_gradle_attempt(
     else:
         commit_id = repo.resolve_revision(revision=committed_revision)
     if repo.tree_id(revision=commit_id) != checked_tree:
-        raise GradleError("Accepted commit tree differs from checked tree")
+        msg = "Accepted commit tree differs from checked tree"
+        raise GradleError(msg)
     prepared = prepared.model_copy(update={"accepted_commit_id": commit_id})
     run = _replace_gradle_attempt(run, prepared)
     persist_gradle_run(run)
@@ -476,10 +485,11 @@ def process_gradle_run(
             persist_gradle_run(run)
             continue
         if not context_inputs_valid(run.context, project, clock()):
-            raise GradleError(
+            msg = (
                 "Comparison context expired or changed; "
                 "rebuild evidence before continuing"
             )
+            raise GradleError(msg)
         run = _replace_gradle_attempt(
             run, ApplyingAttempt(candidate=candidate, baseline=run.accepted_snapshot)
         )
@@ -522,23 +532,28 @@ def gradle_run_finalization_check(
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
     if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
-        raise GradleError("Unfinished or failed Gradle attempt prevents finalization")
+        msg = "Unfinished or failed Gradle attempt prevents finalization"
+        raise GradleError(msg)
     accepted = [
         attempt
         for attempt in run.attempts
         if isinstance(attempt, (ReadyAttempt, CompletedAttempt))
     ]
     if not accepted:
-        raise GradleError("No verified Gradle update to finalize")
+        msg = "No verified Gradle update to finalize"
+        raise GradleError(msg)
     if not context_inputs_valid(run.context, project, clock()):
-        raise GradleError("Final comparison context is stale")
+        msg = "Final comparison context is stale"
+        raise GradleError(msg)
     if (
         repo.resolve_revision(revision=run.managed_bookmark) != run.managed_tip_id
         or repo.tree_id(revision=run.managed_tip_id) != run.accepted_snapshot.tree_id
     ):
-        raise GradleError("Managed tip differs from the verified snapshot")
+        msg = "Managed tip differs from the verified snapshot"
+        raise GradleError(msg)
     if tuple(gradle_check_commands(project)) != accepted[-1].receipt.checks.commands:
-        raise GradleError("Configured verification commands changed")
+        msg = "Configured verification commands changed"
+        raise GradleError(msg)
     probe = accepted[-1].candidate.model_copy(
         update={"origins": frozenset({"ordinary"})}
     )
@@ -546,12 +561,14 @@ def gradle_run_finalization_check(
         run.initial_snapshot, run.accepted_snapshot, probe
     )
     if not isinstance(comparison, VerifiedComparison):
-        raise GradleError("Final snapshot regressed against original run baseline")
+        msg = "Final snapshot regressed against original run baseline"
+        raise GradleError(msg)
     credited = frozenset(
         key for attempt in accepted for key in attempt.receipt.verified_fixes
     )
     if credited & frozenset(item.key for item in run.accepted_snapshot.findings):
-        raise GradleError("An earlier credited fix was reintroduced")
+        msg = "An earlier credited fix was reintroduced"
+        raise GradleError(msg)
     for attempt in accepted:
         _require_publication_age(
             attempt.candidate, minimum_age_days, publication, clock=clock
@@ -566,7 +583,8 @@ def gradle_evidence_workspace(
     try:
         workspace = manager.__enter__()
     except RevisionError as exc:
-        raise GradleError("Cannot create recorded-baseline proof workspace") from exc
+        msg = "Cannot create recorded-baseline proof workspace"
+        raise GradleError(msg) from exc
     try:
         yield project.model_copy(update={"path": workspace.path})
     except BaseException as body_error:
@@ -585,9 +603,8 @@ def gradle_evidence_workspace(
         try:
             manager.__exit__(None, None, None)
         except RevisionError as exc:
-            raise GradleError(
-                "Cannot clean up recorded-baseline proof workspace"
-            ) from exc
+            msg = "Cannot clean up recorded-baseline proof workspace"
+            raise GradleError(msg) from exc
 
 
 def rebuild_gradle_run_evidence(
@@ -603,7 +620,8 @@ def rebuild_gradle_run_evidence(
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     if run.has(ApplyingAttempt):
-        raise GradleError("Reconcile interrupted attempt before rebuilding context")
+        msg = "Reconcile interrupted attempt before rebuilding context"
+        raise GradleError(msg)
     accepted = [
         item
         for item in run.attempts
@@ -616,7 +634,8 @@ def rebuild_gradle_run_evidence(
         parse_catalogue(base_project.path / GRADLE_CATALOGUE_RELPATH)
         resolution = collect_gradle_resolution(base_project)
         if isinstance(resolution, IncompleteResolution):
-            raise GradleError("Recorded baseline cannot produce complete coverage")
+            msg = "Recorded baseline cannot produce complete coverage"
+            raise GradleError(msg)
         context = initialize_comparison_context(
             base_project, resolution, paths.gradle_contexts_dir(), clock=clock
         )
@@ -655,14 +674,14 @@ def rebuild_gradle_run_evidence(
                 )
                 comparison = compare_gradle_snapshots(baseline, after, old.candidate)
                 if not isinstance(comparison, VerifiedComparison):
-                    raise GradleError("Recorded accepted change fails fresh comparison")
+                    msg = "Recorded accepted change fails fresh comparison"
+                    raise GradleError(msg)
                 _require_publication_age(
                     old.candidate, minimum_age_days, publication, clock=clock
                 )
                 if not old.receipt.verified_fixes <= comparison.removed:
-                    raise GradleError(
-                        "Fresh context cannot prove every credited historical fix"
-                    )
+                    msg = "Fresh context cannot prove every credited historical fix"
+                    raise GradleError(msg)
                 receipt = _verification_receipt(
                     baseline=baseline,
                     after=after,
@@ -716,36 +735,42 @@ def rollback_failed_gradle_update(
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
     if run.flow != Workflow.UPDATE or run.has(ApplyingAttempt):
-        raise GradleError("Rollback requires a failed update ledger")
+        msg = "Rollback requires a failed update ledger"
+        raise GradleError(msg)
     if not run.has(FailedAttempt):
-        raise GradleError("Rollback requires a failed update ledger")
+        msg = "Rollback requires a failed update ledger"
+        raise GradleError(msg)
     reclaim_gradle_outputs(project.path)
     if (
         repo.resolve_revision(revision=run.managed_bookmark) != run.managed_tip_id
         or repo.resolve_revision(revision="@-") != run.managed_tip_id
         or repo.tree_id(revision=run.managed_tip_id) != run.accepted_snapshot.tree_id
     ):
-        raise GradleError("Failed update is not a child of its recorded accepted tip")
+        msg = "Failed update is not a child of its recorded accepted tip"
+        raise GradleError(msg)
     changed = repo.changed_paths()
     if changed - {str(GRADLE_CATALOGUE_RELPATH)}:
-        raise GradleError("Failed update contains changes outside the owned catalogue")
+        msg = "Failed update contains changes outside the owned catalogue"
+        raise GradleError(msg)
     try:
         dirty = repo.has_changes()
     except RevisionError as exc:
-        raise GradleError("Could not inspect failed Gradle workspace") from exc
+        msg = "Could not inspect failed Gradle workspace"
+        raise GradleError(msg) from exc
     if dirty:
         try:
             repo.discard()
         except RevisionError as exc:
-            raise GradleError(
-                "Could not restore the latest accepted Gradle baseline"
-            ) from exc
+            msg = "Could not restore the latest accepted Gradle baseline"
+            raise GradleError(msg) from exc
     try:
         dirty = repo.has_changes()
     except RevisionError as exc:
-        raise GradleError("Could not inspect failed Gradle workspace") from exc
+        msg = "Could not inspect failed Gradle workspace"
+        raise GradleError(msg) from exc
     if dirty or repo.tree_id() != run.accepted_snapshot.tree_id:
-        raise GradleError("Failed update rollback did not restore the accepted tree")
+        msg = "Failed update rollback did not restore the accepted tree"
+        raise GradleError(msg)
 
 
 def _record_interrupted_failure(
@@ -775,24 +800,26 @@ def _interrupted_commit(
     commit = state.accepted_commit_id
     if commit is None:
         if repo.has_changes():
-            raise GradleError(
-                "Interrupted working copy is not an empty committed child"
-            )
+            msg = "Interrupted working copy is not an empty committed child"
+            raise GradleError(msg)
         commit = parent
     if (
         not repo.is_ancestor(ancestor=run.managed_tip_id, descendant=commit)
         or commit == run.managed_tip_id
     ):
-        raise GradleError("Interrupted checked commit has no trustworthy run ancestry")
+        msg = "Interrupted checked commit has no trustworthy run ancestry"
+        raise GradleError(msg)
     if (
         repo.tree_id(revision=commit) != state.checked_tree_id
         or state.after is None
         or state.after.tree_id != state.checked_tree_id
     ):
-        raise GradleError("Interrupted commit differs from checked tree")
+        msg = "Interrupted commit differs from checked tree"
+        raise GradleError(msg)
     current_tip = repo.resolve_revision(revision=run.managed_bookmark)
     if current_tip not in {run.managed_tip_id, commit}:
-        raise GradleError("Managed bookmark moved outside interrupted attempt")
+        msg = "Managed bookmark moved outside interrupted attempt"
+        raise GradleError(msg)
     return commit
 
 
@@ -868,7 +895,8 @@ def reconcile_gradle_applying(
     repo = services.repository(Path(project.path))
     pending = [item for item in run.attempts if isinstance(item, ApplyingAttempt)]
     if len(pending) != 1:
-        raise GradleError("Expected one interrupted Gradle attempt")
+        msg = "Expected one interrupted Gradle attempt"
+        raise GradleError(msg)
     state = pending[0]
     complete = (
         state.after is not None
@@ -902,7 +930,8 @@ def reconcile_gradle_applying(
     assert after is not None and checks is not None  # proven complete above
     comparison = compare_gradle_snapshots(state.baseline, after, state.candidate)
     if not isinstance(comparison, VerifiedComparison):
-        raise GradleError("Interrupted comparison does not prove acceptance")
+        msg = "Interrupted comparison does not prove acceptance"
+        raise GradleError(msg)
     _require_publication_age(
         state.candidate, minimum_age_days, publication, clock=clock
     )
@@ -943,23 +972,28 @@ def continue_gradle_resolve(
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
     if run.flow != Workflow.RESOLVE:
-        raise GradleError("Continuation requires a resolve-owned Gradle run")
+        msg = "Continuation requires a resolve-owned Gradle run"
+        raise GradleError(msg)
     reclaim_gradle_outputs(project.path)
     try:
         dirty = repo.has_changes()
     except RevisionError as exc:
-        raise GradleError("Could not inspect manual changes before --continue") from exc
+        msg = "Could not inspect manual changes before --continue"
+        raise GradleError(msg) from exc
     if dirty:
-        raise GradleError("Commit or discard manual changes before --continue")
+        msg = "Commit or discard manual changes before --continue"
+        raise GradleError(msg)
     repaired_commit = repo.resolve_revision(revision="@-")
     if (
         not repo.is_ancestor(ancestor=run.managed_tip_id, descendant=repaired_commit)
         or repaired_commit == run.managed_tip_id
     ):
-        raise GradleError("Repair must be a committed descendant of the managed tip")
+        msg = "Repair must be a committed descendant of the managed tip"
+        raise GradleError(msg)
     failures = [item for item in run.attempts if isinstance(item, FailedAttempt)]
     if len(failures) != 1:
-        raise GradleError("Expected exactly one preserved resolve blocker")
+        msg = "Expected exactly one preserved resolve blocker"
+        raise GradleError(msg)
     candidate = failures[0].candidate
     block = validate_gradle_recovery(project, candidate.target)
     if block is not None:

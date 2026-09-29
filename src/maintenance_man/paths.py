@@ -50,5 +50,6 @@ def project_file(directory: Path, project: str, suffix: str = "") -> Path:
     name = sanitise_project_name(project)
     candidate = directory / f"{name}{suffix}"
     if not name or candidate.parent.resolve() != directory.resolve():
-        raise ValueError(f"Invalid project name: {project!r}")
+        msg = f"Invalid project name: {project!r}"
+        raise ValueError(msg)
     return candidate

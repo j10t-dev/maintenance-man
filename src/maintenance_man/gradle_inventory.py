@@ -56,23 +56,26 @@ def _top_level_components(
         tuple(row for row in raw if _is_object(row)) if isinstance(raw, list) else ()
     )
     if not isinstance(raw, list) or len(components) != len(raw):
-        raise GradleError(
+        msg = (
             f"malformed CycloneDX inventory {source}: "
             "components must be an array of objects"
         )
+        raise GradleError(msg)
     if not components:
-        raise GradleError(
+        msg = (
             f"CycloneDX inventory {source} has no components; an empty inventory is "
             f"an unsupported scan, not a clean result"
         )
+        raise GradleError(msg)
     if not any(
         str(component.get("purl", "")).startswith("pkg:maven/")
         for component in components
     ):
-        raise GradleError(
+        msg = (
             f"CycloneDX inventory {source} has no Maven components; the scan scope "
             f"is unsupported, not clean"
         )
+        raise GradleError(msg)
     return components
 
 
@@ -81,16 +84,20 @@ def parse_inventory_text(text: str, *, source: str) -> CycloneDxInventory:
     try:
         document = json.loads(text)
     except json.JSONDecodeError as e:
-        raise GradleError(f"malformed CycloneDX inventory {source}: {e}") from e
+        msg = f"malformed CycloneDX inventory {source}: {e}"
+        raise GradleError(msg) from e
     if not isinstance(document, dict):
-        raise GradleError(f"malformed CycloneDX inventory {source}: expected an object")
+        msg = f"malformed CycloneDX inventory {source}: expected an object"
+        raise GradleError(msg)
     if document.get("bomFormat") != "CycloneDX":
-        raise GradleError(f"{source} is not a CycloneDX document")
+        msg = f"{source} is not a CycloneDX document"
+        raise GradleError(msg)
     if _spec_version(document.get("specVersion")) < (1, 5):
-        raise GradleError(
+        msg = (
             f"unsupported CycloneDX spec version "
             f"{document.get('specVersion')!r} in {source}; mm requires 1.5 or later"
         )
+        raise GradleError(msg)
     return CycloneDxInventory(components=_top_level_components(document, source))
 
 
@@ -100,12 +107,14 @@ def load_inventory(path: Path) -> tuple[bytes, CycloneDxInventory]:
         payload = path.read_bytes()
         text = payload.decode("utf-8")
     except FileNotFoundError as e:
-        raise GradleError(
+        msg = (
             f"cyclonedxBom produced no inventory at {path}; is org.cyclonedx.bom "
             f"3.4.1 applied with the documented fixed output paths?"
-        ) from e
+        )
+        raise GradleError(msg) from e
     except (UnicodeDecodeError, OSError) as e:
-        raise GradleError(f"malformed CycloneDX inventory {path}: {e}") from e
+        msg = f"malformed CycloneDX inventory {path}: {e}"
+        raise GradleError(msg) from e
     return payload, parse_inventory_text(text, source=str(path))
 
 
@@ -114,7 +123,8 @@ def _maven_module(purl: str) -> ModuleId:
     coordinate, separator, version = identity.rpartition("@")
     group, slash, artifact = coordinate.partition("/")
     if not (separator and slash and group and artifact and version):
-        raise ValueError("malformed Maven purl")
+        msg = "malformed Maven purl"
+        raise ValueError(msg)
     return ModuleId(
         group=unquote(group), artifact=unquote(artifact), version=unquote(version)
     )
@@ -122,10 +132,12 @@ def _maven_module(purl: str) -> ModuleId:
 
 def _row_purl(row: object) -> tuple[dict[str, object], str]:
     if not _is_object(row):
-        raise ValueError("component must be an object")
+        msg = "component must be an object"
+        raise ValueError(msg)
     purl = row.get("purl", "")
     if not isinstance(purl, str):
-        raise ValueError("component purl must be a string")
+        msg = "component purl must be a string"
+        raise ValueError(msg)
     return row, purl
 
 
@@ -141,11 +153,13 @@ def _visit_row(
         if "project_path" in qualifiers:
             paths = qualifiers["project_path"]
             if len(paths) != 1 or local_projects.get(paths[0]) != module:
-                raise ValueError("unverified local project identity")
+                msg = "unverified local project identity"
+                raise ValueError(msg)
         else:
             found.add(module)
     elif row.get("type") == "library" and not purl:
-        raise ValueError("library component has no package identity")
+        msg = "library component has no package identity"
+        raise ValueError(msg)
     _visit_rows(row.get("components", []), local_projects, found)
 
 
@@ -155,7 +169,8 @@ def _visit_rows(
     found: set[ModuleId],
 ) -> None:
     if not isinstance(rows, (list, tuple)):
-        raise ValueError("components must be an array")
+        msg = "components must be an array"
+        raise ValueError(msg)
     for row in rows:
         _visit_row(row, local_projects, found)
 
@@ -170,7 +185,8 @@ def _bound_modules(
     try:
         _visit_rows(inventory.components, local_projects, found)
     except (ValueError, TypeError, ValidationError) as exc:
-        raise GradleError(f"Malformed CycloneDX inventory: {exc}") from exc
+        msg = f"Malformed CycloneDX inventory: {exc}"
+        raise GradleError(msg) from exc
     return tuple(
         sorted(
             found, key=lambda module: (module.group, module.artifact, module.version)

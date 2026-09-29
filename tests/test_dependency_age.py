@@ -475,7 +475,8 @@ def test_publication_negative_results_retry_next_command(tmp_path):
 
 def test_publication_failure_has_readable_reason_and_debug_details(tmp_path, caplog):
     def transport(url, repository, suffix, count):
-        raise PublicationError("publication lookup timed out")
+        msg = "publication lookup timed out"
+        raise PublicationError(msg)
 
     _, request, _, context = _publication_fixture(tmp_path)
     context.transport = transport
@@ -1193,7 +1194,8 @@ def test_gradle_scan_age_filter_keeps_unknown_and_filters_known_young(
 
     def transport(url, repository, suffix, count):
         if date is None:
-            raise TimeoutError("unavailable")
+            msg = "unavailable"
+            raise TimeoutError(msg)
         body = _pom(module)
         if kind == "plugin":
             body = body.replace(
@@ -1276,7 +1278,8 @@ def test_gradle_group_age_requires_every_member_date(tmp_path, case, kept, dated
     def transport(url, repository, suffix, count):
         artifact = "two" if "/two/" in url else "one"
         if repository == "google" or (artifact == "two" and case != "all-old"):
-            raise TimeoutError("unavailable")
+            msg = "unavailable"
+            raise TimeoutError(msg)
         date = (
             "Thu, 17 Sep 2026 00:00:00 GMT"
             if case.startswith("young")

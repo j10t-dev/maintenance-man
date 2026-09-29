@@ -55,7 +55,8 @@ def test_parse_selection(text, expected):
 def _missing(tool):
     def require(name, hint):
         if name == tool:
-            raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+            msg = f"{name} is not installed or not on PATH. {hint}"
+            raise ToolNotFoundError(msg)
         return Path("/usr/bin") / name
 
     return require

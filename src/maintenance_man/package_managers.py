@@ -39,16 +39,16 @@ class PackageManagerOps:
 def package_manager_ops(name: str) -> PackageManagerOps:
     """Return the operations for a non-Gradle package manager."""
     if name == "gradle":
-        raise UnsupportedPackageManagerError(
+        msg = (
             "Gradle updates are applied through the Gradle adapter, not a "
             "package-manager command"
         )
+        raise UnsupportedPackageManagerError(msg)
     try:
         return PACKAGE_MANAGERS[name]
     except KeyError:
-        raise UnsupportedPackageManagerError(
-            f"Unsupported package manager: {name}"
-        ) from None
+        msg = f"Unsupported package manager: {name}"
+        raise UnsupportedPackageManagerError(msg) from None
 
 
 def _npm_publish_date(pkg: str, version: str, project_path: Path) -> datetime | None:
@@ -65,10 +65,11 @@ def _maven_publish_date(pkg: str, version: str, project_path: Path) -> datetime 
 
 def _bun_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
     if not (workspace / "package.json").is_file():
-        raise UpdateCommandError(
+        msg = (
             "package.json is missing from the update workspace; "
             "check that the project exists on main and rescan"
         )
+        raise UpdateCommandError(msg)
     return [["bun", "add", f"{pkg}@{version}"]]
 
 
@@ -88,7 +89,8 @@ def _uv_update_command(
     command = ["uv", "add"]
     if location.kind == "group":
         if location.group is None:
-            raise UpdateCommandError("UV group dependency location missing group name")
+            msg = "UV group dependency location missing group name"
+            raise UpdateCommandError(msg)
         command.extend(["--group", location.group])
     command.append(f"{pkg}=={version}")
     return command

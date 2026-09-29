@@ -71,7 +71,8 @@ def parse_resolution_report(text: str) -> ResolutionOutcome:
         report = ResolutionReport.model_validate_json(text)
         _validate_report_semantics(report)
     except (ValidationError, ValueError) as exc:
-        raise GradleError(f"Malformed Gradle resolution report: {exc}") from exc
+        msg = f"Malformed Gradle resolution report: {exc}"
+        raise GradleError(msg) from exc
     reasons = list(report.selection_errors)
     actual = {scope.scope for scope in report.scopes}
     reasons.extend(
@@ -91,15 +92,18 @@ def parse_resolution_report(text: str) -> ResolutionOutcome:
 
 def _validate_report_semantics(report: ResolutionReport) -> None:
     if not re.fullmatch(r"[0-9a-f]{64}", report.catalogue_digest):
-        raise ValueError("invalid catalogue digest")
+        msg = "invalid catalogue digest"
+        raise ValueError(msg)
     for scope in report.selected_scopes:
         if not scope.project_path.startswith(":") or not scope.configuration:
-            raise ValueError("invalid scope identity")
+            msg = "invalid scope identity"
+            raise ValueError(msg)
     for repository in report.repositories:
         if repository.url is not None:
             url = urlsplit(repository.url)
             if url.username or url.password or url.query or url.fragment:
-                raise ValueError("repository report contains private or ambiguous URL")
+                msg = "repository report contains private or ambiguous URL"
+                raise ValueError(msg)
     for scope in report.scopes:
         for component in scope.components:
             _validate_component_identity(component)
@@ -107,7 +111,8 @@ def _validate_report_semantics(report: ResolutionReport) -> None:
 
 def _validate_component_identity(component: ResolvedComponent) -> None:
     if not component.id:
-        raise ValueError("empty component ID")
+        msg = "empty component ID"
+        raise ValueError(msg)
     if component.module is not None and any(
         not value or re.search(r"[\s:/\\]", value)
         for value in (
@@ -116,7 +121,8 @@ def _validate_component_identity(component: ResolvedComponent) -> None:
             component.module.version,
         )
     ):
-        raise ValueError("invalid Maven identity")
+        msg = "invalid Maven identity"
+        raise ValueError(msg)
 
 
 def _report_command(task: str, script: Path) -> list[str]:
@@ -170,7 +176,8 @@ def generate_gradle_report(
             bom = root / GRADLE_INVENTORY_BOM_RELPATH
             report_path = directory / "report.json"
             if bom.is_symlink() or report_path.is_symlink():
-                raise GradleError("Gradle report output is a symlink")
+                msg = "Gradle report output is a symlink"
+                raise GradleError(msg)
             inventory_bytes, inventory = load_inventory(bom)
             outcome = parse_resolution_report(report_path.read_text(encoding="utf-8"))
             require_catalogue_unchanged(
@@ -180,7 +187,8 @@ def generate_gradle_report(
                 reported_digest=outcome.report.catalogue_digest,
             )
         except (OSError, UnicodeError) as exc:
-            raise GradleError(f"Could not capture Gradle resolution: {exc}") from exc
+            msg = f"Could not capture Gradle resolution: {exc}"
+            raise GradleError(msg) from exc
         yield GeneratedGradleReport(
             bom_path=bom,
             inventory_bytes=inventory_bytes,
@@ -692,12 +700,14 @@ def validate_gradle_candidates(
             )
             response = directory / "candidate-validation.json"
             if response.is_symlink():
-                raise GradleError("Candidate validation output is a symlink")
+                msg = "Candidate validation output is a symlink"
+                raise GradleError(msg)
             batch = CandidateValidationBatch.model_validate_json(response.read_text())
             expected = {request["request_id"]: request for request in requests}
             actual = {result.request_id: result for result in batch.results}
             if len(actual) != len(batch.results) or actual.keys() != expected.keys():
-                raise GradleError("Candidate validation response coverage mismatch")
+                msg = "Candidate validation response coverage mismatch"
+                raise GradleError(msg)
             for request_id, result in actual.items():
                 request = expected[request_id]
                 if (
@@ -711,20 +721,21 @@ def validate_gradle_candidates(
                     request["project_path"],
                     request["kind"],
                 ):
-                    raise GradleError("Candidate validation identity mismatch")
+                    msg = "Candidate validation identity mismatch"
+                    raise GradleError(msg)
                 if (
                     result.reason is None
                     and result.selected_version != request["candidate_version"]
                 ):
-                    raise GradleError(
-                        "Candidate validation success selected a different version"
-                    )
+                    msg = "Candidate validation success selected a different version"
+                    raise GradleError(msg)
                 if (
                     result.reason is None
                     and request["kind"] == "plugin"
                     and result.implementation is None
                 ):
-                    raise GradleError("Candidate marker success lacks implementation")
+                    msg = "Candidate marker success lacks implementation"
+                    raise GradleError(msg)
             require_catalogue_unchanged(
                 before,
                 file_digest(root / GRADLE_CATALOGUE_RELPATH),
@@ -732,7 +743,8 @@ def validate_gradle_candidates(
             )
             return batch
         except (OSError, UnicodeError, ValidationError) as exc:
-            raise GradleError(f"Invalid candidate validation output: {exc}") from exc
+            msg = f"Invalid candidate validation output: {exc}"
+            raise GradleError(msg) from exc
 
 
 def attach_gradle_publications(

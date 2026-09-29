@@ -221,7 +221,8 @@ class TestUvAuditParsing:
 
 
 def _missing_trivy(name, hint):
-    raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+    msg = f"{name} is not installed or not on PATH. {hint}"
+    raise ToolNotFoundError(msg)
 
 
 @pytest.mark.parametrize(
@@ -711,7 +712,8 @@ def test_gradle_discovery_failure_is_not_swallowed(
     scoped_publication_scan, monkeypatch
 ):
     def fail(project):
-        raise GradleError("discovery failed")
+        msg = "discovery failed"
+        raise GradleError(msg)
 
     monkeypatch.setattr("maintenance_man.scanner.discover_gradle_updates", fail)
     with pytest.raises(GradleError, match="discovery failed"):
@@ -1053,7 +1055,8 @@ def test_gradle_scan_error_leaves_previous_results_intact(
     results_file.write_text('{"previous": true}', encoding="utf-8")
 
     def _boom(project):
-        raise GradleError("./gradlew mmGradleReport failed (exit 1): boom")
+        msg = "./gradlew mmGradleReport failed (exit 1): boom"
+        raise GradleError(msg)
 
     monkeypatch.setattr("maintenance_man.scanner.generate_gradle_report", _boom)
 
@@ -1143,7 +1146,8 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
 
     def _cannot_remove(*args, **kwargs):
         if not kwargs.get("ignore_errors"):
-            raise PermissionError("cleanup denied")
+            msg = "cleanup denied"
+            raise PermissionError(msg)
 
     monkeypatch.setattr(subprocess, "run", _run)
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)

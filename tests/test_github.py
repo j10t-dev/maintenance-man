@@ -97,7 +97,8 @@ def test_pr_bookmarks_normalizes_subprocess_failures(
         if failure == "status":
             return subprocess.CompletedProcess(command, 2, "", "host rejected")
         if failure == "launch":
-            raise OSError("cannot launch")
+            msg = "cannot launch"
+            raise OSError(msg)
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
     monkeypatch.setattr(process.subprocess, "run", run)

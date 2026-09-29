@@ -153,7 +153,8 @@ def apply_gradle_update(
             run_gradle(root, _APPLY_ARGS, label="versionCatalogApplyUpdates")
             _assert_only_target_changed(before, parse_catalogue(catalogue_path), target)
     except OSError as e:
-        raise GradleError(f"versionCatalogApplyUpdates failed: {e}") from e
+        msg = f"versionCatalogApplyUpdates failed: {e}"
+        raise GradleError(msg) from e
     return None
 
 
@@ -248,11 +249,12 @@ def discover_gradle_updates(project: ProjectConfig) -> list[UpdateFinding]:
             if not any(
                 line.strip() == GRADLE_NO_UPDATES_SIGNAL for line in output.splitlines()
             ):
-                raise GradleError(
+                msg = (
                     f"versionCatalogUpdate produced no report at "
                     f"{GRADLE_UPDATE_REPORT_RELPATH} — is version-catalog-update 1.1.1 "
                     f"applied to {root}?"
                 )
+                raise GradleError(msg)
             proposals = []
         else:
             proposals = parse_update_report(report_path)
@@ -274,9 +276,11 @@ def parse_catalogue(path: Path) -> Catalogue:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError as e:
-        raise GradleError(f"Version catalogue not found: {path}") from e
+        msg = f"Version catalogue not found: {path}"
+        raise GradleError(msg) from e
     except (UnicodeDecodeError, OSError) as e:
-        raise GradleError(f"Failed to parse version catalogue {path}: {e}") from e
+        msg = f"Failed to parse version catalogue {path}: {e}"
+        raise GradleError(msg) from e
     return parse_catalogue_text(text, source=str(path))
 
 
@@ -285,7 +289,8 @@ def parse_catalogue_text(text: str, *, source: str = "<catalogue>") -> Catalogue
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
-        raise GradleError(f"Failed to parse version catalogue {source}: {e}") from e
+        msg = f"Failed to parse version catalogue {source}: {e}"
+        raise GradleError(msg) from e
 
     versions: dict[str, CatalogueVersion] = {}
     for name, value in _table(raw, "versions", source).items():
@@ -334,9 +339,8 @@ def parse_update_report(path: Path) -> list[ReportProposal]:
     try:
         text = path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError) as e:
-        raise GradleError(
-            f"malformed version catalogue update report {path}: {e}"
-        ) from e
+        msg = f"malformed version catalogue update report {path}: {e}"
+        raise GradleError(msg) from e
     return parse_update_report_text(text, source=str(path))
 
 
@@ -347,17 +351,17 @@ def parse_update_report_text(
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
-        raise GradleError(
-            f"malformed version catalogue update report {source}: {e}"
-        ) from e
+        msg = f"malformed version catalogue update report {source}: {e}"
+        raise GradleError(msg) from e
 
     proposals: list[ReportProposal] = []
     for alias, value in _table(raw, "libraries", source).items():
         if not isinstance(value, str) or value.count(":") != 2:
-            raise GradleError(
+            msg = (
                 f"malformed library entry '{alias}' in {source}: expected "
                 f"'group:artifact:version', got {value!r}"
             )
+            raise GradleError(msg)
         group, name, version = value.split(":")
         proposals.append(
             ReportProposal(
@@ -369,10 +373,11 @@ def parse_update_report_text(
         )
     for alias, value in _table(raw, "plugins", source).items():
         if not isinstance(value, str) or value.count(":") != 1:
-            raise GradleError(
+            msg = (
                 f"malformed plugin entry '{alias}' in {source}: expected "
                 f"'plugin.id:version', got {value!r}"
             )
+            raise GradleError(msg)
         plugin_id, version = value.split(":")
         proposals.append(
             ReportProposal(
@@ -485,19 +490,22 @@ def owned_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
     try:
         inventory_dir.mkdir(parents=True)
     except OSError as exc:
-        raise GradleError(f"Could not create Gradle inventory: {exc}") from exc
+        msg = f"Could not create Gradle inventory: {exc}"
+        raise GradleError(msg) from exc
     try:
         (inventory_dir / ".mm-owned").write_bytes(b"")
     except OSError as exc:
         _remove_owned_tree(inventory_dir)
-        raise GradleError(f"Could not create Gradle inventory: {exc}") from exc
+        msg = f"Could not create Gradle inventory: {exc}"
+        raise GradleError(msg) from exc
     try:
         yield inventory_dir
     finally:
         _validate_owned_output_parents(root)
         marker = inventory_dir / ".mm-owned"
         if inventory_dir.is_symlink() or marker.is_symlink() or not marker.is_file():
-            raise GradleError("Gradle inventory ownership changed during operation")
+            msg = "Gradle inventory ownership changed during operation"
+            raise GradleError(msg)
         _remove_owned_tree(inventory_dir)
 
 
@@ -508,7 +516,8 @@ def run_gradle(
     _validate_owned_output_parents(root)
     wrapper = root / "gradlew"
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
-        raise GradleError(f"No executable Gradle wrapper at {wrapper}")
+        msg = f"No executable Gradle wrapper at {wrapper}"
+        raise GradleError(msg)
 
     return run_captured(
         [str(wrapper), *args],
@@ -537,7 +546,8 @@ def claim_owned_file(path: Path, marker: Path, label: str) -> None:
             raise _collision(path, label)
         path.unlink()
     except OSError as e:
-        raise GradleError(f"Could not claim {label} at {path}: {e}") from e
+        msg = f"Could not claim {label} at {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def claim_owned_dir(path: Path, label: str) -> None:
@@ -552,7 +562,8 @@ def claim_owned_dir(path: Path, label: str) -> None:
             raise _collision(path, label)
         shutil.rmtree(path)
     except OSError as e:
-        raise GradleError(f"Could not claim {label} at {path}: {e}") from e
+        msg = f"Could not claim {label} at {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def _validate_owned_output_parents(root: Path) -> None:
@@ -566,9 +577,8 @@ def _validate_owned_output_parents(root: Path) -> None:
         ):
             raise _collision(report_parent, "Gradle report directory")
     except OSError as e:
-        raise GradleError(
-            f"Could not inspect Gradle output parents in {root}: {e}"
-        ) from e
+        msg = f"Could not inspect Gradle output parents in {root}: {e}"
+        raise GradleError(msg) from e
 
 
 def reclaim_gradle_outputs(root: Path) -> None:
@@ -582,9 +592,8 @@ def reclaim_gradle_outputs(root: Path) -> None:
         marker.unlink(missing_ok=True)
         claim_owned_dir(inventory, "Gradle inventory directory")
     except (OSError, GradleError) as e:
-        raise GradleError(
-            f"Could not reclaim interrupted Gradle outputs in {root}: {e}"
-        ) from e
+        msg = f"Could not reclaim interrupted Gradle outputs in {root}: {e}"
+        raise GradleError(msg) from e
 
 
 def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str | None:
@@ -621,7 +630,8 @@ def normalise_alias(name: str) -> str:
 def assert_safe_text(value: str, label: str) -> str:
     """Reject report data that cannot be safely written to a TOML document."""
     if not value or _UNSAFE_TEXT_RE.search(value):
-        raise GradleError(f"unsafe {label}: {value!r}")
+        msg = f"unsafe {label}: {value!r}"
+        raise GradleError(msg)
     return value
 
 
@@ -648,7 +658,8 @@ def _owned_update_report(root: Path) -> Iterator[Path]:
         try:
             marker.write_bytes(b"")
         except OSError as e:
-            raise GradleError(f"Could not mark Gradle update report {path}: {e}") from e
+            msg = f"Could not mark Gradle update report {path}: {e}"
+            raise GradleError(msg) from e
         yield path
     finally:
         try:
@@ -656,9 +667,8 @@ def _owned_update_report(root: Path) -> Iterator[Path]:
             path.unlink(missing_ok=True)
             marker.unlink(missing_ok=True)
         except OSError as e:
-            raise GradleError(
-                f"Could not remove owned Gradle update report {path}: {e}"
-            ) from e
+            msg = f"Could not remove owned Gradle update report {path}: {e}"
+            raise GradleError(msg) from e
 
 
 def _group_finding(
@@ -849,7 +859,8 @@ def _unsupported_entry(kind: GradleKind, alias: str, reason: str) -> CatalogueEn
 def _table(raw: dict[str, Any], name: str, source: str) -> dict[str, Any]:
     table = raw.get(name, {})
     if not isinstance(table, dict):
-        raise GradleError(f"malformed [{name}] table in {source}")
+        msg = f"malformed [{name}] table in {source}"
+        raise GradleError(msg)
     return table
 
 
@@ -870,7 +881,8 @@ def _digest(path: Path) -> str:
     try:
         return file_digest(path)
     except OSError as e:
-        raise GradleError(f"Could not read Gradle catalogue {path}: {e}") from e
+        msg = f"Could not read Gradle catalogue {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def _remove_owned_tree(path: Path) -> None:
@@ -882,7 +894,8 @@ def _remove_owned_tree(path: Path) -> None:
     except FileNotFoundError:
         pass
     except OSError as e:
-        raise GradleError(f"failed to remove owned Gradle inventory {path}: {e}") from e
+        msg = f"failed to remove owned Gradle inventory {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def _validate_catalogue_state(
@@ -1001,18 +1014,20 @@ def _assert_only_target_changed(
     because both sides are compared as parsed models, not as text.
     """
     if before.preserved_semantics != after.preserved_semantics:
-        raise GradleError(
+        msg = (
             "versionCatalogApplyUpdates changed bundles or unsupported "
             "catalogue declarations"
         )
+        raise GradleError(msg)
     changed = {
         (member.kind, normalise_alias(member.alias)) for member in target.members
     }
     if set(before.entries) != set(after.entries):
-        raise GradleError(
+        msg = (
             "versionCatalogApplyUpdates added or removed catalogue aliases; "
             "the catalogue change was not the selected group"
         )
+        raise GradleError(msg)
 
     for key, old in before.entries.items():
         _assert_alias_change(
@@ -1024,7 +1039,8 @@ def _assert_only_target_changed(
         )
 
     if set(before.versions) != set(after.versions):
-        raise GradleError("versionCatalogApplyUpdates added or removed version entries")
+        msg = "versionCatalogApplyUpdates added or removed version entries"
+        raise GradleError(msg)
 
     changed_ref = normalise_alias(target.version_ref) if target.version_ref else None
     for name, old_version in before.versions.items():
@@ -1046,24 +1062,22 @@ def _assert_alias_change(
 ) -> None:
     new = after.entries[old.key]
     if old.coordinate != new.coordinate or _ref_key(old) != _ref_key(new):
-        raise GradleError(
+        msg = (
             f"alias '{old.alias}' changed identity during apply: "
             f"{old.coordinate}/{_ref_key(old)} -> {new.coordinate}/{_ref_key(new)}"
         )
+        raise GradleError(msg)
     old_value = _version_value(before, old)
     new_value = _version_value(after, new)
     if selected and (new.unsupported is not None or new_value is None):
-        raise GradleError(
-            f"selected alias {new.alias!r} no longer has a simple version"
-        )
+        msg = f"selected alias {new.alias!r} no longer has a simple version"
+        raise GradleError(msg)
     if selected and new_value != target_version:
-        raise GradleError(
-            f"'{old.alias}' is {new_value!r} after apply, expected {target_version!r}"
-        )
+        msg = f"'{old.alias}' is {new_value!r} after apply, expected {target_version!r}"
+        raise GradleError(msg)
     if not selected and old_value != new_value:
-        raise GradleError(
-            f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
-        )
+        msg = f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
+        raise GradleError(msg)
 
 
 def _assert_named_version_change(
@@ -1074,14 +1088,16 @@ def _assert_named_version_change(
     target_version: str,
 ) -> None:
     if selected and new.value != target_version:
-        raise GradleError(
+        msg = (
             f"version '{old.name}' is {new.value!r} after apply, "
             f"expected {target_version!r}"
         )
+        raise GradleError(msg)
     if not selected and new.value != old.value:
-        raise GradleError(
+        msg = (
             f"unexpected change to version '{old.name}': {old.value!r} -> {new.value!r}"
         )
+        raise GradleError(msg)
 
 
 def _version_value(catalogue: Catalogue, entry: CatalogueEntry) -> str | None:

@@ -401,7 +401,8 @@ def test_comparison_setup_requires_trivy_and_leaves_no_cache(
     parent = tmp_path / "cache"
 
     def missing(name, hint):
-        raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+        msg = f"{name} is not installed or not on PATH. {hint}"
+        raise ToolNotFoundError(msg)
 
     monkeypatch.setattr(verification, "require_tool", missing)
     with pytest.raises(ToolNotFoundError, match="trivy"):
@@ -955,7 +956,8 @@ def test_check_evidence_uses_clock_after_effects(workflow, monkeypatch):
 
 
 def _revision_failure(*args, **kwargs):
-    raise RevisionError("jj unavailable")
+    msg = "jj unavailable"
+    raise RevisionError(msg)
 
 
 @pytest.mark.parametrize("stage", ["before-checked", "after-checked"])
@@ -1301,7 +1303,8 @@ def test_failed_checks_prevent_capture_and_ready(workflow, monkeypatch):
     run = begin_workflow(workflow)
 
     def failed(*args, **kwargs):
-        raise updater.GradleError("unit failed")
+        msg = "unit failed"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(updater, "run_gradle_checks", failed)
     monkeypatch.setattr(
@@ -1657,7 +1660,8 @@ def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise ProcessError("configured unit test failed")
+            msg = "configured unit test failed"
+            raise ProcessError(msg)
 
     monkeypatch.setattr("maintenance_man.updater.run_live", run_test)
 
@@ -1962,7 +1966,8 @@ def test_gradle_failed_attempt_prevents_finalization_after_another_group_passes(
     updater.save_gradle_run(updater.gradle_run_path("sample"), pending)
 
     def failing_apply(*args):
-        raise updater.GradleError("second group failed")
+        msg = "second group failed"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(updater, "apply_gradle_update", failing_apply)
     result = updater.process_gradle_run(
@@ -1990,7 +1995,8 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
     def build(*args):
         effects.append("build")
         if failure == "build":
-            raise updater.BuildError("build failed")
+            msg = "build failed"
+            raise updater.BuildError(msg)
 
     def tests(*args, **kwargs):
         effects.append("tests")
@@ -2247,7 +2253,8 @@ def finalizer_effects(workflow, monkeypatch, run):
         assert saved.promoted_commit_id == run.managed_tip_id
         state["refreshes"] += 1
         if state["refreshes"] == 1:
-            raise RevisionError("refresh failed")
+            msg = "refresh failed"
+            raise RevisionError(msg)
 
     def publish(*args, **kwargs):
         state["published"] += 1
@@ -2329,7 +2336,8 @@ def test_gradle_crash_after_promotion_before_ledger_is_recognized(
         nonlocal crashed
         if value.promoted_commit_id and not crashed:
             crashed = True
-            raise updater.GradleError("simulated durable-write crash")
+            msg = "simulated durable-write crash"
+            raise updater.GradleError(msg)
         original_save(path, value)
 
     monkeypatch.setattr(updater, "save_gradle_run", crash_save)
@@ -2484,7 +2492,8 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
             and not crashed
         ):
             crashed = True
-            raise updater.GradleError("simulated commit crash")
+            msg = "simulated commit crash"
+            raise updater.GradleError(msg)
         original_save(path, value)
 
     monkeypatch.setattr(updater, "save_gradle_run", crash_after_commit)
@@ -2578,7 +2587,8 @@ def test_gradle_recovery_sees_the_clock_advanced_by_an_effect(
             and not crashed
         ):
             crashed = True
-            raise updater.GradleError("simulated commit crash")
+            msg = "simulated commit crash"
+            raise updater.GradleError(msg)
         original_save(path, value)
 
     monkeypatch.setattr(updater, "save_gradle_run", crash_after_commit)
@@ -2757,7 +2767,8 @@ def test_failed_attempt_is_durable_before_discard(workflow, monkeypatch):
     run = begin_workflow(workflow)
 
     def failed_checks(*args, **kwargs):
-        raise updater.GradleError("unit failed")
+        msg = "unit failed"
+        raise updater.GradleError(msg)
 
     def observe_discard():
         saved = updater.load_gradle_run(updater.gradle_run_path("sample"))
@@ -2845,7 +2856,8 @@ def test_gradle_failed_ready_save_leaves_accepted_intent_and_reconciles(
 
     def refuse_ready(path, value):
         if isinstance(value.attempts[0], ReadyAttempt):
-            raise updater.GradleError("ready save failed")
+            msg = "ready save failed"
+            raise updater.GradleError(msg)
         original_save(path, value)
 
     monkeypatch.setattr(updater, "save_gradle_run", refuse_ready)
@@ -2886,11 +2898,13 @@ def test_gradle_failed_failed_save_performs_no_discard(workflow, monkeypatch):
 
     def refuse_failed(path, value):
         if isinstance(value.attempts[0], FailedAttempt):
-            raise updater.GradleError("failed save failed")
+            msg = "failed save failed"
+            raise updater.GradleError(msg)
         original_save(path, value)
 
     def failed_checks(*args, **kwargs):
-        raise updater.GradleError("unit failed")
+        msg = "unit failed"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(updater, "run_gradle_checks", failed_checks)
     monkeypatch.setattr(updater, "save_gradle_run", refuse_failed)
@@ -2910,7 +2924,8 @@ def test_gradle_failed_applying_save_leaves_candidate_planned(workflow, monkeypa
     def refuse_first(path, value):
         calls.append(value.attempts[0].state)
         if len(calls) == 1:
-            raise updater.GradleError("applying save failed")
+            msg = "applying save failed"
+            raise updater.GradleError(msg)
         original_save(path, value)
 
     monkeypatch.setattr(updater, "save_gradle_run", refuse_first)
@@ -3098,7 +3113,8 @@ def test_gradle_continue_failure_before_new_snapshot_keeps_prior_failed_after(
     workflow.vcs.repository(workflow.project.path).commit(message="manual repair")
 
     def failed_checks(*args, **kwargs):
-        raise updater.GradleError("retry checks failed")
+        msg = "retry checks failed"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(updater, "run_gradle_checks", failed_checks)
     with pytest.raises(updater.GradleError, match="retry checks failed"):
@@ -3160,7 +3176,8 @@ def test_gradle_cli_uses_ledger_even_without_scan_results(workflow, monkeypatch)
 
     def read_published(*args):
         assert finalized, "scan JSON must not authorize ledger recovery"
-        raise cli.NoScanResultsError("no published results")
+        msg = "no published results"
+        raise cli.NoScanResultsError(msg)
 
     def finish(value, *args, **kwargs):
         nonlocal finalized
@@ -3730,7 +3747,8 @@ def test_gradle_result_render_uses_durable_or_published_evidence(
         reads.append("load")
         if published_exists:
             return published
-        raise cli.NoScanResultsError("no saved results")
+        msg = "no saved results"
+        raise cli.NoScanResultsError(msg)
 
     monkeypatch.setattr(workflow_service, "load_scan_results", load)
     before = run.model_dump_json()
@@ -4022,7 +4040,8 @@ def test_rebuilt_baseline_check_failure_releases_new_context(
     state = rebuild_evidence
 
     def fail_checks(*args, **kwargs):
-        raise updater.GradleError("baseline build failed")
+        msg = "baseline build failed"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(updater, "run_gradle_checks", fail_checks)
     with pytest.raises(updater.GradleError, match="baseline build failed"):
@@ -4207,7 +4226,8 @@ def test_failed_rebuild_preserves_durable_context(
     )
 
     def fail_save(*args):
-        raise updater.GradleError("ledger write failed")
+        msg = "ledger write failed"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(updater, "save_gradle_run", fail_save)
     with pytest.raises(updater.GradleError, match="ledger write failed"):
@@ -4229,7 +4249,8 @@ def test_failed_save_after_replace_keeps_new_context(rebuild_evidence, monkeypat
 
     def replace_then_fail(path, run):
         original(path, run)
-        raise updater.GradleError("directory fsync failed after replace")
+        msg = "directory fsync failed after replace"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(updater, "save_gradle_run", replace_then_fail)
     with pytest.raises(updater.GradleError, match="fsync"):
@@ -4274,7 +4295,8 @@ def test_gradle_retry_replans_after_native_preparation_failure(driver, monkeypat
     )
 
     def fail(*args):
-        raise updater.GradleError("Temporary native metadata failure")
+        msg = "Temporary native metadata failure"
+        raise updater.GradleError(msg)
 
     monkeypatch.setattr(candidates, "validate_gradle_candidates", fail)
     assert invoke_driver(driver) is Outcome.FAILED
@@ -4298,7 +4320,8 @@ def test_gradle_empty_discovery_checks_fresh_security_findings(
 
     def previous(*args):
         if not cached:
-            raise cli.NoScanResultsError("No saved scan")
+            msg = "No saved scan"
+            raise cli.NoScanResultsError(msg)
         return ScanResult(
             project="sample",
             scanned_at=driver.workflow.context.created_at,
@@ -4395,7 +4418,8 @@ def test_gradle_run_applies_shared_target_once_after_owned_output_cleanup(
     if inventory_state == "cleanup-error":
 
         def fail(*args, **kwargs):
-            raise PermissionError("Cannot reclaim inventory")
+            msg = "Cannot reclaim inventory"
+            raise PermissionError(msg)
 
         monkeypatch.setattr(gradle.shutil, "rmtree", fail)
     result = updater.process_gradle_run(
@@ -4647,7 +4671,8 @@ def test_checked_gradle_update_can_record_unknown_publication(
 
     def timeout(*args):
         calls.append(args[0])
-        raise TimeoutError("unavailable")
+        msg = "unavailable"
+        raise TimeoutError(msg)
 
     with PublicationLookupContext(tmp_path / "publications", timeout) as publication:
         result = updater.process_gradle_run(

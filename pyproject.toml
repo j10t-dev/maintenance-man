@@ -31,7 +31,7 @@ line-length = 88
 extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N", "TRY002", "TRY201", "TRY203", "TRY400", "TRY401", "TID251"]
+select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N", "TRY002", "TRY201", "TRY203", "TRY400", "TRY401", "TID251", "EM101", "EM102", "EM103"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/maintenance_man/process.py" = ["TID251"]

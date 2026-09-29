@@ -80,7 +80,8 @@ def _load_pyproject(project_path: Path) -> dict:
         with pyproject_path.open("rb") as f:
             return tomllib.load(f)
     except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
-        raise UvDependencyError(f"Failed to read {pyproject_path}: {e}") from e
+        msg = f"Failed to read {pyproject_path}: {e}"
+        raise UvDependencyError(msg) from e
 
 
 def _iter_runtime_dependency_specs(data: dict) -> list[str]:

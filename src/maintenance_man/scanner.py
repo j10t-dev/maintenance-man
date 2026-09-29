@@ -69,7 +69,8 @@ def scan_project(
     """
     project_path = Path(project.path)
     if not project_path.exists():
-        raise FileNotFoundError(f"Project path does not exist: {project_path}")
+        msg = f"Project path does not exist: {project_path}"
+        raise FileNotFoundError(msg)
     resolution = None
     if project.package_manager == "gradle":
         vulns, updates, secrets, resolution = _scan_gradle_project(
@@ -182,10 +183,11 @@ def scan_gradle(
         for finding in findings:
             scopes = scoped.get((finding.pkg_name, finding.installed_version))
             if not scopes:
-                raise GradleError(
+                msg = (
                     f"Security finding has no selected resolution scope: "
                     f"{finding.pkg_name}"
                 )
+                raise GradleError(msg)
             finding.gradle_scopes = tuple(sorted(scopes))
         return findings, outcome
 
@@ -198,31 +200,38 @@ def _validate_gradle_trivy_vulnerability(
     row: object, label: str, *, consumed: bool
 ) -> None:
     if not _is_trivy_object(row):
-        raise ScanError(f"Malformed {label}: expected an object")
+        msg = f"Malformed {label}: expected an object"
+        raise ScanError(msg)
     if not consumed:
         return
     for field in ("VulnerabilityID", "PkgName", "InstalledVersion"):
         if not isinstance(row.get(field), str) or not row[field]:
-            raise ScanError(f"Malformed {label}.{field}: expected a nonempty string")
+            msg = f"Malformed {label}.{field}: expected a nonempty string"
+            raise ScanError(msg)
     for field in ("Severity", "Title", "Description", "Status"):
         if field in row and not isinstance(row[field], str):
-            raise ScanError(f"Malformed {label}.{field}: expected a string")
+            msg = f"Malformed {label}.{field}: expected a string"
+            raise ScanError(msg)
     for field in ("FixedVersion", "PrimaryURL", "PublishedDate"):
         if field in row and row[field] is not None and not isinstance(row[field], str):
-            raise ScanError(f"Malformed {label}.{field}: expected a string or null")
+            msg = f"Malformed {label}.{field}: expected a string or null"
+            raise ScanError(msg)
 
 
 def _validate_gradle_trivy_result(result: object, index: int) -> dict[str, object]:
     label = f"Trivy SBOM Results[{index}]"
     if not _is_trivy_object(result):
-        raise ScanError(f"Malformed {label}: expected an object")
+        msg = f"Malformed {label}: expected an object"
+        raise ScanError(msg)
     if "Class" in result and not isinstance(result["Class"], str):
-        raise ScanError(f"Malformed {label}.Class: expected a string")
+        msg = f"Malformed {label}.Class: expected a string"
+        raise ScanError(msg)
     vulnerabilities = result.get("Vulnerabilities")
     if vulnerabilities is None:
         return result
     if not isinstance(vulnerabilities, list):
-        raise ScanError(f"Malformed {label}.Vulnerabilities: expected an array")
+        msg = f"Malformed {label}.Vulnerabilities: expected an array"
+        raise ScanError(msg)
     for row_index, row in enumerate(vulnerabilities):
         _validate_gradle_trivy_vulnerability(
             row,
@@ -237,12 +246,15 @@ def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
     try:
         output: object = json.loads(payload)
     except json.JSONDecodeError as e:
-        raise ScanError(f"Failed to parse Trivy SBOM output: {e}") from e
+        msg = f"Failed to parse Trivy SBOM output: {e}"
+        raise ScanError(msg) from e
     if not _is_trivy_object(output):
-        raise ScanError("Malformed Trivy SBOM output: expected an object")
+        msg = "Malformed Trivy SBOM output: expected an object"
+        raise ScanError(msg)
     results = output.get("Results", [])
     if not isinstance(results, list):
-        raise ScanError("Malformed Trivy SBOM Results: expected an array")
+        msg = "Malformed Trivy SBOM Results: expected an array"
+        raise ScanError(msg)
     validated_results = [
         _validate_gradle_trivy_result(result, index)
         for index, result in enumerate(results)
@@ -250,7 +262,8 @@ def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
     try:
         return _parse_vulns(validated_results)
     except ValidationError as e:
-        raise ScanError(f"Malformed Trivy SBOM vulnerability fields: {e}") from e
+        msg = f"Malformed Trivy SBOM vulnerability fields: {e}"
+        raise ScanError(msg) from e
 
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
@@ -387,7 +400,8 @@ def _run_trivy_scan(
     try:
         trivy_output = json.loads(completed.stdout)
     except json.JSONDecodeError as e:
-        raise ScanError(f"Failed to parse Trivy output: {e}") from e
+        msg = f"Failed to parse Trivy output: {e}"
+        raise ScanError(msg) from e
 
     results = trivy_output.get("Results", [])
     return _parse_vulns(results), _parse_secrets(results)
@@ -452,9 +466,8 @@ def capture_gradle_snapshot(
 ) -> GradleSnapshot | IncompleteResolution:
     services = vcs or make_vcs_services()
     if not context_inputs_valid(context, project, clock()):
-        raise GradleError(
-            "Comparison context expired or inputs changed; rebuild baseline and tip"
-        )
+        msg = "Comparison context expired or inputs changed; rebuild baseline and tip"
+        raise GradleError(msg)
     with generate_gradle_report(project) as generated:
         resolution = generated.resolution
         if isinstance(resolution, IncompleteResolution):
@@ -533,7 +546,8 @@ def capture_gradle_snapshot(
         )
     # Generated report/BOM cleanup must precede the jj source-tree snapshot.
     if not context_inputs_valid(context, project, clock()):
-        raise GradleError("Comparison inputs changed during capture")
+        msg = "Comparison inputs changed during capture"
+        raise GradleError(msg)
     return GradleSnapshot(
         tree_id=services.repository(Path(project.path)).tree_id(),
         resolution=resolution,

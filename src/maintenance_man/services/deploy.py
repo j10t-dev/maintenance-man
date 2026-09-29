@@ -194,10 +194,11 @@ def deploy_project(
         emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
         return DeployResult(name, "skip", "skip")
     if not project.deploy_command:
-        raise WorkflowError(
+        msg = (
             f"No deploy_command configured for {name}. "
             f"Add deploy_command to [projects.{name}] in ~/.mm/config.toml."
         )
+        raise WorkflowError(msg)
 
     decision, current_id = should_deploy(
         name,
@@ -210,10 +211,11 @@ def deploy_project(
         emit(ProjectSkipped(name, SkipReason.UNCHANGED))
         return DeployResult(name, "skip", "unchanged")
     if decision is GateDecision.SKIP_BLOCKED:
-        raise WorkflowError(
+        msg = (
             f"Could not resolve main revision for {name}; refusing to deploy "
             "unverified state (use --force to override)."
         )
+        raise WorkflowError(msg)
 
     result = _run_steps(
         name,

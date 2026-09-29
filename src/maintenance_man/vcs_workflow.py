@@ -64,10 +64,11 @@ def sync_main(*, repo: Repository) -> SyncAction:
     repo.fetch(main_only=True)
     ensure_main_bookmark(repo=repo)
     if repo.bookmark_conflicted(bookmark="main"):
-        raise RevisionError(
+        msg = (
             "main bookmark is conflicted; resolve with jj bookmark commands "
             "before syncing"
         )
+        raise RevisionError(msg)
 
     if repo.same_revision(left="main", right="main@origin"):
         refresh_working_copy_from_main(repo=repo)
@@ -82,13 +83,13 @@ def sync_main(*, repo: Repository) -> SyncAction:
         repo.push_bookmark(bookmark="main")
         repo.fetch(main_only=True)
         if not repo.same_revision(left="main", right="main@origin"):
-            raise RevisionError("pushed main but origin/main did not update to match")
+            msg = "pushed main but origin/main did not update to match"
+            raise RevisionError(msg)
         refresh_working_copy_from_main(repo=repo)
         return SyncAction.PUSHED
 
-    raise RevisionError(
-        "local main and origin/main have diverged; resolve manually before syncing"
-    )
+    msg = "local main and origin/main have diverged; resolve manually before syncing"
+    raise RevisionError(msg)
 
 
 def prune_stale_bookmarks(*, repo: Repository, host: CodeHost) -> None:
@@ -141,14 +142,16 @@ def _workspace_path(project: str) -> Path:
     try:
         return paths.project_file(paths.workspaces_dir(), project)
     except (OSError, ValueError) as exc:
-        raise RevisionError(f"Cannot compute workspace path: {exc}") from exc
+        msg = f"Cannot compute workspace path: {exc}"
+        raise RevisionError(msg) from exc
 
 
 def _checked_workspace_path(path: Path) -> Path:
     try:
         return assert_safe_workspace_path(path)
     except (OSError, ValueError) as exc:
-        raise RevisionError(f"Cannot inspect workspace path: {exc}") from exc
+        msg = f"Cannot inspect workspace path: {exc}"
+        raise RevisionError(msg) from exc
 
 
 def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
@@ -156,7 +159,8 @@ def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
     try:
         workspace_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise RevisionError(f"Cannot prepare workspace path: {exc}") from exc
+        msg = f"Cannot prepare workspace path: {exc}"
+        raise RevisionError(msg) from exc
     repo.add_workspace(
         name=_workspace_name(project), path=workspace_path, revision=revision
     )
@@ -174,11 +178,11 @@ def remove_workspace(*, repo: Repository, project: str) -> None:
     except FileNotFoundError:
         return
     except OSError as exc:
-        raise RevisionError(f"Cannot inspect workspace path: {exc}") from exc
+        msg = f"Cannot inspect workspace path: {exc}"
+        raise RevisionError(msg) from exc
     workspace_path = _checked_workspace_path(workspace_path)
     try:
         shutil.rmtree(workspace_path)
     except OSError as exc:
-        raise RevisionError(
-            f"Cannot remove workspace path {workspace_path}: {exc}"
-        ) from exc
+        msg = f"Cannot remove workspace path {workspace_path}: {exc}"
+        raise RevisionError(msg) from exc

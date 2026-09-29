@@ -31,7 +31,8 @@ TRIVY_INSTALL_HINT = "Install it from https://trivy.dev/"
 
 def _digest(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
-        raise GradleError(f"Comparison input is not a regular file: {path}")
+        msg = f"Comparison input is not a regular file: {path}"
+        raise GradleError(msg)
     return file_digest(path)
 
 
@@ -45,12 +46,12 @@ def _policy(project: ProjectConfig) -> bytes:
     for filename in _POLICY_FILES:
         path = Path(project.path) / filename
         if path.exists() or path.is_symlink():
-            raise GradleError(
-                f"Automatic comparison cannot freeze custom policy: {path}"
-            )
+            msg = f"Automatic comparison cannot freeze custom policy: {path}"
+            raise GradleError(msg)
     ignore = Path(project.path) / ".trivyignore"
     if ignore.is_symlink():
-        raise GradleError("Refusing symlinked Trivy ignore input")
+        msg = "Refusing symlinked Trivy ignore input"
+        raise GradleError(msg)
     return ignore.read_bytes() if ignore.exists() else b""
 
 
@@ -69,14 +70,17 @@ def _database_digests(cache: Path) -> dict[str, str]:
     for directory in ("db", "java-db"):
         base = cache / directory
         if base.is_symlink() or not base.is_dir():
-            raise GradleError(f"Missing private Trivy database: {directory}")
+            msg = f"Missing private Trivy database: {directory}"
+            raise GradleError(msg)
         for path in sorted(base.rglob("*")):
             if path.is_symlink():
-                raise GradleError("Symlink in private Trivy database")
+                msg = "Symlink in private Trivy database"
+                raise GradleError(msg)
             if path.is_file():
                 result[str(path.relative_to(cache))] = _digest(path)
     if "db/trivy.db" not in result or "java-db/trivy-java.db" not in result:
-        raise GradleError("Private Trivy databases are incomplete")
+        msg = "Private Trivy databases are incomplete"
+        raise GradleError(msg)
     return result
 
 
@@ -89,7 +93,8 @@ def initialize_comparison_context(
 ) -> ComparisonContext:
     policy = _policy(project)
     if run_cache_parent.is_symlink():
-        raise GradleError("Refusing symlinked comparison cache parent")
+        msg = "Refusing symlinked comparison cache parent"
+        raise GradleError(msg)
     run_cache_parent.mkdir(parents=True, exist_ok=True)
     cache = Path(tempfile.mkdtemp(prefix="gradle-comparison-", dir=run_cache_parent))
     token = uuid.uuid4().hex
@@ -183,9 +188,11 @@ def release_comparison_context(context: ComparisonContext) -> None:
         return
     marker = cache / _MARKER
     if cache.is_symlink() or marker.is_symlink() or not marker.is_file():
-        raise GradleError("Refusing unowned comparison cache cleanup")
+        msg = "Refusing unowned comparison cache cleanup"
+        raise GradleError(msg)
     if marker.read_text() != context.owner_token:
-        raise GradleError("Comparison cache ownership changed")
+        msg = "Comparison cache ownership changed"
+        raise GradleError(msg)
     shutil.rmtree(cache)
 
 

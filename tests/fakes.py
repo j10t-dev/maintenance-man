@@ -139,7 +139,8 @@ class FakeCommands:
         self.calls.append((argv, cwd, kwargs))
         outcomes = self._outcomes.get(key)
         if not outcomes:
-            raise AssertionError(f"Unconfigured command: {argv!r} in {cwd}")
+            msg = f"Unconfigured command: {argv!r} in {cwd}"
+            raise AssertionError(msg)
         result = outcomes.popleft()
         if isinstance(result, BaseException):
             raise result

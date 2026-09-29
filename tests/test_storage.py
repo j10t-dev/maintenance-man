@@ -51,7 +51,8 @@ def test_failed_replace_keeps_old_content(tmp_path, monkeypatch):
     target.write_text("old")
 
     def fail(src, dst):
-        raise OSError("disk full")
+        msg = "disk full"
+        raise OSError(msg)
 
     monkeypatch.setattr(storage.os, "replace", fail)
     with pytest.raises(OSError, match="disk full"):

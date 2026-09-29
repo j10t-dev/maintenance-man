@@ -151,7 +151,8 @@ class VulnFinding(BaseModel):
     @property
     def target_version(self) -> str:
         if self.fixed_version is None:
-            raise ValueError("No fixed version available")
+            msg = "No fixed version available"
+            raise ValueError(msg)
         return self.fixed_version
 
     @property

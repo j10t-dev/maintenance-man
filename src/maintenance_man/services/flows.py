@@ -18,10 +18,11 @@ class FlowConflictError(WorkflowError):
 def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:
     for finding in scan_result.findings:
         if finding.update_status is not None and finding.flow is None:
-            raise FlowConflictError(
+            msg = (
                 f"{project} has in-progress findings without flow ownership — "
                 "please rescan the project."
             )
+            raise FlowConflictError(msg)
 
 
 _RESOLVE_CLAIMABLE_TEST_PHASES = {"unit", "integration", "component"}
@@ -52,11 +53,12 @@ def _assert_no_conflicting_flow(
     if conflicts:
         other_flow = conflicts[0].flow
         assert other_flow is not None
-        raise FlowConflictError(
+        msg = (
             f"Cannot run {active_flow.value} on {project}: {len(conflicts)} "
             f"finding(s) owned by the '{other_flow.value}' flow. Complete or "
             "abandon that flow first."
         )
+        raise FlowConflictError(msg)
 
 
 def load_validated_scan(

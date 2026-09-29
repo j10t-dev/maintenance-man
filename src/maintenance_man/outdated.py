@@ -49,7 +49,8 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     try:
         entries = json.loads(completed.stdout)
     except json.JSONDecodeError as e:
-        raise OutdatedCheckError(f"Failed to parse uv output: {e}") from e
+        msg = f"Failed to parse uv output: {e}"
+        raise OutdatedCheckError(msg) from e
 
     if not isinstance(entries, list) or not all(
         isinstance(entry, dict)
@@ -59,10 +60,11 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         )
         for entry in entries
     ):
-        raise OutdatedCheckError(
+        msg = (
             "Unexpected uv output: expected a list of objects with string "
             "name, version and latest_version"
         )
+        raise OutdatedCheckError(msg)
 
     direct_deps = _get_uv_direct_dep_names(Path(project.path))
 
@@ -81,7 +83,8 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
             and normalise_pkg_name(entry["name"]) in direct_deps
         ]
     except ValidationError as e:
-        raise OutdatedCheckError(f"Unexpected uv output: {e}") from e
+        msg = f"Unexpected uv output: {e}"
+        raise OutdatedCheckError(msg) from e
 
 
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
@@ -97,10 +100,11 @@ def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     )
 
     if completed.returncode != 0 and not completed.stdout.strip():
-        raise OutdatedCheckError(
+        msg = (
             f"bun outdated failed (exit {completed.returncode}): "
             f"{completed.stderr.strip()}"
         )
+        raise OutdatedCheckError(msg)
     if not completed.stdout.strip():
         return []
 

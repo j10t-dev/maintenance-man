@@ -48,7 +48,8 @@ def test_scan_all_continues_after_failure_and_summarises_results(
     def fake_scan(name, project, minimum_age_days, *, vcs):
         del project, minimum_age_days, vcs
         if name == "second":
-            raise ScanError("boom")
+            msg = "boom"
+            raise ScanError(msg)
         return {"first": first, "third": third}[name]
 
     monkeypatch.setattr(scan_service, "require_vcs_tools", lambda: None)

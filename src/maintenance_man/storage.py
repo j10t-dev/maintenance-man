@@ -55,10 +55,11 @@ def load_scan_results(project_name: str) -> ScanResult:
     try:
         data = json.loads(results_file.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        raise NoScanResultsError(
+        msg = (
             f"No scan results found for '{project_name}'. "
             f"Run 'mm scan {project_name}' first."
-        ) from None
+        )
+        raise NoScanResultsError(msg) from None
     return ScanResult.model_validate(data)
 
 

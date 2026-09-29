@@ -22,7 +22,8 @@ def require_tool(name: str, hint: str) -> Path:
     """Return the executable that isolated commands would run, or raise."""
     found = shutil.which(name, path=project_env().get("PATH"))
     if found is None:
-        raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+        msg = f"{name} is not installed or not on PATH. {hint}"
+        raise ToolNotFoundError(msg)
     return Path(found).absolute()
 
 
@@ -54,9 +55,11 @@ def run_captured(
             env=project_env(),
         )
     except subprocess.TimeoutExpired as exc:
-        raise error(f"{label} timed out after {timeout}s{_where(cwd)}") from exc
+        msg = f"{label} timed out after {timeout}s{_where(cwd)}"
+        raise error(msg) from exc
     except (OSError, UnicodeDecodeError) as exc:
-        raise error(f"Could not run {label}{_where(cwd)}: {exc}") from exc
+        msg = f"Could not run {label}{_where(cwd)}: {exc}"
+        raise error(msg) from exc
     if ok_codes is not None and completed.returncode not in ok_codes:
         detail = (completed.stderr or "").strip() or (completed.stdout or "").strip()
         message = f"{label} failed (exit {completed.returncode})"
@@ -83,8 +86,11 @@ def run_live(
             env=project_env(),
         )
     except subprocess.TimeoutExpired as exc:
-        raise error(f"{label} timed out after {timeout}s{_where(cwd)}") from exc
+        msg = f"{label} timed out after {timeout}s{_where(cwd)}"
+        raise error(msg) from exc
     except OSError as exc:
-        raise error(f"Could not run {label}{_where(cwd)}: {exc}") from exc
+        msg = f"Could not run {label}{_where(cwd)}: {exc}"
+        raise error(msg) from exc
     if completed.returncode != 0:
-        raise error(f"{label} failed (exit {completed.returncode})")
+        msg = f"{label} failed (exit {completed.returncode})"
+        raise error(msg)

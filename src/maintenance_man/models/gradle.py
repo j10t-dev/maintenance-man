@@ -67,14 +67,18 @@ class ScopeResolution(GradleRecord):
     def graph_references(self):
         ids = {component.id for component in self.components}
         if len(ids) != len(self.components):
-            raise ValueError("duplicate component ID")
+            msg = "duplicate component ID"
+            raise ValueError(msg)
         if sum(component.kind == "root" for component in self.components) != 1:
-            raise ValueError("scope requires exactly one root")
+            msg = "scope requires exactly one root"
+            raise ValueError(msg)
         for component in self.components:
             if (component.kind == "module") != (component.module is not None):
-                raise ValueError("component/module kind mismatch")
+                msg = "component/module kind mismatch"
+                raise ValueError(msg)
         if any(edge.source not in ids or edge.target not in ids for edge in self.edges):
-            raise ValueError("unknown graph reference")
+            msg = "unknown graph reference"
+            raise ValueError(msg)
         return self
 
 
@@ -97,18 +101,23 @@ class ResolutionReport(GradleRecord):
     @model_validator(mode="after")
     def unique_scopes(self):
         if len(set(self.selected_scopes)) != len(self.selected_scopes):
-            raise ValueError("duplicate selected scope")
+            msg = "duplicate selected scope"
+            raise ValueError(msg)
         if len({scope.scope for scope in self.scopes}) != len(self.scopes):
-            raise ValueError("duplicate scope report")
+            msg = "duplicate scope report"
+            raise ValueError(msg)
         if any(scope.scope not in self.selected_scopes for scope in self.scopes):
-            raise ValueError("unselected scope result")
+            msg = "unselected scope result"
+            raise ValueError(msg)
         if set(self.producer_versions) != {"gradle", "cyclonedx", "report"}:
-            raise ValueError("producer versions missing")
+            msg = "producer versions missing"
+            raise ValueError(msg)
         paths = [project.project_path for project in self.local_projects]
         if len(set(paths)) != len(paths) or not set(paths) <= {
             scope.project_path for scope in self.selected_scopes
         }:
-            raise ValueError("duplicate or unselected local project identity")
+            msg = "duplicate or unselected local project identity"
+            raise ValueError(msg)
         return self
 
 
@@ -121,9 +130,11 @@ class CompleteResolution(GradleRecord):
         if self.report.selection_errors or any(
             s.unresolved for s in self.report.scopes
         ):
-            raise ValueError("incomplete graph")
+            msg = "incomplete graph"
+            raise ValueError(msg)
         if set(self.report.selected_scopes) != {s.scope for s in self.report.scopes}:
-            raise ValueError("missing scope result")
+            msg = "missing scope result"
+            raise ValueError(msg)
         return self
 
 
@@ -171,14 +182,16 @@ class PublicationFact(BaseModel):
     @classmethod
     def utc_date(cls, value):
         if value.tzinfo is None:
-            raise ValueError("publication dates require a timezone")
+            msg = "publication dates require a timezone"
+            raise ValueError(msg)
         return value.astimezone(UTC)
 
     @field_validator("artifact_digest")
     @classmethod
     def digest(cls, value):
         if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
-            raise ValueError("expected SHA-256 digest")
+            msg = "expected SHA-256 digest"
+            raise ValueError(msg)
         return value
 
 
@@ -190,7 +203,8 @@ class PublicationEvidence(BaseModel):
     @classmethod
     def nonempty(cls, value):
         if not value:
-            raise ValueError("publication evidence requires facts")
+            msg = "publication evidence requires facts"
+            raise ValueError(msg)
         return value
 
     @property
@@ -249,7 +263,8 @@ class CandidateValidation(GradleRecord):
     @model_validator(mode="after")
     def result_shape(self):
         if (self.selected_version is None) == (self.reason is None):
-            raise ValueError("require success or unresolved reason")
+            msg = "require success or unresolved reason"
+            raise ValueError(msg)
         return self
 
 
@@ -305,16 +320,19 @@ class FindingEvidence(BaseModel):
     @model_validator(mode="after")
     def nonempty(self):
         if not self.affected_versions or not self.rows:
-            raise ValueError("finding evidence must retain versions and rows")
+            msg = "finding evidence must retain versions and rows"
+            raise ValueError(msg)
         if self.affected_versions != frozenset(
             row.installed_version for row in self.rows
         ):
-            raise ValueError("affected versions disagree with retained rows")
+            msg = "affected versions disagree with retained rows"
+            raise ValueError(msg)
         if any(
             row.vuln_id != self.key.advisory_id or row.pkg_name != self.key.coordinate
             for row in self.rows
         ):
-            raise ValueError("finding rows disagree with key")
+            msg = "finding rows disagree with key"
+            raise ValueError(msg)
         return self
 
 
@@ -350,7 +368,8 @@ class GradleSnapshot(BaseModel):
     @model_validator(mode="after")
     def unique_findings(self):
         if len({finding.key for finding in self.findings}) != len(self.findings):
-            raise ValueError("duplicate snapshot finding key")
+            msg = "duplicate snapshot finding key"
+            raise ValueError(msg)
         return self
 
     @property
@@ -389,9 +408,11 @@ class CheckEvidence(BaseModel):
         if self.command_digests != tuple(
             hashlib.sha256(cmd.encode()).hexdigest() for cmd in self.commands
         ):
-            raise ValueError("check command digests disagree")
+            msg = "check command digests disagree"
+            raise ValueError(msg)
         if self.checked_at.tzinfo is None:
-            raise ValueError("check timestamp must be timezone aware")
+            msg = "check timestamp must be timezone aware"
+            raise ValueError(msg)
         return self
 
 
@@ -410,9 +431,11 @@ class VerificationReceipt(BaseModel):
     @model_validator(mode="after")
     def successful(self):
         if not self.checks.success:
-            raise ValueError("receipt requires passing checks")
+            msg = "receipt requires passing checks"
+            raise ValueError(msg)
         if self.verified_fixes & self.residual_keys:
-            raise ValueError("residual finding cannot be a verified fix")
+            msg = "residual finding cannot be a verified fix"
+            raise ValueError(msg)
         return self
 
 
@@ -461,7 +484,8 @@ class ReadyAttempt(GradleRecord):
             or self.receipt.context_identity != self.after.context_identity
             or self.baseline.context_identity != self.after.context_identity
         ):
-            raise ValueError("receipt does not bind the accepted snapshots")
+            msg = "receipt does not bind the accepted snapshots"
+            raise ValueError(msg)
         return self
 
 
@@ -505,16 +529,20 @@ class GradleRun(GradleRecord):
     def unique_groups(self):
         keys = [attempt.candidate.target.group_key for attempt in self.attempts]
         if len(keys) != len(set(keys)):
-            raise ValueError("a run may attempt each group only once")
+            msg = "a run may attempt each group only once"
+            raise ValueError(msg)
         if self.managed_bookmark != WORKFLOW_BOOKMARKS[self.flow]:
-            raise ValueError("run bookmark and flow disagree")
+            msg = "run bookmark and flow disagree"
+            raise ValueError(msg)
         if (
             self.initial_snapshot.context_identity != self.context.identity
             or self.accepted_snapshot.context_identity != self.context.identity
         ):
-            raise ValueError("run snapshots use a different context")
+            msg = "run snapshots use a different context"
+            raise ValueError(msg)
         if self.refreshed and not self.promoted_commit_id:
-            raise ValueError("refresh requires a recorded promotion")
+            msg = "refresh requires a recorded promotion"
+            raise ValueError(msg)
         return self
 
     def has(self, *kinds: type[GradleRecord]) -> bool:

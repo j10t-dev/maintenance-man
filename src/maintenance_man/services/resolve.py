@@ -136,10 +136,11 @@ def _prepare_resolve_bookmark(
     try:
         if _has_ready_resolve_progress(scan_result):
             if not repo.bookmark_exists(bookmark=bookmark):
-                raise WorkflowError(
+                msg = (
                     f"resolve bookmark '{bookmark}' is missing but in-progress "
                     "state exists — rescan or recover the bookmark manually"
                 )
+                raise WorkflowError(msg)
             if candidates:
                 repo.new_change(revision=bookmark)
             return True
@@ -233,17 +234,18 @@ def _run_candidates(
 def _check_resumable(repo: Repository, bookmark: str) -> None:
     try:
         if not repo.is_ancestor(ancestor=bookmark, descendant="@"):
-            raise WorkflowError(
-                f"--continue requires current jj change to descend from {bookmark}"
-            )
+            msg = f"--continue requires current jj change to descend from {bookmark}"
+            raise WorkflowError(msg)
         has_changes = repo.has_changes()
     except RevisionError as exc:
-        raise WorkflowError(f"Cannot inspect resolve work: {exc}") from exc
+        msg = f"Cannot inspect resolve work: {exc}"
+        raise WorkflowError(msg) from exc
     if has_changes:
-        raise WorkflowError(
+        msg = (
             "--continue requires an empty current jj change — commit or discard "
             "manual changes first"
         )
+        raise WorkflowError(msg)
 
 
 def _retest_blockers(
@@ -275,9 +277,8 @@ def _retest_blockers(
         repo.set_bookmark(bookmark=bookmark, revision="@-")
     except RevisionError as exc:
         save_scan_results(name, scan_result)
-        raise WorkflowError(
-            f"could not move {bookmark} to the committed manual fix"
-        ) from exc
+        msg = f"could not move {bookmark} to the committed manual fix"
+        raise WorkflowError(msg) from exc
     for blocker in failed:
         blocker.update_status = UpdateStatus.READY
         blocker.failed_phase = None
@@ -348,9 +349,8 @@ def resolve_project(
     except (RevisionError, CodeHostError) as exc:
         raise WorkflowError(str(exc)) from exc
     if _ordered_failed_findings(scan_result):
-        raise WorkflowError(
-            f"resolve already paused for {name} — rerun with --continue"
-        )
+        msg = f"resolve already paused for {name} — rerun with --continue"
+        raise WorkflowError(msg)
     if not _prepare_resolve_bookmark(
         name,
         project.path,
@@ -359,5 +359,6 @@ def resolve_project(
         vcs=vcs,
         emit=emit,
     ):
-        raise WorkflowError(f"aborted resolve for {name}")
+        msg = f"aborted resolve for {name}"
+        raise WorkflowError(msg)
     return _run_candidates(name, project, scan_result, candidates, vcs=vcs, emit=emit)

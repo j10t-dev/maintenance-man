@@ -360,7 +360,8 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
             case "no-tests" | "deployable" | "deploy-only" | "no-deploy":
                 return _make_clean_result()
             case _:
-                raise FileNotFoundError(f"Unknown project: {name}")
+                msg = f"Unknown project: {name}"
+                raise FileNotFoundError(msg)
 
     monkeypatch.setattr("maintenance_man.services.scan.scan_project", _fake_scan)
 
@@ -384,7 +385,8 @@ def _two_project_config(mm_home, tmp_path):
 def _missing(tool):
     def require(name, hint):
         if name == tool:
-            raise ToolNotFoundError(f"{name} is not installed or not on PATH. {hint}")
+            msg = f"{name} is not installed or not on PATH. {hint}"
+            raise ToolNotFoundError(msg)
         return Path("/usr/bin") / name
 
     return require
@@ -463,12 +465,14 @@ def test_failed_project_scan_keeps_its_result_and_exits_error(
 
     def trivy(*args, **kwargs):
         if failure == "scanner":
-            raise scanner.ScanError("Trivy filesystem scan failed (exit 1): boom")
+            msg = "Trivy filesystem scan failed (exit 1): boom"
+            raise scanner.ScanError(msg)
         return [], []
 
     def outdated(project):
         if failure == "outdated" and project.package_manager == "bun":
-            raise OutdatedCheckError("bun outdated failed (exit 1): boom")
+            msg = "bun outdated failed (exit 1): boom"
+            raise OutdatedCheckError(msg)
         return []
 
     monkeypatch.setattr("maintenance_man.scanner._run_trivy_scan", trivy)
@@ -486,7 +490,8 @@ def test_scan_warns_and_continues_when_bookmark_pruning_cannot_run(
     mm_home_with_projects, monkeypatch, capsys
 ):
     def fail(**kwargs):
-        raise RevisionError("Could not run jj git fetch: missing jj")
+        msg = "Could not run jj git fetch: missing jj"
+        raise RevisionError(msg)
 
     monkeypatch.setattr("maintenance_man.services.scan.prune_stale_bookmarks", fail)
     with pytest.raises(SystemExit) as exc:
@@ -691,7 +696,8 @@ def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
     def _boom(name, proj_config, *, minimum_age_days, vcs, emit):
-        raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
+        msg = "./gradlew cyclonedxBom failed (exit 1): boom"
+        raise GradleError(msg)
 
     monkeypatch.setattr("maintenance_man.services.scan.scan_one", _boom)
 
@@ -709,7 +715,8 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
     def _scan(name, proj_config, *, minimum_age_days, vcs, emit):
         scanned.append(name)
         if proj_config.package_manager == "gradle":
-            raise GradleError("boom")
+            msg = "boom"
+            raise GradleError(msg)
         return make_scan_result(vulns=[], updates=[])
 
     monkeypatch.setattr("maintenance_man.services.scan.scan_one", _scan)
@@ -910,7 +917,8 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
 
         def fail(path, *args, **kwargs):
             if path == root / GRADLE_INVENTORY_RELPATH:
-                raise PermissionError("mkdir denied")
+                msg = "mkdir denied"
+                raise PermissionError(msg)
             return mkdir(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "mkdir", fail)
@@ -919,14 +927,16 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
 
         def fail(path, content):
             if path == root / GRADLE_INVENTORY_MARKER_RELPATH:
-                raise PermissionError("marker denied")
+                msg = "marker denied"
+                raise PermissionError(msg)
             return write(path, content)
 
         monkeypatch.setattr(Path, "write_bytes", fail)
     elif phase == "inventory-cleanup":
 
         def fail(*args, **kwargs):
-            raise PermissionError("inventory cleanup denied")
+            msg = "inventory cleanup denied"
+            raise PermissionError(msg)
 
         monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
     else:
@@ -943,7 +953,8 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
 
         def fail(path, *args, **kwargs):
             if path == root / GRADLE_UPDATE_REPORT_RELPATH:
-                raise PermissionError("cleanup denied")
+                msg = "cleanup denied"
+                raise PermissionError(msg)
             return unlink(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "unlink", fail)
@@ -1050,7 +1061,8 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
     def run(cmd, **kwargs):
         if cmd[1] == "mmGradleReport":
             if failure == "wrapper-decode":
-                raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
+                msg = "utf8"
+                raise UnicodeDecodeError(msg, b"\xff", 0, 1, "invalid")
             (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
                 (GRADLE_FIXTURES / "bom.json").read_bytes()
             )
@@ -1064,9 +1076,11 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         assert cmd[:2] == ["trivy", "sbom"]
         if failure == "trivy-launch":
-            raise FileNotFoundError("missing interpreter")
+            msg = "missing interpreter"
+            raise FileNotFoundError(msg)
         if failure == "trivy-decode":
-            raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
+            msg = "utf8"
+            raise UnicodeDecodeError(msg, b"\xff", 0, 1, "invalid")
         payload = {
             "trivy-root": [],
             "trivy-results": {"Results": False},

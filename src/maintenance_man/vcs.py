@@ -96,29 +96,33 @@ def assert_safe_workspace_path(path: Path) -> Path:
     except FileNotFoundError:
         path_status = None
     if path_status is not None and stat.S_ISLNK(path_status.st_mode):
-        raise ValueError(f"refusing to remove symlink workspace path: {path}")
+        msg = f"refusing to remove symlink workspace path: {path}"
+        raise ValueError(msg)
 
     root = paths.workspaces_dir().resolve()
     target = path.resolve()
     if target == root:
-        raise ValueError("refusing to remove workspace root")
+        msg = "refusing to remove workspace root"
+        raise ValueError(msg)
     if root not in target.parents:
-        raise ValueError(f"refusing to remove path outside {root}: {target}")
+        msg = f"refusing to remove path outside {root}: {target}"
+        raise ValueError(msg)
     if target.parent != root:
-        raise ValueError(
-            f"refusing to remove nested/non-project workspace path: {target}"
-        )
+        msg = f"refusing to remove nested/non-project workspace path: {target}"
+        raise ValueError(msg)
     return target
 
 
 def _guarded_tip(source_bookmark: str, expected_base: str, expected_tip: str) -> str:
     if source_bookmark not in tuple(WORKFLOW_BOOKMARKS.values()):
-        raise RevisionError("Unexpected managed Gradle bookmark")
+        msg = "Unexpected managed Gradle bookmark"
+        raise RevisionError(msg)
     if not all(
         re.fullmatch(r"[0-9a-f]{40,64}", value)
         for value in (expected_base, expected_tip)
     ):
-        raise RevisionError("Invalid expected revision identity")
+        msg = "Invalid expected revision identity"
+        raise RevisionError(msg)
     base = f"exactly(exactly(main, 1) & {expected_base}, 1)"
     tip = f"exactly(exactly({source_bookmark}, 1) & {expected_tip}, 1)"
     return f"exactly(({base})::({tip}) & ({tip}), 1)"
@@ -143,16 +147,16 @@ def _checked_jj(
 def _one_line(output: str, *, subject: str) -> str:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     if len(lines) != 1:
-        raise RevisionError(
-            f"{subject} must resolve to exactly one value, got {len(lines)}"
-        )
+        msg = f"{subject} must resolve to exactly one value, got {len(lines)}"
+        raise RevisionError(msg)
     return lines[0]
 
 
 def _exact_commit(output: str, *, revision: str) -> str:
     commit_id = _one_line(output, subject=revision)
     if _COMMIT_ID.fullmatch(commit_id) is None:
-        raise RevisionError(f"{revision} returned a malformed commit identity")
+        msg = f"{revision} returned a malformed commit identity"
+        raise RevisionError(msg)
     return commit_id
 
 
@@ -188,7 +192,8 @@ class JjRepository:
             line.strip() for line in result.stdout.splitlines() if line.strip()
         )
         if any(name != bookmark for name in names):
-            raise RevisionError(f"Unexpected bookmark listing for {bookmark}")
+            msg = f"Unexpected bookmark listing for {bookmark}"
+            raise RevisionError(msg)
         return names
 
     def bookmark_exists(self, *, bookmark: str) -> bool:
@@ -212,7 +217,8 @@ class JjRepository:
     def bookmark_conflicted(self, *, bookmark: str) -> bool:
         names = self._bookmark_listing(bookmark)
         if not names:
-            raise RevisionError(f"Cannot inspect bookmark conflict for {bookmark}")
+            msg = f"Cannot inspect bookmark conflict for {bookmark}"
+            raise RevisionError(msg)
         return len(names) > 1
 
     def resolve_revision(self, *, revision: str, read_only: bool = False) -> str:
@@ -220,9 +226,8 @@ class JjRepository:
             revision in self.local_bookmarks()
             and len(self._bookmark_listing(revision)) > 1
         ):
-            raise RevisionError(
-                f"{revision} must resolve to exactly one commit, got multiple targets"
-            )
+            msg = f"{revision} must resolve to exactly one commit, got multiple targets"
+            raise RevisionError(msg)
         prefix = ["--ignore-working-copy", "--color", "never"] if read_only else []
         result = self._run(
             [
@@ -262,7 +267,8 @@ class JjRepository:
             ["git-submodule"],
             ["conflict"],
         ):
-            raise RevisionError("Unexpected revision file listing")
+            msg = "Unexpected revision file listing"
+            raise RevisionError(msg)
         return RevisionFile(commit_id=commit_id, is_regular=kinds == ["file"])
 
     def tree_id(self, *, revision: str = "@") -> str:
@@ -275,7 +281,8 @@ class JjRepository:
             re.MULTILINE,
         )
         if len(trees) != 1:
-            raise RevisionError("Cannot identify the verified jj tree")
+            msg = "Cannot identify the verified jj tree"
+            raise RevisionError(msg)
         return trees[0]
 
     def same_revision(self, *, left: str, right: str) -> bool:
@@ -298,7 +305,8 @@ class JjRepository:
         )
         values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if values not in ([], [descendant_id]):
-            raise RevisionError("Unexpected ancestry result")
+            msg = "Unexpected ancestry result"
+            raise RevisionError(msg)
         return bool(values)
 
     def revision_bookmarks(self, *, revision: str) -> tuple[str, ...]:
@@ -382,7 +390,8 @@ class JjRepository:
             self.resolve_revision(revision="main") != expected.tip
             or self.resolve_revision(revision=bookmark) != expected.tip
         ):
-            raise RevisionError("Local revisions changed during promotion")
+            msg = "Local revisions changed during promotion"
+            raise RevisionError(msg)
 
     def reset_verified_bookmark(
         self, *, bookmark: str, expected: ExpectedRevisions
@@ -391,7 +400,8 @@ class JjRepository:
         base = f"exactly({expected.base} & ::({guarded}), 1)"
         self._run(["bookmark", "set", bookmark, "--allow-backwards", "-r", base])
         if self.resolve_revision(revision=bookmark) != expected.base:
-            raise RevisionError("Local revisions changed during reset")
+            msg = "Local revisions changed during reset"
+            raise RevisionError(msg)
 
     def fetch(self, *, main_only: bool = False) -> None:
         arguments = ["git", "fetch", "--remote", "origin"]
@@ -413,13 +423,15 @@ class JjRepository:
             self.resolve_revision(revision="main") != expected.base
             or self.resolve_revision(revision=bookmark) != expected.tip
         ):
-            raise RevisionError("Local revisions changed during submission")
+            msg = "Local revisions changed during submission"
+            raise RevisionError(msg)
 
     def workspace_names(self) -> frozenset[str]:
         result = self._run(["workspace", "list", "-T", 'name ++ "\\n"'])
         names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if len(names) != len(set(names)):
-            raise RevisionError("Unexpected duplicate workspace listing")
+            msg = "Unexpected duplicate workspace listing"
+            raise RevisionError(msg)
         return frozenset(names)
 
     def add_workspace(self, *, name: str, path: Path, revision: str) -> None:
@@ -476,7 +488,8 @@ def _temporary_workspace(
     try:
         container = Path(tempfile.mkdtemp(prefix="mm-gradle-proof-"))
     except OSError as exc:
-        raise RevisionError(f"Cannot allocate proof workspace: {exc}") from exc
+        msg = f"Cannot allocate proof workspace: {exc}"
+        raise RevisionError(msg) from exc
     token = uuid.uuid4().hex
     marker = container / ".mm-proof-owner"
     name = f"mm-proof-{token}"
@@ -492,7 +505,8 @@ def _temporary_workspace(
                 cleanup = "; allocated path became a symlink and was not removed"
         except OSError as cleanup_exc:
             cleanup = f"; cleanup failed: {cleanup_exc}"
-        raise RevisionError(f"Cannot mark proof workspace: {exc}{cleanup}") from exc
+        msg = f"Cannot mark proof workspace: {exc}{cleanup}"
+        raise RevisionError(msg) from exc
     registered = False
     body_error: BaseException | None = None
     try:

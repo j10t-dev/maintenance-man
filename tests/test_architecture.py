@@ -520,6 +520,28 @@ def test_exception_policy_is_enforced(source: str, expected: str) -> None:
     assert expected in codes
 
 
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ('raise ValueError("invalid input")\n', "EM101"),
+        ('value = 1\nraise ValueError(f"invalid {value}")\n', "EM102"),
+        (
+            'value = 1\nraise ValueError("invalid {}".format(value))\n',
+            "EM103",
+        ),
+    ],
+)
+def test_exception_message_expressions_are_rejected(source: str, expected: str) -> None:
+    status, codes = _ruff_codes(source)
+    assert status == 1
+    assert expected in codes
+
+
+def test_local_exception_message_is_allowed() -> None:
+    _, codes = _ruff_codes('message = "invalid input"\nraise ValueError(message)\n')
+    assert {"EM101", "EM102", "EM103"}.isdisjoint(codes)
+
+
 def test_staged_ruff_policy_configuration() -> None:
     config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["ruff"][
         "lint"
@@ -549,6 +571,9 @@ def test_staged_ruff_policy_configuration() -> None:
         "TRY400",
         "TRY401",
         "TID251",
+        "EM101",
+        "EM102",
+        "EM103",
     }
     assert {
         "PLR0913",

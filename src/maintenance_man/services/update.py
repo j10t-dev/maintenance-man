@@ -131,10 +131,11 @@ def _enter_update_workspace(
 
     if _has_update_progress(scan_result):
         if not repo.bookmark_exists(bookmark=bookmark):
-            raise UpdateSetupError(
+            msg = (
                 f"update bookmark '{bookmark}' is missing but in-progress "
                 "state exists — rescan required"
             )
+            raise UpdateSetupError(msg)
         workspace_path = create_workspace(repo=repo, project=project, revision=bookmark)
         vcs.repository(workspace_path).new_change(revision=bookmark)
         return workspace_path

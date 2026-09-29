@@ -463,7 +463,8 @@ def test_proof_preserves_body_exception(
     original = error_type("proof body failed")
 
     def no_host(path: Path):
-        raise AssertionError(f"unexpected host for {path}")
+        msg = f"unexpected host for {path}"
+        raise AssertionError(msg)
 
     services = VcsServices(repository=c.bind, code_host=no_host)
     before_names = c.repo.workspace_names()
@@ -1804,7 +1805,8 @@ def test_temporary_workspace_body_error_keeps_cleanup_diagnostics(
     monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
 
     def fail_remove(_path: Path) -> None:
-        raise OSError("remove failed")
+        msg = "remove failed"
+        raise OSError(msg)
 
     monkeypatch.setattr(vcs.shutil, "rmtree", fail_remove)
     body_error = RuntimeError("caller")
@@ -1865,7 +1867,8 @@ def test_temporary_workspace_cleanup_errors_raise_combined_revision_error(
         return str(container)
 
     def fail_remove(_path: Path) -> None:
-        raise OSError("remove failed")
+        msg = "remove failed"
+        raise OSError(msg)
 
     monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
     monkeypatch.setattr(vcs.shutil, "rmtree", fail_remove)

@@ -1042,7 +1042,8 @@ def test_failed_discard_persists_original_failure_and_stops(
         saved = load_scan_results("demo")
         assert saved.updates[0].update_status == UpdateStatus.FAILED
         assert saved.updates[0].failed_phase == "unit"
-        raise RevisionError("cannot discard")
+        msg = "cannot discard"
+        raise RevisionError(msg)
 
     state.hook(
         "discard",
