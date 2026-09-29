@@ -48,6 +48,7 @@ from maintenance_man.models.gradle import (
     GradleSnapshot,
     IncompleteResolution,
     PlannedAttempt,
+    PublicationEvidence,
     ReadyAttempt,
     VerificationReceipt,
     VerifiedComparison,
@@ -61,7 +62,7 @@ from maintenance_man.models.scan import (
 from maintenance_man.scanner import ScanError, capture_gradle_snapshot
 from maintenance_man.storage import atomic_write_text
 from maintenance_man.updater import run_test_phases
-from maintenance_man.vcs import RevisionError
+from maintenance_man.vcs import Repository, RevisionError
 from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
 
 
@@ -134,6 +135,101 @@ def _replace_gradle_attempt(run: GradleRun, attempt: AttemptState) -> GradleRun:
     ):
         attempts += (attempt,)
     return GradleRun.model_validate(dict(run) | {"attempts": attempts})
+
+
+def persist_gradle_run(run: GradleRun) -> None:
+    """Save a run to its canonical project ledger."""
+    save_gradle_run(gradle_run_path(run.project), run)
+
+
+def _verification_receipt(
+    *,
+    baseline: GradleSnapshot,
+    after: GradleSnapshot,
+    context: ComparisonContext,
+    checks: CheckEvidence,
+    commit_id: str,
+    comparison: VerifiedComparison,
+    publications: tuple[PublicationEvidence, ...],
+) -> VerificationReceipt:
+    return VerificationReceipt(
+        checked_tree_id=after.tree_id,
+        accepted_commit_id=commit_id,
+        baseline_snapshot_id=baseline.snapshot_id,
+        after_snapshot_id=after.snapshot_id,
+        context_identity=context.identity,
+        checks=checks,
+        publications=publications,
+        verified_fixes=comparison.removed,
+        residual_keys=comparison.residual,
+    )
+
+
+def _accept_attempt(run: GradleRun, attempt: ReadyAttempt) -> GradleRun:
+    """Advance the managed tip and accepted snapshot to a verified attempt."""
+    advanced = _replace_gradle_attempt(run, attempt).model_copy(
+        update={
+            "managed_tip_id": attempt.receipt.accepted_commit_id,
+            "accepted_snapshot": attempt.after,
+        }
+    )
+    return GradleRun.model_validate(dict(advanced))
+
+
+def _require_publication_age(
+    candidate: GradleCandidate,
+    minimum_age_days: int,
+    publication: PublicationLookupContext,
+    *,
+    clock: Clock,
+) -> None:
+    block = evaluate_gradle_candidate_age(
+        candidate, minimum_age_days, publication, clock()
+    )
+    if block is not None:
+        raise GradleError(block.reason)
+
+
+def _record_failed_attempt(
+    run: GradleRun, candidate: GradleCandidate, reason: str
+) -> GradleRun | None:
+    """Save a FAILED attempt, or return None when checked intent must survive."""
+    latest = load_gradle_run(gradle_run_path(run.project)) or run
+    state = next(
+        item
+        for item in latest.attempts
+        if item.candidate.target.group_key == candidate.target.group_key
+    )
+    if isinstance(state, ApplyingAttempt) and state.checked_tree_id is not None:
+        # A checked commit may already exist. Recovery must reconcile it;
+        # never discard or synthesize a failure after that irreversible effect.
+        return None
+    failed = FailedAttempt(
+        candidate=candidate,
+        baseline=latest.accepted_snapshot,
+        reason=reason,
+        after=state.after
+        if isinstance(state, (ApplyingAttempt, FailedAttempt))
+        else None,
+    )
+    latest = _replace_gradle_attempt(latest, failed)
+    persist_gradle_run(latest)
+    return latest
+
+
+def _restore_accepted_baseline(
+    run: GradleRun, repo: Repository, cause: Exception
+) -> None:
+    try:
+        repo.discard()
+    except RevisionError as restore_exc:
+        raise GradleError(
+            "Could not restore the latest accepted Gradle baseline"
+        ) from restore_exc
+    if repo.tree_id() != run.accepted_snapshot.tree_id:
+        raise GradleError(
+            "Could not restore the latest accepted Gradle baseline"
+        ) from cause
 
 
 def gradle_check_commands(project: ProjectConfig) -> tuple[str, ...]:
@@ -250,7 +346,7 @@ def start_gradle_run(
         attempts=tuple(PlannedAttempt(candidate=candidate) for candidate in candidates),
     )
     if persist:
-        save_gradle_run(gradle_run_path(project_name), run)
+        persist_gradle_run(run)
     return run
 
 
@@ -268,7 +364,7 @@ def verify_applied_gradle_attempt(
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
-    path = gradle_run_path(run.project)
+    gradle_run_path(run.project)  # refuse an invalid ledger path before any effect
     checks, after = capture_checked_gradle_snapshot(
         project,
         run.project,
@@ -288,17 +384,13 @@ def verify_applied_gradle_attempt(
         candidate=candidate, baseline=run.accepted_snapshot, checks=checks, after=after
     )
     run = _replace_gradle_attempt(run, observed)
-    save_gradle_run(path, run)
+    persist_gradle_run(run)
     comparison = compare_gradle_snapshots(run.accepted_snapshot, after, candidate)
     if not isinstance(comparison, VerifiedComparison):
         raise GradleError(
             "Security verification failed: " + "; ".join(comparison.reasons)
         )
-    block = evaluate_gradle_candidate_age(
-        candidate, minimum_age_days, publication, clock()
-    )
-    if block is not None:
-        raise GradleError(block.reason)
+    _require_publication_age(candidate, minimum_age_days, publication, clock=clock)
     checked_tree = repo.tree_id()
     if checked_tree != after.tree_id:
         raise GradleError("Tree changed after security verification")
@@ -310,7 +402,7 @@ def verify_applied_gradle_attempt(
         checked_tree_id=checked_tree,
     )
     run = _replace_gradle_attempt(run, prepared)
-    save_gradle_run(path, run)
+    persist_gradle_run(run)
     if committed_revision is None:
         try:
             dirty = repo.has_changes()
@@ -331,21 +423,19 @@ def verify_applied_gradle_attempt(
         raise GradleError("Accepted commit tree differs from checked tree")
     prepared = prepared.model_copy(update={"accepted_commit_id": commit_id})
     run = _replace_gradle_attempt(run, prepared)
-    save_gradle_run(path, run)
+    persist_gradle_run(run)
     if repo.bookmark_exists(bookmark=run.managed_bookmark):
         repo.set_bookmark(bookmark=run.managed_bookmark, revision=commit_id)
     else:
         repo.create_bookmark(bookmark=run.managed_bookmark, revision=commit_id)
-    receipt = VerificationReceipt(
-        checked_tree_id=checked_tree,
-        accepted_commit_id=commit_id,
-        baseline_snapshot_id=run.accepted_snapshot.snapshot_id,
-        after_snapshot_id=after.snapshot_id,
-        context_identity=run.context.identity,
+    receipt = _verification_receipt(
+        baseline=run.accepted_snapshot,
+        after=after,
+        context=run.context,
         checks=checks,
+        commit_id=commit_id,
+        comparison=comparison,
         publications=publication.evidence_for(candidate),
-        verified_fixes=comparison.removed,
-        residual_keys=comparison.residual,
     )
     accepted = ReadyAttempt(
         candidate=candidate,
@@ -353,11 +443,8 @@ def verify_applied_gradle_attempt(
         after=after,
         receipt=receipt,
     )
-    run = _replace_gradle_attempt(run, accepted).model_copy(
-        update={"managed_tip_id": commit_id, "accepted_snapshot": after}
-    )
-    run = GradleRun.model_validate(dict(run))
-    save_gradle_run(path, run)
+    run = _accept_attempt(run, accepted)
+    persist_gradle_run(run)
     return run
 
 
@@ -386,7 +473,7 @@ def process_gradle_run(
             run = _replace_gradle_attempt(
                 run, WithheldAttempt(candidate=candidate, reason=reason)
             )
-            save_gradle_run(gradle_run_path(run.project), run)
+            persist_gradle_run(run)
             continue
         if not context_inputs_valid(run.context, project, clock()):
             raise GradleError(
@@ -396,7 +483,7 @@ def process_gradle_run(
         run = _replace_gradle_attempt(
             run, ApplyingAttempt(candidate=candidate, baseline=run.accepted_snapshot)
         )
-        save_gradle_run(gradle_run_path(run.project), run)
+        persist_gradle_run(run)
         try:
             block = apply_gradle_update(project, candidate.target)
             if block is not None:
@@ -412,40 +499,14 @@ def process_gradle_run(
                 clock=clock,
             )
         except (GradleError, ScanError, RevisionError) as exc:
-            # Read latest pre-effect intent to retain commit-crash evidence.
-            latest = load_gradle_run(gradle_run_path(run.project))
-            if latest is not None:
-                run = latest
-            state = next(
-                item
-                for item in run.attempts
-                if item.candidate.target.group_key == candidate.target.group_key
-            )
-            if isinstance(state, ApplyingAttempt) and state.checked_tree_id is not None:
-                # A checked commit may already exist. Recovery must reconcile it;
-                # never discard or synthesize a failure after that irreversible effect.
+            # Reads latest pre-effect intent to retain commit-crash evidence.
+            failed = _record_failed_attempt(run, candidate, str(exc))
+            if failed is None:
                 raise
-            failed = FailedAttempt(
-                candidate=candidate,
-                baseline=run.accepted_snapshot,
-                reason=str(exc),
-                after=state.after if isinstance(state, ApplyingAttempt) else None,
-            )
-            run = _replace_gradle_attempt(run, failed)
-            save_gradle_run(gradle_run_path(run.project), run)
-            if run.flow == Workflow.UPDATE:
-                try:
-                    repo.discard()
-                except RevisionError as restore_exc:
-                    raise GradleError(
-                        "Could not restore the latest accepted Gradle baseline"
-                    ) from restore_exc
-                if repo.tree_id() != run.accepted_snapshot.tree_id:
-                    raise GradleError(
-                        "Could not restore the latest accepted Gradle baseline"
-                    ) from exc
-            else:
+            run = failed
+            if run.flow != Workflow.UPDATE:
                 return run
+            _restore_accepted_baseline(run, repo, exc)
     return run
 
 
@@ -492,11 +553,9 @@ def gradle_run_finalization_check(
     if credited & frozenset(item.key for item in run.accepted_snapshot.findings):
         raise GradleError("An earlier credited fix was reintroduced")
     for attempt in accepted:
-        block = evaluate_gradle_candidate_age(
-            attempt.candidate, minimum_age_days, publication, clock()
+        _require_publication_age(
+            attempt.candidate, minimum_age_days, publication, clock=clock
         )
-        if block is not None:
-            raise GradleError(block.reason)
 
 
 @contextmanager
@@ -597,28 +656,21 @@ def rebuild_gradle_run_evidence(
                 comparison = compare_gradle_snapshots(baseline, after, old.candidate)
                 if not isinstance(comparison, VerifiedComparison):
                     raise GradleError("Recorded accepted change fails fresh comparison")
-                block = evaluate_gradle_candidate_age(
-                    old.candidate,
-                    minimum_age_days,
-                    publication,
-                    clock(),
+                _require_publication_age(
+                    old.candidate, minimum_age_days, publication, clock=clock
                 )
-                if block is not None:
-                    raise GradleError(block.reason)
                 if not old.receipt.verified_fixes <= comparison.removed:
                     raise GradleError(
                         "Fresh context cannot prove every credited historical fix"
                     )
-                receipt = VerificationReceipt(
-                    checked_tree_id=after.tree_id,
-                    accepted_commit_id=old.receipt.accepted_commit_id,
-                    baseline_snapshot_id=baseline.snapshot_id,
-                    after_snapshot_id=after.snapshot_id,
-                    context_identity=context.identity,
+                receipt = _verification_receipt(
+                    baseline=baseline,
+                    after=after,
+                    context=context,
                     checks=checks,
+                    commit_id=old.receipt.accepted_commit_id,
+                    comparison=comparison,
                     publications=publication.evidence_for(old.candidate),
-                    verified_fixes=comparison.removed,
-                    residual_keys=comparison.residual,
                 )
                 updates = {"baseline": baseline, "after": after, "receipt": receipt}
                 rebuilt_attempts[old.candidate.target.group_key] = type(
@@ -646,7 +698,7 @@ def rebuild_gradle_run_evidence(
             }
         )
         if persist:
-            save_gradle_run(gradle_run_path(run.project), rebuilt)
+            persist_gradle_run(rebuilt)
             if run.context.private_cache_path != context.private_cache_path:
                 retire_gradle_context(run.context)
         return rebuilt
@@ -696,6 +748,112 @@ def rollback_failed_gradle_update(
         raise GradleError("Failed update rollback did not restore the accepted tree")
 
 
+def _record_interrupted_failure(
+    run: GradleRun,
+    state: ApplyingAttempt,
+    project: ProjectConfig,
+    *,
+    vcs: VcsServices,
+) -> GradleRun:
+    """Record an uncommitted interruption as FAILED, then roll an update back."""
+    failed = FailedAttempt(
+        candidate=state.candidate,
+        baseline=state.baseline,
+        reason="Interrupted Gradle attempt requires rollback or committed repair",
+        after=state.after,
+    )
+    run = _replace_gradle_attempt(run, failed)
+    persist_gradle_run(run)
+    if run.flow == Workflow.UPDATE:
+        rollback_failed_gradle_update(run, project, vcs=vcs)
+    return run
+
+
+def _interrupted_commit(
+    run: GradleRun, state: ApplyingAttempt, parent: str, repo: Repository
+) -> str:
+    commit = state.accepted_commit_id
+    if commit is None:
+        if repo.has_changes():
+            raise GradleError(
+                "Interrupted working copy is not an empty committed child"
+            )
+        commit = parent
+    if (
+        not repo.is_ancestor(ancestor=run.managed_tip_id, descendant=commit)
+        or commit == run.managed_tip_id
+    ):
+        raise GradleError("Interrupted checked commit has no trustworthy run ancestry")
+    if (
+        repo.tree_id(revision=commit) != state.checked_tree_id
+        or state.after is None
+        or state.after.tree_id != state.checked_tree_id
+    ):
+        raise GradleError("Interrupted commit differs from checked tree")
+    current_tip = repo.resolve_revision(revision=run.managed_bookmark)
+    if current_tip not in {run.managed_tip_id, commit}:
+        raise GradleError("Managed bookmark moved outside interrupted attempt")
+    return commit
+
+
+def _reprove_interrupted_commit(
+    run: GradleRun,
+    state: ApplyingAttempt,
+    commit: str,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+    *,
+    vcs: VcsServices,
+    emit: Emit,
+    clock: Clock,
+) -> tuple[GradleRun, ApplyingAttempt]:
+    # Keep the on-disk intent until BOTH historical accepted work and the
+    # checked interrupted commit have been proven under one fresh context.
+    previous_context = run.context
+    prefix = run.model_copy(
+        update={"attempts": tuple(item for item in run.attempts if item is not state)}
+    )
+    prefix = rebuild_gradle_run_evidence(
+        prefix,
+        project,
+        publication,
+        minimum_age_days,
+        persist=False,
+        vcs=vcs,
+        emit=emit,
+        clock=clock,
+    )
+    try:
+        with gradle_evidence_workspace(project, commit, vcs=vcs) as checked_project:
+            checks, after = capture_checked_gradle_snapshot(
+                checked_project,
+                run.project,
+                prefix.context,
+                expected_tree=state.checked_tree_id,
+                target=state.candidate.target,
+                vcs=vcs,
+                emit=emit,
+                clock=clock,
+            )
+            state = state.model_copy(
+                update={
+                    "baseline": prefix.accepted_snapshot,
+                    "after": after,
+                    "checks": checks,
+                    "accepted_commit_id": commit,
+                }
+            )
+            run = _replace_gradle_attempt(prefix, state)
+            persist_gradle_run(run)
+            if previous_context.private_cache_path != prefix.context.private_cache_path:
+                retire_gradle_context(previous_context)
+    except BaseException:
+        discard_unpersisted_gradle_context(run.project, prefix.context)
+        raise
+    return run, state
+
+
 def reconcile_gradle_applying(
     run: GradleRun,
     project: ProjectConfig,
@@ -717,118 +875,49 @@ def reconcile_gradle_applying(
         and state.checks is not None
         and state.checked_tree_id is not None
     )
-    commit = state.accepted_commit_id
     parent = repo.resolve_revision(revision="@-")
-    if not complete or (commit is None and parent == run.managed_tip_id):
+    if not complete or (
+        state.accepted_commit_id is None and parent == run.managed_tip_id
+    ):
         # Includes intent-only, mutation/check interruption and checked intent
         # saved before commit. None is evidence of an accepted commit.
-        failed = FailedAttempt(
-            candidate=state.candidate,
-            baseline=state.baseline,
-            reason="Interrupted Gradle attempt requires rollback or committed repair",
-            after=state.after,
-        )
-        run = _replace_gradle_attempt(run, failed)
-        save_gradle_run(gradle_run_path(run.project), run)
-        if run.flow == Workflow.UPDATE:
-            rollback_failed_gradle_update(run, project, vcs=services)
-        return run
-    if commit is None:
-        if repo.has_changes():
-            raise GradleError(
-                "Interrupted working copy is not an empty committed child"
-            )
-        commit = parent
-    if (
-        not repo.is_ancestor(ancestor=run.managed_tip_id, descendant=commit)
-        or commit == run.managed_tip_id
-    ):
-        raise GradleError("Interrupted checked commit has no trustworthy run ancestry")
-    if (
-        repo.tree_id(revision=commit) != state.checked_tree_id
-        or state.after.tree_id != state.checked_tree_id
-    ):
-        raise GradleError("Interrupted commit differs from checked tree")
-    current_tip = repo.resolve_revision(revision=run.managed_bookmark)
-    if current_tip not in {run.managed_tip_id, commit}:
-        raise GradleError("Managed bookmark moved outside interrupted attempt")
+        return _record_interrupted_failure(run, state, project, vcs=services)
+    commit = _interrupted_commit(run, state, parent, repo)
     block = validate_gradle_recovery(project, state.candidate.target)
     if block is not None:
         raise GradleError(block.reason)
-    after, checks, checked_tree = state.after, state.checks, state.checked_tree_id
     if not context_inputs_valid(run.context, project, clock()):
-        # Keep the on-disk intent until BOTH historical accepted work and the
-        # checked interrupted commit have been proven under one fresh context.
-        previous_context = run.context
-        prefix = run.model_copy(
-            update={
-                "attempts": tuple(item for item in run.attempts if item is not state)
-            }
-        )
-        prefix = rebuild_gradle_run_evidence(
-            prefix,
+        run, state = _reprove_interrupted_commit(
+            run,
+            state,
+            commit,
             project,
             publication,
             minimum_age_days,
-            persist=False,
             vcs=services,
             emit=emit,
             clock=clock,
         )
-        try:
-            with gradle_evidence_workspace(
-                project, commit, vcs=services
-            ) as checked_project:
-                checks, after = capture_checked_gradle_snapshot(
-                    checked_project,
-                    run.project,
-                    prefix.context,
-                    expected_tree=state.checked_tree_id,
-                    target=state.candidate.target,
-                    vcs=services,
-                    emit=emit,
-                    clock=clock,
-                )
-                state = state.model_copy(
-                    update={
-                        "baseline": prefix.accepted_snapshot,
-                        "after": after,
-                        "checks": checks,
-                        "accepted_commit_id": commit,
-                    }
-                )
-                run = _replace_gradle_attempt(prefix, state)
-                save_gradle_run(gradle_run_path(run.project), run)
-                if (
-                    previous_context.private_cache_path
-                    != prefix.context.private_cache_path
-                ):
-                    retire_gradle_context(previous_context)
-        except BaseException:
-            discard_unpersisted_gradle_context(run.project, prefix.context)
-            raise
+    after, checks = state.after, state.checks
+    assert after is not None and checks is not None  # proven complete above
     comparison = compare_gradle_snapshots(state.baseline, after, state.candidate)
     if not isinstance(comparison, VerifiedComparison):
         raise GradleError("Interrupted comparison does not prove acceptance")
-    block = evaluate_gradle_candidate_age(
-        state.candidate, minimum_age_days, publication, clock()
+    _require_publication_age(
+        state.candidate, minimum_age_days, publication, clock=clock
     )
-    if block is not None:
-        raise GradleError(block.reason)
     if repo.bookmark_exists(bookmark=run.managed_bookmark):
         repo.set_bookmark(bookmark=run.managed_bookmark, revision=commit)
     else:
         repo.create_bookmark(bookmark=run.managed_bookmark, revision=commit)
-    receipt = VerificationReceipt(
-        checked_tree_id=checked_tree,
-        accepted_commit_id=commit,
-        baseline_snapshot_id=state.baseline.snapshot_id,
-        after_snapshot_id=after.snapshot_id,
-        context_identity=run.context.identity,
+    receipt = _verification_receipt(
+        baseline=state.baseline,
+        after=after,
+        context=run.context,
         checks=checks,
+        commit_id=commit,
+        comparison=comparison,
         publications=publication.evidence_for(state.candidate),
-        verified_fixes=comparison.removed,
-        residual_keys=comparison.residual,
     )
     accepted = ReadyAttempt(
         candidate=state.candidate,
@@ -836,11 +925,8 @@ def reconcile_gradle_applying(
         after=after,
         receipt=receipt,
     )
-    run = _replace_gradle_attempt(run, accepted).model_copy(
-        update={"managed_tip_id": commit, "accepted_snapshot": after}
-    )
-    run = GradleRun.model_validate(dict(run))
-    save_gradle_run(gradle_run_path(run.project), run)
+    run = _accept_attempt(run, accepted)
+    persist_gradle_run(run)
     return run
 
 
@@ -901,23 +987,5 @@ def continue_gradle_resolve(
             clock=clock,
         )
     except (GradleError, ScanError, RevisionError) as exc:
-        latest = load_gradle_run(gradle_run_path(run.project)) or run
-        state = next(
-            item
-            for item in latest.attempts
-            if item.candidate.target.group_key == candidate.target.group_key
-        )
-        if isinstance(state, ApplyingAttempt) and state.checked_tree_id is not None:
-            raise
-        failed = FailedAttempt(
-            candidate=candidate,
-            baseline=latest.accepted_snapshot,
-            reason=str(exc),
-            after=state.after
-            if isinstance(state, (ApplyingAttempt, FailedAttempt))
-            else None,
-        )
-        save_gradle_run(
-            gradle_run_path(run.project), _replace_gradle_attempt(latest, failed)
-        )
+        _record_failed_attempt(run, candidate, str(exc))
         raise

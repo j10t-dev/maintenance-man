@@ -2026,6 +2026,7 @@ def test_gradle_uncommitted_interruption_becomes_failed(
         path=repo.path,
         action=assert_saved_before_discard,
     )
+    workflow.vcs_state.clear_calls()
     result = updater.reconcile_gradle_applying(
         run,
         workflow.project,
@@ -2039,6 +2040,8 @@ def test_gradle_uncommitted_interruption_becomes_failed(
     assert workflow.effects == (
         ["discard"] if flow == Workflow.UPDATE and dirty else []
     )
+    # Reconcile reads the parent once; the update rollback guard reads it again.
+    assert len(_parent_reads(workflow)) == (2 if flow == Workflow.UPDATE else 1)
     assert workflow.state["tree"] == (
         workflow.after.tree_id
         if flow == Workflow.RESOLVE and dirty
@@ -2472,6 +2475,17 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
         lambda *args, **kwargs: workflow.context,
     )
     workflow.vcs_state.clear_calls()
+    durable_saves = []
+    persisting_save = updater.save_gradle_run
+
+    def record_save(path, value):
+        persisting_save(path, value)
+        attempt = value.attempts[0]
+        durable_saves.append(
+            (attempt.state, getattr(attempt, "accepted_commit_id", None))
+        )
+
+    monkeypatch.setattr(updater, "save_gradle_run", record_save)
     recovered = updater.reconcile_gradle_applying(
         interrupted,
         workflow.project,
@@ -2482,6 +2496,12 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
     )
     assert recovered.attempts[0].state == "ready"
     assert recovered.managed_tip_id == accepted_commit
+    # A stale context saves the refreshed APPLYING intent before READY.
+    assert durable_saves == (
+        [("applying", accepted_commit), ("ready", None)] if stale else [("ready", None)]
+    )
+    assert len(_parent_reads(workflow)) == 1
+    assert updater.load_gradle_run(updater.gradle_run_path("sample")) == recovered
     assert workflow.effects.count("apply") == 1
     assert workflow.effects.count("commit") == 1
     visited = [
@@ -2685,6 +2705,395 @@ def test_gradle_rejected_snapshot_survives_resolve_retry(workflow, monkeypatch):
     assert stored.attempts[0].state == "failed"
     assert stored.attempts[0].after == workflow.after
     assert workflow.effects.count("apply") == applies_before_retry == 1
+
+
+def test_failed_attempt_is_durable_before_discard(workflow, monkeypatch):
+    run = begin_workflow(workflow)
+
+    def failed_checks(*args, **kwargs):
+        raise updater.GradleError("unit failed")
+
+    def observe_discard():
+        saved = updater.load_gradle_run(updater.gradle_run_path("sample"))
+        assert saved is not None
+        assert isinstance(saved.attempts[0], FailedAttempt)
+        assert saved.attempts[0].reason == "unit failed"
+        assert saved.accepted_snapshot == workflow.initial
+
+    monkeypatch.setattr(updater, "run_gradle_checks", failed_checks)
+    workflow.vcs_state.hook("discard", phase="before", action=observe_discard)
+    result = updater.process_gradle_run(
+        run,
+        workflow.project,
+        workflow.publication,
+        7,
+        vcs=workflow.vcs,
+        emit=RecordingEmit(),
+    )
+    assert isinstance(result.attempts[0], FailedAttempt)
+    assert workflow.effects == ["apply", "discard"]
+
+
+def _stored_attempt(workflow):
+    stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert stored is not None
+    return stored.attempts[0]
+
+
+def _hook_bookmark(workflow, action):
+    for method in ("create_bookmark", "set_bookmark"):
+        workflow.vcs_state.hook(method, phase="before", action=action)
+
+
+def test_gradle_durable_state_at_each_repository_effect(workflow):
+    run = begin_workflow(workflow)
+    seen = {}
+
+    def before_commit():
+        attempt = _stored_attempt(workflow)
+        assert isinstance(attempt, ApplyingAttempt)
+        assert attempt.checked_tree_id == workflow.after.tree_id
+        assert attempt.accepted_commit_id is None
+        seen["commit"] = True
+
+    def before_bookmark():
+        attempt = _stored_attempt(workflow)
+        assert isinstance(attempt, ApplyingAttempt)
+        assert attempt.checked_tree_id == workflow.after.tree_id
+        assert attempt.accepted_commit_id is not None
+        seen["bookmark"] = attempt.accepted_commit_id
+
+    workflow.vcs_state.hook("commit", phase="before", action=before_commit)
+    _hook_bookmark(workflow, before_bookmark)
+    result = updater.process_gradle_run(
+        run,
+        workflow.project,
+        workflow.publication,
+        7,
+        vcs=workflow.vcs,
+        emit=RecordingEmit(),
+    )
+    ready = _stored_attempt(workflow)
+    assert isinstance(ready, ReadyAttempt)
+    assert seen["commit"] is True
+    receipt = ready.receipt
+    assert receipt.accepted_commit_id == seen["bookmark"] == result.managed_tip_id
+    assert receipt.checked_tree_id == ready.after.tree_id == workflow.after.tree_id
+    assert receipt.baseline_snapshot_id == workflow.initial.snapshot_id
+    assert receipt.after_snapshot_id == workflow.after.snapshot_id
+    assert receipt.context_identity == workflow.context.identity
+    assert receipt.checks.commands == (
+        workflow.project.build_command,
+        workflow.project.test_unit,
+    )
+    assert updater.load_gradle_run(updater.gradle_run_path("sample")) == result
+    assert result.accepted_snapshot == workflow.after
+    assert workflow.effects == ["apply", "commit", "bookmark"]
+
+
+def test_gradle_failed_ready_save_leaves_accepted_intent_and_reconciles(
+    workflow, monkeypatch
+):
+    run = begin_workflow(workflow)
+    original_save = updater.save_gradle_run
+
+    def refuse_ready(path, value):
+        if isinstance(value.attempts[0], ReadyAttempt):
+            raise updater.GradleError("ready save failed")
+        original_save(path, value)
+
+    monkeypatch.setattr(updater, "save_gradle_run", refuse_ready)
+    with pytest.raises(updater.GradleError, match="ready save failed"):
+        updater.process_gradle_run(
+            run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+        )
+    monkeypatch.setattr(updater, "save_gradle_run", original_save)
+    stored = _stored_attempt(workflow)
+    assert isinstance(stored, ApplyingAttempt)
+    assert stored.accepted_commit_id is not None
+    assert workflow.effects == ["apply", "commit", "bookmark"]
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: True)
+    loaded = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert loaded is not None
+    recovered = updater.reconcile_gradle_applying(
+        loaded,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
+    )
+    ready = recovered.attempts[0]
+    assert isinstance(ready, ReadyAttempt)
+    assert ready.receipt.accepted_commit_id == stored.accepted_commit_id
+    assert ready.receipt.after_snapshot_id == stored.after.snapshot_id
+    assert ready.receipt.checks == stored.checks
+    assert ready.receipt.checked_tree_id == workflow.after.tree_id
+    assert recovered.managed_tip_id == stored.accepted_commit_id
+    assert workflow.effects.count("apply") == 1
+    assert workflow.effects.count("commit") == 1
+
+
+def test_gradle_failed_failed_save_performs_no_discard(workflow, monkeypatch):
+    run = begin_workflow(workflow)
+    original_save = updater.save_gradle_run
+
+    def refuse_failed(path, value):
+        if isinstance(value.attempts[0], FailedAttempt):
+            raise updater.GradleError("failed save failed")
+        original_save(path, value)
+
+    def failed_checks(*args, **kwargs):
+        raise updater.GradleError("unit failed")
+
+    monkeypatch.setattr(updater, "run_gradle_checks", failed_checks)
+    monkeypatch.setattr(updater, "save_gradle_run", refuse_failed)
+    with pytest.raises(updater.GradleError, match="failed save failed"):
+        updater.process_gradle_run(
+            run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+        )
+    assert workflow.effects == ["apply"]
+    assert isinstance(_stored_attempt(workflow), ApplyingAttempt)
+
+
+def test_gradle_failed_applying_save_leaves_candidate_planned(workflow, monkeypatch):
+    run = begin_workflow(workflow)
+    original_save = updater.save_gradle_run
+    calls = []
+
+    def refuse_first(path, value):
+        calls.append(value.attempts[0].state)
+        if len(calls) == 1:
+            raise updater.GradleError("applying save failed")
+        original_save(path, value)
+
+    monkeypatch.setattr(updater, "save_gradle_run", refuse_first)
+    with pytest.raises(updater.GradleError, match="applying save failed"):
+        updater.process_gradle_run(
+            run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+        )
+    assert calls == ["applying"]
+    assert workflow.effects == []
+    assert _stored_attempt(workflow).state == "planned"
+
+
+def test_gradle_bookmark_failure_keeps_accepted_intent_and_reconciles(
+    workflow, monkeypatch
+):
+    run = begin_workflow(workflow)
+    # Production creates the managed bookmark at base first, so the fresh path
+    # moves it with set_bookmark.
+    workflow.vcs_state.seed_bookmark(
+        workflow.project.path,
+        bookmark=run.managed_bookmark,
+        targets=(run.base_commit_id,),
+    )
+    workflow.vcs_state.fail(
+        "set_bookmark",
+        error=RevisionError("bookmark unavailable"),
+        path=workflow.project.path,
+    )
+    with pytest.raises(RevisionError, match="bookmark unavailable"):
+        updater.process_gradle_run(
+            run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+        )
+    stored = _stored_attempt(workflow)
+    assert isinstance(stored, ApplyingAttempt)
+    assert stored.accepted_commit_id is not None
+    assert workflow.effects == ["apply", "commit"]
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: True)
+    loaded = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert loaded is not None
+    recovered = updater.reconcile_gradle_applying(
+        loaded,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
+    )
+    ready = recovered.attempts[0]
+    assert isinstance(ready, ReadyAttempt)
+    assert ready.receipt.accepted_commit_id == stored.accepted_commit_id
+    assert ready.receipt.after_snapshot_id == stored.after.snapshot_id
+    assert ready.receipt.checks == stored.checks
+    assert ready.receipt.checked_tree_id == ready.after.tree_id
+    assert workflow.effects.count("apply") == 1
+
+
+def _parent_reads(workflow):
+    return [
+        call
+        for call in workflow.vcs_state.attempts
+        if call.method == "resolve_revision"
+        and dict(call.arguments).get("revision") == "@-"
+    ]
+
+
+@pytest.fixture
+def checked_commit(workflow):
+    """A checked, committed interrupted attempt whose commit is a real child."""
+    run = begin_workflow(workflow)
+    ready = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    ).attempts[0]
+    assert isinstance(ready, ReadyAttempt)
+    commit = ready.receipt.accepted_commit_id
+    interrupted = ApplyingAttempt(
+        candidate=workflow.candidate,
+        baseline=workflow.initial,
+        checks=ready.receipt.checks,
+        after=workflow.after,
+        checked_tree_id=workflow.after.tree_id,
+        accepted_commit_id=commit,
+    )
+    workflow.vcs_state.seed_bookmark(
+        workflow.project.path,
+        bookmark=run.managed_bookmark,
+        targets=(run.base_commit_id,),
+    )
+    workflow.effects.clear()
+    workflow.vcs_state.clear_calls()
+    return SimpleNamespace(
+        run=updater._replace_gradle_attempt(run, interrupted),
+        state=interrupted,
+        commit=commit,
+    )
+
+
+def _reconcile(workflow, run):
+    return updater.reconcile_gradle_applying(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
+
+
+def test_gradle_committed_recovery_reads_parent_once(
+    workflow, checked_commit, monkeypatch
+):
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: True)
+    recovered = _reconcile(workflow, checked_commit.run)
+    assert isinstance(recovered.attempts[0], ReadyAttempt)
+    assert len(_parent_reads(workflow)) == 1
+    assert workflow.effects == ["bookmark"]
+
+
+@pytest.mark.parametrize(
+    "refusal,message",
+    [
+        ("ancestry", "trustworthy run ancestry"),
+        ("unrelated-parent", "trustworthy run ancestry"),
+        ("tree", "differs from checked tree"),
+        ("bookmark", "bookmark moved"),
+    ],
+)
+def test_gradle_unsafe_committed_recovery_refuses_before_bookmark_move(
+    workflow, checked_commit, monkeypatch, refusal, message
+):
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    run = checked_commit.run
+    if refusal == "ancestry":
+        state = checked_commit.state.model_copy(
+            update={"accepted_commit_id": run.managed_tip_id}
+        )
+        run = updater._replace_gradle_attempt(run, state)
+    elif refusal == "unrelated-parent":
+        # The accepted commit is not a descendant of the (sibling) managed tip.
+        sibling = workflow.vcs_state.seed_commit(
+            workflow.project.path,
+            parent=run.base_commit_id,
+            files={"gradle/libs.versions.toml": '[versions]\nlib = "sibling"\n'},
+            description="unrelated parent",
+        )
+        run = run.model_copy(update={"managed_tip_id": sibling})
+    elif refusal == "tree":
+        state = checked_commit.state.model_copy(
+            update={"checked_tree_id": workflow.initial.tree_id}
+        )
+        run = updater._replace_gradle_attempt(run, state)
+    else:
+        other = workflow.vcs_state.seed_commit(
+            workflow.project.path,
+            parent=run.base_commit_id,
+            files={"gradle/libs.versions.toml": '[versions]\nlib = "other"\n'},
+            description="unrelated",
+        )
+        workflow.vcs_state.seed_bookmark(
+            workflow.project.path, bookmark=run.managed_bookmark, targets=(other,)
+        )
+    with pytest.raises(updater.GradleError, match=message):
+        _reconcile(workflow, run)
+    assert workflow.effects == []
+    assert not {"set_bookmark", "create_bookmark"} & {
+        call.method for call in workflow.vcs_state.effects
+    }
+
+
+def test_gradle_continue_failure_before_new_snapshot_keeps_prior_failed_after(
+    workflow, monkeypatch
+):
+    security = workflow.candidate.model_copy(
+        update={
+            "origins": frozenset({"security"}),
+            "requested_advisories": frozenset({"CVE-1"}),
+            "requested_coordinates": frozenset({"g:lib"}),
+        }
+    )
+    failed = updater.process_gradle_run(
+        begin_workflow(workflow, Workflow.RESOLVE, security),
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
+    )
+    assert isinstance(failed.attempts[0], FailedAttempt)
+    assert failed.attempts[0].after == workflow.after
+    monkeypatch.setattr(updater, "reclaim_gradle_outputs", lambda *args: None)
+    workflow.vcs.repository(workflow.project.path).commit(message="manual repair")
+
+    def failed_checks(*args, **kwargs):
+        raise updater.GradleError("retry checks failed")
+
+    monkeypatch.setattr(updater, "run_gradle_checks", failed_checks)
+    with pytest.raises(updater.GradleError, match="retry checks failed"):
+        updater.continue_gradle_resolve(
+            failed,
+            workflow.project,
+            workflow.publication,
+            7,
+            emit=RecordingEmit(),
+        )
+    stored = _stored_attempt(workflow)
+    assert isinstance(stored, FailedAttempt)
+    assert stored.reason == "retry checks failed"
+    assert stored.after == workflow.after
+
+
+def test_rebuild_of_completed_attempt_stays_completed(rebuild_evidence):
+    state = rebuild_evidence
+    ready = state.run.attempts[0]
+    completed = CompletedAttempt(
+        candidate=ready.candidate,
+        baseline=ready.baseline,
+        after=ready.after,
+        receipt=ready.receipt,
+        promoted_commit_id=ready.receipt.accepted_commit_id,
+    )
+    run = state.run.model_copy(update={"attempts": (completed,)})
+    rebuilt = updater.rebuild_gradle_run_evidence(
+        run,
+        state.workflow.project,
+        state.workflow.publication,
+        7,
+        persist=False,
+        vcs=state.workflow.vcs,
+        emit=RecordingEmit(),
+    )
+    attempt = rebuilt.attempts[0]
+    assert isinstance(attempt, CompletedAttempt)
+    assert attempt.promoted_commit_id == state.accepted_commit_id
+    assert attempt.receipt.accepted_commit_id == state.accepted_commit_id
+    assert attempt.receipt.checked_tree_id == state.workflow.after.tree_id
 
 
 def test_gradle_cli_uses_ledger_even_without_scan_results(workflow, monkeypatch):
