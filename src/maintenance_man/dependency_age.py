@@ -1,10 +1,8 @@
-import dbm
 import functools
 import hashlib
 import http.client
 import json
 import logging
-import os
 import threading
 import time
 import urllib.error
@@ -31,164 +29,15 @@ from maintenance_man.models.gradle import (
     PublicationRequest,
     RepositoryId,
 )
-from maintenance_man.models.publication import Registry, RegistryFact
-from maintenance_man.models.scan import (
-    UpdateFinding,
+from maintenance_man.models.publication import (
+    PublicationSource,
+    Registry,
+    RegistryFact,
 )
+from maintenance_man.models.scan import UpdateFinding
 from maintenance_man.process import ProcessError, run_captured
 from maintenance_man.storage import atomic_write_text
 from maintenance_man.uv_dependencies import normalise_pkg_name
-
-
-def filter_by_age(
-    updates: list[UpdateFinding],
-    lookup: Callable[[str, str], datetime | None],
-    min_age_days: int,
-) -> list[UpdateFinding]:
-    """Filter out updates where the target version is younger than min_age_days.
-
-    Sets published_date on each update. Returns only updates that pass the age gate.
-    If min_age_days is 0, returns all updates unmodified (no registry lookups).
-    """
-    if min_age_days == 0 or not updates:
-        return list(updates)
-
-    cutoff = _utcnow() - timedelta(days=min_age_days)
-
-    def _lookup_one(update: UpdateFinding) -> tuple[UpdateFinding, datetime | None]:
-        try:
-            return update, lookup(update.pkg_name, update.latest_version)
-        except Exception:
-            return update, None
-
-    pool = ThreadPoolExecutor(max_workers=8)
-    try:
-        lookups = list(pool.map(_lookup_one, updates))
-    finally:
-        pool.shutdown(cancel_futures=True)
-
-    result: list[UpdateFinding] = []
-    for update, pub_date in lookups:
-        if pub_date is not None:
-            update = update.model_copy(update={"published_date": pub_date})
-            if pub_date >= cutoff:
-                continue
-        result.append(update)
-
-    return result
-
-
-def get_npm_publish_date(
-    pkg: str,
-    version: str,
-    project_path: Path,
-) -> datetime | None:
-    """Fetch publish date via ``bun info``."""
-    try:
-        completed = run_captured(
-            ["bun", "info", f"{pkg}@{version}"],
-            project_path,
-            timeout=30,
-            label="bun info",
-            ok_codes=None,
-        )
-    except ProcessError:
-        return None
-
-    ts = next(
-        (
-            line.removeprefix("Published:").strip()
-            for line in completed.stdout.splitlines()
-            if line.startswith("Published:")
-        ),
-        None,
-    )
-    return datetime.fromisoformat(ts) if ts else None
-
-
-def get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
-    """Look up publish date, checking a local dbm cache before hitting PyPI."""
-    key = f"{pkg}:{version}"
-    cache_file = str(_pypi_cache_dir() / "pypi-publish-dates")
-
-    with _pypi_cache_lock:
-        try:
-            with dbm.open(cache_file, "c") as db:
-                if cached := db.get(key.encode()):
-                    return datetime.fromisoformat(cached.decode())
-        except OSError:
-            pass
-
-    quote = functools.partial(urllib.parse.quote, safe="")
-    data = _fetch_json(f"https://pypi.org/pypi/{quote(pkg)}/{quote(version)}/json")
-
-    ts = next(
-        (
-            u.get("upload_time_iso_8601")
-            for u in data.get("urls", [])
-            if u.get("upload_time_iso_8601")
-        ),
-        None,
-    )
-    if ts is None:
-        return None
-
-    dt = datetime.fromisoformat(ts)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-
-    with _pypi_cache_lock:
-        try:
-            with dbm.open(cache_file, "c") as db:
-                db[key] = dt.isoformat()
-        except OSError:
-            pass
-
-    return dt
-
-
-def get_maven_publish_date(pkg: str, version: str) -> datetime | None:
-    """Fetch publish date from Maven Central.
-
-    pkg is in the format "groupId:artifactId".
-    """
-    group_id, artifact_id = pkg.split(":", 1)
-    quote = functools.partial(urllib.parse.quote, safe="")
-    url = (
-        f"https://search.maven.org/solrsearch/select?"
-        f"q=g:{quote(group_id)}+AND+a:{quote(artifact_id)}+AND+v:{quote(version)}"
-        f"&rows=1&wt=json"
-    )
-    data = _fetch_json(url)
-    if (docs := data.get("response", {}).get("docs", [])) and (
-        ts_ms := docs[0].get("timestamp")
-    ):
-        return datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
-    return None
-
-
-def _utcnow() -> datetime:
-    """Return current UTC time. Extracted for testability."""
-    return datetime.now(UTC)
-
-
-def _fetch_json(url: str) -> dict:
-    """Fetch JSON from a URL using stdlib urllib."""
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
-
-
-def _pypi_cache_dir() -> Path:
-    """Return (and create) the maintenance-man cache directory."""
-    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
-    d = base / "maintenance-man"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-_pypi_cache_lock = threading.Lock()
-
 
 _ROOTS = {
     "central": "https://repo.maven.apache.org/maven2",
@@ -865,8 +714,66 @@ def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
     return None
 
 
-def _scan_publication_futures(update, resolution, context):
-    requests = []
+type _Member = (
+    tuple[Future[PublicationFact | AgeBlock | None], ...]
+    | tuple[Future[RegistryFact | AgeBlock | None], ...]
+)
+
+
+def _filter_by_age(
+    updates: list[UpdateFinding],
+    schedule: Callable[[UpdateFinding], tuple[list[_Member], int]],
+    cutoff: datetime,
+) -> list[UpdateFinding]:
+    """Apply the one scan age rule; every update is scheduled before any wait."""
+    pending = [(update, *schedule(update)) for update in updates]
+    assessed = (
+        _assess_publication(update, members, expected, cutoff)
+        for update, members, expected in pending
+    )
+    return [update for update in assessed if update is not None]
+
+
+def _assess_publication(
+    update: UpdateFinding,
+    members: list[_Member],
+    expected: int,
+    cutoff: datetime,
+) -> UpdateFinding | None:
+    dates: list[datetime] = []
+    complete = bool(members) and len(members) == expected
+    for futures in members:
+        results = [future.result() for future in futures]
+        known = [
+            result
+            for result in results
+            if isinstance(result, (PublicationFact, RegistryFact))
+        ]
+        digests = {
+            result.artifact_digest
+            for result in known
+            if isinstance(result, PublicationFact)
+        }
+        dates.extend(fact.timestamp for fact in known)
+        if (
+            not known
+            or any(isinstance(result, AgeBlock) for result in results)
+            or len(digests) > 1
+        ):
+            complete = False
+    if dates and max(dates) >= cutoff:
+        return None
+    return update.model_copy(
+        update={"published_date": max(dates) if complete else None}
+    )
+
+
+def _gradle_members(
+    update: UpdateFinding,
+    resolution: CompleteResolution,
+    context: PublicationLookupContext,
+) -> list[_Member]:
+    requests: list[_Member] = []
     if update.gradle_target is None:
         return requests
     for member in update.gradle_target.members:
@@ -899,28 +806,6 @@ def _scan_publication_futures(update, resolution, context):
     return requests
 
 
-def _assess_scan_publication(update, requests, cutoff):
-    dates = []
-    complete = (
-        bool(requests)
-        and update.gradle_target is not None
-        and len(requests) == len(update.gradle_target.members)
-    )
-    for futures in requests:
-        facts = [future.result() for future in futures]
-        known = [fact for fact in facts if isinstance(fact, PublicationFact)]
-        dates.extend(fact.timestamp for fact in known)
-        if (
-            any(isinstance(fact, AgeBlock) for fact in facts)
-            or len({fact.artifact_digest for fact in known}) != 1
-        ):
-            complete = False
-    if dates and max(dates) >= cutoff:
-        return None
-    published = max(dates) if complete else None
-    return update.model_copy(update={"published_date": published})
-
-
 def filter_gradle_updates_by_age(
     updates: list[UpdateFinding],
     project: ProjectConfig,
@@ -940,12 +825,53 @@ def filter_gradle_updates_by_age(
     ):
         return list(updates)
     cutoff = context.clock() - timedelta(days=min_age_days)
-    pending = [
-        (update, _scan_publication_futures(update, resolution, context))
-        for update in updates
-    ]
-    assessed = (
-        _assess_scan_publication(update, requests, cutoff)
-        for update, requests in pending
+    return _filter_by_age(
+        updates,
+        lambda update: (
+            _gradle_members(update, resolution, context),
+            len(update.gradle_target.members) if update.gradle_target else 0,
+        ),
+        cutoff,
     )
-    return [update for update in assessed if update is not None]
+
+
+def _registry_members(
+    update: UpdateFinding,
+    source: PublicationSource,
+    project_path: Path,
+    context: PublicationLookupContext,
+) -> list[_Member]:
+    if source != "central":
+        return [
+            (
+                context.submit_registry(
+                    source, update.pkg_name, update.latest_version, project_path
+                ),
+            )
+        ]
+    group, separator, artifact = update.pkg_name.partition(":")
+    if not group or not separator or not artifact or ":" in artifact:
+        return []
+    module = ModuleId(group=group, artifact=artifact, version=update.latest_version)
+    return [(context.submit("central", module),)]
+
+
+def filter_registry_updates_by_age(
+    updates: list[UpdateFinding],
+    source: PublicationSource,
+    project_path: Path,
+    min_age_days: int,
+    context: PublicationLookupContext,
+) -> list[UpdateFinding]:
+    """Filter known young registry releases; unknown dates remain eligible."""
+    if not updates or min_age_days == 0:
+        return list(updates)
+    cutoff = context.clock() - timedelta(days=min_age_days)
+    return _filter_by_age(
+        updates,
+        lambda update: (
+            _registry_members(update, source, project_path, context),
+            1,
+        ),
+        cutoff,
+    )

@@ -345,7 +345,10 @@ class TestScanProjectWithUpdates:
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: fake_updates),
             ),
-            patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
+            patch(
+                "maintenance_man.scanner.filter_registry_updates_by_age",
+                return_value=fake_updates,
+            ),
         ):
             result = scan_project("clean", project)
 
@@ -393,7 +396,10 @@ class TestScanProjectWithUpdates:
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: fake_updates),
             ),
-            patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
+            patch(
+                "maintenance_man.scanner.filter_registry_updates_by_age",
+                return_value=fake_updates,
+            ),
         ):
             result = scan_project("vulnerable", project)
 
@@ -404,14 +410,17 @@ class TestScanProjectWithUpdates:
         assert "brand-new-pkg" in update_pkg_names
 
     def test_scan_passes_min_version_age_days(self, scan_results_dir: Path):
-        """min_version_age_days parameter is forwarded to filter_by_age."""
+        """min_version_age_days is forwarded to filter_registry_updates_by_age."""
         project = _make_project(FIXTURES_DIR / "clean-project")
         with (
             patch(
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: []),
             ),
-            patch("maintenance_man.scanner.filter_by_age", return_value=[]) as mock_age,
+            patch(
+                "maintenance_man.scanner.filter_registry_updates_by_age",
+                return_value=[],
+            ) as mock_age,
         ):
             scan_project("clean", project, min_version_age_days=14)
 
@@ -1520,26 +1529,62 @@ def test_scan_steps_follow_the_table_vulnerability_source(
     assert calls == expected
 
 
-def test_scan_binds_the_project_path_into_publication_lookups(
+def test_scan_dates_bun_updates_with_bun_info_in_the_project(
     mm_home, tmp_path, monkeypatch
 ):
-    seen = []
+    calls = []
 
-    def publish_date(pkg, version, project_path):
-        seen.append((pkg, version, project_path))
-        return _OLD
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs["cwd"]))
+        return subprocess.CompletedProcess(
+            cmd, 0, "zod | MIT\nPublished: 2024-01-01T00:00:00Z\n", ""
+        )
 
     monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args: ([], []))
     monkeypatch.setattr(
         scanner,
         "package_manager_ops",
-        lambda name: dataclasses.replace(
-            PACKAGE_MANAGERS[name],
-            outdated=lambda project: [make_update(pkg_name="zod")],
-            publish_date=publish_date,
-        ),
+        ops_with_outdated(lambda project: [make_update(pkg_name="zod")]),
     )
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
     project = ProjectConfig(path=tmp_path, package_manager="bun")
     result = scanner.scan_project("demo", project, 7)
-    assert seen == [("zod", make_update(pkg_name="zod").latest_version, tmp_path)]
+    latest = make_update(pkg_name="zod").latest_version
+    assert calls == [(["bun", "info", f"zod@{latest}"], tmp_path)]
     assert [u.published_date for u in result.updates] == [_OLD]
+
+
+@pytest.mark.parametrize(
+    "manager, source", [("uv", "pypi"), ("bun", "npm"), ("mvn", "central")]
+)
+def test_non_gradle_scan_filters_through_one_publication_context(
+    mm_home, tmp_path, monkeypatch, manager, source
+):
+    opened, filtered = [], []
+    real = scanner.PublicationLookupContext
+
+    def factory(path):
+        opened.append(path)
+        return real(path)
+
+    def fake_filter(
+        updates, publication_source, project_path, *, min_age_days, context
+    ):
+        filtered.append(
+            (publication_source, project_path, min_age_days, isinstance(context, real))
+        )
+        return updates
+
+    monkeypatch.setattr(scanner, "PublicationLookupContext", factory)
+    monkeypatch.setattr(scanner, "filter_registry_updates_by_age", fake_filter)
+    monkeypatch.setattr(
+        scanner,
+        "package_manager_ops",
+        ops_with_outdated(lambda project: [make_update()]),
+    )
+    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args: ([], []))
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda *args: [])
+    project = ProjectConfig(path=tmp_path, package_manager=manager, scan_secrets=False)
+    scanner.scan_project("demo", project, 9)
+    assert opened == [paths.publications_dir()]
+    assert filtered == [(source, tmp_path, 9, True)]

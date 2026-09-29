@@ -2,13 +2,12 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
-from maintenance_man import dependency_age
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.publication import PublicationSource
 from maintenance_man.models.scan import UpdateFinding
 from maintenance_man.outdated import bun_outdated, mvn_outdated, uv_outdated
 from maintenance_man.uv_dependencies import (
@@ -32,7 +31,7 @@ class UpdateCommandError(Exception):
 class PackageManagerOps:
     vulnerability_source: VulnerabilitySource
     outdated: Callable[[ProjectConfig], list[UpdateFinding]]
-    publish_date: Callable[[str, str, Path], datetime | None]
+    publication_source: PublicationSource
     update_commands: Callable[[str, str, Path], list[list[str]]]
 
 
@@ -49,18 +48,6 @@ def package_manager_ops(name: str) -> PackageManagerOps:
     except KeyError:
         msg = f"Unsupported package manager: {name}"
         raise UnsupportedPackageManagerError(msg) from None
-
-
-def _npm_publish_date(pkg: str, version: str, project_path: Path) -> datetime | None:
-    return dependency_age.get_npm_publish_date(pkg, version, project_path)
-
-
-def _pypi_publish_date(pkg: str, version: str, project_path: Path) -> datetime | None:
-    return dependency_age.get_pypi_publish_date(pkg, version)
-
-
-def _maven_publish_date(pkg: str, version: str, project_path: Path) -> datetime | None:
-    return dependency_age.get_maven_publish_date(pkg, version)
 
 
 def _bun_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
@@ -110,14 +97,10 @@ def _mvn_update_commands(pkg: str, version: str, workspace: Path) -> list[list[s
 
 PACKAGE_MANAGERS: Mapping[str, PackageManagerOps] = MappingProxyType(
     {
-        "bun": PackageManagerOps(
-            "trivy", bun_outdated, _npm_publish_date, _bun_update_commands
-        ),
-        "uv": PackageManagerOps(
-            "uv-audit", uv_outdated, _pypi_publish_date, _uv_update_commands
-        ),
+        "bun": PackageManagerOps("trivy", bun_outdated, "npm", _bun_update_commands),
+        "uv": PackageManagerOps("uv-audit", uv_outdated, "pypi", _uv_update_commands),
         "mvn": PackageManagerOps(
-            "trivy", mvn_outdated, _maven_publish_date, _mvn_update_commands
+            "trivy", mvn_outdated, "central", _mvn_update_commands
         ),
     }
 )

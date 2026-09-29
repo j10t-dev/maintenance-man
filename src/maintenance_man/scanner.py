@@ -15,8 +15,8 @@ from maintenance_man import paths
 from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
-    filter_by_age,
     filter_gradle_updates_by_age,
+    filter_registry_updates_by_age,
 )
 from maintenance_man.gradle import (
     GradleError,
@@ -138,11 +138,14 @@ def _check_outdated(
 ) -> list[UpdateFinding]:
     """Run the table's outdated check and return aged, de-duplicated findings."""
     raw_updates = ops.outdated(project)
-    aged_updates = filter_by_age(
-        raw_updates,
-        lambda pkg, version: ops.publish_date(pkg, version, project.path),
-        min_age_days=min_version_age_days,
-    )
+    with PublicationLookupContext(paths.publications_dir()) as context:
+        aged_updates = filter_registry_updates_by_age(
+            raw_updates,
+            ops.publication_source,
+            project.path,
+            min_age_days=min_version_age_days,
+            context=context,
+        )
     vuln_pkgs = {v.pkg_name for v in vulns}
     return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
 

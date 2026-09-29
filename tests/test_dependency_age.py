@@ -10,7 +10,6 @@ from email.message import Message
 from threading import Event, Lock
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import patch
 
 import pytest
 
@@ -21,10 +20,7 @@ from maintenance_man.dependency_age import (
     _public_url,
     _publication_http,
     evaluate_gradle_candidate_age,
-    filter_by_age,
-    get_maven_publish_date,
-    get_npm_publish_date,
-    get_pypi_publish_date,
+    filter_registry_updates_by_age,
     lookup_gradle_publication,
     publication_request,
     trusted_repository,
@@ -41,13 +37,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
 )
 
-_PATCH_FETCH = "maintenance_man.dependency_age._fetch_json"
 _PATCH_SUBRUN = "maintenance_man.process.subprocess.run"
-_PATCH_NOW = "maintenance_man.dependency_age._utcnow"
-_PATCH_CACHE_DIR = "maintenance_man.dependency_age._pypi_cache_dir"
-
-
-_FROZEN_NOW = datetime(2026, 1, 30, tzinfo=UTC)
 
 
 def _make_update(pkg: str, latest: str = "2.0.0") -> UpdateFinding:
@@ -57,156 +47,6 @@ def _make_update(pkg: str, latest: str = "2.0.0") -> UpdateFinding:
         latest_version=latest,
         semver_tier=SemverTier.MINOR,
     )
-
-
-def _no_lookup(pkg, version):
-    pytest.fail("no publication lookup expected")
-
-
-class TestFilterByAge:
-    def test_returns_all_without_lookups_when_min_age_is_zero(self):
-        updates = [_make_update("lodash"), _make_update("express")]
-        result = filter_by_age(updates, _no_lookup, min_age_days=0)
-        assert result == updates
-        assert all(u.published_date is None for u in result)
-
-    def test_empty_updates_returns_empty(self):
-        assert filter_by_age([], _no_lookup, min_age_days=7) == []
-
-    @pytest.mark.parametrize(
-        ("published", "kept"),
-        [
-            (datetime(2026, 1, 28, tzinfo=UTC), False),
-            (datetime(2026, 1, 23, tzinfo=UTC), False),
-            (datetime(2026, 1, 22, 23, 59, 59, tzinfo=UTC), True),
-            (datetime(2025, 12, 31, tzinfo=UTC), True),
-        ],
-    )
-    def test_withholds_versions_younger_than_the_minimum_age(self, published, kept):
-        with patch(_PATCH_NOW, return_value=_FROZEN_NOW):
-            result = filter_by_age(
-                [_make_update("lodash")], lambda pkg, v: published, min_age_days=7
-            )
-        assert [u.published_date for u in result] == ([published] if kept else [])
-
-    @pytest.mark.parametrize("outcome", [None, RuntimeError("network error")])
-    def test_unknown_or_failed_lookup_keeps_the_update(self, outcome):
-        def lookup(pkg, version):
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-        result = filter_by_age([_make_update("pkg")], lookup, min_age_days=7)
-        assert [u.published_date for u in result] == [None]
-
-    def test_lookup_receives_package_and_target_version(self):
-        seen = []
-
-        def lookup(pkg, version):
-            seen.append((pkg, version))
-
-        filter_by_age([_make_update("lodash", "4.17.21")], lookup, min_age_days=7)
-        assert seen == [("lodash", "4.17.21")]
-
-
-def test_pypi_lookup_reads_upload_time_and_caches_it(tmp_path):
-    pypi_data = {"urls": [{"upload_time_iso_8601": "2025-12-31T00:00:00"}]}
-    expected = datetime(2025, 12, 31, tzinfo=UTC)
-    with (
-        patch(_PATCH_CACHE_DIR, return_value=tmp_path),
-        patch(_PATCH_FETCH, return_value=pypi_data) as fetch,
-    ):
-        assert get_pypi_publish_date("requests", "2.31.0") == expected
-        assert get_pypi_publish_date("requests", "2.31.0") == expected
-    assert fetch.call_count == 1
-
-
-def test_maven_central_lookup_reads_the_timestamp():
-    published_ms = int(datetime(2025, 12, 31, tzinfo=UTC).timestamp() * 1000)
-    maven_data = {"response": {"docs": [{"timestamp": published_ms}]}}
-    with patch(_PATCH_FETCH, return_value=maven_data):
-        assert get_maven_publish_date("org.slf4j:slf4j-api", "2.0.16") == datetime(
-            2025, 12, 31, tzinfo=UTC
-        )
-
-
-def test_bun_info_runs_isolated_and_parses_any_exit_status(tmp_path, monkeypatch):
-    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
-    calls = []
-
-    def run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(
-            cmd, 1, "pkg@1.0.0 | MIT\nPublished: 2024-01-02T03:04:05Z\n", "warning"
-        )
-
-    monkeypatch.setattr(_PATCH_SUBRUN, run)
-    assert get_npm_publish_date("pkg", "1.0.0", tmp_path) == datetime(
-        2024, 1, 2, 3, 4, 5, tzinfo=UTC
-    )
-    ((cmd, kwargs),) = calls
-    assert cmd == ["bun", "info", "pkg@1.0.0"]
-    assert kwargs["cwd"] == tmp_path
-    assert kwargs["timeout"] == 30
-    assert "VIRTUAL_ENV" not in kwargs["env"]
-
-
-@pytest.mark.parametrize(
-    "raised",
-    [
-        subprocess.TimeoutExpired(["bun", "info"], 30),
-        FileNotFoundError(2, "No such file or directory", "bun"),
-        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
-    ],
-)
-def test_bun_info_execution_failure_is_an_unknown_date(tmp_path, monkeypatch, raised):
-    def run(cmd, **kwargs):
-        raise raised
-
-    monkeypatch.setattr(_PATCH_SUBRUN, run)
-    assert get_npm_publish_date("pkg", "1.0.0", tmp_path) is None
-
-
-_OLD = datetime(2024, 1, 1, tzinfo=UTC)
-
-
-def test_interrupted_age_batch_cancels_queued_lookups(monkeypatch):
-    from maintenance_man import dependency_age as age
-
-    started = Event()
-    release = Event()
-    lock = Lock()
-    calls = []
-
-    def lookup(pkg, version):
-        with lock:
-            calls.append(pkg)
-            if len(calls) == 8:
-                started.set()
-        assert release.wait(10), "worker cleanup did not release active lookups"
-        return _OLD
-
-    class InterruptingPool(ThreadPoolExecutor):
-        def map(self, *args, **kwargs):
-            # Keep the real iterator alive; its own cancellation cannot mask
-            # missing cleanup when interruption follows eager submission.
-            self.held_iterator = super().map(*args, **kwargs)
-            assert started.wait(10), "eight lookups did not start"
-            raise KeyboardInterrupt
-
-        def shutdown(self, wait=True, *, cancel_futures=False):
-            # Process actual queue cancellation before releasing active calls.
-            try:
-                super().shutdown(wait=False, cancel_futures=cancel_futures)
-            finally:
-                release.set()
-            if wait:
-                super().shutdown(wait=True)
-
-    monkeypatch.setattr(age, "ThreadPoolExecutor", InterruptingPool)
-    with pytest.raises(KeyboardInterrupt):
-        filter_by_age([_make_update(f"g:lib{i}") for i in range(40)], lookup, 7)
-    assert len(calls) == 8, "queued lookups ran after interruption"
 
 
 _PUB_NOW = datetime(2026, 9, 18, tzinfo=UTC)
@@ -1515,6 +1355,191 @@ def _pypi_context(cache, response, clock=lambda: _PUB_NOW):
         return body, {}, final_url
 
     return PublicationLookupContext(cache, transport, clock), calls
+
+
+def _no_transport(url, root, suffix, count):
+    pytest.fail("no publication lookup expected")
+
+
+@pytest.mark.parametrize("updates, days", [([], 7), ([_make_update("pkg")], 0)])
+def test_registry_age_skips_lookups(tmp_path, updates, days):
+    with PublicationLookupContext(tmp_path, _no_transport, lambda: _PUB_NOW) as context:
+        result = filter_registry_updates_by_age(
+            updates, "pypi", tmp_path, days, context
+        )
+    assert result == updates
+    assert all(update.published_date is None for update in result)
+
+
+@pytest.mark.parametrize(
+    "upload, kept",
+    [
+        ("2026-09-17T00:00:00Z", False),
+        ("2026-09-11T00:00:00Z", False),
+        ("2026-09-10T23:59:59Z", True),
+        ("2025-12-31T00:00:00Z", True),
+    ],
+)
+def test_registry_age_withholds_young_releases(tmp_path, upload, kept):
+    update = _make_update("pkg", "1.0")
+    context, calls = _pypi_context(tmp_path, _pypi_body(uploads=(upload,)))
+    with context:
+        result = filter_registry_updates_by_age([update], "pypi", tmp_path, 7, context)
+    assert calls[0][0] == "https://pypi.org/pypi/pkg/1.0/json"
+    expected = datetime.fromisoformat(upload)
+    assert [u.published_date for u in result] == ([expected] if kept else [])
+
+
+@pytest.mark.parametrize("response", [None, PublicationError("publication HTTP 429")])
+def test_registry_age_keeps_unknown_dates(tmp_path, response):
+    context, _ = _pypi_context(tmp_path, response)
+    with context:
+        result = filter_registry_updates_by_age(
+            [_make_update("pkg", "1.0")], "pypi", tmp_path, 7, context
+        )
+    assert [u.published_date for u in result] == [None]
+
+
+def test_registry_age_propagates_unexpected_errors(tmp_path):
+    context, _ = _pypi_context(tmp_path, RuntimeError("bug"))
+    with context, pytest.raises(RuntimeError, match="bug"):
+        filter_registry_updates_by_age(
+            [_make_update("pkg", "1.0")], "pypi", tmp_path, 7, context
+        )
+
+
+def test_registry_age_keeps_input_order(tmp_path):
+    uploads = {
+        "a": "2025-01-01T00:00:00Z",
+        "b": "2026-09-17T00:00:00Z",
+        "c": "2025-02-01T00:00:00Z",
+    }
+
+    def transport(url, root, suffix, count):
+        name = suffix.split("/")[1]
+        return _pypi_body(name, "1.0", (uploads[name],)), {}, url
+
+    updates = [_make_update(name, "1.0") for name in ("a", "b", "c")]
+    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+        result = filter_registry_updates_by_age(updates, "pypi", tmp_path, 7, context)
+    assert [u.pkg_name for u in result] == ["a", "c"]
+
+
+def test_mvn_age_uses_the_exact_central_pom_and_cache(tmp_path):
+    update = _make_update("org.example:lib", "2.0")
+    first_calls = []
+
+    def transport(url, repository, suffix, count):
+        first_calls.append((url, repository))
+        module = ModuleId(group="org.example", artifact="lib", version="2.0")
+        return _pom(module), {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"}, url
+
+    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+        result = filter_registry_updates_by_age(
+            [update], "central", tmp_path, 7, context
+        )
+    assert first_calls == [
+        (
+            "https://repo.maven.apache.org/maven2/org/example/lib/2.0/lib-2.0.pom",
+            "central",
+        )
+    ]
+    assert [u.published_date for u in result] == [datetime(2026, 9, 1, tzinfo=UTC)]
+    with PublicationLookupContext(tmp_path, _no_transport, lambda: _PUB_NOW) as again:
+        cached = filter_registry_updates_by_age([update], "central", tmp_path, 7, again)
+    assert [u.published_date for u in cached] == [datetime(2026, 9, 1, tzinfo=UTC)]
+
+
+@pytest.mark.parametrize("name", ["lib", "a:b:c", ":lib", "org.example:"])
+def test_mvn_age_skips_names_that_are_not_group_artifact(tmp_path, name):
+    update = _make_update(name, "2.0")
+    with PublicationLookupContext(tmp_path, _no_transport, lambda: _PUB_NOW) as context:
+        result = filter_registry_updates_by_age(
+            [update], "central", tmp_path, 7, context
+        )
+    assert [u.published_date for u in result] == [None]
+
+
+def test_npm_registry_switch_is_seen_by_the_next_scan(tmp_path, monkeypatch):
+    _fake_bun(
+        monkeypatch,
+        "Published: 2024-01-01T00:00:00Z\n",
+        "Published: 2026-09-17T00:00:00Z\n",
+    )
+    update = _make_update("pkg", "1.0.0")
+    kept = []
+    for _ in range(2):
+        with PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW) as context:
+            kept.append(
+                filter_registry_updates_by_age([update], "npm", tmp_path, 7, context)
+            )
+    assert [len(result) for result in kept] == [1, 0]
+
+
+@pytest.mark.parametrize(
+    "source, method, prefix",
+    [("npm", "submit_registry", "pkg"), ("central", "submit", "org.example:lib")],
+)
+def test_registry_age_submits_every_update_before_waiting(
+    tmp_path, monkeypatch, source, method, prefix
+):
+    expected = 12
+    submitted = []
+
+    class Future:
+        def result(self):
+            assert len(submitted) == expected
+
+    def submit(*args):
+        submitted.append(args)
+        return Future()
+
+    context = PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW)
+    monkeypatch.setattr(context, method, submit)
+    updates = [_make_update(f"{prefix}{i}", "1.0") for i in range(expected)]
+    with context:
+        result = filter_registry_updates_by_age(updates, source, tmp_path, 7, context)
+    assert [u.pkg_name for u in result] == [u.pkg_name for u in updates]
+
+
+def test_interrupted_registry_batch_cancels_queued_lookups(tmp_path, monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    started, release, lock = Event(), Event(), Lock()
+    calls, submissions = [], []
+
+    class InterruptingPool(ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            submissions.append(args)
+            if len(submissions) == 12:
+                assert started.wait(10), "eight lookups did not start"
+                raise KeyboardInterrupt
+            return super().submit(*args, **kwargs)
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            try:
+                super().shutdown(wait=False, cancel_futures=cancel_futures)
+            finally:
+                release.set()
+            if wait:
+                super().shutdown(wait=True)
+
+    def transport(url, root, suffix, count):
+        # No count(): the scanning thread holds the context lock inside submit.
+        with lock:
+            calls.append(url)
+            if len(calls) == 8:
+                started.set()
+        assert release.wait(10), "context cleanup did not release lookups"
+
+    monkeypatch.setattr(age, "ThreadPoolExecutor", InterruptingPool)
+    updates = [_make_update(f"pkg{i}", "1.0") for i in range(12)]
+    with (
+        pytest.raises(KeyboardInterrupt),
+        PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context,
+    ):
+        filter_registry_updates_by_age(updates, "pypi", tmp_path, 7, context)
+    assert len(calls) == 8, "queued lookups ran after interruption"
 
 
 def _registry_path(cache, registry, package, version):

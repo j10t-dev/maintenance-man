@@ -168,11 +168,11 @@ A direct security fix requires an exact advisory fix version, or one unambiguous
 
 ### Release-age and verification policy
 
-Gradle uses the same age policy as other package managers: known releases younger than `min_version_age_days` are withheld; unknown or unavailable dates do not prevent updates. Setting `min_version_age_days = 0` skips publication lookups entirely.
+Every package manager uses the same age policy: known releases younger than `min_version_age_days` are withheld; unknown or unavailable dates do not prevent updates. Setting `min_version_age_days = 0` skips publication lookups entirely. PyPI dates come from `pypi.org` with the exact package name and version checked, mvn and Gradle dates come from exact POMs, and those dates are cached under `~/.mm/publications` for 24 hours. npm dates come from `bun info` in the project and are looked up on every scan, because bun's registry configuration can change without mm noticing.
 
 Set `gradle_repository_routing = "standard-public"` only when relevant public repositories have no credentials or custom content/exclusive routing. This declaration enables trusted publication lookups from Maven Central, Google Maven and Plugin Portal. Missing declarations, custom repositories, unavailable metadata and unsupported redirects leave dates unknown. Native catalogue validation, build/test checks and security snapshot comparisons still govern whether a change can be accepted.
 
-POM group and version fields may inherit literal values from a parent with complete coordinates. Unresolved properties, ambiguous declarations, and mismatched coordinates leave the publication date unknown.
+POM group and version fields may inherit literal values from a parent with complete coordinates. For mvn and Gradle alike, unresolved properties, ambiguous declarations, mismatched coordinates and non-UTF-8 POMs leave the publication date unknown.
 
 Configure `build_command` and at least one test phase for automatic acceptance. For Android, use debug assembly plus unit tests and lint. Complete before/after scans use one frozen Trivy database and policy context. Failed checks, incomplete or incomparable coverage, and new or worsened findings block acceptance. An ordinary catalogue update may complete with unchanged residual advisories. A candidate proposed solely as a security fix must remove every requested scoped finding. Saved scan results retain residual CVEs without marking them completed.
 
