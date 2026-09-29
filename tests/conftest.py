@@ -4,7 +4,7 @@ import json
 import subprocess
 from collections.abc import Callable
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,17 @@ from maintenance_man.package_managers import PackageManagerOps, package_manager_
 from maintenance_man.storage import save_scan_results
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor
+
+
+@dataclasses.dataclass
+class FakeClock:
+    current: datetime
+
+    def __call__(self) -> datetime:
+        return self.current
+
+    def advance(self, delta: timedelta) -> None:
+        self.current += delta
 
 
 def completed(

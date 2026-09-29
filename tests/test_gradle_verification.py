@@ -5,7 +5,7 @@ import shutil
 import stat
 import subprocess
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -364,18 +364,41 @@ def test_comparison_setup_requires_trivy_and_leaves_no_cache(
 
 
 @pytest.mark.parametrize(
-    "hours,expected", [(0, True), (23.99, True), (24, False), (-1, False)]
+    "offset,expected",
+    [
+        (timedelta(0), True),
+        (timedelta(hours=23, minutes=59, seconds=59), True),
+        (timedelta(hours=24), False),
+        (timedelta(hours=-1), False),
+    ],
 )
-def test_context_lifetime(frozen_context, hours, expected):
+def test_context_lifetime(frozen_context, offset, expected):
     project, context, calls = frozen_context
     assert (
-        verification.context_inputs_valid(
-            context, project, context.created_at + timedelta(hours=hours)
-        )
+        verification.context_inputs_valid(context, project, context.created_at + offset)
         is expected
     )
     assert sum("--download-db-only" in call for call in calls) == 1
     assert sum("--download-java-db-only" in call for call in calls) == 1
+
+
+def test_context_rejects_naive_time(frozen_context):
+    project, context, _ = frozen_context
+    naive = context.created_at.replace(tzinfo=None)
+    assert not verification.context_inputs_valid(context, project, naive)
+
+
+def test_context_creation_stamps_the_injected_clock(
+    frozen_context, resolution, tmp_path
+):
+    from tests.conftest import FakeClock
+
+    project, _, _ = frozen_context
+    clock = FakeClock(datetime(2031, 5, 6, 7, 8, 9, tzinfo=UTC))
+    context = verification.initialize_comparison_context(
+        project, resolution, tmp_path / "clocked", clock=clock
+    )
+    assert context.created_at == clock.current
 
 
 @pytest.mark.parametrize("mutation", ["db", "ignore", "binary", "owner", "config"])
@@ -511,6 +534,117 @@ def test_capture_reads_before_cleanup_and_never_discovers(
         assert result.findings[0].rows[0].update_status is None
         assert result.inventory_digest == hashlib.sha256(written[0]).hexdigest()
     assert not bom.exists()
+
+
+def _fake_trivy_report(monkeypatch, *, during=None):
+    calls = []
+
+    def trivy(command, **kwargs):
+        calls.append(command)
+        if during is not None:
+            during()
+        return subprocess.CompletedProcess(command, 0, json.dumps({"Results": []}), "")
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", trivy)
+    return calls
+
+
+def test_capture_rejects_context_expiring_during_trivy(
+    frozen_context, resolution, monkeypatch
+):
+    from tests.conftest import FakeClock
+
+    project, context, _ = frozen_context
+    bom = project.path / "temporary-bom.json"
+    bom_exists_at_tree = []
+
+    @contextmanager
+    def report(_project):
+        bom.write_text(
+            json.dumps(
+                {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.6",
+                    "components": [{"type": "library", "purl": "pkg:maven/g/lib@1"}],
+                }
+            )
+        )
+        try:
+            yield _generated(bom, resolution)
+        finally:
+            bom.unlink()
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", report)
+
+    class ObservingClock(FakeClock):
+        def __call__(self):
+            bom_seen.append(bom.exists())
+            return super().__call__()
+
+    bom_seen = []
+    clock = ObservingClock(context.created_at + timedelta(hours=23, minutes=59))
+    calls = _fake_trivy_report(
+        monkeypatch, during=lambda: clock.advance(timedelta(minutes=2))
+    )
+    state = FakeJjState()
+    state.seed_repository(project.path, files={"dep.txt": "1\n"})
+    state.hook(
+        "tree_id",
+        phase="before",
+        action=lambda: bom_exists_at_tree.append(bom.exists()),
+        path=project.path,
+    )
+    with pytest.raises(
+        GradleError, match=r"^Comparison inputs changed during capture$"
+    ):
+        scanner.capture_gradle_snapshot(
+            project, context, vcs=state.services(), clock=clock
+        )
+    assert len(calls) == 1
+    assert not bom.exists()
+    assert bom_exists_at_tree == []
+    # Pre-capture check runs before the BOM exists; the refusing post-capture
+    # check runs only after generated output has been cleaned up.
+    assert bom_seen == [False, False]
+
+
+def test_checked_capture_rejects_context_expiring_during_build(workflow, monkeypatch):
+    from tests.conftest import FakeClock
+
+    run = begin_workflow(workflow)
+    clock = FakeClock(workflow.context.created_at + timedelta(hours=23, minutes=59))
+    monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
+    monkeypatch.setattr(
+        updater, "run_build", lambda *args: clock.advance(timedelta(minutes=2))
+    )
+    monkeypatch.setattr(
+        updater, "run_test_phases", lambda *args, **kwargs: (True, None)
+    )
+    monkeypatch.setattr(
+        updater, "capture_gradle_snapshot", scanner.capture_gradle_snapshot
+    )
+    monkeypatch.setattr(
+        scanner,
+        "generate_gradle_report",
+        lambda *args: pytest.fail("report generated after expiry"),
+    )
+    trivy = _fake_trivy_report(monkeypatch)
+    result = updater.process_gradle_run(
+        run,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
+        clock=clock,
+    )
+    (attempt,) = result.attempts
+    assert isinstance(attempt, FailedAttempt)
+    assert attempt.reason == (
+        "Comparison context expired or inputs changed; rebuild baseline and tip"
+    )
+    assert trivy == []
+    assert not result.has(ReadyAttempt)
+    assert workflow.effects[-1] == "discard"
 
 
 def test_capture_unreadable_bom_is_gradle_error(frozen_context, monkeypatch):
@@ -736,7 +870,7 @@ def workflow(frozen_context, resolution, candidate, scope, monkeypatch, tmp_path
     )
 
 
-def begin_workflow(workflow, flow=Workflow.UPDATE, candidate=None):
+def begin_workflow(workflow, flow=Workflow.UPDATE, candidate=None, **options):
     return updater.start_gradle_run(
         "sample",
         workflow.project,
@@ -746,6 +880,31 @@ def begin_workflow(workflow, flow=Workflow.UPDATE, candidate=None):
         (candidate or workflow.candidate,),
         vcs=workflow.vcs,
         emit=RecordingEmit(),
+        **options,
+    )
+
+
+def test_check_evidence_uses_clock_after_effects(workflow, monkeypatch):
+    from tests.conftest import FakeClock
+
+    clock = FakeClock(datetime(2030, 1, 1, tzinfo=UTC))
+    start = clock()
+    monkeypatch.setattr(
+        updater, "run_build", lambda *args: clock.advance(timedelta(hours=1))
+    )
+
+    def tests(*args, **kwargs):
+        clock.advance(timedelta(minutes=2))
+        return True, None
+
+    monkeypatch.setattr(updater, "run_test_phases", tests)
+    result = real_run_gradle_checks(
+        workflow.project, "sample", emit=RecordingEmit(), clock=clock
+    )
+    assert result.checked_at == start + timedelta(hours=1, minutes=2)
+    assert result.commands == (
+        workflow.project.build_command,
+        workflow.project.test_unit,
     )
 
 
@@ -1273,7 +1432,7 @@ def driver(workflow, resolution, monkeypatch):
     monkeypatch.setattr(
         workflow_service,
         "initialize_comparison_context",
-        lambda *args: workflow.context,
+        lambda *args, **kwargs: workflow.context,
     )
     monkeypatch.setattr(
         workflow_service,
@@ -1335,7 +1494,9 @@ def driver(workflow, resolution, monkeypatch):
     return state
 
 
-def invoke_driver(driver, *, interactive=False, minimum_age_days=7, vcs=None):
+def invoke_driver(
+    driver, *, interactive=False, minimum_age_days=7, vcs=None, **options
+):
     return workflow_service.run_gradle_flow(
         "sample",
         driver.project,
@@ -1344,6 +1505,7 @@ def invoke_driver(driver, *, interactive=False, minimum_age_days=7, vcs=None):
         choose=cli._choose_gradle_candidates if interactive else None,
         vcs=vcs or driver.workflow.vcs,
         emit=driver.emit,
+        **options,
     )
 
 
@@ -1373,6 +1535,71 @@ def test_gradle_driver_promotes_verified_update_with_residual_advisory(driver):
     assert reported.run == run
     assert len(reported.scan.vulnerabilities) == 1
     assert reported.scan.vulnerabilities[0].vuln_id == "CVE-1"
+
+
+def test_gradle_driver_stamps_evidence_with_the_injected_clock(driver, monkeypatch):
+    from maintenance_man.models.scan import ScanResult
+    from tests.conftest import FakeClock
+
+    start = driver.workflow.context.created_at + timedelta(hours=1)
+    clock = FakeClock(start)
+    monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
+    monkeypatch.setattr(
+        updater, "run_build", lambda *args: clock.advance(timedelta(minutes=1))
+    )
+    monkeypatch.setattr(
+        updater, "run_test_phases", lambda *args, **kwargs: (True, None)
+    )
+
+    forwarded = {}
+
+    def spy(module, name):
+        original = getattr(module, name)
+
+        def wrapper(*args, **kwargs):
+            forwarded[name] = kwargs.get("clock")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, wrapper)
+
+    for module, name in (
+        (workflow_service, "_new_gradle_workspace"),
+        (workflow_service, "_prepare_gradle_run"),
+        (workflow_service, "prepare_gradle_candidates"),
+        (workflow_service, "initialize_comparison_context"),
+        (workflow_service, "_publish_verified_gradle_scan"),
+        (workflow_service, "_finish_verified_gradle_run"),
+        (updater, "start_gradle_run"),
+        (updater, "process_gradle_run"),
+        (updater, "gradle_run_finalization_check"),
+    ):
+        spy(module, name)
+
+    assert invoke_driver(driver, clock=clock) is Outcome.SUCCEEDED
+    assert forwarded.keys() == {
+        "_new_gradle_workspace",
+        "_prepare_gradle_run",
+        "prepare_gradle_candidates",
+        "initialize_comparison_context",
+        "_publish_verified_gradle_scan",
+        "_finish_verified_gradle_run",
+        "start_gradle_run",
+        "process_gradle_run",
+        "gradle_run_finalization_check",
+    }
+    assert all(value is clock for value in forwarded.values())
+    run = updater.load_gradle_run(updater.gradle_run_path("sample"))
+    assert run is not None
+    # One build for the baseline, one for the applied update.
+    finished = start + timedelta(minutes=2)
+    assert clock.current == finished
+    attempt = run.attempts[0]
+    assert isinstance(attempt, CompletedAttempt)
+    assert attempt.receipt.checks.checked_at == finished
+    fresh = ScanResult.model_validate_json(
+        (paths.scan_results_dir() / "sample.json").read_bytes()
+    )
+    assert fresh.scanned_at == finished
 
 
 def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
@@ -2240,7 +2467,9 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
         updater, "collect_gradle_resolution", lambda *args: workflow.initial.resolution
     )
     monkeypatch.setattr(
-        updater, "initialize_comparison_context", lambda *args: workflow.context
+        updater,
+        "initialize_comparison_context",
+        lambda *args, **kwargs: workflow.context,
     )
     workflow.vcs_state.clear_calls()
     recovered = updater.reconcile_gradle_applying(
@@ -2261,6 +2490,165 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
         if call.method == "add_workspace"
     ]
     assert visited == ([run.base_commit_id, accepted_commit] if stale else [])
+
+
+@pytest.mark.parametrize("advance", [False, True])
+def test_gradle_recovery_sees_the_clock_advanced_by_an_effect(
+    workflow, monkeypatch, advance
+):
+    from tests.conftest import FakeClock
+
+    clock = FakeClock(workflow.context.created_at + timedelta(hours=23, minutes=59))
+    run = begin_workflow(workflow, clock=clock)
+    original_save = updater.save_gradle_run
+    crashed = False
+
+    def crash_after_commit(path, value):
+        nonlocal crashed
+        item = value.attempts[0]
+        if (
+            isinstance(item, ApplyingAttempt)
+            and item.accepted_commit_id is not None
+            and not crashed
+        ):
+            crashed = True
+            raise updater.GradleError("simulated commit crash")
+        original_save(path, value)
+
+    monkeypatch.setattr(updater, "save_gradle_run", crash_after_commit)
+    with pytest.raises(updater.GradleError, match="commit crash"):
+        updater.process_gradle_run(
+            run,
+            workflow.project,
+            workflow.publication,
+            7,
+            emit=RecordingEmit(),
+            clock=clock,
+        )
+    interrupted = updater.load_gradle_run(updater.gradle_run_path(run.project))
+    assert interrupted is not None
+    repo = workflow.vcs.repository(workflow.project.path)
+    accepted_commit = repo.resolve_revision(revision="@-")
+    workflow.vcs_state.seed_bookmark(
+        workflow.project.path,
+        bookmark=run.managed_bookmark,
+        targets=(run.base_commit_id,),
+    )
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "save_gradle_run", original_save)
+
+    def capture(project, context, **kwargs):
+        tree = workflow.vcs.repository(project.path).tree_id()
+        observed = (
+            workflow.initial if tree == workflow.initial.tree_id else workflow.after
+        )
+        return observed.model_copy(update={"context_identity": context.identity})
+
+    monkeypatch.setattr(updater, "capture_gradle_snapshot", capture)
+    monkeypatch.setattr(
+        updater, "collect_gradle_resolution", lambda *args: workflow.initial.resolution
+    )
+    monkeypatch.setattr(
+        updater,
+        "initialize_comparison_context",
+        lambda *args, clock, **kwargs: workflow.context.model_copy(
+            update={"created_at": clock()}
+        ),
+    )
+    forwarded = []
+    for name in ("rebuild_gradle_run_evidence", "capture_checked_gradle_snapshot"):
+        original = getattr(updater, name)
+
+        def spy(*args, _original=original, _name=name, **kwargs):
+            forwarded.append((_name, kwargs.get("clock")))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(updater, name, spy)
+    if advance:
+        clock.advance(timedelta(minutes=2))  # a long effect crosses the 24h edge
+    workflow.vcs_state.clear_calls()
+    recovered = updater.reconcile_gradle_applying(
+        interrupted,
+        workflow.project,
+        workflow.publication,
+        7,
+        vcs=workflow.vcs,
+        emit=RecordingEmit(),
+        clock=clock,
+    )
+    assert recovered.attempts[0].state == "ready"
+    visited = [
+        dict(call.arguments)["revision"]
+        for call in workflow.vcs_state.effects
+        if call.method == "add_workspace"
+    ]
+    if advance:
+        assert visited == [run.base_commit_id, accepted_commit]
+        assert recovered.context.created_at == clock.current
+        # Rebuild, its baseline capture and reconcile's proof capture share the clock.
+        assert [name for name, _ in forwarded] == [
+            "rebuild_gradle_run_evidence",
+            "capture_checked_gradle_snapshot",
+            "capture_checked_gradle_snapshot",
+        ]
+        assert all(value is clock for _, value in forwarded)
+    else:
+        assert visited == []
+        assert recovered.context == interrupted.context
+
+
+def test_rebuild_forwards_one_clock_to_every_timed_step(rebuild_evidence, monkeypatch):
+    from tests.conftest import FakeClock
+
+    state = rebuild_evidence
+    clock = FakeClock(state.context.created_at)
+    seen = []
+    ages = []
+    checks_evidence = state.run.attempts[0].receipt.checks
+
+    def context(*args, clock, **kwargs):
+        seen.append(("context", clock))
+        return state.context
+
+    def checks(project, _name, *, emit, clock):
+        seen.append(("checks", clock))
+        clock.advance(timedelta(minutes=5))
+        return checks_evidence
+
+    original_capture = updater.capture_gradle_snapshot
+
+    def capture(project, ctx, *, clock, **kwargs):
+        seen.append(("capture", clock))
+        return original_capture(project, ctx)
+
+    monkeypatch.setattr(updater, "initialize_comparison_context", context)
+    monkeypatch.setattr(updater, "run_gradle_checks", checks)
+    monkeypatch.setattr(updater, "capture_gradle_snapshot", capture)
+    monkeypatch.setattr(
+        updater,
+        "evaluate_gradle_candidate_age",
+        lambda candidate, minimum, publication, now: ages.append(now),
+    )
+    updater.rebuild_gradle_run_evidence(
+        state.run,
+        state.workflow.project,
+        state.workflow.publication,
+        7,
+        persist=False,
+        vcs=state.workflow.vcs,
+        emit=RecordingEmit(),
+        clock=clock,
+    )
+    assert [name for name, _ in seen] == [
+        "context",
+        "checks",
+        "capture",
+        "checks",
+        "capture",
+    ]
+    assert all(value is clock for _, value in seen)
+    # The historical age check runs after the fake effects advanced the clock.
+    assert ages == [state.context.created_at + timedelta(minutes=10)]
 
 
 def test_gradle_rejected_snapshot_survives_resolve_retry(workflow, monkeypatch):
@@ -2591,9 +2979,117 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
     assert workflow.effects.count("apply") == 1
 
 
+def test_gradle_flow_forwards_one_clock_to_recovery_and_processing(
+    workflow, monkeypatch
+):
+    from tests.conftest import FakeClock
+
+    ready = updater.process_gradle_run(
+        begin_workflow(workflow, Workflow.RESOLVE),
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
+    )
+    interrupted = updater._replace_gradle_attempt(
+        ready,
+        ApplyingAttempt(candidate=workflow.candidate, baseline=workflow.initial),
+    )
+    updater.save_gradle_run(updater.gradle_run_path("sample"), interrupted)
+    monkeypatch.setattr(
+        workflow_service,
+        "PublicationLookupContext",
+        lambda *args: __import__("contextlib").nullcontext(workflow.publication),
+    )
+    monkeypatch.setattr(workflow_service, "context_inputs_valid", lambda *args: False)
+    monkeypatch.setattr(
+        workflow_service, "_require_gradle_accepted_workspace", lambda *a, **k: None
+    )
+    injected = FakeClock(workflow.context.created_at)
+    forwarded = {}
+
+    def stub(name, result):
+        def call(value, *args, **kwargs):
+            forwarded[name] = kwargs["clock"]
+            return result
+
+        return call
+
+    monkeypatch.setattr(updater, "reconcile_gradle_applying", stub("reconcile", ready))
+    monkeypatch.setattr(updater, "rebuild_gradle_run_evidence", stub("rebuild", ready))
+    monkeypatch.setattr(updater, "process_gradle_run", stub("process", ready))
+    monkeypatch.setattr(
+        workflow_service, "_finish_verified_gradle_run", stub("finish", ready)
+    )
+    workflow_service.run_gradle_flow(
+        "sample",
+        workflow.project,
+        Workflow.RESOLVE,
+        minimum_age_days=7,
+        choose=None,
+        emit=RecordingEmit(),
+        vcs=workflow.vcs,
+        clock=injected,
+    )
+    assert forwarded.keys() == {"reconcile", "rebuild", "process", "finish"}
+    assert all(value is injected for value in forwarded.values())
+
+
+def test_gradle_continue_forwards_one_clock_to_rebuild_and_verification(
+    workflow, monkeypatch
+):
+    from tests.conftest import FakeClock
+
+    failed = updater.process_gradle_run(
+        begin_workflow(workflow, Workflow.RESOLVE),
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
+    )
+    failed = updater._replace_gradle_attempt(
+        failed,
+        FailedAttempt(
+            candidate=workflow.candidate,
+            baseline=workflow.initial,
+            reason="manual repair required",
+        ),
+    )
+    catalogue = workflow.project.path / "gradle/libs.versions.toml"
+    catalogue.write_text(catalogue.read_text().replace('lib = "1"', 'lib = "2"'))
+    workflow.vcs.repository(workflow.project.path).commit(message="Manual repair")
+    monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
+    monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: False)
+    injected = FakeClock(workflow.context.created_at)
+    forwarded = {}
+
+    def stub(name):
+        def call(value, *args, **kwargs):
+            forwarded[name] = kwargs["clock"]
+            return value
+
+        return call
+
+    monkeypatch.setattr(updater, "rebuild_gradle_run_evidence", stub("rebuild"))
+    monkeypatch.setattr(updater, "verify_applied_gradle_attempt", stub("verify"))
+    updater.continue_gradle_resolve(
+        failed,
+        workflow.project,
+        workflow.publication,
+        7,
+        vcs=workflow.vcs,
+        emit=RecordingEmit(),
+        clock=injected,
+    )
+    assert forwarded.keys() == {"rebuild", "verify"}
+    assert all(value is injected for value in forwarded.values())
+
+
 def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
     workflow, monkeypatch
 ):
+    from tests.conftest import FakeClock
+
     failed = updater.process_gradle_run(
         begin_workflow(workflow, Workflow.RESOLVE),
         workflow.project,
@@ -2614,8 +3110,12 @@ def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
     monkeypatch.setattr(workflow_service, "context_inputs_valid", lambda *args: True)
     effects = []
 
+    injected = FakeClock(workflow.context.created_at)
+    forwarded = {}
+
     def repair(value, *args, **kwargs):
         effects.append("verify-committed-repair")
+        forwarded["continue"] = kwargs["clock"]
         return value
 
     def guard(value, project, **kwargs):
@@ -2644,10 +3144,12 @@ def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
             choose=None,
             emit=RecordingEmit(),
             vcs=workflow.vcs,
+            clock=injected,
         )
         is Outcome.SUCCEEDED
     )
     assert effects == ["verify-committed-repair", "accepted-workspace-guard", "process"]
+    assert forwarded["continue"] is injected
 
 
 @pytest.mark.parametrize("repaired", [False, True])
@@ -2939,8 +3441,8 @@ def rebuild_evidence(workflow, monkeypatch):
     context = workflow.context.model_copy(update={"private_cache_path": cache})
     observations = SimpleNamespace(mutated=None, visits=[], released=[])
 
-    def checks(project, _project_name, *, emit):
-        del emit
+    def checks(project, _project_name, *, emit, clock):
+        del emit, clock
         catalogue = project.path / "gradle/libs.versions.toml"
         revision = "accepted" if 'lib = "2"' in catalogue.read_text() else "base"
         observations.visits.append(revision)
@@ -2964,7 +3466,9 @@ def rebuild_evidence(workflow, monkeypatch):
     monkeypatch.setattr(
         updater, "collect_gradle_resolution", lambda *args: workflow.initial.resolution
     )
-    monkeypatch.setattr(updater, "initialize_comparison_context", lambda *args: context)
+    monkeypatch.setattr(
+        updater, "initialize_comparison_context", lambda *args, **kwargs: context
+    )
     monkeypatch.setattr(
         updater, "release_comparison_context", observations.released.append
     )
@@ -3001,7 +3505,7 @@ def test_rebuild_validates_the_base_catalogue_before_collection(
     monkeypatch.setattr(
         updater,
         "initialize_comparison_context",
-        lambda *args: pytest.fail("context must not be created"),
+        lambda *args, **kwargs: pytest.fail("context must not be created"),
     )
     with pytest.raises(updater.GradleError, match="Failed to parse version catalogue"):
         updater.rebuild_gradle_run_evidence(
@@ -3209,7 +3713,9 @@ def test_rebuild_retires_only_superseded_durable_context(
     new_path = tmp_path / "replacement-cache"
     shutil.copytree(old.private_cache_path, new_path)
     new = old.model_copy(update={"private_cache_path": new_path})
-    monkeypatch.setattr(updater, "initialize_comparison_context", lambda *args: new)
+    monkeypatch.setattr(
+        updater, "initialize_comparison_context", lambda *args, **kwargs: new
+    )
     monkeypatch.setattr(
         updater, "release_comparison_context", verification.release_comparison_context
     )
@@ -3238,7 +3744,9 @@ def test_failed_rebuild_preserves_durable_context(
     new_path = tmp_path / "replacement-cache"
     shutil.copytree(old.private_cache_path, new_path)
     new = old.model_copy(update={"private_cache_path": new_path})
-    monkeypatch.setattr(updater, "initialize_comparison_context", lambda *args: new)
+    monkeypatch.setattr(
+        updater, "initialize_comparison_context", lambda *args, **kwargs: new
+    )
     monkeypatch.setattr(
         updater, "release_comparison_context", verification.release_comparison_context
     )

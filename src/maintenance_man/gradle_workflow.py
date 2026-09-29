@@ -3,11 +3,11 @@
 import contextlib
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 
 from maintenance_man import gradle_updates as gradle_updater
 from maintenance_man import paths
+from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     filter_gradle_updates_by_age,
@@ -104,6 +104,7 @@ def _prepare_gradle_run(
     choose: GradleChooser | None,
     vcs: VcsServices,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun | Outcome:
     # Resolve current security findings even when discovery produces no proposals.
     vulnerabilities, resolution = scan_gradle(project)
@@ -118,7 +119,7 @@ def _prepare_gradle_run(
         else plan.candidates
     )
     prepared = prepare_gradle_candidates(
-        project, candidates, resolution, publication, minimum_age_days
+        project, candidates, resolution, publication, minimum_age_days, clock=clock
     )
     attempts = tuple(
         WithheldAttempt(candidate=item.candidate, reason=item.block.reason)
@@ -131,7 +132,7 @@ def _prepare_gradle_run(
             ScanReported(
                 ScanResult(
                     project=project_name,
-                    scanned_at=datetime.now(UTC),
+                    scanned_at=clock(),
                     trivy_target=str(project.path),
                     vulnerabilities=vulnerabilities,
                     gradle_resolution=resolution.report.model_dump(mode="json"),
@@ -155,7 +156,7 @@ def _prepare_gradle_run(
         )
     gradle_updater.gradle_check_commands(project)
     context = initialize_comparison_context(
-        project, resolution, paths.gradle_contexts_dir()
+        project, resolution, paths.gradle_contexts_dir(), clock=clock
     )
     try:
         # The first durable record is a complete plan and checked baseline.
@@ -170,6 +171,7 @@ def _prepare_gradle_run(
             persist=False,
             vcs=vcs,
             emit=emit,
+            clock=clock,
         )
         run = GradleRun.model_validate(
             dict(run) | {"attempts": attempts, "selection_blocks": plan.withheld}
@@ -206,6 +208,7 @@ def _publish_verified_gradle_scan(
     minimum_age_days: int,
     *,
     vcs: VcsServices,
+    clock: Clock = utc_now,
 ) -> None:
     repo = vcs.repository(Path(project.path))
     if repo.tree_id() != run.accepted_snapshot.tree_id:
@@ -225,7 +228,7 @@ def _publish_verified_gradle_scan(
     )
     fresh = ScanResult(
         project=run.project,
-        scanned_at=datetime.now(UTC),
+        scanned_at=clock(),
         trivy_target=str(project.path),
         vulnerabilities=rows,
         secrets=secrets,
@@ -269,12 +272,13 @@ def _finish_verified_gradle_run(
     *,
     vcs: VcsServices,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun:
     # Verification reads the accepted revision, not the source workspace's old tree.
     with gradle_updater.gradle_evidence_workspace(
         project, run.managed_tip_id, vcs=vcs
     ) as verified:
-        if not context_inputs_valid(run.context, verified, datetime.now(UTC)):
+        if not context_inputs_valid(run.context, verified, clock()):
             run = gradle_updater.rebuild_gradle_run_evidence(
                 run,
                 verified,
@@ -282,9 +286,10 @@ def _finish_verified_gradle_run(
                 minimum_age_days,
                 vcs=vcs,
                 emit=emit,
+                clock=clock,
             )
         gradle_updater.gradle_run_finalization_check(
-            run, verified, publication, minimum_age_days, vcs=vcs
+            run, verified, publication, minimum_age_days, vcs=vcs, clock=clock
         )
     path = gradle_updater.gradle_run_path(run.project)
     if run.flow == Workflow.RESOLVE:
@@ -333,6 +338,7 @@ def _finish_verified_gradle_run(
             publication,
             minimum_age_days,
             vcs=vcs,
+            clock=clock,
         )
         run = _complete_gradle_attempts(run.model_copy(update={"refreshed": True}))
         gradle_updater.save_gradle_run(path, run)
@@ -428,13 +434,14 @@ def _new_gradle_workspace(
     flow: Workflow,
     *,
     vcs: VcsServices,
+    clock: Clock = utc_now,
 ) -> tuple[ProjectConfig, str]:
     try:
         scan_result = load_scan_results(project_name)
     except NoScanResultsError:
         scan_result = ScanResult(
             project=project_name,
-            scanned_at=datetime.now(UTC),
+            scanned_at=clock(),
             trivy_target=str(project.path),
         )
     legacy = [
@@ -552,6 +559,7 @@ def run_gradle_flow(
     choose: GradleChooser | None,
     emit: Emit,
     vcs: VcsServices | None = None,
+    clock: Clock = utc_now,
 ) -> Outcome:
     services = vcs or make_vcs_services()
     try:
@@ -580,6 +588,7 @@ def run_gradle_flow(
                 project,
                 flow,
                 vcs=services,
+                clock=clock,
             )
         else:
             work = _resume_gradle_workspace(run, project, vcs=services)
@@ -600,6 +609,7 @@ def run_gradle_flow(
                     choose=choose,
                     vcs=services,
                     emit=emit,
+                    clock=clock,
                 )
                 if isinstance(prepared, Outcome):
                     if previous is not None:
@@ -626,6 +636,7 @@ def run_gradle_flow(
                     minimum_age_days,
                     vcs=services,
                     emit=emit,
+                    clock=clock,
                 )
             if continue_:
                 run = gradle_updater.continue_gradle_resolve(
@@ -635,6 +646,7 @@ def run_gradle_flow(
                     minimum_age_days,
                     vcs=services,
                     emit=emit,
+                    clock=clock,
                 )
             elif run.has(FailedAttempt):
                 raise GradleError(
@@ -644,7 +656,7 @@ def run_gradle_flow(
             # Committed resolve repair is separately verified above and becomes
             # the new accepted tip before automatic processing can resume.
             _require_gradle_accepted_workspace(run, work, vcs=services)
-            if not context_inputs_valid(run.context, work, datetime.now(UTC)):
+            if not context_inputs_valid(run.context, work, clock()):
                 run = gradle_updater.rebuild_gradle_run_evidence(
                     run,
                     work,
@@ -652,6 +664,7 @@ def run_gradle_flow(
                     minimum_age_days,
                     vcs=services,
                     emit=emit,
+                    clock=clock,
                 )
             run = gradle_updater.process_gradle_run(
                 run,
@@ -660,6 +673,7 @@ def run_gradle_flow(
                 minimum_age_days,
                 vcs=services,
                 emit=emit,
+                clock=clock,
             )
             if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
                 emit(GradleRunReported(_gradle_display_result(run, project), run))
@@ -689,6 +703,7 @@ def run_gradle_flow(
                 minimum_age_days,
                 vcs=services,
                 emit=emit,
+                clock=clock,
             )
             gradle_updater.retire_gradle_context(run.context)
             emit(GradleRunReported(_gradle_display_result(run, project), run))

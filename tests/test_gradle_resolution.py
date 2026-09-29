@@ -1,9 +1,15 @@
 import json
 import subprocess
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 
+from maintenance_man import gradle_resolution as candidates
+from maintenance_man.dependency_age import PublicationLookupContext
 from maintenance_man.gradle import (
     GRADLE_INVENTORY_BOM_RELPATH,
     GRADLE_INVENTORY_RELPATH,
@@ -16,6 +22,7 @@ from maintenance_man.gradle_resolution import (
     exact_fix_candidate,
     generate_gradle_report,
     parse_resolution_report,
+    prepare_gradle_candidates,
     resolve_gradle_owners,
     select_gradle_candidates,
     validate_gradle_candidates,
@@ -30,6 +37,8 @@ from maintenance_man.models.gradle import (
     IncompleteResolution,
     KnownOwner,
     ModuleId,
+    PublicationFact,
+    PublicationRequest,
     RepositoryDeclaration,
     ResolutionReport,
     ResolvedComponent,
@@ -42,7 +51,7 @@ from maintenance_man.models.scan import (
     Severity,
     VulnFinding,
 )
-from tests.conftest import fixture_runner, report_payload
+from tests.conftest import FakeClock, fixture_runner, report_payload
 
 
 @pytest.mark.parametrize(
@@ -1201,3 +1210,98 @@ def test_mixed_library_plugin_alias_keeps_member_validation_separate():
         "org.jetbrains.kotlin.jvm:org.jetbrains.kotlin.jvm.gradle.plugin",
     ]
     assert result.publication_requests[1].marker_implementation == implementation
+
+
+_NOW = datetime(2030, 6, 15, 12, tzinfo=UTC)
+_MODULE = ModuleId(group="g", artifact="lib", version="2")
+
+
+def _age_candidate():
+    return GradleCandidate(
+        target=GradleUpdateTarget(
+            version_ref="lib",
+            members=[
+                GradleMember(
+                    kind="library",
+                    alias="lib",
+                    coordinate="g:lib",
+                    installed_version="1",
+                )
+            ],
+            target_version="2",
+        ),
+        origins=frozenset({"ordinary"}),
+        publication_requests=(
+            PublicationRequest(
+                module=_MODULE, repositories=("central",), routing_supported=True
+            ),
+        ),
+    )
+
+
+def _prepare_with_publication(published, minimum_age_days, clock, *, prefetch=None):
+    candidate = _age_candidate()
+    fact = PublicationFact(
+        repository="central",
+        module=_MODULE,
+        source_url="https://repo.maven.apache.org/maven2/g/lib/2/lib-2.pom",
+        method="last_modified",
+        artifact_digest="0" * 64,
+        timestamp=published,
+        checked_at=_NOW,
+    )
+    publication = SimpleNamespace(
+        prefetch=lambda requests: prefetch(list(requests)) if prefetch else None,
+        submit=lambda repository, module: SimpleNamespace(result=lambda: fact),
+        results={},
+    )
+    project = ProjectConfig(path=Path("/unused"), package_manager="gradle")
+    batch = CandidateValidationBatch(schema_version=1, results=())
+    with (
+        patch.object(candidates, "validate_gradle_candidates", lambda *args: batch),
+        patch.object(candidates, "attach_gradle_publications", lambda c, *args: c),
+    ):
+        (prepared,) = prepare_gradle_candidates(
+            project.model_copy(update={"gradle_repository_routing": "standard-public"}),
+            (candidate,),
+            CompleteResolution(report=report_stub()),
+            cast(PublicationLookupContext, publication),
+            minimum_age_days,
+            clock=clock,
+        )
+    return prepared
+
+
+def report_stub():
+    return parse_resolution_report(json.dumps(report_payload())).report
+
+
+@pytest.mark.parametrize(
+    "offset,minimum,withheld",
+    [
+        (timedelta(days=7), 7, True),
+        (timedelta(days=7) + timedelta(microseconds=1), 7, False),
+        (timedelta(days=7) - timedelta(microseconds=1), 7, True),
+        (timedelta(0), 0, False),
+    ],
+)
+def test_candidate_age_boundary_uses_the_injected_clock(offset, minimum, withheld):
+    prepared = _prepare_with_publication(_NOW - offset, minimum, FakeClock(_NOW))
+    assert (prepared.block is not None) is withheld
+    if withheld:
+        assert prepared.block.reason == "release younger than required 7 days"
+
+
+def test_candidate_age_reads_the_clock_after_prefetch():
+    clock = FakeClock(_NOW)
+    published = _NOW - timedelta(days=7)
+    # Exactly seven days old is withheld at the start...
+    assert _prepare_with_publication(published, 7, clock).block is not None
+    # ...but a fetch that advances time makes it old enough for the live decision.
+    advanced = _prepare_with_publication(
+        published,
+        7,
+        clock,
+        prefetch=lambda requests: clock.advance(timedelta(microseconds=1)),
+    )
+    assert advanced.block is None

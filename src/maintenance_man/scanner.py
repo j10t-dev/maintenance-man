@@ -12,6 +12,7 @@ from typing import TypeGuard, assert_never
 from pydantic import ValidationError
 
 from maintenance_man import paths
+from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     filter_by_age,
@@ -441,9 +442,10 @@ def capture_gradle_snapshot(
     context: ComparisonContext,
     *,
     vcs: VcsServices | None = None,
+    clock: Clock = utc_now,
 ) -> GradleSnapshot | IncompleteResolution:
     services = vcs or make_vcs_services()
-    if not context_inputs_valid(context, project, datetime.now(UTC)):
+    if not context_inputs_valid(context, project, clock()):
         raise GradleError(
             "Comparison context expired or inputs changed; rebuild baseline and tip"
         )
@@ -524,7 +526,7 @@ def capture_gradle_snapshot(
             )
         )
     # Generated report/BOM cleanup must precede the jj source-tree snapshot.
-    if not context_inputs_valid(context, project, datetime.now(UTC)):
+    if not context_inputs_valid(context, project, clock()):
         raise GradleError("Comparison inputs changed during capture")
     return GradleSnapshot(
         tree_id=services.repository(Path(project.path)).tree_id(),

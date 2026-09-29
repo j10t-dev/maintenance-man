@@ -3,9 +3,10 @@ import os
 import shutil
 import tempfile
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from maintenance_man.clock import Clock, utc_now
 from maintenance_man.gradle import GradleError, file_digest
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
@@ -78,7 +79,11 @@ def _database_digests(cache: Path) -> dict[str, str]:
 
 
 def initialize_comparison_context(
-    project: ProjectConfig, resolution: CompleteResolution, run_cache_parent: Path
+    project: ProjectConfig,
+    resolution: CompleteResolution,
+    run_cache_parent: Path,
+    *,
+    clock: Clock = utc_now,
 ) -> ComparisonContext:
     policy = _policy(project)
     if run_cache_parent.is_symlink():
@@ -127,7 +132,7 @@ def initialize_comparison_context(
             selected_scopes=resolution.report.selected_scopes,
             producer_versions=resolution.report.producer_versions,
             scanner_flags=flags,
-            created_at=datetime.now(UTC),
+            created_at=clock(),
             private_cache_path=cache,
             owner_token=token,
         )

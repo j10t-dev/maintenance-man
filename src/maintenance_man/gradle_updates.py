@@ -7,10 +7,10 @@ import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
 from pathlib import Path
 
 from maintenance_man import paths
+from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     evaluate_gradle_candidate_age,
@@ -146,7 +146,11 @@ def gradle_check_commands(project: ProjectConfig) -> tuple[str, ...]:
 
 
 def run_gradle_checks(
-    project: ProjectConfig, project_name: str, *, emit: Emit
+    project: ProjectConfig,
+    project_name: str,
+    *,
+    emit: Emit,
+    clock: Clock = utc_now,
 ) -> CheckEvidence:
     commands = gradle_check_commands(project)
     checks_started = time.monotonic()
@@ -173,7 +177,7 @@ def run_gradle_checks(
             hashlib.sha256(command.encode()).hexdigest() for command in commands
         ),
         success=True,
-        checked_at=datetime.now(UTC),
+        checked_at=clock(),
     )
 
 
@@ -186,6 +190,7 @@ def capture_checked_gradle_snapshot(
     target: GradleUpdateTarget | None = None,
     vcs: VcsServices | None = None,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> tuple[CheckEvidence, GradleSnapshot]:
     """Bind build, tests and security evidence to one unchanged source tree."""
     services = vcs or make_vcs_services()
@@ -197,10 +202,10 @@ def capture_checked_gradle_snapshot(
         block = validate_gradle_recovery(project, target)
         if block is not None:
             raise GradleError(block.reason)
-    checks = run_gradle_checks(project, project_name, emit=emit)
+    checks = run_gradle_checks(project, project_name, emit=emit, clock=clock)
     if repo.tree_id() != tree:
         raise GradleError("Source tree changed during build or tests")
-    snapshot = capture_gradle_snapshot(project, context, vcs=services)
+    snapshot = capture_gradle_snapshot(project, context, vcs=services, clock=clock)
     if isinstance(snapshot, IncompleteResolution):
         raise GradleError("Coverage incomplete: " + "; ".join(snapshot.reasons))
     if snapshot.tree_id != tree or repo.tree_id() != tree:
@@ -219,6 +224,7 @@ def start_gradle_run(
     persist: bool = True,
     vcs: VcsServices | None = None,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -229,6 +235,7 @@ def start_gradle_run(
         expected_tree=repo.tree_id(revision=base_commit_id),
         vcs=services,
         emit=emit,
+        clock=clock,
     )
     bookmark = WORKFLOW_BOOKMARKS[flow]
     run = GradleRun(
@@ -257,6 +264,7 @@ def verify_applied_gradle_attempt(
     committed_revision: str | None = None,
     vcs: VcsServices | None = None,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -273,6 +281,7 @@ def verify_applied_gradle_attempt(
         ),
         vcs=services,
         emit=emit,
+        clock=clock,
     )
     # Persist the rejected snapshot too: it is diagnostic evidence, not READY.
     observed = ApplyingAttempt(
@@ -286,7 +295,7 @@ def verify_applied_gradle_attempt(
             "Security verification failed: " + "; ".join(comparison.reasons)
         )
     block = evaluate_gradle_candidate_age(
-        candidate, minimum_age_days, publication, datetime.now(UTC)
+        candidate, minimum_age_days, publication, clock()
     )
     if block is not None:
         raise GradleError(block.reason)
@@ -360,6 +369,7 @@ def process_gradle_run(
     *,
     vcs: VcsServices | None = None,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -369,7 +379,7 @@ def process_gradle_run(
         candidate = planned.candidate
         block = validate_gradle_target(project, candidate.target)
         age = evaluate_gradle_candidate_age(
-            candidate, minimum_age_days, publication, datetime.now(UTC)
+            candidate, minimum_age_days, publication, clock()
         )
         reason = block.reason if block else age.reason if age else None
         if reason:
@@ -378,7 +388,7 @@ def process_gradle_run(
             )
             save_gradle_run(gradle_run_path(run.project), run)
             continue
-        if not context_inputs_valid(run.context, project, datetime.now(UTC)):
+        if not context_inputs_valid(run.context, project, clock()):
             raise GradleError(
                 "Comparison context expired or changed; "
                 "rebuild evidence before continuing"
@@ -399,6 +409,7 @@ def process_gradle_run(
                 minimum_age_days,
                 vcs=services,
                 emit=emit,
+                clock=clock,
             )
         except (GradleError, ScanError, RevisionError) as exc:
             # Read latest pre-effect intent to retain commit-crash evidence.
@@ -445,6 +456,7 @@ def gradle_run_finalization_check(
     minimum_age_days: int,
     *,
     vcs: VcsServices | None = None,
+    clock: Clock = utc_now,
 ) -> None:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -457,7 +469,7 @@ def gradle_run_finalization_check(
     ]
     if not accepted:
         raise GradleError("No verified Gradle update to finalize")
-    if not context_inputs_valid(run.context, project, datetime.now(UTC)):
+    if not context_inputs_valid(run.context, project, clock()):
         raise GradleError("Final comparison context is stale")
     if (
         repo.resolve_revision(revision=run.managed_bookmark) != run.managed_tip_id
@@ -481,7 +493,7 @@ def gradle_run_finalization_check(
         raise GradleError("An earlier credited fix was reintroduced")
     for attempt in accepted:
         block = evaluate_gradle_candidate_age(
-            attempt.candidate, minimum_age_days, publication, datetime.now(UTC)
+            attempt.candidate, minimum_age_days, publication, clock()
         )
         if block is not None:
             raise GradleError(block.reason)
@@ -528,6 +540,7 @@ def rebuild_gradle_run_evidence(
     persist: bool = True,
     vcs: VcsServices | None = None,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     if run.has(ApplyingAttempt):
@@ -546,7 +559,7 @@ def rebuild_gradle_run_evidence(
         if isinstance(resolution, IncompleteResolution):
             raise GradleError("Recorded baseline cannot produce complete coverage")
         context = initialize_comparison_context(
-            base_project, resolution, paths.gradle_contexts_dir()
+            base_project, resolution, paths.gradle_contexts_dir(), clock=clock
         )
         try:
             _, initial = capture_checked_gradle_snapshot(
@@ -556,6 +569,7 @@ def rebuild_gradle_run_evidence(
                 expected_tree=base_repo.tree_id(revision=run.base_commit_id),
                 vcs=services,
                 emit=emit,
+                clock=clock,
             )
         except BaseException:
             discard_unpersisted_gradle_context(run.project, context)
@@ -578,6 +592,7 @@ def rebuild_gradle_run_evidence(
                     target=old.candidate.target,
                     vcs=services,
                     emit=emit,
+                    clock=clock,
                 )
                 comparison = compare_gradle_snapshots(baseline, after, old.candidate)
                 if not isinstance(comparison, VerifiedComparison):
@@ -586,7 +601,7 @@ def rebuild_gradle_run_evidence(
                     old.candidate,
                     minimum_age_days,
                     publication,
-                    datetime.now(UTC),
+                    clock(),
                 )
                 if block is not None:
                     raise GradleError(block.reason)
@@ -689,6 +704,7 @@ def reconcile_gradle_applying(
     *,
     vcs: VcsServices | None = None,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -740,7 +756,7 @@ def reconcile_gradle_applying(
     if block is not None:
         raise GradleError(block.reason)
     after, checks, checked_tree = state.after, state.checks, state.checked_tree_id
-    if not context_inputs_valid(run.context, project, datetime.now(UTC)):
+    if not context_inputs_valid(run.context, project, clock()):
         # Keep the on-disk intent until BOTH historical accepted work and the
         # checked interrupted commit have been proven under one fresh context.
         previous_context = run.context
@@ -757,6 +773,7 @@ def reconcile_gradle_applying(
             persist=False,
             vcs=services,
             emit=emit,
+            clock=clock,
         )
         try:
             with gradle_evidence_workspace(
@@ -770,6 +787,7 @@ def reconcile_gradle_applying(
                     target=state.candidate.target,
                     vcs=services,
                     emit=emit,
+                    clock=clock,
                 )
                 state = state.model_copy(
                     update={
@@ -793,7 +811,7 @@ def reconcile_gradle_applying(
     if not isinstance(comparison, VerifiedComparison):
         raise GradleError("Interrupted comparison does not prove acceptance")
     block = evaluate_gradle_candidate_age(
-        state.candidate, minimum_age_days, publication, datetime.now(UTC)
+        state.candidate, minimum_age_days, publication, clock()
     )
     if block is not None:
         raise GradleError(block.reason)
@@ -834,6 +852,7 @@ def continue_gradle_resolve(
     *,
     vcs: VcsServices | None = None,
     emit: Emit,
+    clock: Clock = utc_now,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -859,7 +878,7 @@ def continue_gradle_resolve(
     block = validate_gradle_recovery(project, candidate.target)
     if block is not None:
         raise GradleError(block.reason)
-    if not context_inputs_valid(run.context, project, datetime.now(UTC)):
+    if not context_inputs_valid(run.context, project, clock()):
         run = rebuild_gradle_run_evidence(
             run,
             project,
@@ -867,6 +886,7 @@ def continue_gradle_resolve(
             minimum_age_days,
             vcs=services,
             emit=emit,
+            clock=clock,
         )
     try:
         return verify_applied_gradle_attempt(
@@ -878,6 +898,7 @@ def continue_gradle_resolve(
             committed_revision=repaired_commit,
             vcs=services,
             emit=emit,
+            clock=clock,
         )
     except (GradleError, ScanError, RevisionError) as exc:
         latest = load_gradle_run(gradle_run_path(run.project)) or run

@@ -10,7 +10,6 @@ from collections import deque
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 from typing import TypedDict
@@ -18,6 +17,7 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
+from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     evaluate_gradle_candidate_age,
@@ -723,6 +723,8 @@ def prepare_gradle_candidates(
     resolution: CompleteResolution,
     publication: PublicationLookupContext,
     minimum_age_days: int,
+    *,
+    clock: Clock = utc_now,
 ) -> tuple[PreparedCandidate, ...]:
     """Validate proposed catalogue changes and apply the release-age policy."""
     batch = validate_gradle_candidates(project, candidates, resolution)
@@ -752,7 +754,7 @@ def prepare_gradle_candidates(
             result.append(item)
             continue
         age = evaluate_gradle_candidate_age(
-            item.candidate, minimum_age_days, publication, datetime.now(UTC)
+            item.candidate, minimum_age_days, publication, clock()
         )
         result.append(
             PreparedCandidate(

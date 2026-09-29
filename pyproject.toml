@@ -58,6 +58,7 @@ type = "forbidden"
 source_modules = ["maintenance_man.models"]
 forbidden_modules = [
     "maintenance_man.cli",
+    "maintenance_man.clock",
     "maintenance_man.config",
     "maintenance_man.dependency_age",
     "maintenance_man.deployer",

@@ -158,6 +158,22 @@ def test_stale_comparison_context_is_a_gradle_error(gradle_project, monkeypatch)
         scanner.capture_gradle_snapshot(gradle_project, MagicMock())
 
 
+def test_capture_checks_the_context_at_the_injected_time(gradle_project, monkeypatch):
+    from tests.conftest import FakeClock
+
+    clock = FakeClock(datetime(2032, 2, 3, 4, 5, 6, tzinfo=UTC))
+    observed = []
+
+    def stale(context, project, now):
+        observed.append(now)
+        return False
+
+    monkeypatch.setattr(scanner, "context_inputs_valid", stale)
+    with pytest.raises(GradleError, match="Comparison context expired"):
+        scanner.capture_gradle_snapshot(gradle_project, MagicMock(), clock=clock)
+    assert observed == [clock.current]
+
+
 def _make_project(
     path: str | Path, pm: Literal["bun", "uv", "mvn"] = "uv"
 ) -> ProjectConfig:
