@@ -36,7 +36,13 @@ from maintenance_man.models.events import (
     DeployStepFailed,
     DeployStepStarted,
     DeployStepSucceeded,
+    Emit,
     Event,
+    FindingFailed,
+    FindingPassed,
+    FindingStarted,
+    FindingStepFailed,
+    FindingStepKind,
     HealthChecked,
     HealthcheckUnconfigured,
     Operation,
@@ -47,6 +53,7 @@ from maintenance_man.models.events import (
     ScanReported,
     SkipReason,
     SyncCompleted,
+    TestCommandStarted,
 )
 from maintenance_man.models.gradle import (
     FailedAttempt,
@@ -59,6 +66,7 @@ from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
     UpdateFinding,
+    UpdateResult,
     UpdateStatus,
     VulnFinding,
     Workflow,
@@ -78,11 +86,8 @@ from maintenance_man.storage import (
 )
 from maintenance_man.updater import (
     Finding,
-    UpdateResult,
     consolidate_vulns,
     process_findings,
-    process_updates,
-    process_vulns,
     remove_completed_findings,
     run_test_phases,
     sort_updates_by_risk,
@@ -248,6 +253,47 @@ def _render_project_started(event: ProjectStarted, batch: bool) -> None:
     console.print(f"\n{'═' * 40}")
     console.print(f"[bold]{escape(event.project)}[/]")
     console.print("═" * 40)
+
+
+@_renders(FindingStarted)
+def _render_finding_started(event: FindingStarted, batch: bool) -> None:
+    del batch
+    label = "[bold red]VULN[/]" if event.kind == "vuln" else "[bold cyan]UPDATE[/]"
+    console.print(
+        f"\n  {label} {escape(event.pkg)} {escape(event.installed)} -> "
+        f"{escape(event.target)} ({escape(event.detail)})"
+    )
+
+
+@_renders(TestCommandStarted)
+def _render_test_command_started(event: TestCommandStarted, batch: bool) -> None:
+    del batch
+    console.print(f"  [dim]$ {escape(event.command)}[/]")
+
+
+@_renders(FindingStepFailed)
+def _render_finding_step_failed(event: FindingStepFailed, batch: bool) -> None:
+    del batch
+    error = escape(event.error)
+    if event.step is FindingStepKind.PACKAGE_COMMAND:
+        console.print(f"  [bold red]FAIL[/] Package manager command failed: {error}")
+    else:
+        console.print(f"  [bold red]FAIL[/] {error}")
+
+
+@_renders(FindingPassed)
+def _render_finding_passed(event: FindingPassed, batch: bool) -> None:
+    del batch
+    suffix = " [dim](already applied)[/]" if event.already_applied else ""
+    console.print(f"  [bold green]PASS[/] {escape(event.pkg)}{suffix}")
+
+
+@_renders(FindingFailed)
+def _render_finding_failed(event: FindingFailed, batch: bool) -> None:
+    del batch
+    console.print(
+        f"  [bold red]FAIL[/] {escape(event.pkg)} — {escape(event.phase)} failed"
+    )
 
 
 @_renders(DeployStepStarted)
@@ -634,48 +680,6 @@ def _prompt_selection(
         )
 
 
-def _process_selected_vulns(
-    selected: list[VulnFinding],
-    work_config: ProjectConfig,
-    scan_result: ScanResult,
-    project: str,
-    *,
-    vcs: VcsServices,
-) -> list[UpdateResult]:
-    if not selected:
-        return []
-    console.print(f"\n[bold]Processing {len(selected)} vuln fix(es)...[/]")
-    return process_vulns(
-        selected,
-        work_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan_result,
-        project_name=project,
-        vcs=vcs,
-    )
-
-
-def _process_selected_updates(
-    selected: list[UpdateFinding],
-    work_config: ProjectConfig,
-    scan_result: ScanResult,
-    project: str,
-    *,
-    vcs: VcsServices,
-) -> list[UpdateResult]:
-    if not selected:
-        return []
-    console.print(f"\n[bold]Processing {len(selected)} update(s)...[/]")
-    return process_updates(
-        selected,
-        work_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan_result,
-        project_name=project,
-        vcs=vcs,
-    )
-
-
 def _process_selected_findings(
     selected_vulns: list[VulnFinding],
     selected_updates: list[UpdateFinding],
@@ -699,11 +703,11 @@ def _process_selected_findings(
     return process_findings(
         findings,
         work_config,
-        cfg=None,
         flow=Workflow.UPDATE,
         scan_result=scan_result,
         project_name=project,
         vcs=vcs,
+        emit=_Renderer(batch=False),
     )
 
 
@@ -995,6 +999,7 @@ def _run_resolve_findings(
         project_name=project,
         on_failure="stop",
         vcs=vcs,
+        emit=_Renderer(batch=False),
     )
     if any(not r.passed for r in results) or _ordered_failed_findings(scan_result):
         console.print(
@@ -1219,7 +1224,9 @@ def test(
 
     console.print(f"[bold]Testing {escape(project)}[/]\n")
 
-    passed, failed_phase = run_test_phases(proj_config, proj_config.path)
+    passed, failed_phase = run_test_phases(
+        proj_config, proj_config.path, emit=_Renderer(batch=False)
+    )
 
     if passed:
         console.print("\n[bold green]All test phases passed.[/]")
@@ -1856,7 +1863,9 @@ def _handle_resolve_continue(
         )
     failed = _ordered_failed_findings(scan_result)
     if failed:
-        passed, failed_phase = run_test_phases(proj_config, proj_config.path)
+        passed, failed_phase = run_test_phases(
+            proj_config, proj_config.path, emit=_Renderer(batch=False)
+        )
         for blocker in failed:
             blocker.flow = Workflow.RESOLVE
             if not passed:
@@ -2088,6 +2097,7 @@ def _run_gradle_flow(
     minimum_age_days: int,
     continue_: bool = False,
     vcs: VcsServices,
+    emit: Emit | None = None,
 ) -> int:
     return gradle_workflow.run_gradle_flow(
         project_name,
@@ -2096,6 +2106,7 @@ def _run_gradle_flow(
         interactive=interactive,
         minimum_age_days=minimum_age_days,
         continue_=continue_,
+        emit=emit or _Renderer(batch=False),
         vcs=vcs,
         interaction=gradle_workflow.GradleInteraction(
             choose=_choose_gradle_candidates,

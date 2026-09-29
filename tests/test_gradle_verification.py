@@ -24,6 +24,13 @@ from maintenance_man.cli import (
 from maintenance_man.github import CodeHostError
 from maintenance_man.gradle_updates import run_gradle_checks as real_run_gradle_checks
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import (
+    FindingStepFailed,
+    FindingStepKind,
+)
+from maintenance_man.models.events import (
+    TestCommandStarted as CommandStartedEvent,
+)
 from maintenance_man.models.gradle import (
     ApplyingAttempt,
     CheckEvidence,
@@ -55,9 +62,10 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
-from maintenance_man.process import ToolNotFoundError
+from maintenance_man.process import ProcessError, ToolNotFoundError
 from maintenance_man.vcs import RevisionError
 from tests.fake_vcs import FakeJjState
+from tests.fakes import RecordingEmit
 
 
 def _workflow_vcs(path: Path, *, files: dict[str, str] | None = None):
@@ -567,7 +575,7 @@ def workflow(frozen_context, resolution, candidate, scope, monkeypatch, tmp_path
         repo.tree_id(revision=accepted),
     )
     state = {"snapshot": initial, "tree": initial.tree_id}
-    monkeypatch.setattr(updater, "run_gradle_checks", lambda *args: checks)
+    monkeypatch.setattr(updater, "run_gradle_checks", lambda *args, **kwargs: checks)
     monkeypatch.setattr(
         updater,
         "capture_gradle_snapshot",
@@ -635,6 +643,7 @@ def begin_workflow(workflow, flow=Workflow.UPDATE, candidate=None):
         workflow.context,
         (candidate or workflow.candidate,),
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
 
 
@@ -653,7 +662,11 @@ def test_gradle_revision_failure_is_recorded_or_preserved(workflow, monkeypatch,
             path=workflow.project.path,
         )
         result = updater.process_gradle_run(
-            run, workflow.project, workflow.publication, 7
+            run,
+            workflow.project,
+            workflow.publication,
+            7,
+            emit=RecordingEmit(),
         )
         assert isinstance(result.attempts[0], FailedAttempt)
         assert result.attempts[0].reason == "jj unavailable"
@@ -666,7 +679,9 @@ def test_gradle_revision_failure_is_recorded_or_preserved(workflow, monkeypatch,
             path=workflow.project.path,
         )
         with pytest.raises(RevisionError, match="jj unavailable"):
-            updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+            updater.process_gradle_run(
+                run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+            )
         stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
         assert stored is not None
         assert isinstance(stored.attempts[0], ApplyingAttempt)
@@ -687,6 +702,7 @@ def test_gradle_dirty_query_failure_preserves_checked_intent(workflow):
             workflow.publication,
             7,
             vcs=workflow.vcs,
+            emit=RecordingEmit(),
         )
 
     assert caught.value.__cause__ is failure
@@ -715,6 +731,7 @@ def test_gradle_continue_dirty_query_failure_preserves_failed_ledger(
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     workflow.vcs_state.seed_bookmark(
         workflow.project.path,
@@ -736,6 +753,7 @@ def test_gradle_continue_dirty_query_failure_preserves_failed_ledger(
             workflow.publication,
             7,
             vcs=workflow.vcs,
+            emit=RecordingEmit(),
         )
 
     assert caught.value.__cause__ is failure
@@ -758,6 +776,7 @@ def test_gradle_continue_revision_failure_is_recorded(workflow, monkeypatch):
         workflow.project,
         workflow.publication,
         7,
+        emit=RecordingEmit(),
     )
     workflow.vcs_state.seed_bookmark(
         workflow.project.path,
@@ -775,7 +794,11 @@ def test_gradle_continue_revision_failure_is_recorded(workflow, monkeypatch):
     )
     with pytest.raises(RevisionError, match="jj unavailable"):
         updater.continue_gradle_resolve(
-            failed, workflow.project, workflow.publication, 7
+            failed,
+            workflow.project,
+            workflow.publication,
+            7,
+            emit=RecordingEmit(),
         )
     stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert stored is not None
@@ -804,7 +827,11 @@ def test_gradle_continue_revision_failure_after_checked_intent_is_preserved(
     monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
     monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: True)
     failed = updater.reconcile_gradle_applying(
-        run, workflow.project, workflow.publication, 7
+        run,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
     )
     workflow.vcs_state.clear_calls()
     workflow.vcs_state.fail(
@@ -825,7 +852,11 @@ def test_gradle_continue_revision_failure_after_checked_intent_is_preserved(
     monkeypatch.setattr(updater, "save_gradle_run", record)
     with pytest.raises(RevisionError, match="jj unavailable"):
         updater.continue_gradle_resolve(
-            failed, workflow.project, workflow.publication, 7
+            failed,
+            workflow.project,
+            workflow.publication,
+            7,
+            emit=RecordingEmit(),
         )
 
     stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
@@ -894,7 +925,9 @@ def test_blank_only_test_command_is_a_setup_prerequisite(workflow):
 
 def test_ordinary_residual_is_ready_without_cve_lifecycle(workflow):
     run = begin_workflow(workflow)
-    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    result = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
     assert isinstance(result.attempts[0], ReadyAttempt)
     assert result.attempts[0].state == "ready"
     assert result.accepted_snapshot.findings[0].affected_versions == frozenset({"2"})
@@ -928,7 +961,9 @@ def test_security_residual_fails_and_obeys_workspace_policy(
         }
     )
     run = begin_workflow(workflow, flow, security)
-    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    result = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
     assert result.attempts[0].state == "failed"
     assert result.accepted_snapshot == workflow.initial
     assert workflow.effects == expected_effects
@@ -954,7 +989,7 @@ def test_start_persists_baseline_before_any_apply(workflow):
 def test_failed_checks_prevent_capture_and_ready(workflow, monkeypatch):
     run = begin_workflow(workflow)
 
-    def failed(*args):
+    def failed(*args, **kwargs):
         raise updater.GradleError("unit failed")
 
     monkeypatch.setattr(updater, "run_gradle_checks", failed)
@@ -963,14 +998,18 @@ def test_failed_checks_prevent_capture_and_ready(workflow, monkeypatch):
         "capture_gradle_snapshot",
         lambda *args, **kwargs: pytest.fail("capture after failed checks"),
     )
-    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    result = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
     assert result.attempts[0].state == "failed"
     assert workflow.effects == ["apply", "discard"]
 
 
 def test_finalization_rejects_credited_fix_reintroduced(workflow, scope):
     run = begin_workflow(workflow)
-    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    result = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
     ready = result.attempts[0]
     assert isinstance(ready, ReadyAttempt)
     key = evidence(scope).key
@@ -992,7 +1031,11 @@ def test_missing_routing_declaration_allows_checked_update(workflow, minimum_age
     run = begin_workflow(workflow)
     project = workflow.project.model_copy(update={"gradle_repository_routing": None})
     result = updater.process_gradle_run(
-        run, project, workflow.publication, minimum_age_days
+        run,
+        project,
+        workflow.publication,
+        minimum_age_days,
+        emit=RecordingEmit(),
     )
     assert isinstance(result.attempts[0], ReadyAttempt)
     updater.gradle_run_finalization_check(
@@ -1104,6 +1147,7 @@ def driver(workflow, resolution, monkeypatch):
         refs={"main": base, "@-": base, "mm/update-dependencies": base},
         effects=workflow.effects,
         workflow=workflow,
+        emit=RecordingEmit(),
     )
     monkeypatch.setattr(
         workflow_service,
@@ -1195,6 +1239,7 @@ def invoke_driver(driver, *, interactive=False, minimum_age_days=7, vcs=None):
         interactive=interactive,
         minimum_age_days=minimum_age_days,
         vcs=vcs or driver.workflow.vcs,
+        emit=driver.emit,
     )
 
 
@@ -1220,6 +1265,29 @@ def test_gradle_driver_promotes_verified_update_with_residual_advisory(driver):
     assert fresh.vulnerabilities[0].installed_version == "2"
     assert fresh.vulnerabilities[0].update_status is None
     assert fresh.vulnerabilities[0].flow is None
+
+
+def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
+    monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
+    monkeypatch.setattr(updater, "run_build", lambda *args: None)
+    calls = 0
+
+    def run_test(command, *_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ProcessError("configured unit test failed")
+
+    monkeypatch.setattr("maintenance_man.updater.run_live", run_test)
+
+    assert invoke_driver(driver) == cli.ExitCode.UPDATE_FAILED
+    assert driver.emit.of_type(CommandStartedEvent) == [
+        CommandStartedEvent(driver.project.test_unit),
+        CommandStartedEvent(driver.project.test_unit),
+    ]
+    assert driver.emit.of_type(FindingStepFailed) == [
+        FindingStepFailed(FindingStepKind.TEST, "configured unit test failed")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1490,7 +1558,11 @@ def test_gradle_failed_attempt_prevents_finalization_after_another_group_passes(
 
     first = begin_workflow(workflow)
     accepted = updater.process_gradle_run(
-        first, workflow.project, workflow.publication, 7
+        first,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
     )
     other = workflow.candidate.model_copy(
         update={
@@ -1518,7 +1590,11 @@ def test_gradle_failed_attempt_prevents_finalization_after_another_group_passes(
 
     monkeypatch.setattr(updater, "apply_gradle_update", failing_apply)
     result = updater.process_gradle_run(
-        pending, workflow.project, workflow.publication, 7
+        pending,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
     )
     assert [item.state for item in result.attempts] == ["ready", "failed"]
     assert result.accepted_snapshot == accepted.accepted_snapshot
@@ -1540,7 +1616,7 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
         if failure == "build":
             raise updater.BuildError("build failed")
 
-    def tests(*args):
+    def tests(*args, **kwargs):
         effects.append("tests")
         return False, "unit"
 
@@ -1566,7 +1642,7 @@ def test_gradle_checks_run_configured_tests_through_bash(tmp_path, monkeypatch):
         build_command="./gradlew assembleDebug",
         test_unit="printf ok > tests-ran && test -f tests-ran",
     )
-    evidence = real_run_gradle_checks(project, "sample")
+    evidence = real_run_gradle_checks(project, "sample", emit=RecordingEmit())
     assert evidence.success is True
     assert (tmp_path / "tests-ran").read_text() == "ok"
 
@@ -1582,7 +1658,9 @@ def test_gradle_uncommitted_interruption_becomes_failed(
         candidate=workflow.candidate,
         baseline=workflow.initial,
         after=workflow.after if checked else None,
-        checks=updater.run_gradle_checks(workflow.project, "sample")
+        checks=updater.run_gradle_checks(
+            workflow.project, "sample", emit=RecordingEmit()
+        )
         if checked
         else None,
         checked_tree_id=workflow.after.tree_id if checked else None,
@@ -1619,7 +1697,11 @@ def test_gradle_uncommitted_interruption_becomes_failed(
         action=assert_saved_before_discard,
     )
     result = updater.reconcile_gradle_applying(
-        run, workflow.project, workflow.publication, 7
+        run,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
     )
     assert isinstance(result.attempts[0], FailedAttempt)
     assert result.attempts[0].after == (workflow.after if checked else None)
@@ -1735,12 +1817,20 @@ def test_gradle_resolve_interrupted_before_checks_accepts_only_committed_repair(
     monkeypatch.setattr(updater, "validate_gradle_recovery", lambda *args: None)
     monkeypatch.setattr(updater, "context_inputs_valid", lambda *args: True)
     failed = updater.reconcile_gradle_applying(
-        run, workflow.project, workflow.publication, 7
+        run,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
     )
     assert isinstance(failed.attempts[0], FailedAttempt)
     assert workflow.effects == []
     repaired = updater.continue_gradle_resolve(
-        failed, workflow.project, workflow.publication, 7
+        failed,
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
     )
     assert isinstance(repaired.attempts[0], ReadyAttempt)
     assert repaired.managed_tip_id == repair
@@ -1751,7 +1841,11 @@ def test_gradle_resolve_interrupted_before_checks_accepts_only_committed_repair(
 
 def ready_workflow(workflow):
     return updater.process_gradle_run(
-        begin_workflow(workflow), workflow.project, workflow.publication, 7
+        begin_workflow(workflow),
+        workflow.project,
+        workflow.publication,
+        7,
+        emit=RecordingEmit(),
     )
 
 
@@ -1812,6 +1906,7 @@ def test_gradle_retry_refresh_never_reapplies_or_repromotes(workflow, monkeypatc
             workflow.publication,
             7,
             vcs=workflow.vcs,
+            emit=RecordingEmit(),
         )
     saved = updater.load_gradle_run(updater.gradle_run_path(run.project))
     assert saved is not None
@@ -1823,6 +1918,7 @@ def test_gradle_retry_refresh_never_reapplies_or_repromotes(workflow, monkeypatc
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     assert finished.refreshed
     assert isinstance(finished.attempts[0], CompletedAttempt)
@@ -1865,6 +1961,7 @@ def test_gradle_crash_after_promotion_before_ledger_is_recognized(
             workflow.publication,
             7,
             vcs=workflow.vcs,
+            emit=RecordingEmit(),
         )
     stored = updater.load_gradle_run(updater.gradle_run_path(run.project))
     assert stored is not None
@@ -1876,6 +1973,7 @@ def test_gradle_crash_after_promotion_before_ledger_is_recognized(
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     assert finished.refreshed
     assert state["promotions"] == 1
@@ -1891,6 +1989,7 @@ def test_gradle_resolve_submission_guard_failure_keeps_recoverable_ledger(
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     base, tip = run.base_commit_id, run.managed_tip_id
     sibling = workflow.vcs_state.seed_commit(
@@ -1930,6 +2029,7 @@ def test_gradle_resolve_submission_guard_failure_keeps_recoverable_ledger(
             workflow.publication,
             7,
             vcs=workflow.vcs,
+            emit=RecordingEmit(),
         )
 
     assert updater.gradle_run_path(run.project).read_bytes() == before
@@ -1948,6 +2048,7 @@ def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     host = workflow.vcs.code_host(workflow.project.path)
     host.fail("create_pr", error=CodeHostError("host unavailable"))
@@ -1961,6 +2062,7 @@ def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
             workflow.publication,
             7,
             vcs=workflow.vcs,
+            emit=RecordingEmit(),
         )
 
     stored = updater.load_gradle_run(updater.gradle_run_path(run.project))
@@ -1975,6 +2077,7 @@ def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     assert finished.submitted
     assert isinstance(finished.attempts[0], CompletedAttempt)
@@ -2005,7 +2108,9 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
 
     monkeypatch.setattr(updater, "save_gradle_run", crash_after_commit)
     with pytest.raises(updater.GradleError, match="commit crash"):
-        updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+        updater.process_gradle_run(
+            run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+        )
     interrupted = updater.load_gradle_run(updater.gradle_run_path(run.project))
     assert interrupted is not None
     assert isinstance(interrupted.attempts[0], ApplyingAttempt)
@@ -2039,6 +2144,7 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     assert recovered.attempts[0].state == "ready"
     assert recovered.managed_tip_id == accepted_commit
@@ -2065,6 +2171,7 @@ def test_gradle_rejected_snapshot_survives_resolve_retry(workflow, monkeypatch):
         workflow.project,
         workflow.publication,
         7,
+        emit=RecordingEmit(),
     )
     assert isinstance(failed.attempts[0], FailedAttempt)
     assert failed.attempts[0].after == workflow.after
@@ -2073,7 +2180,11 @@ def test_gradle_rejected_snapshot_survives_resolve_retry(workflow, monkeypatch):
     workflow.vcs.repository(workflow.project.path).commit(message="manual repair")
     with pytest.raises(updater.GradleError, match="Security verification"):
         updater.continue_gradle_resolve(
-            failed, workflow.project, workflow.publication, 7
+            failed,
+            workflow.project,
+            workflow.publication,
+            7,
+            emit=RecordingEmit(),
         )
     stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert stored is not None
@@ -2183,6 +2294,7 @@ def test_gradle_failed_update_restart_retains_evidence(
         workflow.project,
         workflow.publication,
         7,
+        emit=RecordingEmit(),
     )
     workflow.vcs_state.seed_bookmark(
         workflow.project.path,
@@ -2253,6 +2365,7 @@ def test_gradle_failed_update_restart_refuses_uncertain_dirty_state(
         workflow.publication,
         7,
         vcs=workflow.vcs,
+        emit=RecordingEmit(),
     )
     workflow.vcs_state.seed_bookmark(
         workflow.project.path,
@@ -2377,6 +2490,7 @@ def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
         workflow.project,
         workflow.publication,
         7,
+        emit=RecordingEmit(),
     )
     workflow.vcs_state.seed_bookmark(
         workflow.project.path,
@@ -2456,14 +2570,21 @@ def test_gradle_resolve_checks_actual_catalogue_before_accepting_manual_repair(
     report.write_bytes(b"interrupted report")
     marker.write_bytes(b"")
 
-    checks = updater.run_gradle_checks(driver.project, "sample")
+    checks = updater.run_gradle_checks(driver.project, "sample", emit=RecordingEmit())
     calls = []
     monkeypatch.setattr(
-        updater, "run_gradle_checks", lambda *args: calls.append("checks") or checks
+        updater,
+        "run_gradle_checks",
+        lambda *args, **kwargs: calls.append("checks") or checks,
     )
     if repaired:
         result = updater.continue_gradle_resolve(
-            failed, driver.project, workflow.publication, 7, vcs=workflow.vcs
+            failed,
+            driver.project,
+            workflow.publication,
+            7,
+            vcs=workflow.vcs,
+            emit=RecordingEmit(),
         )
         assert isinstance(result.attempts[0], ReadyAttempt)
         assert result.managed_tip_id == repair
@@ -2472,7 +2593,12 @@ def test_gradle_resolve_checks_actual_catalogue_before_accepting_manual_repair(
     else:
         with pytest.raises(updater.GradleError, match="expected 2"):
             updater.continue_gradle_resolve(
-                failed, driver.project, workflow.publication, 7, vcs=workflow.vcs
+                failed,
+                driver.project,
+                workflow.publication,
+                7,
+                vcs=workflow.vcs,
+                emit=RecordingEmit(),
             )
         assert calls == []
         assert ledger.read_bytes() == before
@@ -2685,7 +2811,8 @@ def rebuild_evidence(workflow, monkeypatch):
     context = workflow.context.model_copy(update={"private_cache_path": cache})
     observations = SimpleNamespace(mutated=None, visits=[], released=[])
 
-    def checks(project, _project_name):
+    def checks(project, _project_name, *, emit):
+        del emit
         catalogue = project.path / "gradle/libs.versions.toml"
         revision = "accepted" if 'lib = "2"' in catalogue.read_text() else "base"
         observations.visits.append(revision)
@@ -2736,6 +2863,7 @@ def test_rebuilt_evidence_refuses_a_tree_changed_by_checks(rebuild_evidence, rev
             state.workflow.publication,
             7,
             vcs=state.workflow.vcs,
+            emit=RecordingEmit(),
         )
     assert state.ledger.read_bytes() == state.before
     assert state.observations.released == [state.context]
@@ -2749,6 +2877,7 @@ def test_rebuilt_evidence_preserves_exact_revision_bindings(rebuild_evidence):
         state.workflow.publication,
         7,
         vcs=state.workflow.vcs,
+        emit=RecordingEmit(),
     )
     assert state.observations.visits == ["base", "accepted"]
     assert rebuilt.initial_snapshot.tree_id == state.workflow.initial.tree_id
@@ -2769,13 +2898,17 @@ def test_rebuilt_baseline_check_failure_releases_new_context(
 ):
     state = rebuild_evidence
 
-    def fail_checks(*args):
+    def fail_checks(*args, **kwargs):
         raise updater.GradleError("baseline build failed")
 
     monkeypatch.setattr(updater, "run_gradle_checks", fail_checks)
     with pytest.raises(updater.GradleError, match="baseline build failed"):
         updater.rebuild_gradle_run_evidence(
-            state.run, state.workflow.project, state.workflow.publication, 7
+            state.run,
+            state.workflow.project,
+            state.workflow.publication,
+            7,
+            emit=RecordingEmit(),
         )
     assert state.ledger.read_bytes() == state.before
     assert state.observations.released == [state.context]
@@ -2791,12 +2924,12 @@ def test_acceptance_rejects_source_changes_during_verification(
         original = updater.run_gradle_checks
         capture = MagicMock(side_effect=AssertionError("capture after tree mutation"))
 
-        def mutate(*args):
+        def mutate(*args, **kwargs):
             catalogue.write_text(
                 catalogue.read_text(encoding="utf-8") + "# changed during checks\n",
                 encoding="utf-8",
             )
-            return original(*args)
+            return original(*args, **kwargs)
 
         monkeypatch.setattr(updater, "run_gradle_checks", mutate)
         monkeypatch.setattr(updater, "capture_gradle_snapshot", capture)
@@ -2810,7 +2943,9 @@ def test_acceptance_rejects_source_changes_during_verification(
             return workflow.after
 
         monkeypatch.setattr(updater, "capture_gradle_snapshot", mutate)
-    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    result = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
     assert isinstance(result.attempts[0], FailedAttempt)
     assert "tree" in result.attempts[0].reason.lower()
     assert workflow.effects == ["apply", "discard"]
@@ -2834,7 +2969,9 @@ def test_acceptance_requires_the_applied_catalogue_version(workflow, monkeypatch
 
     monkeypatch.setattr(updater, "apply_gradle_update", undo_target)
     # Simulate an apply hook that returns successfully but restores the old version.
-    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    result = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
     assert isinstance(result.attempts[0], FailedAttempt)
     assert workflow.effects == ["apply", "discard"]
 
@@ -2919,6 +3056,7 @@ def test_rebuild_retires_only_superseded_durable_context(
         7,
         persist=persist,
         vcs=state.workflow.vcs,
+        emit=RecordingEmit(),
     )
     assert rebuilt.context == new
     assert new_path.is_dir()
@@ -2947,7 +3085,11 @@ def test_failed_rebuild_preserves_durable_context(
     monkeypatch.setattr(updater, "save_gradle_run", fail_save)
     with pytest.raises(updater.GradleError, match="ledger write failed"):
         updater.rebuild_gradle_run_evidence(
-            state.run, state.workflow.project, state.workflow.publication, 7
+            state.run,
+            state.workflow.project,
+            state.workflow.publication,
+            7,
+            emit=RecordingEmit(),
         )
     assert old.private_cache_path.is_dir()
     assert not new_path.exists()
@@ -2965,7 +3107,11 @@ def test_failed_save_after_replace_keeps_new_context(rebuild_evidence, monkeypat
     monkeypatch.setattr(updater, "save_gradle_run", replace_then_fail)
     with pytest.raises(updater.GradleError, match="fsync"):
         updater.rebuild_gradle_run_evidence(
-            state.run, state.workflow.project, state.workflow.publication, 7
+            state.run,
+            state.workflow.project,
+            state.workflow.publication,
+            7,
+            emit=RecordingEmit(),
         )
     durable = updater.load_gradle_run(state.ledger)
     assert durable is not None and durable.context == state.context
@@ -3104,12 +3250,12 @@ def test_gradle_run_applies_shared_target_once_after_owned_output_cleanup(
         workflow.state.update(snapshot=workflow.after, tree=workflow.after.tree_id)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    def check(*args):
+    def check(*args, **kwargs):
         assert not inventory.exists()
         assert not (root / gradle.GRADLE_UPDATE_REPORT_RELPATH).exists()
         assert not (root / gradle.GRADLE_REPORT_MARKER_RELPATH).exists()
         workflow.effects.append("checks")
-        return checks(*args)
+        return checks(*args, **kwargs)
 
     monkeypatch.setattr(updater, "apply_gradle_update", gradle.apply_gradle_update)
     monkeypatch.setattr(gradle, "run_gradle", apply_command)
@@ -3120,7 +3266,9 @@ def test_gradle_run_applies_shared_target_once_after_owned_output_cleanup(
             raise PermissionError("Cannot reclaim inventory")
 
         monkeypatch.setattr(gradle.shutil, "rmtree", fail)
-    result = updater.process_gradle_run(run, workflow.project, workflow.publication, 7)
+    result = updater.process_gradle_run(
+        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
+    )
     if inventory_state == "marked":
         assert isinstance(result.attempts[0], ReadyAttempt)
         assert reports == ['[libraries]\n"lib" = "g:lib:2"\n"second" = "g:second:2"\n']
@@ -3170,6 +3318,7 @@ def test_gradle_retries_an_empty_preparation_ledger_from_older_versions(driver):
         driver.workflow.context,
         (),
         vcs=driver.workflow.vcs,
+        emit=RecordingEmit(),
     )
     driver.workflow.vcs_state.seed_bookmark(
         driver.project.path,
@@ -3191,6 +3340,7 @@ def test_gradle_reconsiders_old_withheld_run_on_the_next_invocation(driver):
         driver.workflow.context,
         (),
         vcs=driver.workflow.vcs,
+        emit=RecordingEmit(),
     )
     driver.workflow.vcs_state.seed_bookmark(
         driver.project.path,
@@ -3255,7 +3405,9 @@ def test_checked_gradle_update_can_record_unknown_publication(
         raise TimeoutError("unavailable")
 
     with PublicationLookupContext(tmp_path / "publications", timeout) as publication:
-        result = updater.process_gradle_run(run, workflow.project, publication, 7)
+        result = updater.process_gradle_run(
+            run, workflow.project, publication, 7, emit=RecordingEmit()
+        )
         assert isinstance(result.attempts[0], ReadyAttempt)
         assert result.attempts[0].receipt.publications == ()
         assert result.attempts[0].receipt.checks.success

@@ -3,17 +3,27 @@ from __future__ import annotations
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol
 
-from rich import print as rprint
-
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import (
+    Emit,
+    FindingFailed,
+    FindingPassed,
+    FindingStarted,
+    FindingStepFailed,
+    FindingStepKind,
+    TestCommandStarted,
+)
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     ScanResult,
     SemverTier,
     UpdateFinding,
+    UpdateKind,
+    UpdateResult,
     UpdateStatus,
     VulnFinding,
     Workflow,
@@ -29,9 +39,45 @@ from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import Repository, RevisionError
 from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
 
-type UpdateKind = Literal["vuln", "update"]
-
 FailureStrategy = Literal["continue", "stop"]
+
+
+@dataclass(frozen=True, slots=True)
+class FindingStep:
+    failed_phase: str | None
+    discardable: bool = True
+    already_applied: bool = False
+
+    @property
+    def passed(self) -> bool:
+        return self.failed_phase is None
+
+
+class NextAction(StrEnum):
+    CONTINUE = "continue"
+    STOP = "stop"
+
+
+def finding_transition(
+    step: FindingStep, flow: Workflow
+) -> tuple[UpdateStatus, str | None, Workflow]:
+    if step.passed:
+        return UpdateStatus.READY, None, flow
+    return UpdateStatus.FAILED, step.failed_phase, flow
+
+
+def should_discard(step: FindingStep, on_failure: FailureStrategy) -> bool:
+    return not step.passed and step.discardable and on_failure == "continue"
+
+
+def next_action(
+    step: FindingStep, on_failure: FailureStrategy, discarded: bool | None
+) -> NextAction:
+    if step.passed:
+        return NextAction.CONTINUE
+    if not step.discardable or on_failure == "stop" or discarded is False:
+        return NextAction.STOP
+    return NextAction.CONTINUE
 
 
 class Finding(Protocol):
@@ -50,36 +96,10 @@ class Finding(Protocol):
     def detail(self) -> str: ...
 
 
-@dataclass(slots=True)
-class UpdateResult:
-    """Tracks the outcome of a single update attempt."""
-
-    pkg_name: str
-    kind: UpdateKind
-    passed: bool
-    failed_phase: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _WorkflowConfig:
-    """Parameters for a single maintenance workflow (vuln or update)."""
-
-    kind: UpdateKind
-    label: str
-    commit_fmt: str
-
-
-_VULN_STACK = _WorkflowConfig(
-    kind="vuln",
-    label="[bold red]VULN[/]",
-    commit_fmt="fix: upgrade {pkg} {old} -> {new} for {detail}",
-)
-
-_UPDATE_STACK = _WorkflowConfig(
-    kind="update",
-    label="[bold cyan]UPDATE[/]",
-    commit_fmt="chore: bump {pkg} {old} -> {new} ({detail})",
-)
+_COMMIT_FORMATS: dict[UpdateKind, str] = {
+    "vuln": "fix: upgrade {pkg} {old} -> {new} for {detail}",
+    "update": "chore: bump {pkg} {old} -> {new} ({detail})",
+}
 
 _RISK_ORDER = {
     SemverTier.PATCH: 0,
@@ -220,53 +240,6 @@ def consolidate_vulns(
     return consolidated
 
 
-def process_vulns(
-    vulns: list[VulnFinding],
-    project_config: ProjectConfig,
-    *,
-    flow: Workflow,
-    scan_result: ScanResult | None = None,
-    project_name: str = "",
-    vcs: VcsServices | None = None,
-) -> list[UpdateResult]:
-    """Process vuln fixes in the single-bookmark update flow."""
-    vcs_services = vcs or make_vcs_services()
-    actionable = [v for v in vulns if v.actionable]
-    consolidated = consolidate_vulns(actionable)
-    return process_findings(
-        consolidated,
-        project_config,
-        _VULN_STACK,
-        flow=flow,
-        scan_result=scan_result,
-        project_name=project_name,
-        vcs=vcs_services,
-    )
-
-
-def process_updates(
-    updates: list[UpdateFinding],
-    project_config: ProjectConfig,
-    *,
-    flow: Workflow,
-    scan_result: ScanResult | None = None,
-    project_name: str = "",
-    vcs: VcsServices | None = None,
-) -> list[UpdateResult]:
-    """Process updates in the single-bookmark update flow, risk-ascending."""
-    vcs_services = vcs or make_vcs_services()
-    sorted_updates = sort_updates_by_risk(updates)
-    return process_findings(
-        sorted_updates,
-        project_config,
-        _UPDATE_STACK,
-        flow=flow,
-        scan_result=scan_result,
-        project_name=project_name,
-        vcs=vcs_services,
-    )
-
-
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
     """Sort updates risk-ascending: PATCH < MINOR < MAJOR < UNKNOWN."""
     return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
@@ -282,20 +255,19 @@ def remove_completed_findings(scan_result: ScanResult) -> None:
     scan_result.updates = _keep_incomplete(scan_result.updates)
 
 
-# TODO: extract as part of test command feature
 def run_test_phases(
-    project_config: ProjectConfig, project_path: Path
+    project_config: ProjectConfig, project_path: Path, *, emit: Emit
 ) -> tuple[bool, str | None]:
     """Run configured test phases sequentially. Returns (passed, failed_phase).
 
     Stops on first failure. Returns (True, None) if all phases pass.
     """
     for phase_name, command in project_config.test_phases:
-        rprint(f"  [dim]$ {command}[/]")
+        emit(TestCommandStarted(command))
         try:
             run_live(command, project_path, timeout=600, label=f"{phase_name} tests")
         except ProcessError as exc:
-            rprint(f"  [bold red]FAIL[/] {exc}")
+            emit(FindingStepFailed(FindingStepKind.TEST, str(exc)))
             return False, phase_name
     return True, None
 
@@ -303,13 +275,13 @@ def run_test_phases(
 def process_findings(
     findings: Sequence[Finding],
     project_config: ProjectConfig,
-    cfg: _WorkflowConfig | None = None,
     *,
     flow: Workflow,
     on_failure: FailureStrategy = "continue",
     scan_result: ScanResult | None = None,
     project_name: str = "",
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> list[UpdateResult]:
     """Process findings on the current jj change.
 
@@ -324,196 +296,96 @@ def process_findings(
     project_path = Path(project_config.path)
     vcs_services = vcs or make_vcs_services()
     repo = vcs_services.repository(project_path)
-    has_tests = bool(project_config.test_phases)
-
-    for f in findings:
-        flow_cfg = _workflow_config(f, cfg)
-        rprint(
-            f"\n  {flow_cfg.label} {f.pkg_name} {f.installed_version} "
-            f"-> {f.target_version} ({f.detail})"
-        )
-
-        applied = _apply_update(
-            project_config.package_manager,
-            f.pkg_name,
-            f.target_version,
-            project_path,
-        )
-
-        if not applied:
-            result, discarded = _record_failure(
-                f,
-                flow_cfg.kind,
-                "apply",
-                project_path,
-                scan_result,
-                flow,
-                project_name,
-                vcs=vcs_services,
-                repo=repo,
-                discard=on_failure == "continue",
+    for finding in findings:
+        kind = _kind(finding)
+        emit(
+            FindingStarted(
+                kind,
+                finding.pkg_name,
+                finding.installed_version,
+                finding.target_version,
+                finding.detail,
             )
-            results.append(result)
-            if on_failure == "stop" or not discarded:
-                break
-            continue
-
-        passed, failed_phase = True, None
-        if has_tests:
-            passed, failed_phase = run_test_phases(project_config, project_path)
-
-        if passed:
-            try:
-                has_changes = repo.has_changes()
-            except RevisionError as exc:
-                rprint(f"  [bold red]FAIL[/] {exc}")
-                result, _ = _record_failure(
-                    f,
-                    flow_cfg.kind,
-                    "commit",
-                    project_path,
-                    scan_result,
-                    flow,
-                    project_name,
-                    vcs=vcs_services,
-                    repo=repo,
-                    discard=False,
-                )
-                results.append(result)
-                break
-            if not has_changes:
-                rprint(f"  [bold green]PASS[/] {f.pkg_name} [dim](already applied)[/]")
-                f.update_status = UpdateStatus.READY
-                f.failed_phase = None
-                f.flow = flow
-            else:
-                msg = flow_cfg.commit_fmt.format(
-                    pkg=f.pkg_name,
-                    old=f.installed_version,
-                    new=f.target_version,
-                    detail=f.detail,
-                )
-                try:
-                    repo.commit(message=msg)
-                except RevisionError as exc:
-                    rprint(f"  [bold red]FAIL[/] {exc}")
-                    result, discarded = _record_failure(
-                        f,
-                        flow_cfg.kind,
-                        "commit",
-                        project_path,
-                        scan_result,
-                        flow,
-                        project_name,
-                        vcs=vcs_services,
-                        repo=repo,
-                        discard=on_failure == "continue",
-                    )
-                    results.append(result)
-                    if on_failure == "stop" or not discarded:
-                        break
-                    continue
-                try:
-                    repo.set_bookmark(bookmark=WORKFLOW_BOOKMARKS[flow], revision="@-")
-                except RevisionError as exc:
-                    rprint(f"  [bold red]FAIL[/] {exc}")
-                    result, _ = _record_failure(
-                        f,
-                        flow_cfg.kind,
-                        "commit",
-                        project_path,
-                        scan_result,
-                        flow,
-                        project_name,
-                        vcs=vcs_services,
-                        repo=repo,
-                        discard=False,
-                    )
-                    results.append(result)
-                    break
-                rprint(f"  [bold green]PASS[/] {f.pkg_name}")
-                f.update_status = UpdateStatus.READY
-                f.failed_phase = None
-                f.flow = flow
-        else:
-            rprint(f"  [bold red]FAIL[/] {f.pkg_name} — {failed_phase} failed")
-            result, discarded = _record_failure(
-                f,
-                flow_cfg.kind,
-                failed_phase or "test",
-                project_path,
-                scan_result,
-                flow,
-                project_name,
-                vcs=vcs_services,
-                repo=repo,
-                discard=on_failure == "continue",
-            )
-            results.append(result)
-            if not discarded:
-                break
-            if on_failure == "stop":
-                break
-            continue
-
+        )
+        step = _attempt_finding(finding, kind, project_config, repo, flow, emit)
+        finding.update_status, finding.failed_phase, finding.flow = finding_transition(
+            step, flow
+        )
         _persist_status(scan_result, project_name)
+        discarded = _discard(repo, emit) if should_discard(step, on_failure) else None
         results.append(
-            UpdateResult(
-                pkg_name=f.pkg_name,
-                kind=flow_cfg.kind,
-                passed=passed,
-                failed_phase=failed_phase,
-            )
+            UpdateResult(finding.pkg_name, kind, step.passed, step.failed_phase)
         )
-
-        if not passed and on_failure == "stop":
+        if next_action(step, on_failure, discarded) is NextAction.STOP:
             break
 
     return results
 
 
-def _workflow_config(
-    finding: Finding,
-    cfg: _WorkflowConfig | None,
-) -> _WorkflowConfig:
-    """Return flow config for a finding, inferring it when omitted."""
-    if cfg is not None:
-        return cfg
-    vuln_types = (VulnFinding, _ConsolidatedVuln)
-    return _VULN_STACK if isinstance(finding, vuln_types) else _UPDATE_STACK
+def _kind(finding: Finding) -> UpdateKind:
+    return "vuln" if isinstance(finding, (VulnFinding, _ConsolidatedVuln)) else "update"
 
 
-def _record_failure(
+def _attempt_finding(
     finding: Finding,
     kind: UpdateKind,
-    phase: str,
-    project_path: Path,
-    scan_result: ScanResult | None,
-    flow: Workflow,
-    project_name: str,
-    *,
-    vcs: VcsServices,
+    project_config: ProjectConfig,
     repo: Repository,
-    discard: bool = True,
-) -> tuple[UpdateResult, bool]:
-    """Mark finding as failed, optionally discard changes, persist and return."""
-    finding.update_status = UpdateStatus.FAILED
-    finding.failed_phase = phase
-    finding.flow = flow
-    _persist_status(scan_result, project_name)
-    result = UpdateResult(
-        pkg_name=finding.pkg_name,
-        kind=kind,
-        passed=False,
-        failed_phase=phase,
+    flow: Workflow,
+    emit: Emit,
+) -> FindingStep:
+    project_path = Path(project_config.path)
+    if not _apply_update(
+        project_config.package_manager,
+        finding.pkg_name,
+        finding.target_version,
+        project_path,
+        emit=emit,
+    ):
+        return FindingStep("apply")
+
+    passed, failed_phase = run_test_phases(project_config, project_path, emit=emit)
+    if not passed:
+        phase = failed_phase or "test"
+        emit(FindingFailed(finding.pkg_name, phase))
+        return FindingStep(phase)
+
+    try:
+        has_changes = repo.has_changes()
+    except RevisionError as exc:
+        emit(FindingStepFailed(FindingStepKind.INSPECT, str(exc)))
+        return FindingStep("commit", discardable=False)
+    if not has_changes:
+        emit(FindingPassed(finding.pkg_name, True))
+        return FindingStep(None, already_applied=True)
+
+    message = _COMMIT_FORMATS[kind].format(
+        pkg=finding.pkg_name,
+        old=finding.installed_version,
+        new=finding.target_version,
+        detail=finding.detail,
     )
-    if discard:
-        try:
-            repo.discard()
-        except RevisionError as exc:
-            rprint(f"  [bold red]FAIL[/] {exc}")
-            return result, False
-    return result, True
+    try:
+        repo.commit(message=message)
+    except RevisionError as exc:
+        emit(FindingStepFailed(FindingStepKind.COMMIT, str(exc)))
+        return FindingStep("commit")
+    try:
+        repo.set_bookmark(bookmark=WORKFLOW_BOOKMARKS[flow], revision="@-")
+    except RevisionError as exc:
+        emit(FindingStepFailed(FindingStepKind.BOOKMARK, str(exc)))
+        return FindingStep("commit", discardable=False)
+    emit(FindingPassed(finding.pkg_name, False))
+    return FindingStep(None)
+
+
+def _discard(repo: Repository, emit: Emit) -> bool:
+    try:
+        repo.discard()
+    except RevisionError as exc:
+        emit(FindingStepFailed(FindingStepKind.DISCARD, str(exc)))
+        return False
+    return True
 
 
 def _persist_status(
@@ -526,7 +398,12 @@ def _persist_status(
 
 
 def _apply_update(
-    package_manager: str, pkg_name: str, version: str, project_path: Path
+    package_manager: str,
+    pkg_name: str,
+    version: str,
+    project_path: Path,
+    *,
+    emit: Emit,
 ) -> bool:
     """Apply a single package update. Returns True on success."""
     try:
@@ -534,13 +411,13 @@ def _apply_update(
             pkg_name, version, project_path
         )
     except (UnsupportedPackageManagerError, UpdateCommandError) as e:
-        rprint(f"  [bold red]FAIL[/] {e}")
+        emit(FindingStepFailed(FindingStepKind.PREPARE, str(e)))
         return False
 
     for cmd in commands:
         try:
             run_captured(cmd, project_path, timeout=300, label=shlex.join(cmd))
         except ProcessError as e:
-            rprint(f"  [bold red]FAIL[/] Package manager command failed: {e}")
+            emit(FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, str(e)))
             return False
     return True

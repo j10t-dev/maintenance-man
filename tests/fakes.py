@@ -8,16 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.events import Event
+from maintenance_man.models.events import Emit, Event
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     ScanResult,
     UpdateFinding,
+    UpdateResult,
     UpdateStatus,
     Workflow,
 )
 from maintenance_man.storage import save_scan_results
-from maintenance_man.updater import Finding, UpdateResult
+from maintenance_man.updater import Finding
 from maintenance_man.vcs_workflow import VcsServices
 
 
@@ -47,15 +48,15 @@ class FakeFindingProcessor:
         self,
         findings: Sequence[Finding],
         project_config: ProjectConfig,
-        cfg: object | None = None,
         *,
         flow: Workflow,
         on_failure: str = "continue",
         scan_result: ScanResult | None = None,
         project_name: str = "",
         vcs: VcsServices | None = None,
+        emit: Emit,
     ) -> list[UpdateResult]:
-        del cfg
+        del emit
         assert vcs is not None, "FakeFindingProcessor requires explicit VcsServices"
         repo = vcs.repository(project_config.path)
         results: list[UpdateResult] = []

@@ -34,6 +34,7 @@ from maintenance_man.gradle_verification import (
     snapshot_vulnerabilities,
 )
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import Emit
 from maintenance_man.models.gradle import (
     ApplyingAttempt,
     CompletedAttempt,
@@ -102,6 +103,7 @@ def _prepare_gradle_run(
     *,
     interaction: GradleInteraction,
     vcs: VcsServices,
+    emit: Emit,
 ) -> GradleRun | ExitCode:
     # Resolve current security findings even when discovery produces no proposals.
     vulnerabilities, resolution = _run_gradle_scan(project)
@@ -164,6 +166,7 @@ def _prepare_gradle_run(
             (),
             persist=False,
             vcs=vcs,
+            emit=emit,
         )
         run = GradleRun.model_validate(
             dict(run) | {"attempts": attempts, "selection_blocks": plan.withheld}
@@ -262,6 +265,7 @@ def _finish_verified_gradle_run(
     minimum_age_days: int,
     *,
     vcs: VcsServices,
+    emit: Emit,
 ) -> GradleRun:
     # Verification reads the accepted revision, not the source workspace's old tree.
     with gradle_updater.gradle_evidence_workspace(
@@ -269,7 +273,12 @@ def _finish_verified_gradle_run(
     ) as verified:
         if not context_inputs_valid(run.context, verified, datetime.now(UTC)):
             run = gradle_updater.rebuild_gradle_run_evidence(
-                run, verified, publication, minimum_age_days, vcs=vcs
+                run,
+                verified,
+                publication,
+                minimum_age_days,
+                vcs=vcs,
+                emit=emit,
             )
         gradle_updater.gradle_run_finalization_check(
             run, verified, publication, minimum_age_days, vcs=vcs
@@ -495,6 +504,7 @@ def run_gradle_flow(
     minimum_age_days: int,
     continue_: bool = False,
     interaction: GradleInteraction,
+    emit: Emit,
     vcs: VcsServices | None = None,
 ) -> int:
     services = vcs or make_vcs_services()
@@ -545,6 +555,7 @@ def run_gradle_flow(
                     interactive,
                     interaction=interaction,
                     vcs=services,
+                    emit=emit,
                 )
                 if isinstance(prepared, ExitCode):
                     if previous is not None:
@@ -565,11 +576,21 @@ def run_gradle_flow(
                     gradle_updater.retire_gradle_context(previous.context)
             if run.has(ApplyingAttempt):
                 run = gradle_updater.reconcile_gradle_applying(
-                    run, work, publication, minimum_age_days, vcs=services
+                    run,
+                    work,
+                    publication,
+                    minimum_age_days,
+                    vcs=services,
+                    emit=emit,
                 )
             if continue_:
                 run = gradle_updater.continue_gradle_resolve(
-                    run, work, publication, minimum_age_days, vcs=services
+                    run,
+                    work,
+                    publication,
+                    minimum_age_days,
+                    vcs=services,
+                    emit=emit,
                 )
             elif run.has(FailedAttempt):
                 raise GradleError(
@@ -581,10 +602,20 @@ def run_gradle_flow(
             _require_gradle_accepted_workspace(run, work, vcs=services)
             if not context_inputs_valid(run.context, work, datetime.now(UTC)):
                 run = gradle_updater.rebuild_gradle_run_evidence(
-                    run, work, publication, minimum_age_days, vcs=services
+                    run,
+                    work,
+                    publication,
+                    minimum_age_days,
+                    vcs=services,
+                    emit=emit,
                 )
             run = gradle_updater.process_gradle_run(
-                run, work, publication, minimum_age_days, vcs=services
+                run,
+                work,
+                publication,
+                minimum_age_days,
+                vcs=services,
+                emit=emit,
             )
             if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
                 interaction.report(run, project)
@@ -613,6 +644,7 @@ def run_gradle_flow(
                 publication,
                 minimum_age_days,
                 vcs=services,
+                emit=emit,
             )
             gradle_updater.retire_gradle_context(run.context)
             interaction.report(run, project)

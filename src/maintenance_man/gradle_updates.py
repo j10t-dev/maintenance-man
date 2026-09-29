@@ -35,6 +35,7 @@ from maintenance_man.gradle_verification import (
     release_comparison_context,
 )
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import Emit
 from maintenance_man.models.gradle import (
     ApplyingAttempt,
     AttemptState,
@@ -144,7 +145,9 @@ def gradle_check_commands(project: ProjectConfig) -> tuple[str, ...]:
     return (project.build_command, *tests)
 
 
-def run_gradle_checks(project: ProjectConfig, project_name: str) -> CheckEvidence:
+def run_gradle_checks(
+    project: ProjectConfig, project_name: str, *, emit: Emit
+) -> CheckEvidence:
     commands = gradle_check_commands(project)
     checks_started = time.monotonic()
     try:
@@ -158,7 +161,7 @@ def run_gradle_checks(project: ProjectConfig, project_name: str) -> CheckEvidenc
         "Gradle baseline/update build %.3fs", time.monotonic() - checks_started
     )
     tests_started = time.monotonic()
-    passed, phase = run_test_phases(project, project.path)
+    passed, phase = run_test_phases(project, project.path, emit=emit)
     logging.getLogger(__name__).info(
         "Gradle configured tests %.3fs", time.monotonic() - tests_started
     )
@@ -182,6 +185,7 @@ def capture_checked_gradle_snapshot(
     expected_tree: str | None = None,
     target: GradleUpdateTarget | None = None,
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> tuple[CheckEvidence, GradleSnapshot]:
     """Bind build, tests and security evidence to one unchanged source tree."""
     services = vcs or make_vcs_services()
@@ -193,7 +197,7 @@ def capture_checked_gradle_snapshot(
         block = validate_gradle_recovery(project, target)
         if block is not None:
             raise GradleError(block.reason)
-    checks = run_gradle_checks(project, project_name)
+    checks = run_gradle_checks(project, project_name, emit=emit)
     if repo.tree_id() != tree:
         raise GradleError("Source tree changed during build or tests")
     snapshot = capture_gradle_snapshot(project, context, vcs=services)
@@ -214,6 +218,7 @@ def start_gradle_run(
     *,
     persist: bool = True,
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -223,6 +228,7 @@ def start_gradle_run(
         context,
         expected_tree=repo.tree_id(revision=base_commit_id),
         vcs=services,
+        emit=emit,
     )
     bookmark = WORKFLOW_BOOKMARKS[flow]
     run = GradleRun(
@@ -250,6 +256,7 @@ def verify_applied_gradle_attempt(
     *,
     committed_revision: str | None = None,
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -265,6 +272,7 @@ def verify_applied_gradle_attempt(
             else None
         ),
         vcs=services,
+        emit=emit,
     )
     # Persist the rejected snapshot too: it is diagnostic evidence, not READY.
     observed = ApplyingAttempt(
@@ -351,6 +359,7 @@ def process_gradle_run(
     minimum_age_days: int,
     *,
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -389,6 +398,7 @@ def process_gradle_run(
                 publication,
                 minimum_age_days,
                 vcs=services,
+                emit=emit,
             )
         except (GradleError, ScanError, RevisionError) as exc:
             # Read latest pre-effect intent to retain commit-crash evidence.
@@ -517,6 +527,7 @@ def rebuild_gradle_run_evidence(
     *,
     persist: bool = True,
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     if run.has(ApplyingAttempt):
@@ -544,6 +555,7 @@ def rebuild_gradle_run_evidence(
                 context,
                 expected_tree=base_repo.tree_id(revision=run.base_commit_id),
                 vcs=services,
+                emit=emit,
             )
         except BaseException:
             discard_unpersisted_gradle_context(run.project, context)
@@ -565,6 +577,7 @@ def rebuild_gradle_run_evidence(
                     ),
                     target=old.candidate.target,
                     vcs=services,
+                    emit=emit,
                 )
                 comparison = compare_gradle_snapshots(baseline, after, old.candidate)
                 if not isinstance(comparison, VerifiedComparison):
@@ -675,6 +688,7 @@ def reconcile_gradle_applying(
     minimum_age_days: int,
     *,
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -742,6 +756,7 @@ def reconcile_gradle_applying(
             minimum_age_days,
             persist=False,
             vcs=services,
+            emit=emit,
         )
         try:
             with gradle_evidence_workspace(
@@ -754,6 +769,7 @@ def reconcile_gradle_applying(
                     expected_tree=state.checked_tree_id,
                     target=state.candidate.target,
                     vcs=services,
+                    emit=emit,
                 )
                 state = state.model_copy(
                     update={
@@ -817,6 +833,7 @@ def continue_gradle_resolve(
     minimum_age_days: int,
     *,
     vcs: VcsServices | None = None,
+    emit: Emit,
 ) -> GradleRun:
     services = vcs or make_vcs_services()
     repo = services.repository(Path(project.path))
@@ -844,7 +861,12 @@ def continue_gradle_resolve(
         raise GradleError(block.reason)
     if not context_inputs_valid(run.context, project, datetime.now(UTC)):
         run = rebuild_gradle_run_evidence(
-            run, project, publication, minimum_age_days, vcs=services
+            run,
+            project,
+            publication,
+            minimum_age_days,
+            vcs=services,
+            emit=emit,
         )
     try:
         return verify_applied_gradle_attempt(
@@ -855,6 +877,7 @@ def continue_gradle_resolve(
             minimum_age_days,
             committed_revision=repaired_commit,
             vcs=services,
+            emit=emit,
         )
     except (GradleError, ScanError, RevisionError) as exc:
         latest = load_gradle_run(gradle_run_path(run.project)) or run

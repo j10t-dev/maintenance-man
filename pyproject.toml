@@ -93,7 +93,6 @@ type = "protected"
 protected_modules = ["rich"]
 allowed_importers = ["maintenance_man.cli"]
 ignore_imports = [
-    "maintenance_man.updater -> rich",
     "maintenance_man.gradle_workflow -> rich",
 ]
 

@@ -10,12 +10,12 @@ from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
     ScanResult,
+    UpdateResult,
     UpdateStatus,
     Workflow,
 )
 from maintenance_man.process import ProcessError, ToolNotFoundError
 from maintenance_man.storage import load_scan_results, save_scan_results
-from maintenance_man.updater import UpdateResult
 from maintenance_man.vcs import RevisionError
 from tests.conftest import (
     make_gradle_target,

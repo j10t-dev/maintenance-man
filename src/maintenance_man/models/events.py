@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from maintenance_man.models.scan import ScanResult
+from maintenance_man.models.scan import ScanResult, UpdateKind
 
 
 class Outcome(StrEnum):
@@ -37,6 +37,16 @@ class DeployStep(StrEnum):
     BUILD = "build"
     DEPLOY = "deploy"
     HEALTH = "health"
+
+
+class FindingStepKind(StrEnum):
+    PREPARE = "prepare"
+    PACKAGE_COMMAND = "package_command"
+    TEST = "test"
+    INSPECT = "inspect"
+    COMMIT = "commit"
+    BOOKMARK = "bookmark"
+    DISCARD = "discard"
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +111,38 @@ class HealthcheckUnconfigured:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class FindingStarted:
+    kind: UpdateKind
+    pkg: str
+    installed: str
+    target: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class TestCommandStarted:
+    command: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindingStepFailed:
+    step: FindingStepKind
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindingPassed:
+    pkg: str
+    already_applied: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FindingFailed:
+    pkg: str
+    phase: str
+
+
 type Event = (
     ProjectStarted
     | ProjectSkipped
@@ -112,5 +154,10 @@ type Event = (
     | DeployStepFailed
     | HealthChecked
     | HealthcheckUnconfigured
+    | FindingStarted
+    | TestCommandStarted
+    | FindingStepFailed
+    | FindingPassed
+    | FindingFailed
 )
 type Emit = Callable[[Event], None]

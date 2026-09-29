@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum, auto
 from typing import Any, Literal
@@ -75,6 +76,17 @@ WORKFLOW_BOOKMARKS: Mapping[Workflow, str] = {
 
 type GradleKind = Literal["library", "plugin"]
 type GradleBlockKind = Literal["age", "mapping", "conflict", "stale"]
+type UpdateKind = Literal["vuln", "update"]
+
+
+@dataclass(slots=True)
+class UpdateResult:
+    """Outcome of one dependency update attempt."""
+
+    pkg_name: str
+    kind: UpdateKind
+    passed: bool
+    failed_phase: str | None = None
 
 
 class GradleMember(BaseModel):

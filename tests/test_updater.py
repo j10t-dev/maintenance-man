@@ -11,6 +11,14 @@ from maintenance_man.gradle import (
     validate_gradle_target,
 )
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import (
+    FindingFailed,
+    FindingStepFailed,
+    FindingStepKind,
+)
+from maintenance_man.models.events import (
+    TestCommandStarted as CommandStartedEvent,
+)
 from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,
@@ -23,13 +31,16 @@ from maintenance_man.models.scan import (
 from maintenance_man.process import ProcessError
 from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
+    FindingStep,
+    NextAction,
     _apply_update,
     consolidate_vulns,
+    finding_transition,
+    next_action,
     process_findings,
-    process_updates,
-    process_vulns,
     remove_completed_findings,
     run_test_phases,
+    should_discard,
     sort_updates_by_risk,
 )
 from maintenance_man.uv_dependencies import (
@@ -39,8 +50,44 @@ from maintenance_man.uv_dependencies import (
 from maintenance_man.vcs_workflow import VcsServices
 from tests.conftest import make_gradle_target
 from tests.fake_vcs import FakeJj, FakeJjState
+from tests.fakes import RecordingEmit
 
 # -- Factory helpers --
+
+
+PASSED = FindingStep(None)
+ALREADY = FindingStep(None, already_applied=True)
+FAILED = FindingStep("unit")
+UNSAFE = FindingStep("commit", discardable=False)
+
+
+@pytest.mark.parametrize(
+    "step,on_failure,discarded,discard,action",
+    [
+        (PASSED, "continue", None, False, NextAction.CONTINUE),
+        (ALREADY, "stop", None, False, NextAction.CONTINUE),
+        (FAILED, "continue", True, True, NextAction.CONTINUE),
+        (FAILED, "continue", False, True, NextAction.STOP),
+        (FAILED, "stop", None, False, NextAction.STOP),
+        (UNSAFE, "continue", None, False, NextAction.STOP),
+        (UNSAFE, "stop", None, False, NextAction.STOP),
+    ],
+)
+def test_finding_decisions(step, on_failure, discarded, discard, action):
+    assert should_discard(step, on_failure) is discard
+    assert next_action(step, on_failure, discarded) is action
+
+
+@pytest.mark.parametrize(
+    "step,expected",
+    [
+        (PASSED, (UpdateStatus.READY, None, Workflow.RESOLVE)),
+        (FAILED, (UpdateStatus.FAILED, "unit", Workflow.RESOLVE)),
+        (UNSAFE, (UpdateStatus.FAILED, "commit", Workflow.RESOLVE)),
+    ],
+)
+def test_finding_transition(step, expected):
+    assert finding_transition(step, Workflow.RESOLVE) == expected
 
 
 def make_vuln(**overrides: Any) -> VulnFinding:
@@ -172,7 +219,10 @@ class TestApplyUpdate:
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
 
-        assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is True
+        assert (
+            _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=RecordingEmit())
+            is True
+        )
         assert [call.args[0] for call in mock_run.call_args_list] == [
             ["uv", "add", "pytest==9.0.3"],
             ["uv", "add", "--group", "dev", "pytest==9.0.3"],
@@ -183,7 +233,6 @@ class TestApplyUpdate:
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
     ):
         (tmp_path / "pyproject.toml").write_text(
             '[project]\ndependencies = ["pytest>=8.0"]\n\n'
@@ -207,22 +256,29 @@ class TestApplyUpdate:
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
 
-        assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
+        emit = RecordingEmit()
+        assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
         assert mock_run.call_count == 2
-        assert "uv add --group dev pytest==9.0.3" in capsys.readouterr().out
+        assert emit.of_type(FindingStepFailed) == [
+            FindingStepFailed(
+                FindingStepKind.PACKAGE_COMMAND,
+                "uv add --group dev pytest==9.0.3 failed (exit 1): boom",
+            )
+        ]
 
     def test_uv_pyproject_read_failure_is_apply_failure(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
     ):
         mock_run = MagicMock()
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
 
-        assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
+        emit = RecordingEmit()
+        assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
         assert mock_run.call_count == 0
-        assert "Failed to read" in capsys.readouterr().out
+        assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PREPARE
+        assert "Failed to read" in emit.of_type(FindingStepFailed)[0].error
 
 
 @pytest.mark.parametrize(
@@ -233,7 +289,7 @@ class TestApplyUpdate:
     ],
 )
 def test_package_command_execution_failure_stops_the_apply(
-    tmp_path, monkeypatch, capsys, raised
+    tmp_path, monkeypatch, raised
 ):
     (tmp_path / "pyproject.toml").write_text(
         '[project]\ndependencies = ["pytest>=8.0"]\n\n'
@@ -248,9 +304,11 @@ def test_package_command_execution_failure_stops_the_apply(
         raise raised
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
-    assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
+    emit = RecordingEmit()
+    assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
     assert calls == [["uv", "add", "pytest==9.0.3"]]
-    assert "uv add pytest==9.0.3" in capsys.readouterr().out
+    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PACKAGE_COMMAND
+    assert "uv add pytest==9.0.3" in emit.of_type(FindingStepFailed)[0].error
 
 
 @pytest.mark.parametrize(
@@ -272,7 +330,7 @@ def test_maven_finalisation_execution_failure_is_an_apply_failure(
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
-    assert _apply_update("mvn", "g:a", "2.0", tmp_path) is False
+    assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
     assert calls == [
         (
             ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"],
@@ -290,7 +348,7 @@ def test_maven_finalisation_does_not_run_after_a_failed_update(tmp_path, monkeyp
         return subprocess.CompletedProcess(cmd, 1, "", "no such dependency")
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
-    assert _apply_update("mvn", "g:a", "2.0", tmp_path) is False
+    assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
     assert calls == [
         ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"]
     ]
@@ -314,6 +372,7 @@ def test_package_boundary_failure_is_persisted_as_a_failed_apply(
         scan_result=scan_result,
         project_name="demo",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert results[0].failed_phase == "apply"
@@ -339,7 +398,7 @@ class TestRunTestPhases:
             test_unit="bun test",
             test_integration="bun run test:integration",
         )
-        passed, failed_phase = run_test_phases(tc, tmp_path)
+        passed, failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert passed is True
         assert failed_phase is None
         assert mock_run.call_count == 2
@@ -352,7 +411,7 @@ class TestRunTestPhases:
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
-        passed, failed_phase = run_test_phases(tc, tmp_path)
+        passed, failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert passed is False
         assert failed_phase == "unit"
         assert mock_run.call_count == 1
@@ -375,7 +434,7 @@ class TestRunTestPhases:
             test_unit="bun test",
             test_integration="bun run test:integration",
         )
-        passed, failed_phase = run_test_phases(tc, tmp_path)
+        passed, failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert passed is False
         assert failed_phase == "integration"
 
@@ -391,7 +450,7 @@ class TestRunTestPhases:
         tc = ProjectConfig(
             path=tmp_path, package_manager="bun", test_unit="bun test"
         )  # no integration or component
-        passed, _ = run_test_phases(tc, tmp_path)
+        passed, _ = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert passed is True
         assert mock_run.call_count == 1  # only unit
 
@@ -408,7 +467,7 @@ class TestRunTestPhases:
             test_unit="  ",
             test_integration="bun run test:integration",
         )
-        assert run_test_phases(tc, tmp_path) == (True, None)
+        assert run_test_phases(tc, tmp_path, emit=RecordingEmit()) == (True, None)
         assert [c.args[0] for c in mock_run.call_args_list] == [
             "bun run test:integration"
         ]
@@ -420,7 +479,7 @@ def test_test_phases_run_through_bash(tmp_path):
         package_manager="bun",
         test_unit="printf '%s' 'a b' > out.txt && test \"$(cat out.txt)\" = 'a b'",
     )
-    assert run_test_phases(config, tmp_path) == (True, None)
+    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) == (True, None)
     # Under shlex.split printf prints every argument and exits 0; only Bash
     # performs the redirect.
     assert (tmp_path / "out.txt").read_text() == "a b"
@@ -433,14 +492,20 @@ def test_first_failed_phase_stops_later_phases(tmp_path):
         test_unit="exit 3",
         test_integration="touch integration-ran",
     )
-    assert run_test_phases(config, tmp_path) == (False, "unit")
+    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) == (False, "unit")
     assert not (tmp_path / "integration-ran").exists()
 
 
-def test_test_phase_launch_failure_is_a_failed_phase(tmp_path, capsys):
+def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
     config = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="true")
-    assert run_test_phases(config, tmp_path / "missing") == (False, "unit")
-    assert "Could not run unit tests" in capsys.readouterr().out
+    emit = RecordingEmit()
+    assert run_test_phases(config, tmp_path / "missing", emit=emit) == (
+        False,
+        "unit",
+    )
+    assert emit.events[0] == CommandStartedEvent("true")
+    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.TEST
+    assert "Could not run unit tests" in emit.of_type(FindingStepFailed)[0].error
 
 
 # -- sort_updates_by_risk --
@@ -627,7 +692,11 @@ def test_success_commits_and_advances_the_flow_bookmark(
     update = make_update()
 
     results = process_findings(
-        [update], project_config, flow=flow, vcs=_services(processor_vcs)
+        [update],
+        project_config,
+        flow=flow,
+        vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     state = processor_vcs["state"]
@@ -657,6 +726,7 @@ def test_already_applied_is_ready_without_a_commit(
         flow=flow,
         on_failure="stop" if flow == Workflow.RESOLVE else "continue",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert results[0].passed is True
@@ -671,12 +741,14 @@ def test_update_failure_discards_then_attempts_the_next_finding(
     phase = processor_vcs["phase"]
     phase.side_effect = [ProcessError("unit failed"), None]
     findings = [make_update(), make_update(SemverTier.MINOR)]
+    emit = RecordingEmit()
 
     results = process_findings(
         findings,
         project_config,
         flow=Workflow.UPDATE,
         vcs=_services(processor_vcs),
+        emit=emit,
     )
 
     assert [result.passed for result in results] == [False, True]
@@ -685,6 +757,7 @@ def test_update_failure_discards_then_attempts_the_next_finding(
     assert findings[0].flow == Workflow.UPDATE
     assert processor_vcs["package"].call_count == 2
     assert "discard" in [call.method for call in processor_vcs["state"].effects]
+    assert emit.of_type(FindingFailed)[0].phase == "unit"
 
 
 @pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
@@ -701,6 +774,7 @@ def test_all_successful_findings_commit_without_discard(
         flow=flow,
         on_failure="stop" if flow == Workflow.RESOLVE else "continue",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert len(results) == 2
@@ -732,6 +806,7 @@ def test_update_success_failure_success_sequence_continues_after_discard(
         project_config,
         flow=Workflow.UPDATE,
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert [result.passed for result in results] == [True, False, True]
@@ -752,6 +827,7 @@ def test_resolve_failure_preserves_changes_and_stops(
         flow=Workflow.RESOLVE,
         on_failure="stop",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert len(results) == 1
@@ -775,6 +851,7 @@ def test_resolve_apply_failure_stops_without_attempting_the_next_finding(
         flow=Workflow.RESOLVE,
         on_failure="stop",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert len(results) == 1
@@ -801,6 +878,7 @@ def test_resolve_success_then_failure_leaves_later_finding_unattempted(
         flow=Workflow.RESOLVE,
         on_failure="stop",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert [result.passed for result in results] == [True, False]
@@ -836,6 +914,7 @@ def test_repository_failure_never_saves_ready(
         scan_result=scan,
         project_name="demo",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     saved = load_scan_results("demo")
@@ -872,6 +951,7 @@ def test_resolve_commit_failure_preserves_changes_and_stops(
         flow=Workflow.RESOLVE,
         on_failure="stop",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert len(results) == 1
@@ -896,6 +976,7 @@ def test_apply_failure_discards_and_continues(
         project_config,
         flow=Workflow.UPDATE,
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert [result.passed for result in results] == [False, True]
@@ -917,6 +998,7 @@ def test_no_test_config_skips_tests_and_commits(
         flow=flow,
         on_failure="stop" if flow == Workflow.RESOLVE else "continue",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     assert results[0].passed is True
@@ -934,6 +1016,7 @@ def test_empty_findings_have_no_repository_effects(
             project_config,
             flow=Workflow.UPDATE,
             vcs=_services(processor_vcs),
+            emit=RecordingEmit(),
         )
         == []
     )
@@ -946,9 +1029,6 @@ def test_failed_discard_persists_original_failure_and_stops(
     from maintenance_man.vcs import RevisionError
 
     state = processor_vcs["state"]
-    state.fail(
-        "discard", error=RevisionError("cannot discard"), path=project_config.path
-    )
     processor_vcs["phase"].side_effect = ProcessError("unit failed")
     findings = [make_update(), make_update(SemverTier.MINOR)]
     scan = ScanResult(
@@ -957,6 +1037,20 @@ def test_failed_discard_persists_original_failure_and_stops(
         trivy_target=str(project_config.path),
         updates=findings,
     )
+
+    def assert_persisted_before_discard_failure() -> None:
+        saved = load_scan_results("demo")
+        assert saved.updates[0].update_status == UpdateStatus.FAILED
+        assert saved.updates[0].failed_phase == "unit"
+        raise RevisionError("cannot discard")
+
+    state.hook(
+        "discard",
+        phase="before",
+        action=assert_persisted_before_discard_failure,
+        path=project_config.path,
+    )
+    emit = RecordingEmit()
     results = process_findings(
         findings,
         project_config,
@@ -964,12 +1058,16 @@ def test_failed_discard_persists_original_failure_and_stops(
         scan_result=scan,
         project_name="demo",
         vcs=_services(processor_vcs),
+        emit=emit,
     )
 
     assert len(results) == 1
     saved = load_scan_results("demo")
     assert saved.updates[0].failed_phase == "unit"
     assert saved.updates[0].update_status == UpdateStatus.FAILED
+    assert emit.of_type(FindingStepFailed)[-1] == FindingStepFailed(
+        FindingStepKind.DISCARD, "cannot discard"
+    )
 
 
 def test_update_statuses_are_persisted_after_each_finding(
@@ -991,6 +1089,7 @@ def test_update_statuses_are_persisted_after_each_finding(
         scan_result=scan,
         project_name="demo",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     saved = load_scan_results("demo")
@@ -1021,6 +1120,7 @@ def test_resolve_failure_status_is_persisted_before_stopping(
         scan_result=scan,
         project_name="demo",
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
 
     saved = load_scan_results("demo")
@@ -1029,35 +1129,98 @@ def test_resolve_failure_status_is_persisted_before_stopping(
     assert saved.updates[0].flow == Workflow.RESOLVE
 
 
-def test_process_vulns_consolidates_and_processes(
+def test_grouped_vulnerability_failure_is_persisted_for_every_original(
+    processor_vcs: ProcessorDeps, project_config: ProjectConfig
+):
+    processor_vcs["phase"].side_effect = ProcessError("unit failed")
+    vulns = [
+        make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.31.0"),
+        make_vuln(vuln_id="CVE-2", pkg_name="requests", fixed_version="2.32.4"),
+    ]
+    scan = ScanResult(
+        project="demo",
+        scanned_at=datetime.now(tz=UTC),
+        trivy_target=str(project_config.path),
+        vulnerabilities=vulns,
+    )
+
+    results = process_findings(
+        consolidate_vulns(vulns),
+        project_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        project_name="demo",
+        vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
+    )
+
+    assert [(result.kind, result.passed) for result in results] == [("vuln", False)]
+    saved = load_scan_results("demo")
+    assert [
+        (finding.update_status, finding.failed_phase, finding.flow)
+        for finding in saved.vulnerabilities
+    ] == [
+        (UpdateStatus.FAILED, "unit", Workflow.UPDATE),
+        (UpdateStatus.FAILED, "unit", Workflow.UPDATE),
+    ]
+
+
+def test_successful_consolidated_vulnerability_persists_every_original(
     processor_vcs: ProcessorDeps, project_config: ProjectConfig
 ):
     vulns = [
         make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.31.0"),
         make_vuln(vuln_id="CVE-2", pkg_name="requests", fixed_version="2.32.4"),
     ]
-    results = process_vulns(
-        vulns, project_config, flow=Workflow.UPDATE, vcs=_services(processor_vcs)
+    scan = ScanResult(
+        project="demo",
+        scanned_at=datetime.now(tz=UTC),
+        trivy_target=str(project_config.path),
+        vulnerabilities=vulns,
     )
+
+    results = process_findings(
+        consolidate_vulns(vulns),
+        project_config,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        project_name="demo",
+        vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
+    )
+
     assert [(result.kind, result.passed) for result in results] == [("vuln", True)]
+    saved = load_scan_results("demo")
+    assert [
+        (finding.update_status, finding.failed_phase, finding.flow)
+        for finding in saved.vulnerabilities
+    ] == [
+        (UpdateStatus.READY, None, Workflow.UPDATE),
+        (UpdateStatus.READY, None, Workflow.UPDATE),
+    ]
 
 
 def test_process_updates_sorts_by_risk(
     processor_vcs: ProcessorDeps, project_config: ProjectConfig
 ):
-    results = process_updates(
-        [make_update(SemverTier.MAJOR), make_update(SemverTier.PATCH)],
+    results = process_findings(
+        sort_updates_by_risk(
+            [make_update(SemverTier.MAJOR), make_update(SemverTier.PATCH)]
+        ),
         project_config,
         flow=Workflow.UPDATE,
         vcs=_services(processor_vcs),
+        emit=RecordingEmit(),
     )
     assert [result.pkg_name for result in results] == ["pkg-a", "pkg-c"]
 
 
-def test_gradle_config_records_a_failed_apply_not_a_crash(tmp_path, capsys):
+def test_gradle_config_records_a_failed_apply_not_a_crash(tmp_path):
     """Unreachable by design; it must still degrade, not unwind the flow."""
-    assert _apply_update("gradle", "room", "2.8.5", tmp_path) is False
-    assert "Gradle" in capsys.readouterr().out
+    emit = RecordingEmit()
+    assert _apply_update("gradle", "room", "2.8.5", tmp_path, emit=emit) is False
+    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PREPARE
+    assert "Gradle" in emit.of_type(FindingStepFailed)[0].error
 
 
 def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
@@ -1068,7 +1231,9 @@ def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
 
     monkeypatch.setattr(subprocess, "run", _timeout)
 
-    assert run_test_phases(project_config, Path(project_config.path)) == (False, "unit")
+    assert run_test_phases(
+        project_config, Path(project_config.path), emit=RecordingEmit()
+    ) == (False, "unit")
 
 
 def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(
@@ -1089,10 +1254,12 @@ def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(
     assert "update workspace" in block.reason
 
 
-def test_bun_update_without_a_manifest_runs_no_command(tmp_path, monkeypatch, capsys):
+def test_bun_update_without_a_manifest_runs_no_command(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "maintenance_man.process.subprocess.run",
         lambda *args, **kwargs: pytest.fail("no command may run"),
     )
-    assert _apply_update("bun", "zod", "4.6.5", tmp_path) is False
-    assert "package.json" in capsys.readouterr().out
+    emit = RecordingEmit()
+    assert _apply_update("bun", "zod", "4.6.5", tmp_path, emit=emit) is False
+    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PREPARE
+    assert "package.json" in emit.of_type(FindingStepFailed)[0].error

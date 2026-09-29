@@ -13,11 +13,11 @@ from maintenance_man.cli import (
 from maintenance_man.github import CodeHostError
 from maintenance_man.models.scan import (
     ScanResult,
+    UpdateResult,
     UpdateStatus,
     Workflow,
 )
 from maintenance_man.storage import load_scan_results
-from maintenance_man.updater import UpdateResult
 from maintenance_man.vcs import RevisionError
 from tests.conftest import (
     make_gradle_target,
@@ -507,7 +507,8 @@ class TestResolveContinue:
         mock_apply = MagicMock(return_value=True)
         monkeypatch.setattr(updater, "_apply_update", mock_apply)
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda cfg, p: (True, None)
+            "maintenance_man.cli.run_test_phases",
+            lambda cfg, p, *, emit: (True, None),
         )
         monkeypatch.setattr(
             "maintenance_man.cli.process_findings",
@@ -537,7 +538,8 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda cfg, p: (True, None)
+            "maintenance_man.cli.run_test_phases",
+            lambda cfg, p, *, emit: (True, None),
         )
         monkeypatch.setattr(
             "maintenance_man.cli.process_findings",
@@ -588,7 +590,8 @@ class TestResolveContinue:
         state = mock_resolve_cli_deps["vcs_state"]
         state.clear_calls()
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda _cfg, _path: (True, None)
+            "maintenance_man.cli.run_test_phases",
+            lambda _cfg, _path, *, emit: (True, None),
         )
         monkeypatch.setattr(
             updater,
@@ -616,7 +619,8 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda cfg, p: (True, None)
+            "maintenance_man.cli.run_test_phases",
+            lambda cfg, p, *, emit: (True, None),
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -644,7 +648,8 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda cfg, p: (True, None)
+            "maintenance_man.cli.run_test_phases",
+            lambda cfg, p, *, emit: (True, None),
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -676,7 +681,8 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda cfg, p: (True, None)
+            "maintenance_man.cli.run_test_phases",
+            lambda cfg, p, *, emit: (True, None),
         )
 
         mock_process = MagicMock(return_value=[])
@@ -695,7 +701,8 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda cfg, p: (False, "unit")
+            "maintenance_man.cli.run_test_phases",
+            lambda cfg, p, *, emit: (False, "unit"),
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -726,7 +733,8 @@ class TestResolveContinue:
         """A commit-phase failure can become READY when the bookmark is clean
         and tests pass (operator committed the fix manually)."""
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases", lambda cfg, p: (True, None)
+            "maintenance_man.cli.run_test_phases",
+            lambda cfg, p, *, emit: (True, None),
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
