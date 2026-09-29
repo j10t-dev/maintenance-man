@@ -15,6 +15,14 @@ from tests.conftest import configure_fake_vcs, run_mm, write_config
 from tests.fake_vcs import FakeJjState
 
 
+def test_deploy_summary_prints_bracketed_project_literal(capsys) -> None:
+    cli._print_deploy_summary(
+        [cli.DeployResult("a[b]", build_status="pass", deploy_status="pass")]
+    )
+
+    assert "a[b]" in capsys.readouterr().out
+
+
 @dataclass(frozen=True)
 class _DeployVcs:
     state: FakeJjState

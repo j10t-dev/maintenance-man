@@ -92,7 +92,7 @@ class TestSharedCommandPrerequisites:
     ) -> None:
         deps = request.getfixturevalue(deps_fixture)
         deps["vcs_state"].clear_calls()
-        monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("gh"))
+        monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("gh"))
 
         with pytest.raises(SystemExit) as exc_info:
             app([command, "vulnerable"])
@@ -109,7 +109,7 @@ class TestSharedCommandPrerequisites:
     ) -> None:
         deps = request.getfixturevalue(deps_fixture)
         deps["vcs_state"].clear_calls()
-        monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("jj"))
+        monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("jj"))
 
         with pytest.raises(SystemExit) as exc_info:
             app([command, "vulnerable"])
@@ -266,7 +266,7 @@ class TestUpdatePreChecks:
         (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
 
         monkeypatch.setattr(
-            "maintenance_man.cli.require_tool",
+            "maintenance_man.vcs_workflow.require_tool",
             _missing("gh"),
         )
 
@@ -1079,7 +1079,7 @@ class TestUpdateTargetSelection:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.require_tool",
+            "maintenance_man.vcs_workflow.require_tool",
             _missing("gh"),
         )
 
@@ -1443,9 +1443,9 @@ def test_batch_summary_labels_pass_and_fail(capsys):
     _print_mass_update_summary(
         [
             (
-                "android",
+                "a[b]",
                 [
-                    UpdateResult(pkg_name="room", kind="update", passed=True),
+                    UpdateResult(pkg_name="room[x]", kind="update", passed=True),
                     UpdateResult(
                         pkg_name="okhttp",
                         kind="vuln",
@@ -1460,6 +1460,8 @@ def test_batch_summary_labels_pass_and_fail(capsys):
     assert "PASS" in out
     assert "FAIL (unit)" in out
     assert "BLOCKED" not in out
+    assert "a[b]" in out
+    assert "room[x]" in out
 
 
 @pytest.mark.parametrize("batch", [False, True])

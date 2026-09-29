@@ -108,6 +108,23 @@ class TestListCommand:
         assert "myapp" in output
         assert "uv" in output
 
+    def test_list_prints_bracketed_project_name_literally(
+        self, mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        mm_home.mkdir(parents=True)
+        (mm_home / "config.toml").write_text(
+            f'[projects."a[b]"]\npath = "{project}"\npackage_manager = "uv"\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list"])
+
+        assert exc_info.value.code == 0
+        assert "a[b]" in capsys.readouterr().out
+
 
 class TestListFindings:
     def test_shows_never_for_unscanned_projects(

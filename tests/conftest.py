@@ -103,7 +103,7 @@ def _tools_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
     def found(name: str, hint: str) -> Path:
         return Path("/usr/bin") / name
 
-    monkeypatch.setattr("maintenance_man.cli.require_tool", found)
+    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", found)
     monkeypatch.setattr("maintenance_man.scanner.require_tool", found)
 
 

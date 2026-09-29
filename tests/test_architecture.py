@@ -455,6 +455,27 @@ def test_package_directories_are_regular_packages() -> None:
     assert namespace == [], f"add __init__.py to: {namespace}"
 
 
+def test_only_cli_prints_prompts_or_exits() -> None:
+    violations: list[str] = []
+    for module, (path, text) in package_sources().items():
+        if module == "cli":
+            continue
+        for node in ast.walk(ast.parse(text, filename=path)):
+            match node:
+                case ast.Call(func=ast.Name(id="print" | "input" as name)):
+                    violations.append(f"{path}:{node.lineno} calls {name}")
+                case ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="sys"), attr="exit")
+                ):
+                    violations.append(f"{path}:{node.lineno} calls sys.exit")
+                case ast.Raise(
+                    exc=ast.Name(id="SystemExit")
+                    | ast.Call(func=ast.Name(id="SystemExit"))
+                ):
+                    violations.append(f"{path}:{node.lineno} raises SystemExit")
+    assert violations == []
+
+
 def _site_lines(sites: list[PrivateAccessSite]) -> str:
     return "\n".join(
         f"{s.path}:{s.line} {s.access[0]} -> {s.access[1]}.{s.access[2]}" for s in sites

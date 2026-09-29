@@ -75,6 +75,7 @@ forbidden_modules = [
     "maintenance_man.process",
     "maintenance_man.resources",
     "maintenance_man.scanner",
+    "maintenance_man.services",
     "maintenance_man.storage",
     "maintenance_man.updater",
     "maintenance_man.uv_dependencies",
@@ -109,3 +110,10 @@ name = "The CLI is a leaf"
 type = "protected"
 protected_modules = ["maintenance_man.cli"]
 allowed_importers = []
+
+[[tool.importlinter.contracts]]
+id = "services-cli-only"
+name = "Only the CLI imports services"
+type = "protected"
+protected_modules = ["maintenance_man.services"]
+allowed_importers = ["maintenance_man.cli"]

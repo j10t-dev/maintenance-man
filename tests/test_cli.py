@@ -1,9 +1,12 @@
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
-from maintenance_man import __version__
+from maintenance_man import __version__, cli
 from maintenance_man.cli import app
+from tests.conftest import run_mm
 
 
 class TestHelp:
@@ -42,6 +45,88 @@ class TestInitCommand:
         out = capsys.readouterr().out.replace("\n", "")
         assert str(mm_home) in out
         assert (mm_home / "config.toml").is_file()
+
+    def test_init_prints_bracketed_home_path_literally(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "[home]"
+        output = StringIO()
+        monkeypatch.setattr("maintenance_man.paths.MM_HOME", home)
+        monkeypatch.setattr(
+            cli, "console", Console(file=output, width=220, color_system=None)
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["init"])
+
+        assert exc_info.value.code == 0
+        assert str(home) in output.getvalue()
+
+
+def test_fatal_prints_bracketed_plain_text_literally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=220, color_system=None)
+    )
+
+    with pytest.raises(SystemExit):
+        cli._fatal("bad [projects.x]")
+
+    assert "Error: bad [projects.x]" in output.getvalue()
+
+
+def test_config_validation_error_keeps_pydantic_type_suffix(
+    mm_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mm_home.mkdir(parents=True)
+    (mm_home / "config.toml").write_text(
+        '[projects.api]\npackage_manager = "uv"\n', encoding="utf-8"
+    )
+
+    assert run_mm("scan") == 1
+
+    assert "[type=missing" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("deploy", "Add deploy_command to [projects.api] in ~/.mm/config.toml."),
+        ("build", "Add build_command to [projects.api]"),
+        ("test", "Add test_unit to [projects.api]"),
+    ],
+)
+def test_missing_command_error_keeps_config_table_literal(
+    mm_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    expected: str,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    mm_home.mkdir(parents=True)
+    (mm_home / "config.toml").write_text(
+        f'[projects.api]\npath = "{project}"\npackage_manager = "uv"\n',
+        encoding="utf-8",
+    )
+
+    assert run_mm(command, "api") == 1
+
+    assert expected in " ".join(capsys.readouterr().out.split())
+
+
+def test_deploy_check_hint_keeps_defaults_table_literal(
+    mm_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mm_home.mkdir(parents=True)
+    (mm_home / "config.toml").write_text("[defaults]\n", encoding="utf-8")
+
+    assert run_mm("deploy", "--check") == 0
+
+    assert "configured in [defaults]" in capsys.readouterr().out
 
 
 class TestDeployCommand:
@@ -159,3 +244,21 @@ class TestTodoCommand:
             app(["todo"])
         assert exc_info.value.code == 0
         assert "no projects" in capsys.readouterr().out.lower()
+
+    def test_todo_prints_bracketed_panel_title_literally(
+        self, mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "TODO.md").write_text("# Keep *Markdown*\n", encoding="utf-8")
+        mm_home.mkdir(parents=True)
+        (mm_home / "config.toml").write_text(
+            f'[projects."a[b]"]\npath = "{project}"\npackage_manager = "uv"\n',
+            encoding="utf-8",
+        )
+
+        assert run_mm("todo", "a[b]") == 0
+
+        output = capsys.readouterr().out
+        assert "a[b]" in output
+        assert "Keep Markdown" in output

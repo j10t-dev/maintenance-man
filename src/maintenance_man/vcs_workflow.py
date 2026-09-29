@@ -10,13 +10,21 @@ from maintenance_man import paths
 from maintenance_man.github import CodeHost, GitHubCodeHost
 from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.paths import sanitise_project_name
+from maintenance_man.process import require_tool
 from maintenance_man.vcs import (
+    GH_INSTALL_HINT,
+    JJ_INSTALL_HINT,
     ExpectedRevisions,
     JjRepository,
     Repository,
     RevisionError,
     assert_safe_workspace_path,
 )
+
+
+def require_vcs_tools() -> None:
+    require_tool("gh", GH_INSTALL_HINT)
+    require_tool("jj", JJ_INSTALL_HINT)
 
 
 @dataclass(frozen=True, slots=True)

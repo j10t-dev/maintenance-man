@@ -1,3 +1,4 @@
+import typing
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
@@ -11,6 +12,14 @@ from maintenance_man import cli, scanner, vcs_workflow
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import (
+    Event,
+    Operation,
+    OperationFailed,
+    ProjectSkipped,
+    SkipReason,
+    SyncCompleted,
+)
 from maintenance_man.models.gradle import (
     CandidateWithheld,
     CompleteResolution,
@@ -31,6 +40,8 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
+from maintenance_man.services import scan as scan_service
+from maintenance_man.services.scan import ScanSummary
 from maintenance_man.storage import load_scan_results
 from maintenance_man.vcs import RevisionError
 from tests.conftest import (
@@ -41,6 +52,150 @@ from tests.conftest import (
     write_config,
 )
 from tests.fake_vcs import FakeJjState
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize(
+    ("event", "single", "batch_text"),
+    [
+        (
+            ProjectSkipped("a[b]", SkipReason.PATH_MISSING, "/tmp/[path]"),
+            "Warning: a[b] — path does not exist: /tmp/[path]",
+            "Warning: a[b] — path does not exist: /tmp/[path]",
+        ),
+        (
+            ProjectSkipped("a[b]", SkipReason.NO_SCAN_RESULTS),
+            "a[b] — no scan results; nothing to do.",
+            "",
+        ),
+        (
+            ProjectSkipped("a[b]", SkipReason.NOTHING_TO_DO, "resolve"),
+            "a[b] — nothing to resolve.",
+            "  a[b] — nothing to update",
+        ),
+        (
+            ProjectSkipped("a[b]", SkipReason.FLOW_CONFLICT, "bad [projects.x]"),
+            "  Skipped: a[b] — bad [projects.x]",
+            "  Skipped: a[b] — bad [projects.x]",
+        ),
+        (
+            ProjectSkipped("a[b]", SkipReason.NOT_DEPLOYABLE),
+            "a[b] — skipped (not deployable)",
+            "a[b] — skipped (not deployable)",
+        ),
+        (
+            ProjectSkipped("a[b]", SkipReason.UNCHANGED),
+            "a[b] unchanged since last deploy (use --force to redeploy).",
+            "a[b] — unchanged since last deploy",
+        ),
+        (
+            ProjectSkipped("a[b]", SkipReason.BLOCKED),
+            "Warning: a[b] — could not resolve main revision; skipping "
+            "(use --force to deploy anyway)",
+            "Warning: a[b] — could not resolve main revision; skipping "
+            "(use --force to deploy anyway)",
+        ),
+        (
+            OperationFailed(Operation.UPDATE_SETUP, "a[b]", "bad [projects.x]"),
+            "  Error: a[b] — bad [projects.x]",
+            "  Error: a[b] — bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.PROMOTE, "a[b]", "bad [projects.x]"),
+            "Promotion failed: bad [projects.x]",
+            "Promotion failed: bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.REFRESH, "a[b]", "bad [projects.x]"),
+            "Workspace refresh failed: a[b]: bad [projects.x]",
+            "Workspace refresh failed: a[b]: bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.WORKSPACE_CLEANUP, "a[b]", "bad [projects.x]"),
+            "Workspace cleanup failed: bad [projects.x]",
+            "  Workspace cleanup failed: bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.BOOKMARK_CLEANUP, "a[b]", "bad [projects.x]"),
+            "Bookmark cleanup failed: bad [projects.x]",
+            "  Bookmark cleanup failed: a[b] — bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.RESOLVE_SETUP, "a[b]", "bad [projects.x]"),
+            "  Resolve setup failed: bad [projects.x]",
+            "  Resolve setup failed: bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.SUBMIT, "a[b]", "bad [projects.x]"),
+            "  bad [projects.x]\n  Submit failed. Keeping mm/resolve-dependencies "
+            "for manual recovery.",
+            "  bad [projects.x]\n  Submit failed. Keeping mm/resolve-dependencies "
+            "for manual recovery.",
+        ),
+        (
+            OperationFailed(Operation.REMOTE_SYNC, "a[b]", "bad [projects.x]"),
+            "Warning: a[b] — failed to sync remote: bad [projects.x]",
+            "Warning: a[b] — failed to sync remote: bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.SCAN, "a[b]", "bad [projects.x]"),
+            "Error: a[b] — bad [projects.x]",
+            "Error: a[b] — bad [projects.x]",
+        ),
+        (
+            OperationFailed(Operation.SYNC, "a[b]", "bad [projects.x]"),
+            "  a[b] — bad [projects.x]",
+            "  a[b] — bad [projects.x]",
+        ),
+        (
+            SyncCompleted("a[b]", "already [up] to date"),
+            "  a[b] — already [up] to date",
+            "  a[b] — already [up] to date",
+        ),
+    ],
+)
+def test_event_renderer_preserves_text(
+    monkeypatch: pytest.MonkeyPatch,
+    event: Event,
+    single: str,
+    batch_text: str,
+    batch: bool,
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=220, color_system=None)
+    )
+
+    cli._Renderer(batch=batch)(event)
+
+    assert output.getvalue().rstrip("\n") == (batch_text if batch else single)
+
+
+def test_every_event_has_a_renderer() -> None:
+    assert set(typing.get_args(Event.__value__)) == set(cli._RENDERERS)
+
+
+def test_numbered_findings_print_bracketed_values_literally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=220, color_system=None)
+    )
+    vuln = (
+        _make_vulnerable_result()
+        .vulnerabilities[0]
+        .model_copy(update={"pkg_name": "a[b]", "vuln_id": "CVE-[x]"})
+    )
+    update = (
+        _make_updates_only_result().updates[0].model_copy(update={"pkg_name": "u[p]"})
+    )
+
+    cli._print_numbered_findings([vuln], [update])
+
+    assert "a[b]" in output.getvalue()
+    assert "CVE-[x]" in output.getvalue()
+    assert "u[p]" in output.getvalue()
 
 
 @pytest.mark.parametrize("failure", ["fetch", "local_bookmarks", "delete_bookmark"])
@@ -61,9 +216,9 @@ def test_housekeeping_failure_still_saves_scan(
     )
     monkeypatch.setattr(cli, "make_vcs_services", state.services)
     monkeypatch.setattr(
-        cli, "prune_repository_bookmarks", vcs_workflow.prune_stale_bookmarks
+        scan_service, "prune_stale_bookmarks", vcs_workflow.prune_stale_bookmarks
     )
-    monkeypatch.setattr(cli, "scan_project", scanner.scan_project)
+    monkeypatch.setattr(scan_service, "scan_project", scanner.scan_project)
     monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
     monkeypatch.setattr(
         scanner, "package_manager_ops", ops_with_outdated(lambda project: [])
@@ -132,7 +287,7 @@ def _make_updates_only_result() -> ScanResult:
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
     monkeypatch.setattr(
-        "maintenance_man.cli.prune_repository_bookmarks", lambda **kwargs: None
+        "maintenance_man.services.scan.prune_stale_bookmarks", lambda **kwargs: None
     )
 
     def _fake_scan(
@@ -153,7 +308,7 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
             case _:
                 raise FileNotFoundError(f"Unknown project: {name}")
 
-    monkeypatch.setattr("maintenance_man.cli.scan_project", _fake_scan)
+    monkeypatch.setattr("maintenance_man.services.scan.scan_project", _fake_scan)
 
 
 def _two_project_config(mm_home, tmp_path):
@@ -184,7 +339,7 @@ def _missing(tool):
 def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys):
     mm_home.mkdir(parents=True)
     (mm_home / "config.toml").write_text("")
-    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("trivy"))
+    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("trivy"))
     monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
     with pytest.raises(SystemExit) as exc:
         app(["scan"])
@@ -197,7 +352,7 @@ def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys
 def test_scan_without_trivy_reports_an_unknown_project(
     mm_home_with_projects, monkeypatch, capsys
 ):
-    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("trivy"))
+    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("trivy"))
     monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
     with pytest.raises(SystemExit) as exc:
         app(["scan", "nonexistent"])
@@ -209,9 +364,9 @@ def test_scan_without_trivy_reports_an_unknown_project(
 def test_scan_warns_and_continues_without_housekeeping_tools(
     mm_home_with_projects, monkeypatch, capsys, tool
 ):
-    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing(tool))
+    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing(tool))
     prune = MagicMock(return_value=True)
-    monkeypatch.setattr("maintenance_man.cli.prune_repository_bookmarks", prune)
+    monkeypatch.setattr("maintenance_man.services.scan.prune_stale_bookmarks", prune)
     with pytest.raises(SystemExit) as exc:
         app(["scan", "clean"])
     assert exc.value.code == 0
@@ -224,8 +379,10 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
 ):
     results = _two_project_config(mm_home, tmp_path)
     (results / "first.json").unlink()
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scanner.scan_project)
-    monkeypatch.setattr("maintenance_man.cli.require_tool", _missing("trivy"))
+    monkeypatch.setattr(
+        "maintenance_man.services.scan.scan_project", scanner.scan_project
+    )
+    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("trivy"))
     monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
     monkeypatch.setattr(
@@ -245,7 +402,9 @@ def test_failed_project_scan_keeps_its_result_and_exits_error(
     mm_home, tmp_path, monkeypatch, failure, argv
 ):
     results = _two_project_config(mm_home, tmp_path)
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scanner.scan_project)
+    monkeypatch.setattr(
+        "maintenance_man.services.scan.scan_project", scanner.scan_project
+    )
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
 
     def trivy(*args, **kwargs):
@@ -275,7 +434,7 @@ def test_scan_warns_and_continues_when_bookmark_pruning_cannot_run(
     def fail(**kwargs):
         raise RevisionError("Could not run jj git fetch: missing jj")
 
-    monkeypatch.setattr("maintenance_man.cli.prune_repository_bookmarks", fail)
+    monkeypatch.setattr("maintenance_man.services.scan.prune_stale_bookmarks", fail)
     with pytest.raises(SystemExit) as exc:
         app(["scan", "clean"])
     assert exc.value.code == 0
@@ -409,9 +568,7 @@ def test_blocked_update_candidates_still_exit_updates_found():
     )
 
     assert result.has_updates is True
-    assert _scan_exit_code(result.has_actionable_vulns, result.has_updates) == (
-        ExitCode.UPDATES_FOUND
-    )
+    assert _scan_exit_code(ScanSummary.of(result)) == ExitCode.UPDATES_FOUND
 
 
 def test_scan_keeps_update_planning_diagnostics_out_of_standard_rows(monkeypatch):
@@ -484,10 +641,10 @@ def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
 
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
-    def _boom(name, proj_config, min_age_days, *, vcs):
+    def _boom(name, proj_config, *, minimum_age_days, vcs, emit):
         raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
 
-    monkeypatch.setattr("maintenance_man.cli._scan_one", _boom)
+    monkeypatch.setattr("maintenance_man.services.scan.scan_one", _boom)
 
     with pytest.raises(SystemExit) as exc:
         app(["scan", "android"])
@@ -500,13 +657,13 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
 ):
     scanned: list[str] = []
 
-    def _scan(name, proj_config, min_age_days, *, vcs):
+    def _scan(name, proj_config, *, minimum_age_days, vcs, emit):
         scanned.append(name)
         if proj_config.package_manager == "gradle":
             raise GradleError("boom")
         return make_scan_result(vulns=[], updates=[])
 
-    monkeypatch.setattr("maintenance_man.cli._scan_one", _scan)
+    monkeypatch.setattr("maintenance_man.services.scan.scan_one", _scan)
 
     with pytest.raises(SystemExit) as exc:
         app(["scan"])
@@ -558,13 +715,11 @@ def test_scan_blocked_no_fix_vulnerability_exit(
     )
     assert not result.has_actionable_vulns
     monkeypatch.setattr(
-        "maintenance_man.cli.scan_project", lambda *args, **kwargs: result
+        "maintenance_man.services.scan.scan_project", lambda *args, **kwargs: result
     )
     with pytest.raises(SystemExit) as exc:
         app(["scan"] if all_projects else ["scan", "sample"])
-    expected = (
-        2 if manager == "gradle" and with_vulnerability else (3 if with_updates else 0)
-    )
+    expected = 3 if with_updates else 0
     assert exc.value.code == expected
 
 
@@ -574,7 +729,7 @@ def test_all_scan_real_wrapper_launch_error_preserves_results_and_scans_next(
     from maintenance_man.gradle import GRADLE_INVENTORY_RELPATH
     from maintenance_man.scanner import scan_project
 
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scan_project)
+    monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
 
     root = Path(gradle_project.path)
     (root / "gradlew").write_text("#!/definitely/missing/mm-interpreter\n")
@@ -682,7 +837,7 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
     from maintenance_man.scanner import _check_outdated, scan_project
     from tests.conftest import GRADLE_FIXTURES
 
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scan_project)
+    monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
     root = Path(gradle_project.path)
     mm_home.mkdir(parents=True, exist_ok=True)
     (mm_home / "config.toml").write_text(
@@ -824,7 +979,7 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
     results = mm_home / "scan-results"
     results.mkdir()
     (results / "android.json").write_bytes(b"old result bytes")
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scan_project)
+    monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr(
         "maintenance_man.scanner._check_outdated",
@@ -913,12 +1068,13 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_pat
     state = FakeJjState()
     project_path = tmp_path / "project"
     state.seed_repository(project_path, files={})
-    monkeypatch.setattr(cli, "scan_project", lambda *args, **kwargs: result)
-    cli._scan_one(
+    monkeypatch.setattr(scan_service, "scan_project", lambda *args, **kwargs: result)
+    scan_service.scan_one(
         "android",
         ProjectConfig(path=project_path, package_manager=manager),
-        7,
+        minimum_age_days=7,
         vcs=state.services(),
+        emit=cli._Renderer(batch=False),
     )
     rendered = output.getvalue()
     assert rendered.count("org.example:shared") == 2

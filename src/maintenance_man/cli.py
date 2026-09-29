@@ -1,6 +1,6 @@
 import contextlib
 import sys
-import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -15,7 +15,8 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from maintenance_man import __version__, gradle_workflow, paths
+from maintenance_man import __version__, gradle_workflow, paths, vcs_workflow
+from maintenance_man import config as config_module
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
@@ -33,16 +34,23 @@ from maintenance_man.deployer import (
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
 from maintenance_man.github import CodeHostError
-from maintenance_man.gradle import (
-    GradleError,
-    workspace_environment_reason,
-)
+from maintenance_man.gradle import workspace_environment_reason
 from maintenance_man.gradle_verification import snapshot_vulnerabilities
 from maintenance_man.models.activity import (
     ActivityEvent,
     ProjectActivity,
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
+from maintenance_man.models.events import (
+    Event,
+    Operation,
+    OperationFailed,
+    Outcome,
+    ProjectSkipped,
+    ScanReported,
+    SkipReason,
+    SyncCompleted,
+)
 from maintenance_man.models.gradle import (
     FailedAttempt,
     GradleCandidate,
@@ -52,6 +60,7 @@ from maintenance_man.models.gradle import (
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     ScanResult,
+    SecretFinding,
     UpdateFinding,
     UpdateStatus,
     VulnFinding,
@@ -59,9 +68,9 @@ from maintenance_man.models.scan import (
     highest_fix_version,
     sort_vulns_by_severity,
 )
-from maintenance_man.outdated import OutdatedCheckError
-from maintenance_man.process import ToolNotFoundError, require_tool
-from maintenance_man.scanner import ScanError, scan_project
+from maintenance_man.process import ToolNotFoundError
+from maintenance_man.services import scan as scan_service
+from maintenance_man.services.scan import ScanSummary
 from maintenance_man.storage import (
     NoScanResultsError,
     load_activity,
@@ -81,8 +90,6 @@ from maintenance_man.updater import (
     sort_updates_by_risk,
 )
 from maintenance_man.vcs import (
-    GH_INSTALL_HINT,
-    JJ_INSTALL_HINT,
     RevisionError,
     workspace_path_for_project,
 )
@@ -94,22 +101,12 @@ from maintenance_man.vcs_workflow import (
     push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
-    sync_main,
 )
 from maintenance_man.vcs_workflow import (
     current_label as repository_current_label,
 )
 from maintenance_man.vcs_workflow import (
     prune_stale_bookmarks as prune_repository_bookmarks,
-)
-
-# Errors that fail one project's scan without stopping a batch.
-_SCAN_ERRORS: tuple[type[Exception], ...] = (
-    ScanError,
-    GradleError,
-    RevisionError,
-    OutdatedCheckError,
-    ToolNotFoundError,
 )
 
 
@@ -161,6 +158,139 @@ console = Console()
 
 _TABLE_STYLE: dict[str, Any] = {"show_edge": False, "pad_edge": False, "box": None}
 
+type _Render = Callable[[Any, bool], None]
+_RENDERERS: dict[type, _Render] = {}
+
+
+def _renders(kind: type) -> Callable[[_Render], _Render]:
+    def register(render: _Render) -> _Render:
+        _RENDERERS[kind] = render
+        return render
+
+    return register
+
+
+@dataclass(frozen=True, slots=True)
+class _Renderer:
+    batch: bool
+
+    def __call__(self, event: Event) -> None:
+        _RENDERERS[type(event)](event, self.batch)
+
+
+_SKIP_TEXT: dict[SkipReason, tuple[str | None, str | None]] = {
+    SkipReason.PATH_MISSING: (
+        "[bold yellow]Warning:[/] {name} — path does not exist: {detail}",
+        "[bold yellow]Warning:[/] {name} — path does not exist: {detail}",
+    ),
+    SkipReason.NO_SCAN_RESULTS: (
+        "[bold green]{name}[/] — no scan results; nothing to do.",
+        None,
+    ),
+    SkipReason.NOTHING_TO_DO: (
+        "[bold green]{name}[/] — nothing to {detail}.",
+        "[dim]  {name} — nothing to update[/]",
+    ),
+    SkipReason.FLOW_CONFLICT: (
+        "  [bold yellow]Skipped:[/] {name} — {detail}",
+        "  [bold yellow]Skipped:[/] {name} — {detail}",
+    ),
+    SkipReason.NOT_DEPLOYABLE: (
+        "[dim]{name} — skipped (not deployable)[/]",
+        "[dim]{name} — skipped (not deployable)[/]",
+    ),
+    SkipReason.UNCHANGED: (
+        "[bold yellow]{name}[/] unchanged since last deploy (use --force to redeploy).",
+        "[dim]{name} — unchanged since last deploy[/]",
+    ),
+    SkipReason.BLOCKED: (
+        "[bold yellow]Warning:[/] {name} — could not resolve main revision; "
+        "skipping (use --force to deploy anyway)",
+        "[bold yellow]Warning:[/] {name} — could not resolve main revision; "
+        "skipping (use --force to deploy anyway)",
+    ),
+}
+
+_OPERATION_TEXT: dict[Operation, tuple[str, str]] = {
+    Operation.UPDATE_SETUP: (
+        "  [bold red]Error:[/] {name} — {error}",
+        "  [bold red]Error:[/] {name} — {error}",
+    ),
+    Operation.PROMOTE: (
+        "[bold red]Promotion failed:[/] {error}",
+        "[bold red]Promotion failed:[/] {error}",
+    ),
+    Operation.REFRESH: (
+        "[bold red]Workspace refresh failed:[/] {name}: {error}",
+        "[bold red]Workspace refresh failed:[/] {name}: {error}",
+    ),
+    Operation.WORKSPACE_CLEANUP: (
+        "[bold red]Workspace cleanup failed:[/] {error}",
+        "  [bold red]Workspace cleanup failed:[/] {error}",
+    ),
+    Operation.BOOKMARK_CLEANUP: (
+        "[bold red]Bookmark cleanup failed:[/] {error}",
+        "  [bold red]Bookmark cleanup failed:[/] {name} — {error}",
+    ),
+    Operation.RESOLVE_SETUP: (
+        "  [bold red]Resolve setup failed:[/] {error}",
+        "  [bold red]Resolve setup failed:[/] {error}",
+    ),
+    Operation.SUBMIT: (
+        "  [dim]{error}[/]\n  [bold yellow]Submit failed.[/] Keeping {bookmark} "
+        "for manual recovery.",
+        "  [dim]{error}[/]\n  [bold yellow]Submit failed.[/] Keeping {bookmark} "
+        "for manual recovery.",
+    ),
+    Operation.REMOTE_SYNC: (
+        "[bold yellow]Warning:[/] {name} — failed to sync remote: {error}",
+        "[bold yellow]Warning:[/] {name} — failed to sync remote: {error}",
+    ),
+    Operation.SCAN: (
+        "[bold red]Error:[/] {name} — {error}",
+        "[bold red]Error:[/] {name} — {error}",
+    ),
+    Operation.SYNC: (
+        "[bold red]  {name} — {error}[/]",
+        "[bold red]  {name} — {error}[/]",
+    ),
+}
+
+
+@_renders(ProjectSkipped)
+def _render_project_skipped(event: ProjectSkipped, batch: bool) -> None:
+    template = _SKIP_TEXT[event.reason][int(batch)]
+    if template is None:
+        return
+    console.print(
+        template.format(name=escape(event.project), detail=escape(event.detail or ""))
+    )
+
+
+@_renders(OperationFailed)
+def _render_operation_failed(event: OperationFailed, batch: bool) -> None:
+    template = _OPERATION_TEXT[event.operation][int(batch)]
+    console.print(
+        template.format(
+            name=escape(event.project),
+            error=escape(event.error),
+            bookmark=escape(WORKFLOW_BOOKMARKS[Workflow.RESOLVE]),
+        )
+    )
+
+
+@_renders(ScanReported)
+def _render_scan_reported(event: ScanReported, batch: bool) -> None:
+    del batch
+    _print_scan_result(event.result, elapsed_s=event.elapsed_s)
+
+
+@_renders(SyncCompleted)
+def _render_sync_completed(event: SyncCompleted, batch: bool) -> None:
+    del batch
+    console.print(f"  {escape(event.project)} — {escape(event.action)}")
+
+
 app = cyclopts.App(
     name="mm",
     help="Config-driven CLI for routine software project maintenance.",
@@ -177,13 +307,8 @@ def main() -> None:
 def init() -> None:
     """Initialise the ~/.mm directory and skeleton config."""
     ensure_mm_home()
-    console.print(f"Initialised {paths.mm_home()}")
-    console.print(f"Edit {paths.config_path()} to add projects.")
-
-
-def _require_vcs_tools() -> None:
-    require_tool("gh", GH_INSTALL_HINT)
-    require_tool("jj", JJ_INSTALL_HINT)
+    console.print(f"Initialised {escape(str(paths.mm_home()))}")
+    console.print(f"Edit {escape(str(paths.config_path()))} to add projects.")
 
 
 @app.command
@@ -212,73 +337,19 @@ def scan(
     if project:
         proj_config = _resolve_proj(cfg, project)
         try:
-            result = _scan_one(
-                project, proj_config, cfg.defaults.min_version_age_days, vcs=vcs
+            result = scan_service.scan_one(
+                project,
+                proj_config,
+                minimum_age_days=cfg.defaults.min_version_age_days,
+                vcs=vcs,
+                emit=_Renderer(batch=False),
             )
-        except _SCAN_ERRORS as e:
+        except scan_service.SCAN_ERRORS as e:
             _fatal(str(e))
+        sys.exit(_scan_exit_code(ScanSummary.of(result)))
 
-        sys.exit(
-            _scan_exit_code(_scan_has_vulns(result, proj_config), result.has_updates)
-        )
-
-    # Scan all projects
-    has_vulns = False
-    has_updates = False
-    had_error = False
-    for name, proj_config in cfg.projects.items():
-        if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
-            )
-            continue
-        try:
-            result = _scan_one(
-                name, proj_config, cfg.defaults.min_version_age_days, vcs=vcs
-            )
-        except _SCAN_ERRORS as e:
-            console.print(f"[bold red]Error:[/] {name} — {e}")
-            had_error = True
-            continue
-
-        has_vulns |= _scan_has_vulns(result, proj_config)
-        has_updates |= result.has_updates
-
-    if had_error:
-        sys.exit(ExitCode.ERROR)
-    sys.exit(_scan_exit_code(has_vulns, has_updates))
-
-
-def _scan_has_vulns(result: ScanResult, proj_config: ProjectConfig) -> bool:
-    return result.has_actionable_vulns or (
-        proj_config.package_manager == "gradle"
-        and any(v.blocked_reason for v in result.vulnerabilities)
-    )
-
-
-def _dedupe_preserve_order(names: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for name in names:
-        if name not in seen:
-            seen.add(name)
-            ordered.append(name)
-    return ordered
-
-
-def _validate_project_names(cfg: MmConfig, names: list[str]) -> None:
-    known = set(cfg.projects)
-    for name in names:
-        if name not in known:
-            _fatal(
-                f"Unknown project '{name}'. "
-                f"Known projects: {', '.join(cfg.projects) or '(none)'}"
-            )
-
-
-def _sorted_project_names(cfg: MmConfig) -> list[str]:
-    return sorted(cfg.projects)
+    summary = scan_service.scan_all(cfg, vcs=vcs, emit=_Renderer(batch=True))
+    sys.exit(_scan_exit_code(summary))
 
 
 def _exit_if_no_update_targets(cfg: MmConfig, target_names: list[str]) -> None:
@@ -297,16 +368,18 @@ def _resolve_update_targets(
     *,
     negate: bool,
 ) -> tuple[Literal["single", "batch"], list[str]]:
-    ordered = _dedupe_preserve_order(projects)
-    _validate_project_names(cfg, ordered)
+    try:
+        ordered = config_module.validate_project_names(cfg, projects)
+    except ProjectNotFoundError as exc:
+        _fatal(str(exc))
 
     if negate:
         excluded = set(ordered)
-        targets = [name for name in _sorted_project_names(cfg) if name not in excluded]
+        targets = [name for name in sorted(cfg.projects) if name not in excluded]
         return "batch", targets
 
     if not ordered:
-        return "batch", _sorted_project_names(cfg)
+        return "batch", sorted(cfg.projects)
 
     if len(ordered) == 1:
         return "single", ordered
@@ -339,7 +412,7 @@ def update(
     _exit_if_no_update_targets(cfg, targets)
 
     try:
-        _require_vcs_tools()
+        vcs_workflow.require_vcs_tools()
     except ToolNotFoundError as e:
         _fatal(str(e))
 
@@ -370,30 +443,17 @@ def sync(
         console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
         sys.exit(ExitCode.OK)
 
-    ordered = _dedupe_preserve_order(list(projects))
-    _validate_project_names(cfg, ordered)
-    targets = ordered or _sorted_project_names(cfg)
     vcs_services = make_vcs_services()
-
-    had_errors = False
-    for name in targets:
-        proj_config = cfg.projects[name]
-        if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
-            )
-            had_errors = True
-            continue
-        try:
-            action = sync_main(repo=vcs_services.repository(proj_config.path))
-        except RevisionError as exc:
-            console.print(f"  [bold red]{name} — {exc}[/]")
-            had_errors = True
-        else:
-            console.print(f"  {name} — {action.value}")
-
-    sys.exit(ExitCode.SYNC_FAILED if had_errors else ExitCode.OK)
+    try:
+        outcome = scan_service.sync_projects(
+            cfg,
+            projects,
+            vcs=vcs_services,
+            emit=_Renderer(batch=True),
+        )
+    except ProjectNotFoundError as exc:
+        _fatal(str(exc))
+    sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
 
 def _update_batch_targets(
@@ -413,14 +473,14 @@ def _update_batch_targets(
         proj_config = cfg.projects[name]
         if not proj_config.path.exists():
             console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
+                f"[bold yellow]Warning:[/] {escape(name)} — "
+                f"path does not exist: {escape(str(proj_config.path))}"
             )
             had_errors = True
             continue
 
         console.print(f"\n{'═' * 40}")
-        console.print(f"[bold]{name}[/]")
+        console.print(f"[bold]{escape(name)}[/]")
         console.print("═" * 40)
 
         outcome = _update_batch(
@@ -543,13 +603,17 @@ def _prompt_selection(
     choices = "/".join(parts)
 
     while True:
-        selection = Prompt.ask(f"\n  Select updates [{choices}]", default="all")
+        selection = Prompt.ask(
+            f"\n  Select updates {escape(f'[{choices}]')}", default="all"
+        )
         result = _parse_selection(
             selection, numbered, selectable_vulns, selectable_updates
         )
         if result is not None:
             return result
-        console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
+        console.print(
+            f"[bold red]Invalid selection:[/] '{escape(selection)}'. Try again."
+        )
 
 
 def _process_selected_vulns(
@@ -641,7 +705,7 @@ def _print_update_summary(all_results: list[UpdateResult]) -> None:
         for r in failed:
             phase = r.failed_phase or "unknown"
             label = phase_labels.get(phase, phase)
-            console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
+            console.print(f"  [red]FAIL[/] {escape(r.pkg_name)} — {escape(label)}")
     console.print("─" * 40)
 
 
@@ -725,13 +789,16 @@ def _finalise_local_update(
     try:
         repo.promote_bookmark_to_main(bookmark=bookmark)
     except RevisionError as exc:
-        console.print(f"[bold red]Promotion failed:[/] {exc}")
+        console.print(f"[bold red]Promotion failed:[/] {escape(str(exc))}")
         return False
 
     try:
         refresh_working_copy_from_main(repo=repo)
     except RevisionError as exc:
-        console.print(f"[bold red]Workspace refresh failed:[/] {project_name}: {exc}")
+        console.print(
+            f"[bold red]Workspace refresh failed:[/] {escape(project_name)}: "
+            f"{escape(str(exc))}"
+        )
         return False
 
     for v in scan_result.vulnerabilities:
@@ -743,14 +810,14 @@ def _finalise_local_update(
 
     remove_completed_findings(scan_result)
     save_scan_results(project_name, scan_result)
-    console.print(f"[bold green]Promoted {bookmark} to main.[/]")
+    console.print(f"[bold green]Promoted {escape(bookmark)} to main.[/]")
     return True
 
 
 def _warn_missing_test_config(project: str, proj_config: ProjectConfig) -> None:
     if not proj_config.test_phases:
         console.print(
-            f"  [bold yellow]Warning:[/] {project} — no test configuration "
+            f"  [bold yellow]Warning:[/] {escape(project)} — no test configuration "
             f"(test phases will be skipped)"
         )
 
@@ -763,7 +830,9 @@ def _load_validated_scan(
     try:
         scan_result = load_scan_results(project)
     except NoScanResultsError:
-        console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
+        console.print(
+            f"[bold green]{escape(project)}[/] — no scan results; nothing to do."
+        )
         sys.exit(ExitCode.OK)
     try:
         _assert_supported_in_progress_state(scan_result, project)
@@ -773,7 +842,9 @@ def _load_validated_scan(
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
     if not actionable_vulns and not updates:
-        console.print(f"[bold green]{project}[/] — nothing to {workflow}.")
+        console.print(
+            f"[bold green]{escape(project)}[/] — nothing to {escape(workflow)}."
+        )
         sys.exit(ExitCode.OK)
     _warn_missing_test_config(project, proj_config)
     return scan_result, actionable_vulns, updates
@@ -884,7 +955,7 @@ def _prepare_resolve_bookmark(
         repo.create_bookmark(bookmark=bookmark, revision="main")
         repo.new_change(revision=bookmark)
     except RevisionError as exc:
-        console.print(f"  [bold red]Resolve setup failed:[/] {exc}")
+        console.print(f"  [bold red]Resolve setup failed:[/] {escape(str(exc))}")
         return False
     return True
 
@@ -910,7 +981,7 @@ def _run_resolve_findings(
     if any(not r.passed for r in results) or _ordered_failed_findings(scan_result):
         console.print(
             f"  [bold yellow]Resolve paused.[/] Continue with "
-            f"[bold]mm resolve {project} --continue[/]."
+            f"[bold]mm resolve {escape(project)} --continue[/]."
         )
         return ExitCode.UPDATE_FAILED
 
@@ -959,13 +1030,13 @@ def _submit_resolve_bookmark(
         )
     except (RevisionError, CodeHostError) as exc:
         save_scan_results(project, scan_result)
-        console.print(f"  [dim]{exc}[/]")
+        console.print(f"  [dim]{escape(str(exc))}[/]")
         console.print(
             f"  [bold yellow]Submit failed.[/] Keeping {bookmark} for manual recovery."
         )
         return ExitCode.UPDATE_FAILED
     if output:
-        console.print(f"  [dim]{output}[/]")
+        console.print(f"  [dim]{escape(output)}[/]")
 
     for f in ready_findings:
         f.update_status = UpdateStatus.COMPLETED
@@ -993,9 +1064,11 @@ def _print_mass_update_summary(
     for proj_name, results in project_results:
         for r in results:
             status = (
-                "[green]PASS[/]" if r.passed else f"[red]FAIL ({r.failed_phase})[/]"
+                "[green]PASS[/]"
+                if r.passed
+                else (f"[red]FAIL ({escape(r.failed_phase or '')})[/]")
             )
-            table.add_row(proj_name, r.pkg_name, r.kind, status)
+            table.add_row(escape(proj_name), escape(r.pkg_name), escape(r.kind), status)
 
     console.print()
     console.print(table)
@@ -1019,7 +1092,7 @@ def _deploy_one(
         try:
             _run_build_step(name, proj_config, vcs=vcs)
         except BuildError as e:
-            console.print(f"  [bold red]Build failed:[/] {e}")
+            console.print(f"  [bold red]Build failed:[/] {escape(str(e))}")
             build_status = "fail"
             return DeployResult(
                 project=name,
@@ -1032,7 +1105,7 @@ def _deploy_one(
     try:
         _run_deploy_step(name, proj_config, commit_id, vcs=vcs)
     except DeployError as e:
-        console.print(f"  [bold red]Deploy failed:[/] {e}")
+        console.print(f"  [bold red]Deploy failed:[/] {escape(str(e))}")
         deploy_status = "fail"
         return DeployResult(
             project=name,
@@ -1068,7 +1141,7 @@ def _deploy_all(
 
     for name, proj_config in sorted(cfg.projects.items()):
         if not proj_config.deployable:
-            console.print(f"[dim]{name} — skipped (not deployable)[/]")
+            console.print(f"[dim]{escape(name)} — skipped (not deployable)[/]")
             continue
 
         if not proj_config.deploy_command:
@@ -1076,8 +1149,8 @@ def _deploy_all(
 
         if not proj_config.path.exists():
             console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
+                f"[bold yellow]Warning:[/] {escape(name)} — "
+                f"path does not exist: {escape(str(proj_config.path))}"
             )
             results.append(
                 DeployResult(project=name, build_status="skip", deploy_status="fail")
@@ -1088,7 +1161,7 @@ def _deploy_all(
             name, proj_config.path, activity, force=force, vcs=vcs
         )
         if decision is GateDecision.SKIP_UNCHANGED:
-            console.print(f"[dim]{name} — unchanged since last deploy[/]")
+            console.print(f"[dim]{escape(name)} — unchanged since last deploy[/]")
             results.append(
                 DeployResult(
                     project=name, build_status="skip", deploy_status="unchanged"
@@ -1097,7 +1170,7 @@ def _deploy_all(
             continue
         if decision is GateDecision.SKIP_BLOCKED:
             console.print(
-                f"[bold yellow]Warning:[/] {name} — could not resolve main "
+                f"[bold yellow]Warning:[/] {escape(name)} — could not resolve main "
                 f"revision; skipping (use --force to deploy anyway)"
             )
             results.append(
@@ -1106,7 +1179,7 @@ def _deploy_all(
             continue
 
         console.print(f"\n{'═' * 40}")
-        console.print(f"[bold]{name}[/]")
+        console.print(f"[bold]{escape(name)}[/]")
         console.print("═" * 40)
 
         results.append(
@@ -1143,7 +1216,7 @@ def _print_deploy_summary(results: list[DeployResult]) -> None:
 
     for r in results:
         table.add_row(
-            r.project,
+            escape(r.project),
             status_display[r.build_status],
             status_display[r.deploy_status],
         )
@@ -1154,7 +1227,7 @@ def _print_deploy_summary(results: list[DeployResult]) -> None:
 
 def _warn_missing_healthcheck_url() -> None:
     """Warn when --check was requested but no healthcheck_url is configured."""
-    console.print("[dim]--check: no healthcheck_url configured in [defaults][/]")
+    console.print("[dim]--check: no healthcheck_url configured in \\[defaults][/]")
 
 
 def _record_deploy_activity(
@@ -1244,11 +1317,13 @@ def _run_health_check_step(
     """Run a health check and print a consistent status message."""
     result = check_health(healthcheck_url, project)
     if result.is_up:
-        console.print(f"{indent}[bold green]Healthy:[/] {project} is up")
+        console.print(f"{indent}[bold green]Healthy:[/] {escape(project)} is up")
     elif result.error:
-        console.print(f"{indent}[bold yellow]Warning:[/] {result.error}")
+        console.print(f"{indent}[bold yellow]Warning:[/] {escape(result.error)}")
     else:
-        console.print(f"{indent}[bold yellow]Warning:[/] {project} is not healthy")
+        console.print(
+            f"{indent}[bold yellow]Warning:[/] {escape(project)} is not healthy"
+        )
 
 
 @app.command
@@ -1289,12 +1364,12 @@ def deploy(
     proj_config = _resolve_proj(cfg, project)
 
     if not proj_config.deployable:
-        console.print(f"[dim]{project} — skipped (not deployable)[/]")
+        console.print(f"[dim]{escape(project)} — skipped (not deployable)[/]")
         sys.exit(ExitCode.OK)
 
     if not proj_config.deploy_command:
         _fatal(
-            f"No deploy_command configured for [bold]{project}[/]. "
+            f"No deploy_command configured for {project}. "
             f"Add deploy_command to [projects.{project}] in ~/.mm/config.toml."
         )
 
@@ -1304,26 +1379,26 @@ def deploy(
     )
     if decision is GateDecision.SKIP_UNCHANGED:
         console.print(
-            f"[bold yellow]{project}[/] unchanged since last deploy "
+            f"[bold yellow]{escape(project)}[/] unchanged since last deploy "
             f"(use --force to redeploy)."
         )
         sys.exit(ExitCode.OK)
     if decision is GateDecision.SKIP_BLOCKED:
         _fatal(
-            f"Could not resolve main revision for [bold]{project}[/]; refusing "
+            f"Could not resolve main revision for {project}; refusing "
             f"to deploy unverified state (use --force to override).",
             code=ExitCode.ERROR,
         )
 
     if build and proj_config.build_command:
-        console.print(f"[bold]Building {project}[/]\n")
+        console.print(f"[bold]Building {escape(project)}[/]\n")
         try:
             _run_build_step(project, proj_config, vcs=vcs)
         except BuildError as e:
             _fatal(str(e), code=ExitCode.BUILD_FAILED)
         console.print("\n[bold green]Build succeeded.[/]\n")
 
-    console.print(f"[bold]Deploying {project}[/]\n")
+    console.print(f"[bold]Deploying {escape(project)}[/]\n")
 
     try:
         _run_deploy_step(project, proj_config, current_id, vcs=vcs)
@@ -1336,7 +1411,7 @@ def deploy(
         if not cfg.defaults.healthcheck_url:
             _warn_missing_healthcheck_url()
         else:
-            console.print(f"\n[bold]Checking health of {project}...[/]")
+            console.print(f"\n[bold]Checking health of {escape(project)}...[/]")
             _run_health_check_step(cfg.defaults.healthcheck_url, project)
 
     sys.exit(ExitCode.OK)
@@ -1364,7 +1439,7 @@ def test(
     proj_config = _resolve_proj(cfg, project)
     _require_test_config(project, proj_config)
 
-    console.print(f"[bold]Testing {project}[/]\n")
+    console.print(f"[bold]Testing {escape(project)}[/]\n")
 
     passed, failed_phase = run_test_phases(proj_config, proj_config.path)
 
@@ -1372,7 +1447,7 @@ def test(
         console.print("\n[bold green]All test phases passed.[/]")
         sys.exit(ExitCode.OK)
     else:
-        console.print(f"\n[bold red]Failed:[/] {failed_phase} tests")
+        console.print(f"\n[bold red]Failed:[/] {escape(failed_phase or '')} tests")
         sys.exit(ExitCode.TEST_FAILED)
 
 
@@ -1397,11 +1472,11 @@ def build(
 
     if not proj_config.build_command:
         _fatal(
-            f"No build_command configured for [bold]{project}[/]. "
+            f"No build_command configured for {project}. "
             f"Add build_command to [projects.{project}] in ~/.mm/config.toml."
         )
 
-    console.print(f"[bold]Building {project}[/]\n")
+    console.print(f"[bold]Building {escape(project)}[/]\n")
 
     try:
         _run_build_step(project, proj_config, vcs=vcs)
@@ -1444,7 +1519,8 @@ def list_projects(
             pass
         except Exception:
             console.print(
-                f"[yellow]Warning:[/] corrupt scan results for '{name}' — skipping"
+                f"[yellow]Warning:[/] corrupt scan results for "
+                f"'{escape(name)}' — skipping"
             )
 
     activity = load_activity(paths.activity_path())
@@ -1476,8 +1552,8 @@ def list_projects(
 
         proj_activity = activity.get(name)
         table.add_row(
-            name,
-            project.package_manager,
+            escape(name),
+            escape(str(project.package_manager)),
             *counts,
             _format_activity(proj_activity.last_build if proj_activity else None),
             "[dim]n/a[/]"
@@ -1541,17 +1617,19 @@ def _print_project_todo(name: str, project_path: Path) -> None:
     """Print a single project's TODO.md content with header."""
     todo_path = project_path / "TODO.md"
     if not todo_path.exists():
-        console.print(Panel("[dim]no TODO.md[/]", title=name, border_style="dim"))
+        console.print(
+            Panel("[dim]no TODO.md[/]", title=escape(name), border_style="dim")
+        )
         return
     content = todo_path.read_text().strip()
     if not content:
-        console.print(Panel("[dim]empty[/]", title=name, border_style="dim"))
+        console.print(Panel("[dim]empty[/]", title=escape(name), border_style="dim"))
         return
-    console.print(Panel(Markdown(content), title=name))
+    console.print(Panel(Markdown(content), title=escape(name)))
 
 
 def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
-    console.print(f"[bold red]Error:[/] {msg}")
+    console.print(f"[bold red]Error:[/] {escape(msg)}")
     sys.exit(code)
 
 
@@ -1572,13 +1650,15 @@ def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
 def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
     if not proj_config.test_phases:
         _fatal(
-            f"No test configuration for [bold]{project}[/]. "
+            f"No test configuration for {project}. "
             f"Add test_unit to [projects.{project}] in ~/.mm/config.toml."
         )
 
 
-def _scan_exit_code(has_vulns: bool, has_updates: bool) -> ExitCode:
-    match (has_vulns, has_updates):
+def _scan_exit_code(summary: ScanSummary) -> ExitCode:
+    if summary.had_error:
+        return ExitCode.ERROR
+    match (summary.has_vulns, summary.has_updates):
         case (True, _):
             return ExitCode.VULNS_FOUND
         case (_, True):
@@ -1616,30 +1696,6 @@ def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -
     return time_str
 
 
-def _scan_one(
-    name: str,
-    proj_config: ProjectConfig,
-    min_age_days: int,
-    *,
-    vcs: VcsServices,
-) -> ScanResult:
-    """Scan a single project with timing output."""
-    try:
-        _require_vcs_tools()
-        prune_repository_bookmarks(
-            repo=vcs.repository(proj_config.path),
-            host=vcs.code_host(proj_config.path),
-        )
-    except (ToolNotFoundError, RevisionError, CodeHostError) as exc:
-        console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
-
-    t0 = time.monotonic()
-    result = scan_project(name, proj_config, min_age_days, vcs=vcs)
-    elapsed = time.monotonic() - t0
-    _print_scan_result(result, elapsed_s=elapsed)
-    return result
-
-
 def _print_numbered_findings(
     vulns: list[VulnFinding], updates: list[UpdateFinding]
 ) -> list[VulnFinding | UpdateFinding]:
@@ -1648,15 +1704,16 @@ def _print_numbered_findings(
     numbered: list[VulnFinding | UpdateFinding] = []
     for idx, v in enumerate(vulns, 1):
         console.print(
-            f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {v.pkg_name} "
-            f"{v.installed_version} -> {v.fixed_version} ({v.vuln_id})"
+            f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {escape(v.pkg_name)} "
+            f"{escape(v.installed_version)} -> {escape(v.fixed_version or '')} "
+            f"({escape(v.vuln_id)})"
         )
         numbered.append(v)
     for idx, u in enumerate(updates, len(vulns) + 1):
         console.print(
-            f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {u.pkg_name} "
-            f"{u.installed_version} -> {u.latest_version} "
-            f"({u.semver_tier.value})"
+            f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {escape(u.pkg_name)} "
+            f"{escape(u.installed_version)} -> {escape(u.latest_version)} "
+            f"({escape(u.semver_tier.value)})"
         )
         numbered.append(u)
     return numbered
@@ -1706,13 +1763,14 @@ def _choose_gradle_candidates(
 ) -> tuple[GradleCandidate, ...]:
     for index, candidate in enumerate(candidates, 1):
         console.print(
-            f"{index}. {candidate.target.display_name} -> "
-            f"{candidate.target.target_version}"
+            f"{index}. {escape(candidate.target.display_name)} -> "
+            f"{escape(candidate.target.target_version)}"
         )
         for member in candidate.target.members:
             console.print(
-                f"   {member.alias}: {member.coordinate} "
-                f"{member.installed_version} -> {candidate.target.target_version}"
+                f"   {escape(member.alias)}: {escape(member.coordinate)} "
+                f"{escape(member.installed_version)} -> "
+                f"{escape(candidate.target.target_version)}"
             )
     while True:
         selection = (
@@ -1790,7 +1848,7 @@ def _run_update_flow(
         try:
             remove_workspace(repo=vcs.repository(proj_config.path), project=project)
         except RevisionError as exc:
-            console.print(f"[bold red]Workspace cleanup failed:[/] {exc}")
+            console.print(f"[bold red]Workspace cleanup failed:[/] {escape(str(exc))}")
             finalised = False
     if not finalised:
         return ExitCode.UPDATE_FAILED
@@ -1799,7 +1857,7 @@ def _run_update_flow(
             bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
         )
     except RevisionError as exc:
-        console.print(f"[bold red]Bookmark cleanup failed:[/] {exc}")
+        console.print(f"[bold red]Bookmark cleanup failed:[/] {escape(str(exc))}")
         return ExitCode.UPDATE_FAILED
     return ExitCode.OK
 
@@ -1836,18 +1894,20 @@ def _update_batch(
         _assert_supported_in_progress_state(scan_result, project)
         _assert_no_conflicting_flow(scan_result, Workflow.UPDATE, project)
     except _FlowConflictError as e:
-        console.print(f"  [bold yellow]Skipped:[/] {project} — {e}")
+        console.print(
+            f"  [bold yellow]Skipped:[/] {escape(project)} — {escape(str(e))}"
+        )
         return None
     actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
     updates = scan_result.updates
     if not actionable_vulns and (not updates):
-        console.print(f"  [dim]{project} — nothing to update[/]")
+        console.print(f"  [dim]{escape(project)} — nothing to update[/]")
         return ([], False)
     _warn_missing_test_config(project, proj_config)
     try:
         wt_path = _enter_update_workspace(project, proj_config, scan_result, vcs=vcs)
     except (_UpdateSetupError, RevisionError, CodeHostError) as e:
-        console.print(f"  [bold red]Error:[/] {project} — {e}")
+        console.print(f"  [bold red]Error:[/] {escape(project)} — {escape(str(e))}")
         return None
     work_config = proj_config.model_copy(update={"path": wt_path})
     finalised = False
@@ -1875,7 +1935,9 @@ def _update_batch(
         try:
             remove_workspace(repo=vcs.repository(proj_config.path), project=project)
         except RevisionError as exc:
-            console.print(f"  [bold red]Workspace cleanup failed:[/] {exc}")
+            console.print(
+                f"  [bold red]Workspace cleanup failed:[/] {escape(str(exc))}"
+            )
             finalised = False
             promotion_attempted = True
     if finalised:
@@ -1884,7 +1946,10 @@ def _update_batch(
                 bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
             )
         except RevisionError as exc:
-            console.print(f"  [bold red]Bookmark cleanup failed:[/] {project} — {exc}")
+            console.print(
+                f"  [bold red]Bookmark cleanup failed:[/] {escape(project)} — "
+                f"{escape(str(exc))}"
+            )
             finalised = False
     return (
         all_results,
@@ -1947,7 +2012,7 @@ def resolve(
     proj_config = _resolve_proj(cfg, project)
     minimum_age_days = cfg.defaults.min_version_age_days
     try:
-        _require_vcs_tools()
+        vcs_workflow.require_vcs_tools()
     except ToolNotFoundError as e:
         _fatal(str(e))
     vcs = make_vcs_services()
@@ -1972,13 +2037,11 @@ def resolve(
         prune_repository_bookmarks(repo=repo, host=vcs.code_host(proj_config.path))
         ensure_main_bookmark(repo=repo)
         if _ordered_failed_findings(scan_result):
-            _fatal(
-                f"resolve already paused for [bold]{project}[/] — rerun with --continue"
-            )
+            _fatal(f"resolve already paused for {project} — rerun with --continue")
         if not _prepare_resolve_bookmark(
             proj_config.path, scan_result, candidates, vcs=vcs
         ):
-            _fatal(f"aborted resolve for [bold]{project}[/]")
+            _fatal(f"aborted resolve for {project}")
     except (RevisionError, CodeHostError) as exc:
         _fatal(str(exc))
     sys.exit(
@@ -2025,7 +2088,8 @@ def _handle_resolve_continue(
             save_scan_results(project, scan_result)
             names = ", ".join(b.pkg_name for b in failed)
             console.print(
-                f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
+                f"  [bold red]FAIL[/] {escape(failed_phase or '')} — "
+                f"still blocking: {escape(names)}"
             )
             return ExitCode.UPDATE_FAILED
         try:
@@ -2038,7 +2102,7 @@ def _handle_resolve_continue(
             blocker.failed_phase = None
         save_scan_results(project, scan_result)
         for blocker in failed:
-            console.print(f"  [bold green]PASS[/] {blocker.pkg_name}")
+            console.print(f"  [bold green]PASS[/] {escape(blocker.pkg_name)}")
     return _run_resolve_findings(
         project,
         proj_config,
@@ -2104,7 +2168,7 @@ def _print_scan_result(
     timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
 
     if total == 0:
-        console.print(f"[bold green]{result.project}[/] — clean{timing}")
+        console.print(f"[bold green]{escape(result.project)}[/] — clean{timing}")
         return
 
     categories = [
@@ -2115,88 +2179,97 @@ def _print_scan_result(
     ]
     parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
 
-    console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
+    console.print(f"\n[bold]{escape(result.project)}[/] — {', '.join(parts)}{timing}")
+    _print_vuln_table(actionable)
+    _print_advisory_table(advisories)
+    _print_secrets(secrets)
+    _print_update_table(updates)
 
-    if actionable:
-        # Determine the winning fix version per package for the marker.
-        win_versions: dict[str, str] = {}
-        pkg_counts: dict[str, int] = {}
-        for v in actionable:
-            pkg_counts[v.pkg_name] = pkg_counts.get(v.pkg_name, 0) + 1
-        for pkg in pkg_counts:
-            if pkg_counts[pkg] > 1:
-                group = [v for v in actionable if v.pkg_name == pkg]
-                win_versions[pkg] = highest_fix_version(group)
 
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold red", width=4)
-        table.add_column("Package", overflow="fold")
-        table.add_column("Installed")
-        table.add_column("Fix")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in actionable:
-            fix_col = v.fixed_version or ""
-            if (
-                v.pkg_name in win_versions
-                and v.fixed_version == win_versions[v.pkg_name]
-            ):
-                fix_col += " ← fix"
-            table.add_row(
-                "VULN",
-                v.pkg_name,
-                v.installed_version,
-                fix_col,
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
+def _print_vuln_table(vulnerabilities: list[VulnFinding]) -> None:
+    if not vulnerabilities:
+        return
+    win_versions: dict[str, str] = {}
+    for package in {item.pkg_name for item in vulnerabilities}:
+        group = [item for item in vulnerabilities if item.pkg_name == package]
+        if len(group) > 1:
+            win_versions[package] = highest_fix_version(group)
 
-    if advisories:
-        table = Table(show_header=False, **_TABLE_STYLE)
-        table.add_column("", style="bold yellow", width=4)
-        table.add_column("Package", overflow="fold")
-        table.add_column("Installed")
-        table.add_column("Status")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in advisories:
-            table.add_row(
-                "ADV",
-                v.pkg_name,
-                v.installed_version,
-                v.status,
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
+    table = Table(show_header=True, **_TABLE_STYLE)
+    table.add_column("", style="bold red", width=4)
+    table.add_column("Package", overflow="fold")
+    table.add_column("Installed")
+    table.add_column("Fix")
+    table.add_column("Severity")
+    table.add_column("CVE")
+    for item in vulnerabilities:
+        fix = item.fixed_version or ""
+        if item.pkg_name in win_versions and fix == win_versions[item.pkg_name]:
+            fix += " ← fix"
+        table.add_row(
+            "VULN",
+            escape(item.pkg_name),
+            escape(item.installed_version),
+            escape(fix),
+            escape(item.severity.value),
+            escape(item.vuln_id),
+        )
+    console.print(table)
 
-    if secrets:
-        for s in secrets:
-            console.print(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
 
-    if updates:
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold cyan", width=6, no_wrap=True)
-        table.add_column("Package", overflow="fold")
-        table.add_column("Installed")
-        table.add_column("Latest")
-        table.add_column("Tier")
-        table.add_column("Age")
-        for u in updates:
-            age = ""
-            if u.published_date:
-                days = (datetime.now(UTC) - u.published_date).days
-                age = f"({days} days old)"
-            table.add_row(
-                "UPDATE",
-                u.pkg_name,
-                u.installed_version,
-                u.latest_version,
-                u.semver_tier.value,
-                age,
-            )
-        console.print(table)
+def _print_advisory_table(advisories: list[VulnFinding]) -> None:
+    if not advisories:
+        return
+    table = Table(show_header=False, **_TABLE_STYLE)
+    table.add_column("", style="bold yellow", width=4)
+    table.add_column("Package", overflow="fold")
+    table.add_column("Installed")
+    table.add_column("Status")
+    table.add_column("Severity")
+    table.add_column("CVE")
+    for item in advisories:
+        table.add_row(
+            "ADV",
+            escape(item.pkg_name),
+            escape(item.installed_version),
+            escape(item.status),
+            escape(item.severity.value),
+            escape(item.vuln_id),
+        )
+    console.print(table)
+
+
+def _print_secrets(secrets: list[SecretFinding]) -> None:
+    for item in secrets:
+        console.print(
+            f"  [bold magenta]SECRET[/]  {escape(item.file)} — {escape(item.title)}"
+        )
+
+
+def _print_update_table(updates: list[UpdateFinding]) -> None:
+    if not updates:
+        return
+    table = Table(show_header=True, **_TABLE_STYLE)
+    table.add_column("", style="bold cyan", width=6, no_wrap=True)
+    table.add_column("Package", overflow="fold")
+    table.add_column("Installed")
+    table.add_column("Latest")
+    table.add_column("Tier")
+    table.add_column("Age")
+    for item in updates:
+        age = ""
+        if item.published_date:
+            days = (datetime.now(UTC) - item.published_date).days
+            age = f"({days} days old)"
+        table.add_row(
+            "UPDATE",
+            escape(item.pkg_name),
+            escape(item.installed_version),
+            escape(item.latest_version),
+            escape(item.semver_tier.value),
+            age,
+        )
+    console.print(table)
 
 
 def _print_blocked_findings(scan_result: ScanResult) -> None:

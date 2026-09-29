@@ -3,10 +3,12 @@ from __future__ import annotations
 import subprocess
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
 from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import Event
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     ScanResult,
@@ -17,6 +19,22 @@ from maintenance_man.models.scan import (
 from maintenance_man.storage import save_scan_results
 from maintenance_man.updater import Finding, UpdateResult
 from maintenance_man.vcs_workflow import VcsServices
+
+
+@dataclass
+class RecordingEmit:
+    events: list[Event] = field(default_factory=list)
+
+    def __call__(self, event: Event) -> None:
+        copies = {
+            item.name: value.model_copy(deep=True)
+            for item in fields(event)
+            if isinstance(value := getattr(event, item.name), ScanResult)
+        }
+        self.events.append(replace(event, **copies) if copies else event)
+
+    def of_type[E](self, kind: type[E]) -> list[E]:
+        return [event for event in self.events if isinstance(event, kind)]
 
 
 class FakeFindingProcessor:

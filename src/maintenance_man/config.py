@@ -1,4 +1,5 @@
 import tomllib
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -64,6 +65,21 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
         )
 
     return project
+
+
+def validate_project_names(config: MmConfig, names: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name not in config.projects:
+            raise ProjectNotFoundError(
+                f"Unknown project '{name}'. "
+                f"Known projects: {', '.join(config.projects) or '(none)'}"
+            )
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
 
 
 def ensure_mm_home() -> None:
