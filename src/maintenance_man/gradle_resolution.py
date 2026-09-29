@@ -30,7 +30,6 @@ from maintenance_man.gradle import (
     CatalogueEntry,
     GradleError,
     ReportProposal,
-    _validate_inventory,
     build_update_findings,
     file_digest,
     normalise_alias,
@@ -38,6 +37,7 @@ from maintenance_man.gradle import (
     require_catalogue_unchanged,
     run_gradle,
 )
+from maintenance_man.gradle_inventory import CycloneDxInventory, load_inventory
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     CandidateValidationBatch,
@@ -131,10 +131,20 @@ def _script(directory: Path) -> Path:
     return script
 
 
+@dataclass(frozen=True)
+class GeneratedGradleReport:
+    """One report capture; the path is usable only inside its context."""
+
+    bom_path: Path
+    inventory_bytes: bytes
+    inventory: CycloneDxInventory
+    resolution: ResolutionOutcome
+
+
 @contextmanager
 def generate_gradle_report(
     project: ProjectConfig,
-) -> Iterator[tuple[Path, ResolutionOutcome]]:
+) -> Iterator[GeneratedGradleReport]:
     root = Path(project.path)
     before = file_digest(root / GRADLE_CATALOGUE_RELPATH)
     with owned_gradle_inventory(project) as directory:
@@ -153,7 +163,7 @@ def generate_gradle_report(
             report_path = directory / "report.json"
             if bom.is_symlink() or report_path.is_symlink():
                 raise GradleError("Gradle report output is a symlink")
-            _validate_inventory(bom)
+            inventory_bytes, inventory = load_inventory(bom)
             outcome = parse_resolution_report(report_path.read_text(encoding="utf-8"))
             require_catalogue_unchanged(
                 before,
@@ -163,14 +173,19 @@ def generate_gradle_report(
             )
         except (OSError, UnicodeError) as exc:
             raise GradleError(f"Could not capture Gradle resolution: {exc}") from exc
-        yield bom, outcome
+        yield GeneratedGradleReport(
+            bom_path=bom,
+            inventory_bytes=inventory_bytes,
+            inventory=inventory,
+            resolution=outcome,
+        )
 
 
 def collect_gradle_resolution(project: ProjectConfig) -> ResolutionOutcome:
     # Digest validation binds this report to the source file. No graph is
     # reconstructed from TOML.
-    with generate_gradle_report(project) as (_, outcome):
-        return outcome
+    with generate_gradle_report(project) as generated:
+        return generated.resolution
 
 
 EXACT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")

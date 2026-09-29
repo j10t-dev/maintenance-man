@@ -18,6 +18,12 @@ from maintenance_man.gradle import (
     GRADLE_INVENTORY_BOM_RELPATH,
     GradleError,
 )
+from maintenance_man.gradle_inventory import (
+    CycloneDxInventory,
+    load_inventory,
+    parse_inventory_text,
+)
+from maintenance_man.gradle_resolution import GeneratedGradleReport
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
@@ -39,6 +45,7 @@ from maintenance_man.storage import load_scan_results
 from tests.conftest import (
     GRADLE_FIXTURES,
     completed,
+    fixture_runner,
     make_update,
     make_vuln,
     ops_with_outdated,
@@ -245,7 +252,7 @@ def test_gradle_scan_requires_trivy_before_generating_a_report(
         lambda *args: pytest.fail("report without trivy"),
     )
     with pytest.raises(ToolNotFoundError, match="trivy"):
-        scanner._run_gradle_scan(gradle_project)
+        scanner.scan_gradle(gradle_project)
 
 
 @pytest.mark.integration
@@ -658,7 +665,7 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         ),
     )
     monkeypatch.setattr(
-        scanner, "_run_gradle_scan", lambda project: (state.vulns, resolution)
+        scanner, "scan_gradle", lambda project: (state.vulns, resolution)
     )
     monkeypatch.setattr(
         scanner, "discover_gradle_updates", lambda project: state.findings
@@ -824,6 +831,34 @@ def _gradle_resolution_fixture():
     return parse_resolution_report(json.dumps(_gradle_report_payload()))
 
 
+def _generated(bom, resolution):
+    payload, inventory = load_inventory(bom)
+    return GeneratedGradleReport(
+        bom_path=bom,
+        inventory_bytes=payload,
+        inventory=inventory,
+        resolution=resolution,
+    )
+
+
+def _nested_malformed_inventory() -> tuple[bytes, CycloneDxInventory]:
+    """Envelope-valid top level whose nested identity is malformed."""
+    text = json.dumps(
+        {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "components": [
+                {
+                    "type": "library",
+                    "purl": "pkg:maven/g/lib@1",
+                    "components": [{"type": "library", "purl": 42}],
+                }
+            ],
+        }
+    )
+    return text.encode(), parse_inventory_text(text, source="memory-bom")
+
+
 def _yield_fixture_bom(project):
     @contextmanager
     def _generate(_project):
@@ -833,7 +868,7 @@ def _yield_fixture_bom(project):
             (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"), encoding="utf-8"
         )
         try:
-            yield bom, _gradle_resolution_fixture()
+            yield _generated(bom, _gradle_resolution_fixture())
         finally:
             shutil.rmtree(bom.parent, ignore_errors=True)
 
@@ -855,24 +890,27 @@ def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
 
 
 def test_gradle_scan_unreadable_bom_is_gradle_error(gradle_project, monkeypatch):
-    from maintenance_man.scanner import _run_gradle_scan
+    from maintenance_man.scanner import scan_gradle
 
-    @contextmanager
-    def _generate(_project):
-        yield (
-            Path(gradle_project.path) / "missing-bom.json",
-            _gradle_resolution_fixture(),
-        )
+    def runner(root, args, *, label):
+        completed = fixture_runner(root, args, label=label)
+        (root / GRADLE_INVENTORY_BOM_RELPATH).unlink()
+        return completed
 
-    monkeypatch.setattr("maintenance_man.scanner.generate_gradle_report", _generate)
-    with pytest.raises(GradleError, match="Could not capture Gradle resolution"):
-        _run_gradle_scan(gradle_project)
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", runner)
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
+    )
+    with pytest.raises(GradleError, match="cyclonedxBom produced no inventory"):
+        scan_gradle(gradle_project)
+    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
 def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
     gradle_project, monkeypatch
 ):
-    from maintenance_man.scanner import _run_gradle_scan
+    from maintenance_man.scanner import scan_gradle
 
     payload = _gradle_report_payload()
     payload["scopes"][0]["components"] = [
@@ -895,7 +933,7 @@ def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
         )
         resolution = parse_resolution_report(json.dumps(payload))
         try:
-            yield bom, resolution
+            yield _generated(bom, resolution)
         finally:
             shutil.rmtree(bom.parent, ignore_errors=True)
 
@@ -903,13 +941,13 @@ def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
     _trivy_sbom(monkeypatch, stdout='{"Results": []}')
 
     with pytest.raises(GradleError, match="no selected resolution identity"):
-        _run_gradle_scan(gradle_project)
+        scan_gradle(gradle_project)
 
 
 def test_gradle_scan_finding_without_resolution_scope_is_error(
     gradle_project, monkeypatch
 ):
-    from maintenance_man.scanner import _run_gradle_scan
+    from maintenance_man.scanner import scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -932,7 +970,7 @@ def test_gradle_scan_finding_without_resolution_scope_is_error(
     )
 
     with pytest.raises(GradleError, match="no selected resolution scope"):
-        _run_gradle_scan(gradle_project)
+        scan_gradle(gradle_project)
 
 
 def test_gradle_scan_rejects_omitted_resolved_modules(
@@ -944,13 +982,14 @@ def test_gradle_scan_rejects_omitted_resolved_modules(
 
     @contextmanager
     def incomplete_inventory(project):
-        with _yield_fixture_bom(project)(project) as (bom, resolution):
+        with _yield_fixture_bom(project)(project) as generated:
+            bom = generated.bom_path
             document = json.loads(bom.read_text())
             document["components"] = [
                 row for row in document["components"] if row["name"] == "gson"
             ]
             bom.write_text(json.dumps(document))
-            yield bom, resolution
+            yield _generated(bom, generated.resolution)
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report", incomplete_inventory
@@ -974,7 +1013,7 @@ def test_gradle_scan_records_selected_resolution_scopes(gradle_project, monkeypa
     configuration="runtimeClasspath". So the expected scope string, computed
     independently of scanner.py, is ":/project/runtimeClasspath".
     """
-    from maintenance_man.scanner import _run_gradle_scan
+    from maintenance_man.scanner import scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -982,7 +1021,7 @@ def test_gradle_scan_records_selected_resolution_scopes(gradle_project, monkeypa
     )
     _trivy_sbom(monkeypatch)
 
-    findings, _ = _run_gradle_scan(gradle_project)
+    findings, _ = scan_gradle(gradle_project)
 
     assert findings
     assert all(
@@ -1053,7 +1092,7 @@ def test_gradle_scan_runs_the_existing_secret_scan_when_enabled(
     )
     secret_calls: list[Path] = []
     monkeypatch.setattr(
-        "maintenance_man.scanner._run_trivy_secret_scan",
+        "maintenance_man.scanner.scan_secrets",
         lambda path, skip_dirs: (secret_calls.append(path), [])[1],
     )
 
@@ -1116,7 +1155,7 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
 def test_gradle_trivy_malformed_shape_is_scan_error(
     gradle_project, monkeypatch, payload
 ):
-    from maintenance_man.scanner import ScanError, _run_gradle_scan
+    from maintenance_man.scanner import ScanError, scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -1124,7 +1163,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
     )
     _trivy_sbom(monkeypatch, stdout=json.dumps(payload))
     with pytest.raises(ScanError, match="Trivy"):
-        _run_gradle_scan(gradle_project)
+        scan_gradle(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
@@ -1139,7 +1178,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
 def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
     gradle_project, monkeypatch, failure
 ):
-    from maintenance_man.scanner import ScanError, _run_gradle_scan
+    from maintenance_man.scanner import ScanError, scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -1151,7 +1190,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
 
     monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(ScanError, match="Trivy"):
-        _run_gradle_scan(gradle_project)
+        scan_gradle(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
@@ -1257,6 +1296,33 @@ def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semanti
     assert findings[0].fixed_version is None
 
 
+def test_scan_gradle_incomplete_resolution_raises_before_binding_or_trivy(
+    gradle_project, monkeypatch
+):
+    from maintenance_man.gradle_resolution import parse_resolution_report
+
+    raw = _gradle_report_payload()
+    raw["scopes"][0]["unresolved"] = ["g:missing:1.0"]
+    resolution = parse_resolution_report(json.dumps(raw))
+
+    @contextmanager
+    def capture(project):
+        yield GeneratedGradleReport(
+            bom_path=Path(project.path) / "bom.json",
+            inventory_bytes=_nested_malformed_inventory()[0],
+            inventory=_nested_malformed_inventory()[1],
+            resolution=resolution,
+        )
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", capture)
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
+    )
+    with pytest.raises(GradleError, match="Incomplete Gradle resolution"):
+        scanner.scan_gradle(gradle_project)
+
+
 def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch):
     from contextlib import contextmanager
 
@@ -1271,7 +1337,12 @@ def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch
 
     @contextmanager
     def capture(project):
-        yield tmp_path / "bom.json", resolution
+        yield GeneratedGradleReport(
+            bom_path=tmp_path / "bom.json",
+            inventory_bytes=_nested_malformed_inventory()[0],
+            inventory=_nested_malformed_inventory()[1],
+            resolution=resolution,
+        )
 
     monkeypatch.setattr(scanner, "generate_gradle_report", capture)
     monkeypatch.setattr(paths, "MM_HOME", tmp_path / "mm")
@@ -1331,7 +1402,7 @@ def test_gradle_scan_checks_local_project_provenance(
         bom = Path(project.path) / "fixture-bom.json"
         bom.write_text(json.dumps(inventory))
         try:
-            yield bom, parse_resolution_report(json.dumps(payload))
+            yield _generated(bom, parse_resolution_report(json.dumps(payload)))
         finally:
             bom.unlink()
 
@@ -1360,12 +1431,12 @@ def test_gradle_scan_checks_local_project_provenance(
     else:
         _trivy_sbom(monkeypatch)
     if variant == "local":
-        findings, _ = scanner._run_gradle_scan(gradle_project)
+        findings, _ = scanner.scan_gradle(gradle_project)
         assert findings
         assert all(f.gradle_scopes == (":/project/runtimeClasspath",) for f in findings)
     else:
         with pytest.raises(GradleError):
-            scanner._run_gradle_scan(gradle_project)
+            scanner.scan_gradle(gradle_project)
 
 
 @pytest.mark.parametrize(
@@ -1396,7 +1467,7 @@ def test_scan_steps_follow_the_table_vulnerability_source(
 
     monkeypatch.setattr(scanner, "_run_uv_audit", uv_audit)
     monkeypatch.setattr(scanner, "_run_trivy_scan", trivy)
-    monkeypatch.setattr(scanner, "_run_trivy_secret_scan", secret)
+    monkeypatch.setattr(scanner, "scan_secrets", secret)
     monkeypatch.setattr(
         scanner,
         "package_manager_ops",

@@ -14,7 +14,6 @@ from maintenance_man.gradle import (
     GRADLE_REPORT_MARKER_RELPATH,
     GRADLE_UPDATE_REPORT_RELPATH,
     GradleError,
-    _validate_inventory,
     apply_gradle_update,
     claim_owned_dir,
     discover_gradle_updates,
@@ -631,7 +630,8 @@ class TestGradleReportInventory:
         )
         root = Path(gradle_project.path)
 
-        with generate_gradle_report(gradle_project) as (bom, _):
+        with generate_gradle_report(gradle_project) as generated:
+            bom = generated.bom_path
             assert bom == root / GRADLE_INVENTORY_BOM_RELPATH
             assert json.loads(bom.read_text())["specVersion"] == "1.6"
 
@@ -738,73 +738,6 @@ def test_report_generation_refuses_catalogue_mutation(gradle_project, monkeypatc
     assert not (root / GRADLE_INVENTORY_RELPATH).exists()
 
 
-class TestValidateInventory:
-    @pytest.mark.parametrize(
-        "fixture, expected",
-        [
-            (None, "produced no inventory"),
-            ("bom-empty.json", "no components"),
-            ("bom-non-maven.json", "no Maven components"),
-        ],
-    )
-    def test_unusable_inventory_is_an_error_not_a_clean_scan(
-        self, tmp_path, fixture, expected
-    ):
-        bom = tmp_path / "bom.json"
-        if fixture is not None:
-            bom.write_text(
-                (GRADLE_FIXTURES / fixture).read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-
-        with pytest.raises(GradleError, match=expected):
-            _validate_inventory(bom)
-
-    @pytest.mark.parametrize(
-        "spec, accepted",
-        [("1.5", True), ("1.6", True), ("1.7", True), ("1.4", False), ("junk", False)],
-    )
-    def test_spec_version_is_a_floor_not_an_equality(self, tmp_path, spec, accepted):
-        """A CycloneDX patch bump must not brick every Gradle scan."""
-        document = json.loads((GRADLE_FIXTURES / "bom.json").read_text())
-        document["specVersion"] = spec
-        bom = tmp_path / "bom.json"
-        bom.write_text(json.dumps(document), encoding="utf-8")
-
-        if accepted:
-            _validate_inventory(bom)
-        else:
-            with pytest.raises(GradleError, match=r"1.5 or later"):
-                _validate_inventory(bom)
-
-    def test_malformed_inventory_json_is_an_error(self, tmp_path):
-        bom = tmp_path / "bom.json"
-        bom.write_text("{not json", encoding="utf-8")
-
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            _validate_inventory(bom)
-
-    @pytest.mark.parametrize(
-        "document",
-        [
-            [],
-            None,
-            {"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [None]},
-            {
-                "bomFormat": "CycloneDX",
-                "specVersion": "1.6",
-                "components": {"purl": "pkg:maven/g/a@1"},
-            },
-        ],
-    )
-    def test_malformed_inventory_structure_is_a_gradle_error(self, tmp_path, document):
-        bom = tmp_path / "bom.json"
-        bom.write_text(json.dumps(document), encoding="utf-8")
-
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            _validate_inventory(bom)
-
-
 def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
     monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", fixture_runner)
 
@@ -815,9 +748,9 @@ def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
     with (
         pytest.raises(GradleError, match="cleanup denied"),
-        generate_gradle_report(gradle_project) as (bom, _),
+        generate_gradle_report(gradle_project) as generated,
     ):
-        assert bom.is_file()
+        assert generated.bom_path.is_file()
 
 
 def _apply_wrapper(edits: dict[str, str] | None = None, *, returncode: int = 0):
@@ -1281,7 +1214,8 @@ def test_discovery_keeps_active_owned_inventory_context(gradle_project, monkeypa
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    with generate_gradle_report(gradle_project) as (bom, _):
+    with generate_gradle_report(gradle_project) as generated:
+        bom = generated.bom_path
         before = bom.read_bytes()
         assert discover_gradle_updates(gradle_project)
         assert bom.read_bytes() == before
@@ -1451,7 +1385,8 @@ def test_adapter_filesystem_read_failure_is_actionable_and_releases_outputs(
         )
     else:
         monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
-    method = Path.read_bytes if read == "digest" else Path.read_text
+    reads_bytes = read in {"digest", "inventory"}
+    method = Path.read_bytes if reads_bytes else Path.read_text
     blocked = root / (
         GRADLE_CATALOGUE_RELPATH
         if read == "digest"
@@ -1465,7 +1400,7 @@ def test_adapter_filesystem_read_failure_is_actionable_and_releases_outputs(
             raise PermissionError("read denied")
         return method(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes" if read == "digest" else "read_text", fail)
+    monkeypatch.setattr(Path, "read_bytes" if reads_bytes else "read_text", fail)
     with pytest.raises(GradleError, match="read denied"):
         if read == "inventory":
             with generate_gradle_report(gradle_project):

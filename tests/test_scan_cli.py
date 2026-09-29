@@ -936,7 +936,7 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
             (GRADLE_FIXTURES / "resolution/empty.json").read_text()
         )
         monkeypatch.setattr(
-            "maintenance_man.scanner._run_gradle_scan",
+            "maintenance_man.scanner.scan_gradle",
             lambda *args: ([], resolution),
         )
         unlink = Path.unlink
@@ -1043,7 +1043,7 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
             (GRADLE_FIXTURES / "resolution/empty.json").read_text()
         )
         monkeypatch.setattr(
-            "maintenance_man.scanner._run_gradle_scan",
+            "maintenance_man.scanner.scan_gradle",
             lambda *args: ([], resolution),
         )
 

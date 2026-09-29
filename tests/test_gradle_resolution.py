@@ -4,7 +4,12 @@ from unittest.mock import patch
 
 import pytest
 
-from maintenance_man.gradle import GradleError, parse_catalogue
+from maintenance_man.gradle import (
+    GRADLE_INVENTORY_BOM_RELPATH,
+    GRADLE_INVENTORY_RELPATH,
+    GradleError,
+    parse_catalogue,
+)
 from maintenance_man.gradle_resolution import (
     attach_gradle_publications,
     collect_gradle_resolution,
@@ -99,13 +104,45 @@ def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):
     with patch(
         "maintenance_man.gradle_resolution.run_gradle", side_effect=fixture_runner
     ):
-        with generate_gradle_report(project) as (bom, resolution):
-            assert bom.is_file()
-            assert isinstance(resolution, CompleteResolution)
+        with generate_gradle_report(project) as generated:
+            assert generated.bom_path.is_file()
+            assert isinstance(generated.resolution, CompleteResolution)
         assert not (tmp_path / ".mm-gradle-inventory").exists()
         result = collect_gradle_resolution(project)
     assert isinstance(result, CompleteResolution)
     assert result.report.scopes[0].components[0].kind == "root"
+
+
+def test_captured_inventory_bytes_and_models_survive_cleanup(tmp_path):
+    project = make_project(tmp_path)
+    with patch(
+        "maintenance_man.gradle_resolution.run_gradle", side_effect=fixture_runner
+    ):
+        with generate_gradle_report(project) as generated:
+            on_disk = generated.bom_path.read_bytes()
+        assert not generated.bom_path.exists()
+    assert generated.inventory_bytes == on_disk
+    assert [row["purl"] for row in generated.inventory.components] == [
+        "pkg:maven/g/a@1.0"
+    ]
+    assert isinstance(generated.resolution, CompleteResolution)
+
+
+def test_inventory_envelope_is_refused_before_the_report_is_parsed(tmp_path):
+    project = make_project(tmp_path)
+
+    def runner(root, args, *, label):
+        completed = fixture_runner(root, args, label=label)
+        (root / GRADLE_INVENTORY_BOM_RELPATH).write_text("[]")
+        (root / GRADLE_INVENTORY_RELPATH / "report.json").write_text("{not json")
+        return completed
+
+    with (
+        patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner),
+        pytest.raises(GradleError, match="malformed CycloneDX inventory"),
+        generate_gradle_report(project),
+    ):
+        pytest.fail("malformed inventory must not yield")
 
 
 def test_unmarked_output_is_never_reclaimed(tmp_path):

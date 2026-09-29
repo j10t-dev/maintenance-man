@@ -64,6 +64,7 @@ forbidden_modules = [
     "maintenance_man.env",
     "maintenance_man.exit_codes",
     "maintenance_man.gradle",
+    "maintenance_man.gradle_inventory",
     "maintenance_man.gradle_resolution",
     "maintenance_man.gradle_updates",
     "maintenance_man.gradle_verification",

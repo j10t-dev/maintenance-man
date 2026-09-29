@@ -62,8 +62,8 @@ from maintenance_man.models.scan import (
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import (
     ScanError,
-    _run_gradle_scan,
-    _run_trivy_secret_scan,
+    scan_gradle,
+    scan_secrets,
 )
 from maintenance_man.storage import (
     NoScanResultsError,
@@ -106,7 +106,7 @@ def _prepare_gradle_run(
     emit: Emit,
 ) -> GradleRun | Outcome:
     # Resolve current security findings even when discovery produces no proposals.
-    vulnerabilities, resolution = _run_gradle_scan(project)
+    vulnerabilities, resolution = scan_gradle(project)
     catalogue = parse_catalogue(project.path / GRADLE_CATALOGUE_RELPATH)
     proposals = (
         discovered if discovered is not None else discover_gradle_updates(project)
@@ -219,7 +219,7 @@ def _publish_verified_gradle_scan(
     )
     rows = snapshot_vulnerabilities(run.accepted_snapshot)
     secrets = (
-        _run_trivy_secret_scan(project.path, project.scan_skip_dirs)
+        scan_secrets(project.path, project.scan_skip_dirs)
         if project.scan_secrets
         else []
     )

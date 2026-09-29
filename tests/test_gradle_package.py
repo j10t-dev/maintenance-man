@@ -196,15 +196,16 @@ def test_real_gradle_producer_and_native_intervals(tmp_path):
         "project_path": ":app",
         "module": {"group": "fixture", "artifact": "app", "version": "unspecified"},
     } in report["local_projects"]
+    from maintenance_man.gradle_inventory import bind_inventory, parse_inventory_text
     from maintenance_man.gradle_resolution import parse_resolution_report
-    from maintenance_man.scanner import _inventory_modules
 
     inventory = (owned / "bom.json").read_bytes()
     assert "project_path=%3Aapp" in inventory.decode()
-    modules = _inventory_modules(
-        inventory, parse_resolution_report(json.dumps(report)).report
+    coverage = bind_inventory(
+        parse_inventory_text(inventory.decode(), source="real-bom"),
+        parse_resolution_report(json.dumps(report)).report,
     )
-    assert [(m.coordinate, m.version) for m in modules] == [("g:a", "1.0")]
+    assert [(m.coordinate, m.version) for m in coverage.modules] == [("g:a", "1.0")]
     assert any(
         component["module"] == {"group": "g", "artifact": "a", "version": "1.0"}
         for scope in report["scopes"]

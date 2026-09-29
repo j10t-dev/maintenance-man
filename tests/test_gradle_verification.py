@@ -19,8 +19,10 @@ from maintenance_man import gradle_updates as updater
 from maintenance_man import gradle_verification as verification
 from maintenance_man import gradle_workflow as workflow_service
 from maintenance_man.github import CodeHostError
-from maintenance_man.gradle import GradleError
+from maintenance_man.gradle import GRADLE_INVENTORY_BOM_RELPATH, GradleError
 from maintenance_man.gradle import parse_catalogue as real_parse_catalogue
+from maintenance_man.gradle_inventory import load_inventory
+from maintenance_man.gradle_resolution import GeneratedGradleReport
 from maintenance_man.gradle_updates import run_gradle_checks as real_run_gradle_checks
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
@@ -72,6 +74,16 @@ from maintenance_man.process import ProcessError, ToolNotFoundError
 from maintenance_man.vcs import RevisionError
 from tests.fake_vcs import FakeJjState
 from tests.fakes import RecordingEmit
+
+
+def _generated(bom: Path, resolution) -> GeneratedGradleReport:
+    payload, inventory = load_inventory(bom)
+    return GeneratedGradleReport(
+        bom_path=bom,
+        inventory_bytes=payload,
+        inventory=inventory,
+        resolution=resolution,
+    )
 
 
 def _workflow_vcs(path: Path, *, files: dict[str, str] | None = None):
@@ -418,6 +430,7 @@ def test_capture_reads_before_cleanup_and_never_discovers(
     assert expected_tree != source_tree
     project = project.model_copy(update={"path": update_path})
     bom = project.path / "temporary-bom.json"
+    written: list[bytes] = []
 
     @contextmanager
     def report(_project):
@@ -425,6 +438,7 @@ def test_capture_reads_before_cleanup_and_never_discovers(
             json.dumps(
                 {
                     "bomFormat": "CycloneDX",
+                    "specVersion": "1.6",
                     "components": [
                         {
                             "type": "library",
@@ -436,8 +450,9 @@ def test_capture_reads_before_cleanup_and_never_discovers(
                 }
             )
         )
+        written.append(bom.read_bytes())
         try:
-            yield bom, resolution
+            yield _generated(bom, resolution)
         finally:
             bom.unlink()
 
@@ -494,23 +509,104 @@ def test_capture_reads_before_cleanup_and_never_discovers(
         assert len(result.findings) == 1
         assert result.findings[0].key.scope == resolution.report.selected_scopes[0]
         assert result.findings[0].rows[0].update_status is None
+        assert result.inventory_digest == hashlib.sha256(written[0]).hexdigest()
     assert not bom.exists()
 
 
-def test_capture_unreadable_bom_is_gradle_error(
-    frozen_context, resolution, monkeypatch
+def test_capture_unreadable_bom_is_gradle_error(frozen_context, monkeypatch):
+    from tests.conftest import fixture_runner
+
+    project, context, _ = frozen_context
+    root = project.path
+    (root / "gradle").mkdir()
+    (root / "gradle" / "libs.versions.toml").write_text('[versions]\nx = "1.0"\n')
+
+    def runner(root_arg, args, *, label):
+        completed = fixture_runner(root_arg, args, label=label)
+        (root_arg / GRADLE_INVENTORY_BOM_RELPATH).unlink()
+        return completed
+
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", runner)
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
+    )
+    with pytest.raises(scanner.GradleError, match="cyclonedxBom produced no inventory"):
+        scanner.capture_gradle_snapshot(project, context)
+    assert not (root / ".mm-gradle-inventory").exists()
+
+
+@pytest.mark.parametrize("row", ["incomplete", "scope", "producer", "matching"])
+def test_capture_checks_resolution_before_nested_inventory_identity(
+    frozen_context, resolution, scope, monkeypatch, row
 ):
     project, context, _ = frozen_context
+    supplied = resolution
+    if row == "incomplete":
+        supplied = IncompleteResolution(
+            report=resolution.report, reasons=("unresolved: g:lib",)
+        )
+    elif row == "scope":
+        other = ScopeId(project_path=":other", domain="project", configuration="c")
+        supplied = resolution.model_copy(
+            update={
+                "report": resolution.report.model_copy(
+                    update={"selected_scopes": (scope, other)}
+                )
+            }
+        )
+    elif row == "producer":
+        supplied = resolution.model_copy(
+            update={
+                "report": resolution.report.model_copy(
+                    update={
+                        "producer_versions": {
+                            **resolution.report.producer_versions,
+                            "gradle": "9.0",
+                        }
+                    }
+                )
+            }
+        )
+    bom = project.path / "nested-bom.json"
 
     @contextmanager
     def report(_project):
-        yield project.path / "missing-bom.json", resolution
+        bom.write_text(
+            json.dumps(
+                {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.6",
+                    "components": [
+                        {
+                            "type": "library",
+                            "purl": "pkg:maven/g/lib@1",
+                            "components": [{"type": "library", "purl": 42}],
+                        }
+                    ],
+                }
+            )
+        )
+        try:
+            yield _generated(bom, supplied)
+        finally:
+            bom.unlink()
 
     monkeypatch.setattr(scanner, "generate_gradle_report", report)
-    with pytest.raises(
-        scanner.GradleError, match="Could not capture Gradle resolution"
-    ):
-        scanner.capture_gradle_snapshot(project, context)
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
+    )
+    if row == "matching":
+        with pytest.raises(scanner.GradleError, match="Malformed CycloneDX inventory"):
+            scanner.capture_gradle_snapshot(project, context)
+        return
+    result = scanner.capture_gradle_snapshot(project, context)
+    assert isinstance(result, IncompleteResolution)
+    if row == "incomplete":
+        assert result is supplied
+    else:
+        assert result.reasons == ("selected scopes or producer versions changed",)
 
 
 @pytest.fixture
@@ -1073,7 +1169,7 @@ def test_gradle_no_updates_does_not_require_build_hooks(workflow, monkeypatch):
     monkeypatch.setattr(workflow_service, "discover_gradle_updates", lambda *args: [])
     monkeypatch.setattr(
         workflow_service,
-        "_run_gradle_scan",
+        "scan_gradle",
         lambda *args: ([], workflow.initial.resolution),
     )
     monkeypatch.setattr(
@@ -1171,7 +1267,7 @@ def driver(workflow, resolution, monkeypatch):
     )
     monkeypatch.setattr(
         workflow_service,
-        "_run_gradle_scan",
+        "scan_gradle",
         lambda *args: (list(workflow.initial.findings[0].rows), resolution),
     )
     monkeypatch.setattr(
@@ -2637,7 +2733,7 @@ def test_gradle_fresh_scan_does_not_clear_unfinished_ledger(driver, monkeypatch)
         cli, "_load_cfg", lambda *args: MmConfig(projects={"sample": driver.project})
     )
     monkeypatch.setattr(
-        scanner, "_run_gradle_scan", lambda *args: ([], workflow.initial.resolution)
+        scanner, "scan_gradle", lambda *args: ([], workflow.initial.resolution)
     )
     monkeypatch.setattr(scanner, "discover_gradle_updates", lambda *args: [])
     result_path = paths.MM_HOME / "scan-results" / "sample.json"
@@ -2755,9 +2851,17 @@ def test_snapshot_checks_local_project_provenance(
     @contextmanager
     def generate(_project):
         bom = project.path / "fixture-bom.json"
-        bom.write_text(json.dumps({"bomFormat": "CycloneDX", "components": components}))
+        bom.write_text(
+            json.dumps(
+                {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.6",
+                    "components": components,
+                }
+            )
+        )
         try:
-            yield bom, resolution
+            yield _generated(bom, resolution)
         finally:
             bom.unlink()
 
@@ -3069,7 +3173,7 @@ def test_snapshot_refuses_inventory_missing_a_resolved_module(
             )
         )
         try:
-            yield bom, resolution
+            yield _generated(bom, resolution)
         finally:
             bom.unlink()
 

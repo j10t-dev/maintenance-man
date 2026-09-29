@@ -7,7 +7,6 @@ groups shared versions, and manages adapter-owned temporary outputs.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -872,62 +871,6 @@ def _digest(path: Path) -> str:
         return file_digest(path)
     except OSError as e:
         raise GradleError(f"Could not read Gradle catalogue {path}: {e}") from e
-
-
-def _validate_inventory(path: Path) -> None:
-    """A missing, empty, non-Maven or malformed inventory is never a clean scan."""
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as e:
-        raise GradleError(
-            f"cyclonedxBom produced no inventory at {path}; is org.cyclonedx.bom "
-            f"3.4.1 applied with the documented fixed output paths?"
-        ) from e
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
-        raise GradleError(f"malformed CycloneDX inventory {path}: {e}") from e
-
-    if not isinstance(document, dict):
-        raise GradleError(f"malformed CycloneDX inventory {path}: expected an object")
-    if document.get("bomFormat") != "CycloneDX":
-        raise GradleError(f"{path} is not a CycloneDX document")
-    if _spec_version(document.get("specVersion")) < (1, 5):
-        raise GradleError(
-            f"unsupported CycloneDX spec version "
-            f"{document.get('specVersion')!r} in {path}; mm requires 1.5 or later"
-        )
-    components = document.get("components", [])
-    if not isinstance(components, list) or any(
-        not isinstance(component, dict) for component in components
-    ):
-        raise GradleError(
-            f"malformed CycloneDX inventory {path}: "
-            "components must be an array of objects"
-        )
-    if not components:
-        raise GradleError(
-            f"CycloneDX inventory {path} has no components; an empty inventory is "
-            f"an unsupported scan, not a clean result"
-        )
-    if not any(
-        str(component.get("purl", "")).startswith("pkg:maven/")
-        for component in components
-    ):
-        raise GradleError(
-            f"CycloneDX inventory {path} has no Maven components; the scan scope is "
-            f"unsupported, not clean"
-        )
-
-
-def _spec_version(raw: object) -> tuple[int, ...]:
-    """Parse a CycloneDX specVersion as a numeric tuple. Unparsable sorts lowest.
-
-    A floor rather than an equality: a plugin patch bump that emits a newer
-    schema must not turn every Gradle scan into a hard error.
-    """
-    try:
-        return tuple(int(part) for part in str(raw).split("."))
-    except ValueError:
-        return (0,)
 
 
 def _remove_owned_tree(path: Path) -> None:

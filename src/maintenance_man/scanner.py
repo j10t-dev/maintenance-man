@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeGuard, assert_never
-from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
 
@@ -22,9 +21,8 @@ from maintenance_man.gradle import (
     GradleError,
     discover_gradle_updates,
 )
-from maintenance_man.gradle_resolution import (
-    generate_gradle_report,
-)
+from maintenance_man.gradle_inventory import bind_inventory
+from maintenance_man.gradle_resolution import generate_gradle_report
 from maintenance_man.gradle_verification import TRIVY_INSTALL_HINT, context_inputs_valid
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
@@ -35,8 +33,6 @@ from maintenance_man.models.gradle import (
     GradleSnapshot,
     IncompleteResolution,
     ModuleId,
-    ResolutionReport,
-    ScopeId,
 )
 from maintenance_man.models.scan import (
     ScanResult,
@@ -75,16 +71,8 @@ def scan_project(
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
     resolution = None
     if project.package_manager == "gradle":
-        vulns, resolution = _run_gradle_scan(project)
-        updates = discover_gradle_updates(project)
-        with PublicationLookupContext(paths.gradle_publications_dir()) as context:
-            updates = filter_gradle_updates_by_age(
-                updates, project, resolution, min_version_age_days, context
-            )
-        secrets = (
-            _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
-            if project.scan_secrets
-            else []
+        vulns, updates, secrets, resolution = _scan_gradle_project(
+            project, min_version_age_days
         )
     else:
         ops = package_manager_ops(project.package_manager)
@@ -92,7 +80,7 @@ def scan_project(
             case "uv-audit":
                 vulns = _run_uv_audit(project_path)
                 secrets = (
-                    _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
+                    scan_secrets(project_path, project.scan_skip_dirs)
                     if project.scan_secrets
                     else []
                 )
@@ -121,6 +109,25 @@ def scan_project(
     return scan_result
 
 
+def _scan_gradle_project(
+    project: ProjectConfig, min_version_age_days: int
+) -> tuple[
+    list[VulnFinding], list[UpdateFinding], list[SecretFinding], CompleteResolution
+]:
+    vulns, resolution = scan_gradle(project)
+    updates = discover_gradle_updates(project)
+    with PublicationLookupContext(paths.gradle_publications_dir()) as context:
+        updates = filter_gradle_updates_by_age(
+            updates, project, resolution, min_version_age_days, context
+        )
+    secrets = (
+        scan_secrets(Path(project.path), project.scan_skip_dirs)
+        if project.scan_secrets
+        else []
+    )
+    return vulns, updates, secrets, resolution
+
+
 def _check_outdated(
     project: ProjectConfig,
     ops: PackageManagerOps,
@@ -138,23 +145,23 @@ def _check_outdated(
     return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
 
 
-def _run_gradle_scan(
+def scan_gradle(
     project: ProjectConfig,
 ) -> tuple[list[VulnFinding], CompleteResolution]:
     """Scan the project's own freshly captured resolution and inventory."""
     require_tool("trivy", TRIVY_INSTALL_HINT)
-    with generate_gradle_report(project) as (bom, outcome):
+    with generate_gradle_report(project) as generated:
+        outcome = generated.resolution
         if isinstance(outcome, IncompleteResolution):
             raise GradleError(
                 "Incomplete Gradle resolution: " + "; ".join(outcome.reasons)
             )
-        modules = _inventory_modules(_read_inventory(bom), outcome.report)
-        module_scopes = _resolution_module_scopes(outcome.report)
-        coverage_errors = _inventory_coverage_errors(modules, module_scopes)
-        if coverage_errors:
+        coverage = bind_inventory(generated.inventory, outcome.report)
+        if coverage.errors:
             raise GradleError(
-                "Incomplete Gradle inventory: " + "; ".join(coverage_errors)
+                "Incomplete Gradle inventory: " + "; ".join(coverage.errors)
             )
+        bom = generated.bom_path
         cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
         completed = run_captured(
             cmd,
@@ -169,7 +176,7 @@ def _run_gradle_scan(
                 f"{scope.project_path}/{scope.domain}/{scope.configuration}"
                 for scope in scopes
             }
-            for module, scopes in module_scopes.items()
+            for module, scopes in coverage.scopes.items()
         }
         for finding in findings:
             scopes = scoped.get((finding.pkg_name, finding.installed_version))
@@ -331,7 +338,7 @@ _UV_AUDIT_FIXED_RE = re.compile(r"^\s+Fixed in:\s+(?P<version>\S+)\s*$")
 _UV_AUDIT_URL_RE = re.compile(r"^\s+Advisory information:\s+(?P<url>\S+)\s*$")
 
 
-def _run_trivy_secret_scan(
+def scan_secrets(
     project_path: Path,
     skip_dirs: list[str] | None = None,
 ) -> list[SecretFinding]:
@@ -429,101 +436,6 @@ def _parse_secrets(results: list[dict]) -> list[SecretFinding]:
     ]
 
 
-def _inventory_modules(
-    payload: bytes, report: ResolutionReport
-) -> tuple[ModuleId, ...]:
-    try:
-        document = json.loads(payload)
-        if not isinstance(document, dict) or document.get("bomFormat") != "CycloneDX":
-            raise ValueError("expected CycloneDX object")
-        found: set[ModuleId] = set()
-        local_projects = {
-            project.project_path: project.module for project in report.local_projects
-        }
-
-        def visit(rows):
-            if not isinstance(rows, list):
-                raise ValueError("components must be an array")
-            for row in rows:
-                if not isinstance(row, dict):
-                    raise ValueError("component must be an object")
-                purl = row.get("purl", "")
-                if not isinstance(purl, str):
-                    raise ValueError("component purl must be a string")
-                if purl.startswith("pkg:maven/"):
-                    identity = (
-                        purl.removeprefix("pkg:maven/")
-                        .split("?", 1)[0]
-                        .split("#", 1)[0]
-                    )
-                    coordinate, separator, version = identity.rpartition("@")
-                    group, slash, artifact = coordinate.partition("/")
-                    if (
-                        not separator
-                        or not slash
-                        or not group
-                        or not artifact
-                        or not version
-                    ):
-                        raise ValueError("malformed Maven purl")
-                    module = ModuleId(
-                        group=unquote(group),
-                        artifact=unquote(artifact),
-                        version=unquote(version),
-                    )
-                    qualifiers = parse_qs(urlsplit(purl).query, keep_blank_values=True)
-                    if "project_path" in qualifiers:
-                        paths = qualifiers["project_path"]
-                        if len(paths) != 1 or local_projects.get(paths[0]) != module:
-                            raise ValueError("unverified local project identity")
-                    else:
-                        found.add(module)
-                elif row.get("type") == "library" and not purl:
-                    raise ValueError("library component has no package identity")
-                visit(row.get("components", []))
-
-        visit(document.get("components", []))
-        return tuple(
-            sorted(
-                found,
-                key=lambda module: (module.group, module.artifact, module.version),
-            )
-        )
-    except (ValueError, TypeError, ValidationError) as exc:
-        raise GradleError(f"Malformed CycloneDX inventory: {exc}") from exc
-
-
-def _resolution_module_scopes(report: ResolutionReport) -> dict[ModuleId, set[ScopeId]]:
-    scopes: dict[ModuleId, set[ScopeId]] = {}
-    for result in report.scopes:
-        for component in result.components:
-            if component.module is not None:
-                scopes.setdefault(component.module, set()).add(result.scope)
-    return scopes
-
-
-def _inventory_coverage_errors(
-    modules: tuple[ModuleId, ...], scopes: dict[ModuleId, set[ScopeId]]
-) -> tuple[str, ...]:
-    inventory = set(modules)
-    return tuple(
-        f"Inventory module has no selected resolution identity: {module}"
-        for module in modules
-        if module not in scopes
-    ) + tuple(
-        f"resolved module missing from inventory: {module}"
-        for module in scopes
-        if module not in inventory
-    )
-
-
-def _read_inventory(bom: Path) -> bytes:
-    try:
-        return bom.read_bytes()
-    except OSError as exc:
-        raise GradleError(f"Could not capture Gradle resolution: {exc}") from exc
-
-
 def capture_gradle_snapshot(
     project: ProjectConfig,
     context: ComparisonContext,
@@ -535,7 +447,8 @@ def capture_gradle_snapshot(
         raise GradleError(
             "Comparison context expired or inputs changed; rebuild baseline and tip"
         )
-    with generate_gradle_report(project) as (bom, resolution):
+    with generate_gradle_report(project) as generated:
+        resolution = generated.resolution
         if isinstance(resolution, IncompleteResolution):
             return resolution
         report = resolution.report
@@ -546,15 +459,12 @@ def capture_gradle_snapshot(
             return IncompleteResolution(
                 report=report, reasons=("selected scopes or producer versions changed",)
             )
-        inventory = _read_inventory(bom)
-        modules = _inventory_modules(inventory, report)
-        scopes = _resolution_module_scopes(report)
-        coverage_errors = _inventory_coverage_errors(modules, scopes)
-        if coverage_errors:
-            return IncompleteResolution(
-                report=report,
-                reasons=coverage_errors,
-            )
+        coverage = bind_inventory(generated.inventory, report)
+        if coverage.errors:
+            return IncompleteResolution(report=report, reasons=coverage.errors)
+        modules, scopes = coverage.modules, coverage.scopes
+        inventory = generated.inventory_bytes
+        bom = generated.bom_path
         binary = next(
             key.removeprefix("binary:")
             for key in context.loaded_input_digests

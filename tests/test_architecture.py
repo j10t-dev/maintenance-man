@@ -27,13 +27,7 @@ class PrivateAccessSite:
 
 
 # Each entry names the consolidation design that removes it.
-ALLOWED_PRIVATE_ACCESS: frozenset[PrivateAccess] = frozenset(
-    {
-        ("gradle_resolution", "gradle", "_validate_inventory"),  # D
-        ("gradle_workflow", "scanner", "_run_gradle_scan"),  # D
-        ("gradle_workflow", "scanner", "_run_trivy_secret_scan"),  # D
-    }
-)
+ALLOWED_PRIVATE_ACCESS: frozenset[PrivateAccess] = frozenset()
 
 type _Def = ast.FunctionDef | ast.AsyncFunctionDef
 type _Function = _Def | ast.Lambda
@@ -461,6 +455,7 @@ def test_workflow_code_passes_complexity_limit() -> None:
         "src/maintenance_man/cli.py",
         "src/maintenance_man/services",
         "src/maintenance_man/updater.py",
+        "src/maintenance_man/gradle_inventory.py",
     )
     assert result.returncode == 0, result.stdout
 
@@ -534,6 +529,10 @@ def _site_lines(sites: list[PrivateAccessSite]) -> str:
     return "\n".join(
         f"{s.path}:{s.line} {s.access[0]} -> {s.access[1]}.{s.access[2]}" for s in sites
     )
+
+
+def test_private_access_allowlist_is_empty() -> None:
+    assert not ALLOWED_PRIVATE_ACCESS
 
 
 def test_no_new_private_access() -> None:
