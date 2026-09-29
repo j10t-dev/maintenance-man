@@ -4,7 +4,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from maintenance_man.models.gradle import GradleRun
-from maintenance_man.models.scan import ScanResult, UpdateKind, Workflow
+from maintenance_man.models.scan import ScanResult, UpdateKind, UpdateResult, Workflow
 
 
 class Outcome(StrEnum):
@@ -74,6 +74,27 @@ class OperationFailed:
 class ScanReported:
     result: ScanResult
     elapsed_s: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MissingTestConfig:
+    project: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessingStarted:
+    vulns: int
+    updates: int
+
+
+@dataclass(frozen=True, slots=True)
+class FindingsProcessed:
+    results: tuple[UpdateResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Promoted:
+    bookmark: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +204,10 @@ type Event = (
     | ProjectSkipped
     | OperationFailed
     | ScanReported
+    | MissingTestConfig
+    | ProcessingStarted
+    | FindingsProcessed
+    | Promoted
     | SyncCompleted
     | DeployStepStarted
     | DeployStepSucceeded

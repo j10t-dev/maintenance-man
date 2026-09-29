@@ -11,7 +11,3 @@ class ExitCode(IntEnum):
     BUILD_FAILED = 6
     DEPLOY_FAILED = 7
     SYNC_FAILED = 8
-
-
-class UpdateSetupError(Exception):
-    """An update workspace could not be prepared safely."""

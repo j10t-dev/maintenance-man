@@ -14,7 +14,6 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from maintenance_man import __version__, gradle_workflow, paths, vcs_workflow
-from maintenance_man import config as config_module
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
@@ -24,7 +23,6 @@ from maintenance_man.config import (
 )
 from maintenance_man.deployer import BuildError
 from maintenance_man.exit_codes import ExitCode
-from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
 from maintenance_man.github import CodeHostError
 from maintenance_man.models.activity import ActivityEvent
 from maintenance_man.models.config import MmConfig, ProjectConfig
@@ -37,6 +35,7 @@ from maintenance_man.models.events import (
     Event,
     FindingFailed,
     FindingPassed,
+    FindingsProcessed,
     FindingStarted,
     FindingStepFailed,
     FindingStepKind,
@@ -46,12 +45,15 @@ from maintenance_man.models.events import (
     GradleWithheld,
     HealthChecked,
     HealthcheckUnconfigured,
+    MissingTestConfig,
     NoEligibleGradleChanges,
     Operation,
     OperationFailed,
     Outcome,
+    ProcessingStarted,
     ProjectSkipped,
     ProjectStarted,
+    Promoted,
     PullRequestOutput,
     ScanReported,
     SkipReason,
@@ -77,9 +79,10 @@ from maintenance_man.models.scan import (
     sort_vulns_by_severity,
 )
 from maintenance_man.process import ToolNotFoundError
-from maintenance_man.services import WorkflowError
+from maintenance_man.services import WorkflowError, flows
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.services import scan as scan_service
+from maintenance_man.services import update as update_service
 from maintenance_man.services.scan import ScanSummary
 from maintenance_man.storage import (
     NoScanResultsError,
@@ -98,12 +101,9 @@ from maintenance_man.updater import (
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import (
     VcsServices,
-    create_workspace,
     ensure_main_bookmark,
     make_vcs_services,
     push_bookmark_and_create_pr,
-    refresh_working_copy_from_main,
-    remove_workspace,
 )
 from maintenance_man.vcs_workflow import (
     prune_stale_bookmarks as prune_repository_bookmarks,
@@ -238,6 +238,36 @@ def _render_operation_failed(event: OperationFailed, batch: bool) -> None:
 def _render_scan_reported(event: ScanReported, batch: bool) -> None:
     del batch
     _print_scan_result(event.result, elapsed_s=event.elapsed_s)
+
+
+@_renders(MissingTestConfig)
+def _render_missing_test_config(event: MissingTestConfig, batch: bool) -> None:
+    del batch
+    console.print(
+        f"  [bold yellow]Warning:[/] {escape(event.project)} — no test "
+        "configuration (test phases will be skipped)"
+    )
+
+
+@_renders(ProcessingStarted)
+def _render_processing_started(event: ProcessingStarted, batch: bool) -> None:
+    del batch
+    if event.vulns:
+        console.print(f"\n[bold]Processing {event.vulns} vuln fix(es)...[/]")
+    if event.updates:
+        console.print(f"\n[bold]Processing {event.updates} update(s)...[/]")
+
+
+@_renders(FindingsProcessed)
+def _render_findings_processed(event: FindingsProcessed, batch: bool) -> None:
+    if not batch:
+        _print_update_summary(list(event.results))
+
+
+@_renders(Promoted)
+def _render_promoted(event: Promoted, batch: bool) -> None:
+    del batch
+    console.print(f"[bold green]Promoted {escape(event.bookmark)} to main.[/]")
 
 
 @_renders(SyncCompleted)
@@ -470,31 +500,6 @@ def _exit_if_no_update_targets(cfg: MmConfig, target_names: list[str]) -> None:
         sys.exit(ExitCode.OK)
 
 
-def _resolve_update_targets(
-    cfg: MmConfig,
-    projects: list[str],
-    *,
-    negate: bool,
-) -> tuple[Literal["single", "batch"], list[str]]:
-    try:
-        ordered = config_module.validate_project_names(cfg, projects)
-    except ProjectNotFoundError as exc:
-        _fatal(str(exc))
-
-    if negate:
-        excluded = set(ordered)
-        targets = [name for name in sorted(cfg.projects) if name not in excluded]
-        return "batch", targets
-
-    if not ordered:
-        return "batch", sorted(cfg.projects)
-
-    if len(ordered) == 1:
-        return "single", ordered
-
-    return "batch", ordered
-
-
 @app.command
 def update(
     *projects: str,
@@ -515,7 +520,12 @@ def update(
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
-    mode, targets = _resolve_update_targets(cfg, list(projects), negate=negate)
+    try:
+        mode, targets = update_service.resolve_update_targets(
+            cfg, projects, negate=negate
+        )
+    except ProjectNotFoundError as exc:
+        _fatal(str(exc))
 
     _exit_if_no_update_targets(cfg, targets)
 
@@ -526,9 +536,39 @@ def update(
 
     vcs = make_vcs_services()
     if mode == "single":
-        _update_interactive(cfg, targets[0], vcs=vcs)
+        name = targets[0]
+        proj_config = _resolve_proj(cfg, name)
+        try:
+            result = update_service.update_project(
+                name,
+                proj_config,
+                minimum_age_days=cfg.defaults.min_version_age_days,
+                choose=_choose_findings,
+                choose_gradle=_choose_gradle_candidates,
+                vcs=vcs,
+                emit=_Renderer(batch=False),
+            )
+        except WorkflowError as exc:
+            _fatal(str(exc))
+        sys.exit(
+            ExitCode.OK
+            if result.outcome is Outcome.SUCCEEDED
+            else ExitCode.UPDATE_FAILED
+        )
 
-    _update_batch_targets(cfg, target_names=targets, vcs=vcs)
+    batch = update_service.update_projects(
+        cfg, targets, vcs=vcs, emit=_Renderer(batch=True)
+    )
+    summary = [
+        (project.project, list(project.results))
+        for project in batch.projects
+        if project.results
+    ]
+    if summary or not any(
+        project.route is update_service.UpdateRoute.GRADLE for project in batch.projects
+    ):
+        _print_mass_update_summary(summary)
+    sys.exit(ExitCode.UPDATE_FAILED if batch.outcome is Outcome.FAILED else ExitCode.OK)
 
 
 @app.command
@@ -564,171 +604,6 @@ def sync(
     sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
 
-def _update_batch_targets(
-    cfg: MmConfig,
-    *,
-    target_names: list[str],
-    vcs: VcsServices,
-) -> NoReturn:
-    """Update an explicit ordered set of projects, auto-selecting all findings."""
-    _exit_if_no_update_targets(cfg, target_names)
-
-    all_project_results: list[tuple[str, list[UpdateResult]]] = []
-    had_errors = False
-    gradle_reported = False
-
-    for name in target_names:
-        proj_config = cfg.projects[name]
-        if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {escape(name)} — "
-                f"path does not exist: {escape(str(proj_config.path))}"
-            )
-            had_errors = True
-            continue
-
-        console.print(f"\n{'═' * 40}")
-        console.print(f"[bold]{escape(name)}[/]")
-        console.print("═" * 40)
-
-        outcome = _update_batch(
-            name,
-            proj_config,
-            cfg.defaults.min_version_age_days,
-            vcs=vcs,
-        )
-        if outcome is None:
-            had_errors = True
-            continue
-        results, promotion_failed = outcome
-        if proj_config.package_manager == "gradle":
-            gradle_reported = True
-        if promotion_failed:
-            had_errors = True
-        if results:
-            all_project_results.append((name, results))
-
-    if all_project_results or not gradle_reported:
-        _print_mass_update_summary(all_project_results)
-
-    any_failed = had_errors or any(
-        not r.passed for _, results in all_project_results for r in results
-    )
-    sys.exit(ExitCode.UPDATE_FAILED if any_failed else ExitCode.OK)
-
-
-def _enter_update_workspace(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    *,
-    vcs: VcsServices,
-) -> Path:
-    """Create a fresh or resumed update jj workspace. Returns its path."""
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    repo = vcs.repository(proj_config.path)
-    remove_workspace(repo=repo, project=project)
-
-    if _has_update_progress(scan_result):
-        if not repo.bookmark_exists(bookmark=bookmark):
-            raise _UpdateSetupError(
-                f"update bookmark '{bookmark}' is missing but in-progress "
-                f"state exists — rescan required"
-            )
-        workspace_path = create_workspace(repo=repo, project=project, revision=bookmark)
-        vcs.repository(workspace_path).new_change(revision=bookmark)
-        return workspace_path
-
-    prune_repository_bookmarks(repo=repo, host=vcs.code_host(proj_config.path))
-    ensure_main_bookmark(repo=repo)
-    if repo.bookmark_exists(bookmark=bookmark):
-        repo.delete_bookmark(bookmark=bookmark)
-    repo.create_bookmark(bookmark=bookmark, revision="main")
-    workspace_path = create_workspace(repo=repo, project=project, revision="main")
-    try:
-        vcs.repository(workspace_path).new_change(revision=bookmark)
-    except RevisionError:
-        remove_workspace(repo=repo, project=project)
-        raise
-    return workspace_path
-
-
-def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
-    return [
-        vuln
-        for vuln in vulns
-        if vuln.update_status is None
-        or (vuln.update_status == UpdateStatus.FAILED and vuln.flow == Workflow.UPDATE)
-    ]
-
-
-def _selectable_updates(updates: list[UpdateFinding]) -> list[UpdateFinding]:
-    return [
-        u
-        for u in updates
-        if u.update_status is None
-        or (u.update_status == UpdateStatus.FAILED and u.flow == Workflow.UPDATE)
-    ]
-
-
-def _prompt_selection(
-    selectable_vulns: list[VulnFinding],
-    selectable_updates: list[UpdateFinding],
-) -> tuple[list[VulnFinding], list[UpdateFinding]]:
-    numbered = _print_numbered_findings(selectable_vulns, selectable_updates)
-    parts = ["all"]
-    if selectable_vulns:
-        parts.append("vulns")
-    if selectable_updates:
-        parts.append("updates")
-    parts.extend(["1,2,...", "none"])
-    choices = "/".join(parts)
-
-    while True:
-        selection = Prompt.ask(
-            f"\n  Select updates {escape(f'[{choices}]')}", default="all"
-        )
-        result = _parse_selection(
-            selection, numbered, selectable_vulns, selectable_updates
-        )
-        if result is not None:
-            return result
-        console.print(
-            f"[bold red]Invalid selection:[/] '{escape(selection)}'. Try again."
-        )
-
-
-def _process_selected_findings(
-    selected_vulns: list[VulnFinding],
-    selected_updates: list[UpdateFinding],
-    work_config: ProjectConfig,
-    scan_result: ScanResult,
-    project: str,
-    *,
-    vcs: VcsServices,
-) -> list[UpdateResult]:
-    """Process both update categories in one failure-policy sequence."""
-    if selected_vulns:
-        console.print(f"\n[bold]Processing {len(selected_vulns)} vuln fix(es)...[/]")
-    if selected_updates:
-        console.print(f"\n[bold]Processing {len(selected_updates)} update(s)...[/]")
-    findings: list[Finding] = [
-        *consolidate_vulns(selected_vulns),
-        *sort_updates_by_risk(selected_updates),
-    ]
-    if not findings:
-        return []
-    return process_findings(
-        findings,
-        work_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan_result,
-        project_name=project,
-        vcs=vcs,
-        emit=_Renderer(batch=False),
-    )
-
-
 def _print_update_summary(all_results: list[UpdateResult]) -> None:
     passed = [r for r in all_results if r.passed]
     failed = [r for r in all_results if not r.passed]
@@ -749,147 +624,6 @@ def _print_update_summary(all_results: list[UpdateResult]) -> None:
     console.print("─" * 40)
 
 
-def _has_update_progress(scan_result: ScanResult) -> bool:
-    return any(
-        f.update_status in (UpdateStatus.READY, UpdateStatus.FAILED)
-        and f.flow == Workflow.UPDATE
-        for f in scan_result.findings
-    )
-
-
-def _has_update_failures(scan_result: ScanResult) -> bool:
-    return any(
-        f.update_status == UpdateStatus.FAILED and f.flow == Workflow.UPDATE
-        for f in scan_result.findings
-    )
-
-
-class _FlowConflictError(Exception):
-    """Raised when scan-result flow state is incompatible with the active flow."""
-
-
-def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:
-    for f in scan_result.findings:
-        if f.update_status is not None and f.flow is None:
-            raise _FlowConflictError(
-                f"{project} has in-progress findings without flow ownership — "
-                f"please rescan the project."
-            )
-
-
-_RESOLVE_CLAIMABLE_TEST_PHASES = {"unit", "integration", "component"}
-
-
-def _is_resolve_claimable_failure(f: Finding, active_flow: Workflow) -> bool:
-    return (
-        active_flow == Workflow.RESOLVE
-        and f.flow == Workflow.UPDATE
-        and f.update_status == UpdateStatus.FAILED
-        and f.failed_phase in _RESOLVE_CLAIMABLE_TEST_PHASES
-    )
-
-
-def _assert_no_conflicting_flow(
-    scan_result: ScanResult,
-    active_flow: Workflow,
-    project: str,
-) -> None:
-    conflicts = [
-        f
-        for f in scan_result.findings
-        if f.update_status is not None
-        and f.flow is not None
-        and f.flow != active_flow
-        and not _is_resolve_claimable_failure(f, active_flow)
-    ]
-    if conflicts:
-        assert conflicts[0].flow is not None
-        other = conflicts[0].flow.value
-        raise _FlowConflictError(
-            f"Cannot run {active_flow.value} on {project}: {len(conflicts)} "
-            f"finding(s) owned by the '{other}' flow. Complete or abandon "
-            f"that flow first."
-        )
-
-
-def _finalise_local_update(
-    orig_path: Path,
-    scan_result: ScanResult,
-    project_name: str,
-    *,
-    vcs: VcsServices,
-) -> bool:
-    """Promote the update bookmark to main and promote READY findings.
-
-    Dirty-tree checks are unnecessary here because update work runs in an
-    isolated jj workspace, then only the managed bookmark is promoted.
-    """
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    repo = vcs.repository(orig_path)
-    try:
-        repo.promote_bookmark_to_main(bookmark=bookmark)
-    except RevisionError as exc:
-        console.print(f"[bold red]Promotion failed:[/] {escape(str(exc))}")
-        return False
-
-    try:
-        refresh_working_copy_from_main(repo=repo)
-    except RevisionError as exc:
-        console.print(
-            f"[bold red]Workspace refresh failed:[/] {escape(project_name)}: "
-            f"{escape(str(exc))}"
-        )
-        return False
-
-    for v in scan_result.vulnerabilities:
-        if v.update_status == UpdateStatus.READY and v.flow == Workflow.UPDATE:
-            v.update_status = UpdateStatus.COMPLETED
-    for u in scan_result.updates:
-        if u.update_status == UpdateStatus.READY and u.flow == Workflow.UPDATE:
-            u.update_status = UpdateStatus.COMPLETED
-
-    remove_completed_findings(scan_result)
-    save_scan_results(project_name, scan_result)
-    console.print(f"[bold green]Promoted {escape(bookmark)} to main.[/]")
-    return True
-
-
-def _warn_missing_test_config(project: str, proj_config: ProjectConfig) -> None:
-    if not proj_config.test_phases:
-        console.print(
-            f"  [bold yellow]Warning:[/] {escape(project)} — no test configuration "
-            f"(test phases will be skipped)"
-        )
-
-
-def _load_validated_scan(
-    project: str,
-    proj_config: ProjectConfig,
-    workflow: Workflow,
-) -> tuple[ScanResult, list[VulnFinding], list[UpdateFinding]]:
-    try:
-        scan_result = load_scan_results(project)
-    except NoScanResultsError:
-        console.print(
-            f"[bold green]{escape(project)}[/] — no scan results; nothing to do."
-        )
-        sys.exit(ExitCode.OK)
-    try:
-        _assert_supported_in_progress_state(scan_result, project)
-        _assert_no_conflicting_flow(scan_result, workflow, project)
-    except _FlowConflictError as e:
-        _fatal(str(e))
-    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
-    updates = scan_result.updates
-    if not actionable_vulns and not updates:
-        console.print(
-            f"[bold green]{escape(project)}[/] — nothing to {escape(workflow)}."
-        )
-        sys.exit(ExitCode.OK)
-    _warn_missing_test_config(project, proj_config)
-    return scan_result, actionable_vulns, updates
-
-
 # -- Resolve command ---------------------------------------------------------
 
 
@@ -904,7 +638,7 @@ def _ordered_resolve_candidates(
         and (
             (v.flow is None and v.update_status is None)
             or (v.flow == Workflow.RESOLVE and v.update_status == UpdateStatus.FAILED)
-            or _is_resolve_claimable_failure(v, Workflow.RESOLVE)
+            or flows.is_resolve_claimable_failure(v, Workflow.RESOLVE)
         )
     ]
     candidate_updates = [
@@ -912,7 +646,7 @@ def _ordered_resolve_candidates(
         for u in scan_result.updates
         if (u.flow is None and u.update_status is None)
         or (u.flow == Workflow.RESOLVE and u.update_status == UpdateStatus.FAILED)
-        or _is_resolve_claimable_failure(u, Workflow.RESOLVE)
+        or flows.is_resolve_claimable_failure(u, Workflow.RESOLVE)
     ]
     return [
         *consolidate_vulns(candidate_vulns),
@@ -1522,43 +1256,67 @@ def _print_numbered_findings(
     return numbered
 
 
-def _parse_selection(
-    selection: str,
-    numbered: list[VulnFinding | UpdateFinding],
-    actionable_vulns: list[VulnFinding],
-    updates: list[UpdateFinding],
-) -> tuple[list[VulnFinding], list[UpdateFinding]] | None:
-    """Parse user selection string into vuln and update lists.
+type _Selection = Literal["all", "none", "vulns", "updates"] | tuple[int, ...]
 
-    Returns None if the selection string is invalid.
-    """
-    match selection:
-        case "none":
-            return [], []
-        case "all":
-            return actionable_vulns, updates
-        case "vulns":
-            return actionable_vulns, []
-        case "updates":
-            return [], updates
 
-    selected_vulns: list[VulnFinding] = []
-    selected_updates: list[UpdateFinding] = []
+def _parse_selection(text: str, count: int) -> _Selection | None:
+    choice = text.strip().lower()
+    if choice == "all":
+        return "all"
+    if choice == "none":
+        return "none"
+    if choice == "vulns":
+        return "vulns"
+    if choice == "updates":
+        return "updates"
     try:
-        indices = [int(s.strip()) for s in selection.split(",")]
+        indices = [int(part) for part in choice.split(",")]
     except ValueError:
         return None
+    if not all(1 <= index <= count for index in indices):
+        return None
+    return tuple(dict.fromkeys(indices))
 
-    for i in indices:
-        if 1 <= i <= len(numbered):
-            finding = numbered[i - 1]
-            match finding:
-                case VulnFinding():
-                    selected_vulns.append(finding)
-                case UpdateFinding():
-                    selected_updates.append(finding)
 
-    return selected_vulns, selected_updates
+def _choose_findings(
+    selectable_vulns: list[VulnFinding],
+    selectable_updates: list[UpdateFinding],
+) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+    numbered = _print_numbered_findings(selectable_vulns, selectable_updates)
+    parts = ["all"]
+    if selectable_vulns:
+        parts.append("vulns")
+    if selectable_updates:
+        parts.append("updates")
+    parts.extend(["1,2,...", "none"])
+    choices = "/".join(parts)
+
+    while True:
+        text = Prompt.ask(f"\n  Select updates {escape(f'[{choices}]')}", default="all")
+        selection = _parse_selection(text, len(numbered))
+        if selection is None:
+            console.print(
+                f"[bold red]Invalid selection:[/] '{escape(text)}'. Try again."
+            )
+            continue
+        if selection == "all":
+            return selectable_vulns, selectable_updates
+        if selection == "vulns":
+            return selectable_vulns, []
+        if selection == "updates":
+            return [], selectable_updates
+        if selection == "none":
+            return [], []
+
+        selected_vulns: list[VulnFinding] = []
+        selected_updates: list[UpdateFinding] = []
+        for index in selection:
+            finding = numbered[index - 1]
+            if isinstance(finding, VulnFinding):
+                selected_vulns.append(finding)
+            else:
+                selected_updates.append(finding)
+        return selected_vulns, selected_updates
 
 
 def _choose_gradle_candidates(
@@ -1576,13 +1334,13 @@ def _choose_gradle_candidates(
                 f"{escape(candidate.target.target_version)}"
             )
     while True:
-        selection = (
-            console.input(
-                "Select all, none, vulns, updates, or comma-separated numbers: "
-            )
-            .strip()
-            .lower()
+        text = console.input(
+            "Select all, none, vulns, updates, or comma-separated numbers: "
         )
+        selection = _parse_selection(text, len(candidates))
+        if selection is None:
+            console.print("Invalid selection")
+            continue
         if selection == "all":
             return candidates
         if selection == "none":
@@ -1590,203 +1348,9 @@ def _choose_gradle_candidates(
         if selection in {"vulns", "updates"}:
             origin = "security" if selection == "vulns" else "ordinary"
             return tuple(item for item in candidates if origin in item.origins)
-        try:
-            indices = {int(value.strip()) for value in selection.split(",")}
-        except ValueError:
-            console.print("Invalid selection")
-            continue
-        if indices and min(indices) >= 1 and max(indices) <= len(candidates):
-            return tuple(
-                item for index, item in enumerate(candidates, 1) if index in indices
-            )
-        console.print("Invalid selection")
-
-
-def _run_update_flow(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    actionable_vulns: list[VulnFinding],
-    updates: list[UpdateFinding],
-    *,
-    interactive: bool,
-    vcs: VcsServices,
-) -> int:
-    """Set up the workspace, process findings, finalise. Returns exit code."""
-    try:
-        wt_path = _enter_update_workspace(project, proj_config, scan_result, vcs=vcs)
-    except (_UpdateSetupError, RevisionError, CodeHostError) as e:
-        _fatal(str(e))
-    work_config = proj_config.model_copy(update={"path": wt_path})
-    finalised = False
-    try:
-        _print_scan_result(scan_result)
-        selectable_vulns = _selectable_vulns(actionable_vulns)
-        selectable_updates = _selectable_updates(updates)
-        if interactive and (selectable_vulns or selectable_updates):
-            selected_vulns, selected_updates = _prompt_selection(
-                selectable_vulns, selectable_updates
-            )
-        else:
-            selected_vulns, selected_updates = (selectable_vulns, selectable_updates)
-        all_results = _process_selected_findings(
-            selected_vulns,
-            selected_updates,
-            work_config,
-            scan_result,
-            project,
-            vcs=vcs,
+        return tuple(
+            item for index, item in enumerate(candidates, 1) if index in selection
         )
-        _print_update_summary(all_results)
-        if (
-            any(not r.passed for r in all_results)
-            or _has_update_failures(scan_result)
-            or scan_result.blocked_findings
-        ):
-            return ExitCode.UPDATE_FAILED
-        finalised = _finalise_local_update(
-            proj_config.path, scan_result, project, vcs=vcs
-        )
-    finally:
-        try:
-            remove_workspace(repo=vcs.repository(proj_config.path), project=project)
-        except RevisionError as exc:
-            console.print(f"[bold red]Workspace cleanup failed:[/] {escape(str(exc))}")
-            finalised = False
-    if not finalised:
-        return ExitCode.UPDATE_FAILED
-    try:
-        vcs.repository(proj_config.path).delete_bookmark(
-            bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-        )
-    except RevisionError as exc:
-        console.print(f"[bold red]Bookmark cleanup failed:[/] {escape(str(exc))}")
-        return ExitCode.UPDATE_FAILED
-    return ExitCode.OK
-
-
-def _update_batch(
-    project: str,
-    proj_config: ProjectConfig,
-    minimum_age_days: int,
-    *,
-    vcs: VcsServices,
-) -> tuple[list[UpdateResult], bool] | None:
-    """Process all actionable findings for a single project (batch mode).
-
-    Returns ``(results, promotion_failed)``. ``promotion_failed`` is ``True``
-    when outstanding blocks remain or bookmark promotion was attempted and
-    failed. Per-finding failures are reported in ``results``. Returns ``None``
-    if the project was skipped due to an error.
-    """
-    if proj_config.package_manager == "gradle":
-        code = _run_gradle_flow(
-            project,
-            proj_config,
-            Workflow.UPDATE,
-            interactive=False,
-            minimum_age_days=minimum_age_days,
-            vcs=vcs,
-        )
-        return ([], code != ExitCode.OK)
-    try:
-        scan_result = load_scan_results(project)
-    except NoScanResultsError:
-        return ([], False)
-    try:
-        _assert_supported_in_progress_state(scan_result, project)
-        _assert_no_conflicting_flow(scan_result, Workflow.UPDATE, project)
-    except _FlowConflictError as e:
-        console.print(
-            f"  [bold yellow]Skipped:[/] {escape(project)} — {escape(str(e))}"
-        )
-        return None
-    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
-    updates = scan_result.updates
-    if not actionable_vulns and (not updates):
-        console.print(f"  [dim]{escape(project)} — nothing to update[/]")
-        return ([], False)
-    _warn_missing_test_config(project, proj_config)
-    try:
-        wt_path = _enter_update_workspace(project, proj_config, scan_result, vcs=vcs)
-    except (_UpdateSetupError, RevisionError, CodeHostError) as e:
-        console.print(f"  [bold red]Error:[/] {escape(project)} — {escape(str(e))}")
-        return None
-    work_config = proj_config.model_copy(update={"path": wt_path})
-    finalised = False
-    promotion_attempted = False
-    try:
-        _print_scan_result(scan_result)
-        all_results = _process_selected_findings(
-            _selectable_vulns(actionable_vulns),
-            _selectable_updates(updates),
-            work_config,
-            scan_result,
-            project,
-            vcs=vcs,
-        )
-        any_failed_result = any(not r.passed for r in all_results)
-        any_failed_finding = _has_update_failures(scan_result)
-        if not (
-            any_failed_result or any_failed_finding or scan_result.blocked_findings
-        ):
-            promotion_attempted = True
-            finalised = _finalise_local_update(
-                proj_config.path, scan_result, project, vcs=vcs
-            )
-    finally:
-        try:
-            remove_workspace(repo=vcs.repository(proj_config.path), project=project)
-        except RevisionError as exc:
-            console.print(
-                f"  [bold red]Workspace cleanup failed:[/] {escape(str(exc))}"
-            )
-            finalised = False
-            promotion_attempted = True
-    if finalised:
-        try:
-            vcs.repository(proj_config.path).delete_bookmark(
-                bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-            )
-        except RevisionError as exc:
-            console.print(
-                f"  [bold red]Bookmark cleanup failed:[/] {escape(project)} — "
-                f"{escape(str(exc))}"
-            )
-            finalised = False
-    return (
-        all_results,
-        bool(scan_result.blocked_findings) or (promotion_attempted and (not finalised)),
-    )
-
-
-def _update_interactive(cfg: MmConfig, project: str, *, vcs: VcsServices) -> NoReturn:
-    """Update a single project with interactive selection."""
-    proj_config = _resolve_proj(cfg, project)
-    if proj_config.package_manager == "gradle":
-        sys.exit(
-            _run_gradle_flow(
-                project,
-                proj_config,
-                Workflow.UPDATE,
-                interactive=True,
-                minimum_age_days=cfg.defaults.min_version_age_days,
-                vcs=vcs,
-            )
-        )
-    scan_result, actionable_vulns, updates = _load_validated_scan(
-        project, proj_config, Workflow.UPDATE
-    )
-    exit_code = _run_update_flow(
-        project,
-        proj_config,
-        scan_result,
-        actionable_vulns,
-        updates,
-        interactive=True,
-        vcs=vcs,
-    )
-    sys.exit(exit_code)
 
 
 @app.command
@@ -1831,7 +1395,17 @@ def resolve(
                 vcs=vcs,
             )
         )
-    scan_result, _, _ = _load_validated_scan(project, proj_config, Workflow.RESOLVE)
+    try:
+        scan_result = flows.load_validated_scan(
+            project,
+            proj_config,
+            Workflow.RESOLVE,
+            emit=_Renderer(batch=False),
+        )
+    except flows.FlowConflictError as exc:
+        _fatal(str(exc))
+    if scan_result is None:
+        sys.exit(ExitCode.OK)
     if continue_:
         sys.exit(_handle_resolve_continue(project, proj_config, scan_result, vcs=vcs))
     candidates = _ordered_resolve_candidates(scan_result)

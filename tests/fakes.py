@@ -15,11 +15,31 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     UpdateResult,
     UpdateStatus,
+    VulnFinding,
     Workflow,
 )
+from maintenance_man.services.update import FindingChooser
 from maintenance_man.storage import save_scan_results
 from maintenance_man.updater import Finding
 from maintenance_man.vcs_workflow import VcsServices
+
+
+def pick_findings(*pkg_names: str) -> FindingChooser:
+    def choose(
+        vulns: list[VulnFinding], updates: list[UpdateFinding]
+    ) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+        selected_vulns: list[VulnFinding] = []
+        selected_updates: list[UpdateFinding] = []
+        findings = [*vulns, *updates]
+        for pkg_name in pkg_names:
+            finding = next(item for item in findings if item.pkg_name == pkg_name)
+            if isinstance(finding, VulnFinding):
+                selected_vulns.append(finding)
+            else:
+                selected_updates.append(finding)
+        return selected_vulns, selected_updates
+
+    return choose
 
 
 @dataclass

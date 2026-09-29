@@ -2800,11 +2800,17 @@ def test_snapshot_checks_local_project_provenance(
 
 def test_batch_output_retains_verified_gradle_progress(driver, capsys):
     from maintenance_man.models.config import MmConfig
+    from maintenance_man.models.events import Outcome
+    from maintenance_man.services import update as update_service
 
     cfg = MmConfig(projects={"sample": driver.project})
-    with pytest.raises(SystemExit) as exit_info:
-        cli._update_batch_targets(cfg, target_names=["sample"], vcs=driver.workflow.vcs)
-    assert exit_info.value.code == 0
+    result = update_service.update_projects(
+        cfg,
+        ["sample"],
+        vcs=driver.workflow.vcs,
+        emit=cli._Renderer(batch=True),
+    )
+    assert result.outcome is Outcome.SUCCEEDED
     run = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert run is not None and run.refreshed
     assert any(isinstance(attempt, CompletedAttempt) for attempt in run.attempts)

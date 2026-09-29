@@ -300,7 +300,7 @@ def mock_update_cli_deps(
             "pkg-c": (True, None),
         }
     )
-    monkeypatch.setattr("maintenance_man.cli.process_findings", processor)
+    monkeypatch.setattr("maintenance_man.services.update.process_findings", processor)
     return {
         "vcs_state": vcs_state,
         "services": vcs_state.services(),
