@@ -76,6 +76,18 @@ def test_selected_scope_completeness(change, expected):
     assert len(result.report.selected_scopes) == 1
 
 
+def test_malformed_digest_precedes_incomplete_resolution():
+    raw = report_payload()
+    raw["catalogue_digest"] = "invalid"
+    raw["selection_errors"] = ["scope unavailable"]
+    with pytest.raises(GradleError) as caught:
+        parse_resolution_report(json.dumps(raw))
+    assert str(caught.value) == (
+        "Malformed Gradle resolution report: invalid catalogue digest"
+    )
+    assert type(caught.value.__cause__) is ValueError
+
+
 @pytest.mark.parametrize(
     "change", ["schema", "reference", "duplicate", "url", "version"]
 )
@@ -193,6 +205,8 @@ def ownership_graph(
     domain="project",
     longer_path=False,
     overlapping=False,
+    cycle=False,
+    converging=False,
 ):
     (tmp_path / "libs.toml").write_text(
         """
@@ -237,6 +251,52 @@ b = { module = "g:other", version.ref = "b" }
             "constraint": constraint,
         },
     ]
+    if cycle:
+        scope["edges"].append(
+            {
+                "source": "child",
+                "target": "parent",
+                "requested": "g:parent:1.0.0",
+                "constraint": False,
+            }
+        )
+    if converging:
+        scope["components"] += [
+            {
+                "id": name,
+                "kind": "module",
+                "module": {"group": "g", "artifact": name, "version": "1.0.0"},
+                "variants": [],
+            }
+            for name in ("constrained-bridge", "unconstrained-bridge")
+        ]
+        scope["edges"] = [
+            scope["edges"][0],
+            {
+                "source": "parent",
+                "target": "constrained-bridge",
+                "requested": "g:constrained-bridge:1.0.0",
+                "constraint": True,
+            },
+            {
+                "source": "constrained-bridge",
+                "target": "child",
+                "requested": "g:child:2.0.0",
+                "constraint": False,
+            },
+            {
+                "source": "parent",
+                "target": "unconstrained-bridge",
+                "requested": "g:unconstrained-bridge:1.0.0",
+                "constraint": False,
+            },
+            {
+                "source": "unconstrained-bridge",
+                "target": "child",
+                "requested": "g:child:2.0.0",
+                "constraint": False,
+            },
+        ]
     if ambiguous:
         scope["components"].append(
             {
@@ -300,18 +360,29 @@ b = { module = "g:other", version.ref = "b" }
 
 
 @pytest.mark.parametrize(
-    "ambiguous,constraint,longer_path,overlapping,affected,expected",
+    "ambiguous,constraint,longer_path,overlapping,cycle,converging,affected,kind,group",
     [
-        (False, False, False, False, "child", "parent"),
-        (False, True, False, False, "child", "platform"),
-        (True, False, False, False, "child", "unknown"),
-        (True, False, True, False, "child", "unknown"),
-        (True, False, False, True, "child", "unknown"),
-        (True, False, False, True, "parent", "unknown"),
+        (False, False, False, False, False, False, "child", "parent", "ref:a"),
+        (False, True, False, False, False, False, "child", "platform", "ref:a"),
+        (False, False, False, False, True, False, "child", "parent", "ref:a"),
+        (False, False, False, False, False, True, "child", "parent", "ref:a"),
+        (True, False, False, False, False, False, "child", "unknown", None),
+        (True, False, True, False, False, False, "child", "unknown", None),
+        (True, False, False, True, False, False, "child", "unknown", None),
+        (True, False, False, True, False, False, "parent", "unknown", None),
     ],
 )
 def test_actual_edges_establish_unique_owner(
-    tmp_path, ambiguous, constraint, longer_path, overlapping, affected, expected
+    tmp_path,
+    ambiguous,
+    constraint,
+    longer_path,
+    overlapping,
+    cycle,
+    converging,
+    affected,
+    kind,
+    group,
 ):
     catalogue, result = ownership_graph(
         tmp_path,
@@ -319,6 +390,8 @@ def test_actual_edges_establish_unique_owner(
         constraint=constraint,
         longer_path=longer_path,
         overlapping=overlapping,
+        cycle=cycle,
+        converging=converging,
     )
     module = ModuleId(
         group="g",
@@ -327,9 +400,120 @@ def test_actual_edges_establish_unique_owner(
     )
     owners = resolve_gradle_owners(catalogue, result, module)
     assert len(owners) == 1
-    assert owners[0].kind == expected
+    assert owners[0].kind == kind
     if isinstance(owners[0], KnownOwner):
-        assert owners[0].group_key == "ref:a"
+        assert owners[0].group_key == group
+
+
+def plugin_marker_graph(tmp_path, *, domain="buildscript", failure=None):
+    (tmp_path / "plugins.toml").write_text(
+        """
+[versions]
+plugin = "1.0.0"
+[plugins]
+plugin = { id = "com.example.plugin", version.ref = "plugin" }
+"""
+    )
+    catalogue = parse_catalogue(tmp_path / "plugins.toml")
+    raw = report_payload()
+    raw["selected_scopes"][0]["domain"] = domain
+    scope = raw["scopes"][0]
+    scope["scope"]["domain"] = domain
+    scope["components"] += [
+        {
+            "id": "marker",
+            "kind": "module",
+            "module": {
+                "group": "com.example.plugin",
+                "artifact": "com.example.plugin.gradle.plugin",
+                "version": "1.0.0",
+            },
+            "variants": [],
+        },
+        {
+            "id": "implementation",
+            "kind": "module",
+            "module": {
+                "group": "com.example",
+                "artifact": "implementation",
+                "version": "2.0.0",
+            },
+            "variants": [],
+        },
+    ]
+    requested = (
+        "com.example:implementation:[1,3)"
+        if failure == "range"
+        else "com.example:implementation:2.1.0"
+        if failure == "mismatch"
+        else "com.example:implementation:2.0.0"
+    )
+    scope["edges"] = [
+        {
+            "source": "root",
+            "target": "marker",
+            "requested": "com.example.plugin:com.example.plugin.gradle.plugin:1.0.0",
+            "constraint": False,
+        },
+        {
+            "source": "marker",
+            "target": "implementation",
+            "requested": requested,
+            "constraint": False,
+        },
+    ]
+    if failure == "two_edges":
+        scope["components"].append(
+            {
+                "id": "other",
+                "kind": "module",
+                "module": {"group": "g", "artifact": "other", "version": "1.0"},
+                "variants": [],
+            }
+        )
+        scope["edges"].append(
+            {
+                "source": "marker",
+                "target": "other",
+                "requested": "g:other:1.0",
+                "constraint": False,
+            }
+        )
+    result = parse_resolution_report(json.dumps(raw))
+    assert isinstance(result, CompleteResolution)
+    return catalogue, result
+
+
+@pytest.mark.parametrize(
+    "domain,kind,group",
+    [
+        ("buildscript", "plugin", "ref:plugin"),
+        ("project", "unknown", None),
+    ],
+)
+def test_plugin_marker_owner_is_limited_to_buildscript(tmp_path, domain, kind, group):
+    catalogue, resolution = plugin_marker_graph(tmp_path, domain=domain)
+    owners = resolve_gradle_owners(
+        catalogue,
+        resolution,
+        ModuleId(group="com.example", artifact="implementation", version="2.0.0"),
+    )
+    assert len(owners) == 1
+    assert owners[0].kind == kind
+    if isinstance(owners[0], KnownOwner):
+        assert owners[0].group_key == group
+
+
+@pytest.mark.parametrize("failure", ["two_edges", "range", "mismatch"])
+def test_plugin_marker_requires_one_exact_implementation_edge(tmp_path, failure):
+    catalogue, resolution = plugin_marker_graph(tmp_path, failure=failure)
+    owners = resolve_gradle_owners(
+        catalogue,
+        resolution,
+        ModuleId(group="com.example", artifact="implementation", version="2.0.0"),
+    )
+    assert len(owners) == 1
+    assert owners[0].kind == "unknown"
 
 
 def candidate():
@@ -444,6 +628,33 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
         ScopeId(project_path=":", domain="project", configuration="runtimeClasspath"),
     )
     assert selected.publication_requests == ()
+
+
+def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
+    from maintenance_man.gradle import ReportProposal, build_update_findings
+
+    catalogue, resolution = ownership_graph(tmp_path)
+    discovered = [
+        build_update_findings(
+            catalogue,
+            [
+                ReportProposal(
+                    kind="library",
+                    alias="a",
+                    coordinate="g:parent",
+                    version=version,
+                )
+            ],
+        )[0]
+        for version in ("1.0.1", "1.0.2")
+    ]
+
+    result = select_gradle_candidates(catalogue, resolution, [], discovered)
+
+    assert result.candidates == ()
+    assert len(result.withheld) == 1
+    assert result.withheld[0].group_key == "ref:a"
+    assert result.withheld[0].reason == "conflicting or non-exact catalogue proposals"
 
 
 def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_root(

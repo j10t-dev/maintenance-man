@@ -898,55 +898,11 @@ def _validate_catalogue_state(
 
     expected_version = target.target_version if expect_applied else None
     for member in target.members:
-        entry = catalogue.entry(member.kind, member.alias)
-        if entry is None:
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"the catalogue no longer declares {member.kind} "
-                    f"'{member.alias}'; rescan required"
-                ),
-            )
-        if entry.coordinate != member.coordinate:
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"'{member.alias}' now resolves to {entry.coordinate}, not "
-                    f"{member.coordinate}; rescan required"
-                ),
-            )
-        if entry.unsupported is not None:
-            return GradleBlock(kind="mapping", reason=entry.unsupported)
-        if _ref_key(entry) != (
-            normalise_alias(target.version_ref) if target.version_ref else None
-        ):
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"'{member.alias}' no longer shares version reference "
-                    f"'{target.version_ref}'; rescan required"
-                ),
-            )
-        version = catalogue.version_of(entry)
-        if version is None or version.value is None:
-            return GradleBlock(
-                kind="mapping",
-                reason=(
-                    f"'{member.alias}' no longer has a simple catalogue version; "
-                    f"resolve manually"
-                ),
-            )
-        expected = expected_version or member.installed_version
-        if version.value != expected:
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"'{member.alias}' is at {version.value}, expected {expected}; "
-                    f"the catalogue no longer matches the scan; note that an "
-                    f"uncommitted catalogue edit is not visible in the update "
-                    f"workspace. Rescan required"
-                ),
-            )
+        block = _validate_catalogue_member(
+            catalogue, target, member, expected_version=expected_version
+        )
+        if block is not None:
+            return block
 
     if target.version_ref is not None:
         current = {entry.key for entry in catalogue.members_of_ref(target.version_ref)}
@@ -962,6 +918,78 @@ def _validate_catalogue_state(
                 ),
             )
     return None
+
+
+def _validate_catalogue_member(
+    catalogue: Catalogue,
+    target: GradleUpdateTarget,
+    member: GradleMember,
+    *,
+    expected_version: str | None,
+) -> GradleBlock | None:
+    entry = catalogue.entry(member.kind, member.alias)
+    if entry is None:
+        return GradleBlock(
+            kind="stale",
+            reason=(
+                f"the catalogue no longer declares {member.kind} "
+                f"'{member.alias}'; rescan required"
+            ),
+        )
+    if entry.coordinate != member.coordinate:
+        return GradleBlock(
+            kind="stale",
+            reason=(
+                f"'{member.alias}' now resolves to {entry.coordinate}, not "
+                f"{member.coordinate}; rescan required"
+            ),
+        )
+    if entry.unsupported is not None:
+        return GradleBlock(kind="mapping", reason=entry.unsupported)
+    expected_ref = normalise_alias(target.version_ref) if target.version_ref else None
+    if _ref_key(entry) != expected_ref:
+        return GradleBlock(
+            kind="stale",
+            reason=(
+                f"'{member.alias}' no longer shares version reference "
+                f"'{target.version_ref}'; rescan required"
+            ),
+        )
+    return _validate_catalogue_member_version(
+        catalogue,
+        entry,
+        expected_version or member.installed_version,
+        recorded_alias=member.alias,
+    )
+
+
+def _validate_catalogue_member_version(
+    catalogue: Catalogue,
+    entry: CatalogueEntry,
+    expected: str,
+    *,
+    recorded_alias: str,
+) -> GradleBlock | None:
+    version = catalogue.version_of(entry)
+    if version is None or version.value is None:
+        return GradleBlock(
+            kind="mapping",
+            reason=(
+                f"'{recorded_alias}' no longer has a simple catalogue version; "
+                f"resolve manually"
+            ),
+        )
+    if version.value == expected:
+        return None
+    return GradleBlock(
+        kind="stale",
+        reason=(
+            f"'{recorded_alias}' is at {version.value}, expected {expected}; "
+            f"the catalogue no longer matches the scan; note that an "
+            f"uncommitted catalogue edit is not visible in the update "
+            f"workspace. Rescan required"
+        ),
+    )
 
 
 def _assert_only_target_changed(
@@ -987,46 +1015,73 @@ def _assert_only_target_changed(
         )
 
     for key, old in before.entries.items():
-        new = after.entries[key]
-        if old.coordinate != new.coordinate or _ref_key(old) != _ref_key(new):
-            raise GradleError(
-                f"alias '{old.alias}' changed identity during apply: "
-                f"{old.coordinate}/{_ref_key(old)} -> {new.coordinate}/{_ref_key(new)}"
-            )
-        old_value = _version_value(before, old)
-        new_value = _version_value(after, new)
-        if key in changed:
-            if new.unsupported is not None or new_value is None:
-                raise GradleError(
-                    f"selected alias {new.alias!r} no longer has a simple version"
-                )
-            if new_value != target.target_version:
-                raise GradleError(
-                    f"'{old.alias}' is {new_value!r} after apply, "
-                    f"expected {target.target_version!r}"
-                )
-        elif old_value != new_value:
-            raise GradleError(
-                f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
-            )
+        _assert_alias_change(
+            before,
+            after,
+            old,
+            selected=key in changed,
+            target_version=target.target_version,
+        )
 
     if set(before.versions) != set(after.versions):
         raise GradleError("versionCatalogApplyUpdates added or removed version entries")
 
     changed_ref = normalise_alias(target.version_ref) if target.version_ref else None
     for name, old_version in before.versions.items():
-        new_version = after.versions[name]
-        if name == changed_ref:
-            if new_version.value != target.target_version:
-                raise GradleError(
-                    f"version '{old_version.name}' is {new_version.value!r} after "
-                    f"apply, expected {target.target_version!r}"
-                )
-        elif new_version.value != old_version.value:
-            raise GradleError(
-                f"unexpected change to version '{old_version.name}': "
-                f"{old_version.value!r} -> {new_version.value!r}"
-            )
+        _assert_named_version_change(
+            old_version,
+            after.versions[name],
+            selected=name == changed_ref,
+            target_version=target.target_version,
+        )
+
+
+def _assert_alias_change(
+    before: Catalogue,
+    after: Catalogue,
+    old: CatalogueEntry,
+    *,
+    selected: bool,
+    target_version: str,
+) -> None:
+    new = after.entries[old.key]
+    if old.coordinate != new.coordinate or _ref_key(old) != _ref_key(new):
+        raise GradleError(
+            f"alias '{old.alias}' changed identity during apply: "
+            f"{old.coordinate}/{_ref_key(old)} -> {new.coordinate}/{_ref_key(new)}"
+        )
+    old_value = _version_value(before, old)
+    new_value = _version_value(after, new)
+    if selected and (new.unsupported is not None or new_value is None):
+        raise GradleError(
+            f"selected alias {new.alias!r} no longer has a simple version"
+        )
+    if selected and new_value != target_version:
+        raise GradleError(
+            f"'{old.alias}' is {new_value!r} after apply, expected {target_version!r}"
+        )
+    if not selected and old_value != new_value:
+        raise GradleError(
+            f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
+        )
+
+
+def _assert_named_version_change(
+    old: CatalogueVersion,
+    new: CatalogueVersion,
+    *,
+    selected: bool,
+    target_version: str,
+) -> None:
+    if selected and new.value != target_version:
+        raise GradleError(
+            f"version '{old.name}' is {new.value!r} after apply, "
+            f"expected {target_version!r}"
+        )
+    if not selected and new.value != old.value:
+        raise GradleError(
+            f"unexpected change to version '{old.name}': {old.value!r} -> {new.value!r}"
+        )
 
 
 def _version_value(catalogue: Catalogue, entry: CatalogueEntry) -> str | None:

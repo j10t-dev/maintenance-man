@@ -867,6 +867,91 @@ class TestValidateGradleTarget:
         assert block.kind == "stale"
         assert reason_fragment in block.reason
 
+    @pytest.mark.parametrize(
+        "replacements,kind,reason",
+        [
+            (
+                {
+                    'room = "2.8.4"': 'room = "9.9.9"',
+                    'room-runtime = { group = "androidx.room", name = '
+                    '"room-runtime", version.ref = "room" }\n': "",
+                },
+                "stale",
+                "the catalogue no longer declares library 'room-runtime'; "
+                "rescan required",
+            ),
+            (
+                {
+                    'group = "androidx.room", name = "room-runtime"': (
+                        'group = "example.changed", name = "room-runtime"'
+                    ),
+                    'room = "2.8.4"': 'room = { strictly = "2.8.4" }',
+                },
+                "stale",
+                "'room-runtime' now resolves to example.changed:room-runtime, not "
+                "androidx.room:room-runtime; rescan required",
+            ),
+            (
+                {
+                    'room-runtime = { group = "androidx.room", name = '
+                    '"room-runtime", version.ref = "room" }': (
+                        'room-runtime = { module = "androidx.room:room-runtime", '
+                        'version = { strictly = "2.8.4" } }'
+                    )
+                },
+                "mapping",
+                "'room-runtime' uses a rich version declaration, which mm does "
+                "not edit",
+            ),
+            (
+                {'room = "2.8.4"': 'room = { strictly = "2.8.4" }'},
+                "mapping",
+                "'room-runtime' no longer has a simple catalogue version; resolve "
+                "manually",
+            ),
+            (
+                {'room = "2.8.4"': 'room = "2.8.9"'},
+                "stale",
+                "'room-runtime' is at 2.8.9, expected 2.8.4; the catalogue no "
+                "longer matches the scan; note that an uncommitted catalogue edit "
+                "is not visible in the update workspace. Rescan required",
+            ),
+            (
+                {
+                    "room-runtime = {": "room_runtime = {",
+                    'room = "2.8.4"': 'room = { strictly = "2.8.4" }',
+                },
+                "mapping",
+                "'room-runtime' no longer has a simple catalogue version; resolve "
+                "manually",
+            ),
+            (
+                {
+                    "room-runtime = {": "room_runtime = {",
+                    'room = "2.8.4"': 'room = "2.8.9"',
+                },
+                "stale",
+                "'room-runtime' is at 2.8.9, expected 2.8.4; the catalogue no "
+                "longer matches the scan; note that an uncommitted catalogue edit "
+                "is not visible in the update workspace. Rescan required",
+            ),
+        ],
+    )
+    def test_member_validation_preserves_first_failure(
+        self, gradle_project, replacements, kind, reason
+    ):
+        catalogue = Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
+        text = catalogue.read_text(encoding="utf-8")
+        for old, new in replacements.items():
+            text = text.replace(old, new, 1)
+        catalogue.write_text(text, encoding="utf-8")
+
+        block = validate_gradle_target(gradle_project, make_gradle_target())
+
+        assert block is not None
+        assert block.kind == kind
+        assert block.reason == reason
+
 
 class TestApplyGradleUpdate:
     def test_applies_the_group_and_verifies_the_semantic_change(
@@ -932,6 +1017,17 @@ class TestApplyGradleUpdate:
                 },
                 0,
                 "unexpected change to 'gson'",
+            ),
+            (
+                {
+                    'room = "2.8.4"': 'room = "2.8.5"',
+                    'kotlin = "2.4.10"': 'kotlin = "2.4.20"',
+                    'gson = "com.google.code.gson:gson:2.11.0"': (
+                        'gson = "com.google.code.gson:gson:2.12.0"'
+                    ),
+                },
+                0,
+                "unexpected change to 'kotlin-stdlib'",
             ),
             (
                 {
