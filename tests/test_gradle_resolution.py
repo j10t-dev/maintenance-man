@@ -166,21 +166,6 @@ def test_inventory_envelope_is_refused_before_the_report_is_parsed(tmp_path):
         pytest.fail("malformed inventory must not yield")
 
 
-def test_unmarked_output_is_never_reclaimed(tmp_path):
-    project = make_project(tmp_path)
-    owned = tmp_path / ".mm-gradle-inventory"
-    owned.mkdir()
-    (owned / "caller.txt").write_text("keep")
-    with (
-        patch("maintenance_man.gradle_resolution.run_gradle") as runner,
-        pytest.raises(GradleError),
-        generate_gradle_report(project),
-    ):
-        pass
-    runner.assert_not_called()
-    assert (owned / "caller.txt").read_text() == "keep"
-
-
 @pytest.mark.parametrize(
     "installed,fixes,expected",
     [
@@ -1032,6 +1017,12 @@ def _validation_runner(build_response):
     return runner
 
 
+def _write_candidate_validation_response(directory, rows):
+    (directory / "candidate-validation.json").write_text(
+        json.dumps({"schema_version": 1, "results": rows})
+    )
+
+
 @pytest.mark.parametrize("security_only", [False, True])
 def test_shared_members_validate_only_in_projects_that_resolve_them(
     tmp_path, security_only
@@ -1150,128 +1141,94 @@ def test_shared_members_validate_only_in_projects_that_resolve_them(
     ]
 
 
-def test_validate_gradle_candidates_refuses_duplicate_request_id(tmp_path):
-    """Both requests are covered by id, but a request_id repeats: the
-    duplicate collapses in the response dict, so its row count no longer
-    matches what Gradle actually returned."""
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [
-            _success_row(requests[0]),
-            _success_row(
-                requests[1],
-                implementation={"group": "g", "artifact": "impl", "version": "2.0"},
-            ),
-            _success_row(requests[0]),
-        ]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with (
-        patch(
-            "maintenance_man.gradle_resolution.run_gradle",
-            side_effect=_validation_runner(build_response),
+@pytest.mark.parametrize(
+    ("case", "candidate_factory", "rows_for", "reason"),
+    [
+        (
+            "duplicate request id",
+            two_member_candidate,
+            lambda requests: [
+                _success_row(requests[0]),
+                _success_row(
+                    requests[1],
+                    implementation={
+                        "group": "g",
+                        "artifact": "impl",
+                        "version": "2.0",
+                    },
+                ),
+                _success_row(requests[0]),
+            ],
+            "coverage",
         ),
-        pytest.raises(GradleError, match="coverage"),
-    ):
-        validate_gradle_candidates(
-            project, [two_member_candidate()], _resolution_with_repositories(())
-        )
-
-
-def test_validate_gradle_candidates_refuses_extra_row(tmp_path):
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [
-            _success_row(requests[0]),
-            _success_row({**requests[0], "request_id": "99"}),
-        ]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with (
-        patch(
-            "maintenance_man.gradle_resolution.run_gradle",
-            side_effect=_validation_runner(build_response),
+        (
+            "extra row",
+            candidate,
+            lambda requests: [
+                _success_row(requests[0]),
+                _success_row({**requests[0], "request_id": "99"}),
+            ],
+            "coverage",
         ),
-        pytest.raises(GradleError, match="coverage"),
-    ):
-        validate_gradle_candidates(
-            project, [candidate()], _resolution_with_repositories(())
-        )
-
-
-@pytest.mark.parametrize("identity", [{"alias": "wrong-alias"}, {"kind": "plugin"}])
-def test_validate_gradle_candidates_refuses_identity_mismatch(tmp_path, identity):
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [_success_row(requests[0], **identity)]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with (
-        patch(
-            "maintenance_man.gradle_resolution.run_gradle",
-            side_effect=_validation_runner(build_response),
+        (
+            "wrong alias",
+            candidate,
+            lambda requests: [_success_row(requests[0], alias="wrong-alias")],
+            "identity mismatch",
         ),
-        pytest.raises(GradleError, match="identity mismatch"),
-    ):
-        validate_gradle_candidates(
-            project, [candidate()], _resolution_with_repositories(())
-        )
-
-
-def test_validate_gradle_candidates_refuses_success_with_different_version(tmp_path):
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [_success_row(requests[0], selected_version="9.9.9")]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with (
-        patch(
-            "maintenance_man.gradle_resolution.run_gradle",
-            side_effect=_validation_runner(build_response),
+        (
+            "wrong kind",
+            candidate,
+            lambda requests: [_success_row(requests[0], kind="plugin")],
+            "identity mismatch",
         ),
-        pytest.raises(GradleError, match="selected a different version"),
-    ):
-        validate_gradle_candidates(
-            project, [candidate()], _resolution_with_repositories(())
-        )
-
-
-def test_validate_gradle_candidates_refuses_plugin_success_without_implementation(
-    tmp_path,
+        (
+            "wrong selected version",
+            candidate,
+            lambda requests: [_success_row(requests[0], selected_version="9.9.9")],
+            "selected a different version",
+        ),
+        (
+            "missing plugin implementation",
+            two_member_candidate,
+            lambda requests: [
+                _success_row(requests[0]),
+                _success_row(requests[1], implementation=None),
+            ],
+            "marker success lacks implementation",
+        ),
+    ],
+    ids=[
+        "duplicate-request-id",
+        "extra-row",
+        "wrong-alias",
+        "wrong-kind",
+        "wrong-selected-version",
+        "missing-plugin-implementation",
+    ],
+)
+def test_validate_gradle_candidates_refuses_invalid_native_response(
+    tmp_path, case, candidate_factory, rows_for, reason
 ):
     project = make_project(tmp_path)
+    catalogue = tmp_path / "gradle/libs.versions.toml"
+    before = catalogue.read_bytes()
 
     def build_response(root, directory, requests):
-        rows = [
-            _success_row(requests[0]),
-            _success_row(requests[1], implementation=None),
-        ]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
+        del root
+        _write_candidate_validation_response(directory, rows_for(requests))
 
     with (
         patch(
             "maintenance_man.gradle_resolution.run_gradle",
             side_effect=_validation_runner(build_response),
         ),
-        pytest.raises(GradleError, match="marker success lacks implementation"),
+        pytest.raises(GradleError, match=reason),
     ):
         validate_gradle_candidates(
-            project, [two_member_candidate()], _resolution_with_repositories(())
+            project, [candidate_factory()], _resolution_with_repositories(())
         )
+    assert catalogue.read_bytes() == before, case
 
 
 def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):

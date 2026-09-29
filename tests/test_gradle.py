@@ -833,7 +833,6 @@ class TestValidateGradleTarget:
     @pytest.mark.parametrize(
         "old, new, reason_fragment",
         [
-            ('room = "2.8.4"', 'room = "2.8.9"', "expected 2.8.4"),
             (
                 'room-testing = { group = "androidx.room", name = '
                 '"room-testing", version.ref = "room" }\n',

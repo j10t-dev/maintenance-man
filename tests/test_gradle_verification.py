@@ -870,7 +870,6 @@ def workflow(frozen_context, resolution, candidate, scope, monkeypatch, tmp_path
     def apply(applied_project, *_args):
         stored = updater.load_gradle_run(updater.gradle_run_path("sample"))
         assert stored is not None
-        assert stored is not None
         assert stored.attempts[0].state == "applying"
         effects.append("apply")
         applied_catalogue = applied_project.path / "gradle/libs.versions.toml"
@@ -1297,26 +1296,6 @@ def test_start_persists_baseline_before_any_apply(workflow):
     assert run.accepted_snapshot == workflow.initial
     assert run.attempts[0].state == "planned"
     assert updater.load_gradle_run(updater.gradle_run_path("sample")) == run
-
-
-def test_failed_checks_prevent_capture_and_ready(workflow, monkeypatch):
-    run = begin_workflow(workflow)
-
-    def failed(*args, **kwargs):
-        msg = "unit failed"
-        raise updater.GradleError(msg)
-
-    monkeypatch.setattr(updater, "run_gradle_checks", failed)
-    monkeypatch.setattr(
-        updater,
-        "capture_gradle_snapshot",
-        lambda *args, **kwargs: pytest.fail("capture after failed checks"),
-    )
-    result = updater.process_gradle_run(
-        run, workflow.project, workflow.publication, 7, emit=RecordingEmit()
-    )
-    assert result.attempts[0].state == "failed"
-    assert workflow.effects == ["apply", "discard"]
 
 
 def test_finalization_rejects_credited_fix_reintroduced(workflow, scope):
@@ -2778,6 +2757,11 @@ def test_failed_attempt_is_durable_before_discard(workflow, monkeypatch):
         assert saved.accepted_snapshot == workflow.initial
 
     monkeypatch.setattr(updater, "run_gradle_checks", failed_checks)
+    monkeypatch.setattr(
+        updater,
+        "capture_gradle_snapshot",
+        lambda *args, **kwargs: pytest.fail("capture after failed checks"),
+    )
     workflow.vcs_state.hook("discard", phase="before", action=observe_discard)
     result = updater.process_gradle_run(
         run,
@@ -2788,6 +2772,8 @@ def test_failed_attempt_is_durable_before_discard(workflow, monkeypatch):
         emit=RecordingEmit(),
     )
     assert isinstance(result.attempts[0], FailedAttempt)
+    assert result.attempts[0].reason == "unit failed"
+    assert result.accepted_snapshot == workflow.initial
     assert workflow.effects == ["apply", "discard"]
 
 
@@ -3238,6 +3224,45 @@ def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
     )
 
 
+def _seed_source_user_notes(workflow, clean_notes):
+    user_file = workflow.project.path / "user-notes.txt"
+    catalogue_name = "gradle/libs.versions.toml"
+    catalogue = workflow.project.path / catalogue_name
+    source_repo = workflow.vcs.repository(workflow.project.path)
+    workflow.vcs_state.register_files(workflow.project.path, "user-notes.txt")
+    user_file.write_bytes(clean_notes)
+    source_repo.commit(message="seed user notes")
+    clean_base = source_repo.resolve_revision(revision="@-")
+    workflow.vcs_state.seed_bookmark(
+        workflow.project.path, bookmark="main", targets=(clean_base,)
+    )
+    accepted = workflow.vcs_state.seed_commit(
+        workflow.project.path,
+        parent=clean_base,
+        files={
+            catalogue_name: catalogue.read_text(encoding="utf-8").replace(
+                'lib = "1"', 'lib = "2"'
+            ),
+            "user-notes.txt": clean_notes.decode(),
+        },
+        description="accepted fixture with user notes",
+    )
+    workflow.base = clean_base
+    workflow.initial = workflow.initial.model_copy(
+        update={"tree_id": source_repo.tree_id(revision=clean_base)}
+    )
+    workflow.after = workflow.after.model_copy(
+        update={"tree_id": source_repo.tree_id(revision=accepted)}
+    )
+    workflow.state.update(
+        snapshot=workflow.initial,
+        tree=workflow.initial.tree_id,
+        after=workflow.after,
+    )
+    workflow.effects.clear()
+    return source_repo, user_file
+
+
 @pytest.mark.parametrize(
     ("default_dirty", "unsafe", "workspace_exists"),
     [
@@ -3249,8 +3274,11 @@ def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
     ],
 )
 def test_gradle_failed_update_restart_retains_evidence(
-    workflow, monkeypatch, tmp_path, unsafe, default_dirty, workspace_exists
+    workflow, monkeypatch, unsafe, default_dirty, workspace_exists
 ):
+    clean_notes = b"preserve these notes\n"
+    dirty_notes = b"preserve these dirty notes\n"
+    source_repo, user_file = _seed_source_user_notes(workflow, clean_notes)
     security = workflow.candidate.model_copy(
         update={
             "origins": frozenset({"security"}),
@@ -3272,7 +3300,6 @@ def test_gradle_failed_update_restart_retains_evidence(
     )
     workspace = workflow_service.workspace_path_for_project("sample")
     if workspace_exists:
-        source_repo = workflow.vcs.repository(workflow.project.path)
         source_repo.add_workspace(
             name="mm-sample", path=workspace, revision=failed.managed_tip_id
         )
@@ -3281,10 +3308,8 @@ def test_gradle_failed_update_restart_retains_evidence(
         if unsafe:
             workflow.vcs_state.register_files(workspace, "unowned.txt")
             (workspace / "unowned.txt").write_text("unsafe\n", encoding="utf-8")
-    user_file = workflow.project.path / "user-notes.txt"
-    user_file.write_text("preserve these notes")
     if default_dirty:
-        user_file.write_text("preserve these dirty notes", encoding="utf-8")
+        user_file.write_bytes(dirty_notes)
     effects = []
 
     def reset():
@@ -3303,6 +3328,7 @@ def test_gradle_failed_update_restart_retains_evidence(
         action=reset,
     )
     emitted = RecordingEmit()
+    assert source_repo.has_changes() is default_dirty
     if unsafe or not workspace_exists:
         with pytest.raises(updater.GradleError):
             workflow_service._archive_rolled_back_gradle_run(
@@ -3318,7 +3344,7 @@ def test_gradle_failed_update_restart_retains_evidence(
         assert effects == ["reset"]
         (archived,) = emitted.of_type(GradleRunArchived)
         assert archived.path.parent == paths.gradle_runs_dir() / "history"
-    assert user_file.read_text().startswith("preserve these")
+    assert user_file.read_bytes() == (dirty_notes if default_dirty else clean_notes)
 
 
 def test_gradle_failed_update_restart_refuses_uncertain_dirty_state(
@@ -3374,10 +3400,26 @@ def test_gradle_failed_update_restart_refuses_uncertain_dirty_state(
 
 
 @pytest.mark.parametrize(
-    "mutation", ["none", "dirty", "unrelated-parent", "working-tree", "accepted-tree"]
+    ("mutation", "rejection"),
+    [
+        ("none", None),
+        ("dirty", "Automatic Gradle processing requires an empty working change"),
+        (
+            "unrelated-parent",
+            "Working change is not an empty child of the recorded accepted tip",
+        ),
+        (
+            "working-tree",
+            "Working revision differs from the recorded accepted snapshot",
+        ),
+        (
+            "accepted-tree",
+            "Working revision differs from the recorded accepted snapshot",
+        ),
+    ],
 )
 def test_gradle_resume_requires_exact_empty_accepted_child(
-    workflow, monkeypatch, mutation
+    workflow, monkeypatch, mutation, rejection
 ):
     run = ready_workflow(workflow)
     source_repo = workflow.vcs.repository(workflow.project.path)
@@ -3399,7 +3441,7 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
             description="unrelated",
         )
         workspace_repo.new_change(revision=unrelated)
-    elif mutation in {"dirty", "working-tree"}:
+    elif mutation == "dirty":
         (workspace / "gradle/libs.versions.toml").write_text(
             '[versions]\nlib = "unverified"\n', encoding="utf-8"
         )
@@ -3412,6 +3454,26 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
             }
         )
         updater.save_gradle_run(updater.gradle_run_path("sample"), run)
+    observed_clean: list[bool] = []
+    if mutation == "working-tree":
+        assert workspace_repo.has_changes() is False
+        original_has_changes = type(workspace_repo).has_changes
+
+        def clean_then_change(repo):
+            clean = original_has_changes(repo)
+            if repo.path == workspace:
+                observed_clean.append(not clean)
+                assert not clean
+                (workspace / "gradle/libs.versions.toml").write_text(
+                    '[versions]\nlib = "unverified"\n', encoding="utf-8"
+                )
+            return clean
+
+        monkeypatch.setattr(type(workspace_repo), "has_changes", clean_then_change)
+    elif mutation == "dirty":
+        assert workspace_repo.has_changes() is True
+    else:
+        assert workspace_repo.has_changes() is False
     before = updater.gradle_run_path("sample").read_bytes()
     monkeypatch.setattr(
         workflow_service,
@@ -3440,17 +3502,21 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
         path=workflow.project.path,
         action=lambda: effects.append("remove"),
     )
+    emitted = RecordingEmit()
     result = workflow_service.run_gradle_flow(
         "sample",
         workflow.project,
         Workflow.UPDATE,
         minimum_age_days=7,
         choose=None,
-        emit=RecordingEmit(),
+        emit=emitted,
         vcs=workflow.vcs,
     )
     assert result is (Outcome.SUCCEEDED if mutation == "none" else Outcome.FAILED)
     assert effects == (["process", "finalize", "remove"] if mutation == "none" else [])
+    assert observed_clean == ([True] if mutation == "working-tree" else [])
+    if rejection is not None:
+        assert emitted.events == [GradleFlowFailed(Workflow.UPDATE, rejection)]
     assert updater.gradle_run_path("sample").read_bytes() == before
     assert workflow.effects.count("apply") == 1
 
@@ -4470,7 +4536,7 @@ def test_gradle_ineligible_run_does_not_build_or_freeze_scanner_inputs(
     assert driver.effects in ([], ["bookmark"])
 
 
-def test_gradle_retries_an_empty_preparation_ledger_from_older_versions(driver):
+def _start_legacy_preparation_run(driver):
     run = updater.start_gradle_run(
         "sample",
         driver.project,
@@ -4486,6 +4552,11 @@ def test_gradle_retries_an_empty_preparation_ledger_from_older_versions(driver):
         bookmark=run.managed_bookmark,
         targets=(driver.workflow.base,),
     )
+    return run
+
+
+def test_gradle_retries_an_empty_preparation_ledger_from_older_versions(driver):
+    _start_legacy_preparation_run(driver)
     assert invoke_driver(driver) is Outcome.SUCCEEDED
     assert driver.effects == ["apply", "commit", "bookmark", "promote", "refresh"]
 
@@ -4493,21 +4564,7 @@ def test_gradle_retries_an_empty_preparation_ledger_from_older_versions(driver):
 def test_gradle_reconsiders_old_withheld_run_on_the_next_invocation(driver):
     from maintenance_man.models.gradle import WithheldAttempt
 
-    run = updater.start_gradle_run(
-        "sample",
-        driver.project,
-        Workflow.UPDATE,
-        driver.workflow.base,
-        driver.workflow.context,
-        (),
-        vcs=driver.workflow.vcs,
-        emit=RecordingEmit(),
-    )
-    driver.workflow.vcs_state.seed_bookmark(
-        driver.project.path,
-        bookmark=run.managed_bookmark,
-        targets=(driver.workflow.base,),
-    )
+    run = _start_legacy_preparation_run(driver)
     run = run.model_copy(
         update={
             "attempts": (
@@ -4581,21 +4638,7 @@ def test_gradle_preparation_outcome_removes_ledger_then_context_then_workspace(
 ):
     from maintenance_man.models.gradle import AgeBlock, WithheldAttempt
 
-    run = updater.start_gradle_run(
-        "sample",
-        driver.project,
-        Workflow.UPDATE,
-        driver.workflow.base,
-        driver.workflow.context,
-        (),
-        vcs=driver.workflow.vcs,
-        emit=RecordingEmit(),
-    )
-    driver.workflow.vcs_state.seed_bookmark(
-        driver.project.path,
-        bookmark=run.managed_bookmark,
-        targets=(driver.workflow.base,),
-    )
+    run = _start_legacy_preparation_run(driver)
     run = run.model_copy(
         update={
             "attempts": (
