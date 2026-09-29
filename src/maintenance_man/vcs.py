@@ -434,6 +434,37 @@ class JjRepository:
         return _temporary_workspace(self, revision=revision, bind=JjRepository)
 
 
+def _cleanup_proof_workspace(
+    repository: Repository,
+    *,
+    name: str,
+    container: Path,
+    marker: Path,
+    owner_token: str,
+    registered: bool,
+) -> list[str]:
+    diagnostics: list[str] = []
+    if registered:
+        try:
+            repository.forget_workspace(name=name)
+        except RevisionError as exc:
+            diagnostics.append(f"forget workspace failed: {exc}")
+    try:
+        owned = (
+            not container.is_symlink()
+            and not marker.is_symlink()
+            and marker.is_file()
+            and marker.read_text(encoding="utf-8") == owner_token
+        )
+        if owned:
+            shutil.rmtree(container)
+        elif container.exists() or container.is_symlink():
+            diagnostics.append("proof workspace ownership marker changed")
+    except (OSError, UnicodeError) as exc:
+        diagnostics.append(f"remove proof workspace failed: {exc}")
+    return diagnostics
+
+
 @contextmanager
 def _temporary_workspace(
     repository: Repository,
@@ -475,25 +506,14 @@ def _temporary_workspace(
             body_error = exc
             raise
     finally:
-        diagnostics: list[str] = []
-        if registered:
-            try:
-                repository.forget_workspace(name=name)
-            except RevisionError as exc:
-                diagnostics.append(f"forget workspace failed: {exc}")
-        try:
-            owned = (
-                not container.is_symlink()
-                and not marker.is_symlink()
-                and marker.is_file()
-                and marker.read_text(encoding="utf-8") == token
-            )
-            if owned:
-                shutil.rmtree(container)
-            elif container.exists() or container.is_symlink():
-                diagnostics.append("proof workspace ownership marker changed")
-        except (OSError, UnicodeError) as exc:
-            diagnostics.append(f"remove proof workspace failed: {exc}")
+        diagnostics = _cleanup_proof_workspace(
+            repository,
+            name=name,
+            container=container,
+            marker=marker,
+            owner_token=token,
+            registered=registered,
+        )
         if diagnostics:
             detail = "; ".join(diagnostics)
             if body_error is not None:
