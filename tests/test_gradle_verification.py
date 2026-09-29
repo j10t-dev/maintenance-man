@@ -4441,6 +4441,122 @@ def test_gradle_reconsiders_old_withheld_run_on_the_next_invocation(driver):
     assert driver.effects == ["apply", "commit", "bookmark", "promote", "refresh"]
 
 
+def test_finished_continue_does_not_open_workspace(driver, monkeypatch):
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("finished continuation opened a workspace")
+
+    monkeypatch.setattr(workflow_service, "_new_gradle_workspace", unexpected)
+    monkeypatch.setattr(workflow_service, "_resume_gradle_workspace", unexpected)
+    driver.workflow.vcs_state.clear_calls()
+    assert (
+        workflow_service.run_gradle_flow(
+            "sample",
+            driver.project,
+            Workflow.UPDATE,
+            minimum_age_days=7,
+            continue_=True,
+            choose=None,
+            vcs=driver.workflow.vcs,
+            emit=RecordingEmit(),
+        )
+        is Outcome.SUCCEEDED
+    )
+    assert not driver.workflow.vcs_state.effects
+
+
+def _record_cleanup_order(driver, monkeypatch):
+    order = []
+    ledger = updater.gradle_run_path("sample")
+    original_retire = workflow_service.gradle_updater.retire_gradle_context
+    original_release = workflow_service.release_comparison_context
+    original_remove = workflow_service.remove_workspace
+
+    def retire(context):
+        order.append(("retire", ledger.exists()))
+        original_retire(context)
+
+    def release(context):
+        order.append(("release", ledger.exists()))
+        original_release(context)
+
+    def remove(**kwargs):
+        order.append(("workspace", ledger.exists()))
+        original_remove(**kwargs)
+
+    monkeypatch.setattr(
+        workflow_service.gradle_updater, "retire_gradle_context", retire
+    )
+    monkeypatch.setattr(workflow_service, "release_comparison_context", release)
+    monkeypatch.setattr(workflow_service, "remove_workspace", remove)
+    return order
+
+
+def test_gradle_preparation_outcome_removes_ledger_then_context_then_workspace(
+    driver, monkeypatch
+):
+    from maintenance_man.models.gradle import AgeBlock, WithheldAttempt
+
+    run = updater.start_gradle_run(
+        "sample",
+        driver.project,
+        Workflow.UPDATE,
+        driver.workflow.base,
+        driver.workflow.context,
+        (),
+        vcs=driver.workflow.vcs,
+        emit=RecordingEmit(),
+    )
+    driver.workflow.vcs_state.seed_bookmark(
+        driver.project.path,
+        bookmark=run.managed_bookmark,
+        targets=(driver.workflow.base,),
+    )
+    run = run.model_copy(
+        update={
+            "attempts": (
+                WithheldAttempt(candidate=driver.workflow.candidate, reason="old"),
+            )
+        }
+    )
+    updater.save_gradle_run(updater.gradle_run_path("sample"), run)
+    monkeypatch.setattr(
+        candidates,
+        "evaluate_gradle_candidate_age",
+        lambda *args: AgeBlock(reason="still withheld"),
+    )
+    order = _record_cleanup_order(driver, monkeypatch)
+    assert invoke_driver(driver) is Outcome.FAILED
+    assert order == [("retire", False), ("workspace", False)]
+    assert updater.load_gradle_run(updater.gradle_run_path("sample")) is None
+    assert driver.emit.of_type(GradleRunReported) == []
+    assert driver.emit.events[-1] == NoEligibleGradleChanges()
+
+
+def test_gradle_withheld_only_processed_run_reports_then_cleans_up(driver, monkeypatch):
+    from maintenance_man.models.gradle import AgeBlock, WithheldAttempt
+
+    monkeypatch.setattr(
+        updater,
+        "evaluate_gradle_candidate_age",
+        lambda *args: AgeBlock(reason="withheld at apply"),
+    )
+    order = _record_cleanup_order(driver, monkeypatch)
+    assert invoke_driver(driver) is Outcome.FAILED
+    # The leading workspace entry is the fresh workspace replacement.
+    assert order == [("workspace", False), ("release", False), ("workspace", False)]
+    assert updater.load_gradle_run(updater.gradle_run_path("sample")) is None
+    assert [
+        type(event)
+        for event in driver.emit.events
+        if isinstance(event, (GradleRunReported, NoEligibleGradleChanges))
+    ] == [GradleRunReported, NoEligibleGradleChanges]
+    (reported,) = driver.emit.of_type(GradleRunReported)
+    assert all(isinstance(item, WithheldAttempt) for item in reported.run.attempts)
+    assert not {"apply", "commit", "promote"} & set(driver.effects)
+
+
 def test_gradle_updates_without_declared_public_routing(driver):
     driver.project = driver.project.model_copy(
         update={"gradle_repository_routing": None}

@@ -176,9 +176,7 @@ def _prepare_gradle_run(
         run = GradleRun.model_validate(
             dict(run) | {"attempts": attempts, "selection_blocks": plan.withheld}
         )
-        gradle_updater.save_gradle_run(
-            gradle_updater.gradle_run_path(project_name), run
-        )
+        gradle_updater.persist_gradle_run(run)
         return run
     except BaseException:
         gradle_updater.discard_unpersisted_gradle_context(project_name, context)
@@ -291,22 +289,35 @@ def _finish_verified_gradle_run(
         gradle_updater.gradle_run_finalization_check(
             run, verified, publication, minimum_age_days, vcs=vcs, clock=clock
         )
-    path = gradle_updater.gradle_run_path(run.project)
     if run.flow == Workflow.RESOLVE:
-        if not run.submitted:
-            output = push_bookmark_and_create_pr(
-                repo=vcs.repository(Path(project.path)),
-                host=vcs.code_host(Path(project.path)),
-                bookmark=run.managed_bookmark,
-                expected=ExpectedRevisions(
-                    base=run.base_commit_id, tip=run.managed_tip_id
-                ),
-            )
-            if output:
-                emit(PullRequestOutput(output))
-            run = _complete_gradle_attempts(run.model_copy(update={"submitted": True}))
-            gradle_updater.save_gradle_run(path, run)
+        return _submit_gradle_run(run, project, vcs=vcs, emit=emit)
+    run = _promote_gradle_run(run, project, vcs=vcs)
+    return _refresh_gradle_run(
+        run, project, publication, minimum_age_days, vcs=vcs, clock=clock
+    )
+
+
+def _submit_gradle_run(
+    run: GradleRun, project: ProjectConfig, *, vcs: VcsServices, emit: Emit
+) -> GradleRun:
+    if run.submitted:
         return run
+    output = push_bookmark_and_create_pr(
+        repo=vcs.repository(Path(project.path)),
+        host=vcs.code_host(Path(project.path)),
+        bookmark=run.managed_bookmark,
+        expected=ExpectedRevisions(base=run.base_commit_id, tip=run.managed_tip_id),
+    )
+    if output:
+        emit(PullRequestOutput(output))
+    run = _complete_gradle_attempts(run.model_copy(update={"submitted": True}))
+    gradle_updater.persist_gradle_run(run)
+    return run
+
+
+def _promote_gradle_run(
+    run: GradleRun, project: ProjectConfig, *, vcs: VcsServices
+) -> GradleRun:
     repo = vcs.repository(Path(project.path))
     main = repo.resolve_revision(revision="main")
     if run.promoted_commit_id is None:
@@ -320,28 +331,37 @@ def _finish_verified_gradle_run(
         # main already equals verified tip also covers crash after promotion but
         # before this durable record. Finalization above still checks exact tip.
         run = run.model_copy(update={"promoted_commit_id": run.managed_tip_id})
-        gradle_updater.save_gradle_run(path, run)
+        gradle_updater.persist_gradle_run(run)
     elif run.promoted_commit_id != run.managed_tip_id or main != run.promoted_commit_id:
         raise GradleError("Main moved after recorded Gradle promotion")
-    if not run.refreshed:
-        try:
-            refresh_working_copy_from_main(repo=repo)
-        except RevisionError as exc:
-            raise GradleError(
-                "Promotion recorded; working-copy refresh failed, retry update"
-            ) from exc
-        if repo.resolve_revision(revision="main") != run.managed_tip_id:
-            raise GradleError("Main moved during refresh")
-        _publish_verified_gradle_scan(
-            run,
-            project,
-            publication,
-            minimum_age_days,
-            vcs=vcs,
-            clock=clock,
-        )
-        run = _complete_gradle_attempts(run.model_copy(update={"refreshed": True}))
-        gradle_updater.save_gradle_run(path, run)
+    return run
+
+
+def _refresh_gradle_run(
+    run: GradleRun,
+    project: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+    *,
+    vcs: VcsServices,
+    clock: Clock = utc_now,
+) -> GradleRun:
+    if run.refreshed:
+        return run
+    repo = vcs.repository(Path(project.path))
+    try:
+        refresh_working_copy_from_main(repo=repo)
+    except RevisionError as exc:
+        raise GradleError(
+            "Promotion recorded; working-copy refresh failed, retry update"
+        ) from exc
+    if repo.resolve_revision(revision="main") != run.managed_tip_id:
+        raise GradleError("Main moved during refresh")
+    _publish_verified_gradle_scan(
+        run, project, publication, minimum_age_days, vcs=vcs, clock=clock
+    )
+    run = _complete_gradle_attempts(run.model_copy(update={"refreshed": True}))
+    gradle_updater.persist_gradle_run(run)
     return run
 
 
@@ -549,6 +569,163 @@ def _gradle_display_result(run: GradleRun, project: ProjectConfig) -> ScanResult
     )
 
 
+def _open_gradle_run(
+    project_name: str,
+    project: ProjectConfig,
+    flow: Workflow,
+    run: GradleRun | None,
+    *,
+    continue_: bool,
+    vcs: VcsServices,
+    emit: Emit,
+    clock: Clock = utc_now,
+) -> tuple[GradleRun | None, ProjectConfig, str]:
+    if (
+        run is not None
+        and run.flow == Workflow.UPDATE
+        and not continue_
+        and run.has(FailedAttempt)
+    ):
+        _archive_rolled_back_gradle_run(run, project, vcs=vcs, emit=emit)
+        run = None
+    if run is not None and (run.project != project_name or run.flow != flow):
+        raise GradleError("Another Gradle workflow owns the unfinished ledger")
+    if run is None:
+        if continue_:
+            raise GradleError("No preserved Gradle resolve attempt to continue")
+        work, base = _new_gradle_workspace(
+            project_name, project, flow, vcs=vcs, clock=clock
+        )
+        return None, work, base
+    return run, _resume_gradle_workspace(run, project, vcs=vcs), run.base_commit_id
+
+
+def _prepare_or_replan(
+    project_name: str,
+    project: ProjectConfig,
+    work: ProjectConfig,
+    flow: Workflow,
+    base: str,
+    run: GradleRun | None,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+    *,
+    choose: GradleChooser | None,
+    vcs: VcsServices,
+    emit: Emit,
+    clock: Clock = utc_now,
+) -> GradleRun | Outcome:
+    unfinished = run is not None and _gradle_run_needs_replanning(run)
+    if unfinished:
+        _require_gradle_accepted_workspace(run, work, vcs=vcs)
+    if run is not None and not unfinished:
+        return run
+    previous = run
+    prepared = _prepare_gradle_run(
+        project_name,
+        work,
+        flow,
+        base,
+        publication,
+        minimum_age_days,
+        choose=choose,
+        vcs=vcs,
+        emit=emit,
+        clock=clock,
+    )
+    if isinstance(prepared, Outcome):
+        if previous is not None:
+            gradle_updater.gradle_run_path(project_name).unlink()
+            gradle_updater.retire_gradle_context(previous.context)
+        if flow == Workflow.UPDATE:
+            remove_workspace(
+                repo=vcs.repository(Path(project.path)), project=project_name
+            )
+        return prepared
+    if (
+        previous is not None
+        and previous.context.private_cache_path != prepared.context.private_cache_path
+    ):
+        gradle_updater.retire_gradle_context(previous.context)
+    return prepared
+
+
+def _process_or_continue(
+    run: GradleRun,
+    work: ProjectConfig,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+    *,
+    continue_: bool,
+    vcs: VcsServices,
+    emit: Emit,
+    clock: Clock = utc_now,
+) -> GradleRun:
+    if run.has(ApplyingAttempt):
+        run = gradle_updater.reconcile_gradle_applying(
+            run,
+            work,
+            publication,
+            minimum_age_days,
+            vcs=vcs,
+            emit=emit,
+            clock=clock,
+        )
+    if continue_:
+        run = gradle_updater.continue_gradle_resolve(
+            run,
+            work,
+            publication,
+            minimum_age_days,
+            vcs=vcs,
+            emit=emit,
+            clock=clock,
+        )
+    elif run.has(FailedAttempt):
+        raise GradleError(
+            "Preserved Gradle failure requires manual review or resolve --continue"
+        )
+    # Committed resolve repair is separately verified above and becomes
+    # the new accepted tip before automatic processing can resume.
+    _require_gradle_accepted_workspace(run, work, vcs=vcs)
+    if not context_inputs_valid(run.context, work, clock()):
+        run = gradle_updater.rebuild_gradle_run_evidence(
+            run,
+            work,
+            publication,
+            minimum_age_days,
+            vcs=vcs,
+            emit=emit,
+            clock=clock,
+        )
+    return gradle_updater.process_gradle_run(
+        run,
+        work,
+        publication,
+        minimum_age_days,
+        vcs=vcs,
+        emit=emit,
+        clock=clock,
+    )
+
+
+def _close_ineligible_gradle_run(
+    run: GradleRun, project: ProjectConfig, *, vcs: VcsServices, emit: Emit
+) -> Outcome:
+    emit(GradleRunReported(_gradle_display_result(run, project), run))
+    emit(NoEligibleGradleChanges())
+    # A clean/withheld-only run has no effects requiring recovery.
+    gradle_updater.gradle_run_path(run.project).unlink(missing_ok=True)
+    release_comparison_context(run.context)
+    if run.flow == Workflow.UPDATE:
+        remove_workspace(repo=vcs.repository(Path(project.path)), project=run.project)
+    return (
+        Outcome.FAILED
+        if run.attempts or run.selection_blocks or run.initial_snapshot.findings
+        else Outcome.SUCCEEDED
+    )
+
+
 def run_gradle_flow(
     project_name: str,
     project: ProjectConfig,
@@ -563,114 +740,47 @@ def run_gradle_flow(
 ) -> Outcome:
     services = vcs or make_vcs_services()
     try:
-        path = gradle_updater.gradle_run_path(project_name)
-        run = gradle_updater.load_gradle_run(path)
+        run = gradle_updater.load_gradle_run(
+            gradle_updater.gradle_run_path(project_name)
+        )
         if run is not None and (run.refreshed or run.submitted):
             gradle_updater.retire_gradle_context(run.context)
             if continue_:
                 return Outcome.SUCCEEDED
             run = None
-        if (
-            run is not None
-            and run.flow == Workflow.UPDATE
-            and not continue_
-            and run.has(FailedAttempt)
-        ):
-            _archive_rolled_back_gradle_run(run, project, vcs=services, emit=emit)
-            run = None
-        if run is not None and (run.project != project_name or run.flow != flow):
-            raise GradleError("Another Gradle workflow owns the unfinished ledger")
-        if run is None:
-            if continue_:
-                raise GradleError("No preserved Gradle resolve attempt to continue")
-            work, base = _new_gradle_workspace(
+        run, work, base = _open_gradle_run(
+            project_name,
+            project,
+            flow,
+            run,
+            continue_=continue_,
+            vcs=services,
+            emit=emit,
+            clock=clock,
+        )
+        with PublicationLookupContext(paths.gradle_publications_dir()) as publication:
+            prepared = _prepare_or_replan(
                 project_name,
                 project,
+                work,
                 flow,
+                base,
+                run,
+                publication,
+                minimum_age_days,
+                choose=choose,
                 vcs=services,
+                emit=emit,
                 clock=clock,
             )
-        else:
-            work = _resume_gradle_workspace(run, project, vcs=services)
-            base = run.base_commit_id
-        with PublicationLookupContext(paths.gradle_publications_dir()) as publication:
-            unfinished = run is not None and _gradle_run_needs_replanning(run)
-            if unfinished:
-                _require_gradle_accepted_workspace(run, work, vcs=services)
-            if run is None or unfinished:
-                previous = run
-                prepared = _prepare_gradle_run(
-                    project_name,
-                    work,
-                    flow,
-                    base,
-                    publication,
-                    minimum_age_days,
-                    choose=choose,
-                    vcs=services,
-                    emit=emit,
-                    clock=clock,
-                )
-                if isinstance(prepared, Outcome):
-                    if previous is not None:
-                        path.unlink()
-                        gradle_updater.retire_gradle_context(previous.context)
-                    if flow == Workflow.UPDATE:
-                        remove_workspace(
-                            repo=services.repository(Path(project.path)),
-                            project=project_name,
-                        )
-                    return prepared
-                run = prepared
-                if (
-                    previous is not None
-                    and previous.context.private_cache_path
-                    != run.context.private_cache_path
-                ):
-                    gradle_updater.retire_gradle_context(previous.context)
-            if run.has(ApplyingAttempt):
-                run = gradle_updater.reconcile_gradle_applying(
-                    run,
-                    work,
-                    publication,
-                    minimum_age_days,
-                    vcs=services,
-                    emit=emit,
-                    clock=clock,
-                )
-            if continue_:
-                run = gradle_updater.continue_gradle_resolve(
-                    run,
-                    work,
-                    publication,
-                    minimum_age_days,
-                    vcs=services,
-                    emit=emit,
-                    clock=clock,
-                )
-            elif run.has(FailedAttempt):
-                raise GradleError(
-                    "Preserved Gradle failure requires manual review "
-                    "or resolve --continue"
-                )
-            # Committed resolve repair is separately verified above and becomes
-            # the new accepted tip before automatic processing can resume.
-            _require_gradle_accepted_workspace(run, work, vcs=services)
-            if not context_inputs_valid(run.context, work, clock()):
-                run = gradle_updater.rebuild_gradle_run_evidence(
-                    run,
-                    work,
-                    publication,
-                    minimum_age_days,
-                    vcs=services,
-                    emit=emit,
-                    clock=clock,
-                )
-            run = gradle_updater.process_gradle_run(
-                run,
+            if isinstance(prepared, Outcome):
+                return prepared
+            run = _process_or_continue(
+                prepared,
                 work,
                 publication,
                 minimum_age_days,
+                continue_=continue_,
                 vcs=services,
                 emit=emit,
                 clock=clock,
@@ -679,22 +789,8 @@ def run_gradle_flow(
                 emit(GradleRunReported(_gradle_display_result(run, project), run))
                 return Outcome.FAILED
             if not run.has(ReadyAttempt, CompletedAttempt):
-                emit(GradleRunReported(_gradle_display_result(run, project), run))
-                emit(NoEligibleGradleChanges())
-                # A clean/withheld-only run has no effects requiring recovery.
-                path.unlink(missing_ok=True)
-                release_comparison_context(run.context)
-                if flow == Workflow.UPDATE:
-                    remove_workspace(
-                        repo=services.repository(Path(project.path)),
-                        project=project_name,
-                    )
-                return (
-                    Outcome.FAILED
-                    if run.attempts
-                    or run.selection_blocks
-                    or run.initial_snapshot.findings
-                    else Outcome.SUCCEEDED
+                return _close_ineligible_gradle_run(
+                    run, project, vcs=services, emit=emit
                 )
             run = _finish_verified_gradle_run(
                 run,

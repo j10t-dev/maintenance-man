@@ -457,6 +457,7 @@ def test_workflow_code_passes_complexity_limit() -> None:
         "src/maintenance_man/updater.py",
         "src/maintenance_man/gradle_inventory.py",
         "src/maintenance_man/gradle_updates.py",
+        "src/maintenance_man/gradle_workflow.py",
     )
     assert result.returncode == 0, result.stdout
 
