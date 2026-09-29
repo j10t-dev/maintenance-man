@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.console import Console
 
+from maintenance_man import cli
 from maintenance_man.cli import app
 from maintenance_man.config import load_config
 from maintenance_man.gradle import (
@@ -105,6 +107,22 @@ def configure_fake_vcs(
     }
     monkeypatch.setattr("maintenance_man.cli.make_vcs_services", state.services)
     return state, paths_by_name
+
+
+_TERMINAL_OVERRIDES = ("FORCE_COLOR", "NO_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE")
+
+
+@pytest.fixture(autouse=True)
+def _plain_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Render CLI output as plain 80-column text whatever terminal runs the suite.
+
+    The CLI console is built at import, during collection, so it has already
+    read the invoking environment. Replace it with one that is never treated
+    as a terminal, and clear the overrides so child processes are plain too.
+    """
+    for name in _TERMINAL_OVERRIDES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(cli, "console", Console(force_terminal=False, width=80))
 
 
 @pytest.fixture(autouse=True)

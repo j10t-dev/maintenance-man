@@ -688,6 +688,26 @@ def test_complexity_rule_rejects_over_limit(
     assert code in codes
 
 
+@pytest.mark.parametrize(
+    "variable, value", [("FORCE_COLOR", "3"), ("TTY_COMPATIBLE", "1")]
+)
+def test_cli_output_tests_ignore_terminal_overrides(
+    monkeypatch: pytest.MonkeyPatch, variable: str, value: str
+) -> None:
+    # A child process sees the variable before the CLI console is built, as a
+    # developer's shell would. The target test must keep using the default
+    # cli.console rather than patching in its own.
+    monkeypatch.setenv(variable, value)
+    result = run_tool(
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "tests/test_cli.py::test_config_validation_error_keeps_pydantic_type_suffix",
+    )
+    assert result.returncode == 0, result.stdout
+
+
 def test_import_contracts() -> None:
     result = run_tool("lint-imports", "--config", str(PYPROJECT), "--no-cache")
     assert result.returncode == 0, result.stdout
