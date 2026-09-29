@@ -10,11 +10,6 @@ from tests.conftest import run_mm
 
 
 class TestHelp:
-    def test_help_exits_zero(self):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["--help"])
-        assert exc_info.value.code == 0
-
     def test_help_contains_description(self, capsys: pytest.CaptureFixture[str]):
         with pytest.raises(SystemExit) as exc_info:
             app(["--help"])
@@ -23,11 +18,6 @@ class TestHelp:
 
 
 class TestVersion:
-    def test_version_exits_zero(self):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["--version"])
-        assert exc_info.value.code == 0
-
     def test_version_prints_version(self, capsys: pytest.CaptureFixture[str]):
         with pytest.raises(SystemExit) as exc_info:
             app(["--version"])
@@ -169,25 +159,16 @@ class TestTodoCommand:
         )
         return mm_home
 
-    def test_todo_all_shows_content(
+    def test_todo_all_shows_content_and_missing_file(
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """mm todo shows TODO.md content for projects that have one."""
+        """mm todo shows content and missing-file status for all projects."""
         with pytest.raises(SystemExit) as exc_info:
             app(["todo"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
         assert "alpha" in output
         assert "Fix the widget" in output
-
-    def test_todo_all_shows_no_file_message(
-        self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """mm todo shows 'no TODO.md' for projects without the file."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["todo"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
         assert "beta" in output
         assert "no TODO.md" in output
 

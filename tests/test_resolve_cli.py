@@ -145,7 +145,7 @@ class TestResolveFlow:
             for call in mock_resolve_cli_deps["vcs_state"].attempts
         )
 
-    def test_creates_resolve_bookmark(
+    def test_fresh_resolve_runs_full_lifecycle(
         self,
         mm_home_with_projects: Path,
         mock_resolve_fresh: dict,
@@ -162,6 +162,17 @@ class TestResolveFlow:
             call for call in state.effects if call.method == "create_bookmark"
         )
         assert dict(created.arguments)["bookmark"] == _RESOLVE_BOOKMARK
+        setup = [
+            call.method
+            for call in state.effects
+            if call.method in {"delete_bookmark", "create_bookmark", "new_change"}
+        ]
+        assert setup[:3] == ["delete_bookmark", "create_bookmark", "new_change"]
+        host = state.code_host(mock_resolve_fresh["project_paths"]["vulnerable"])
+        assert sum(call.method == "create_pr" for call in host.attempts) == 1
+        saved = load_scan_results("vulnerable")
+        assert saved.vulnerabilities == []
+        assert saved.updates == []
 
     def test_stops_on_first_failure_and_instructs_continue(
         self,
@@ -184,21 +195,6 @@ class TestResolveFlow:
         assert exc_info.value.code == 4
         assert not any(call.method == "create_pr" for call in host.attempts)
         assert "mm resolve vulnerable --continue" in capsys.readouterr().out
-
-    def test_all_pass_submits_pr(
-        self,
-        mm_home_with_projects: Path,
-        mock_resolve_fresh: dict,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        with pytest.raises(SystemExit) as exc_info:
-            app(["resolve", "vulnerable"])
-
-        assert exc_info.value.code == 0
-        host = mock_resolve_fresh["vcs_state"].code_host(
-            mock_resolve_fresh["project_paths"]["vulnerable"]
-        )
-        assert sum(call.method == "create_pr" for call in host.attempts) == 1
 
     def test_existing_ready_resolve_progress_preserves_bookmark_and_submits(
         self,
@@ -252,42 +248,8 @@ class TestResolveFlow:
         assert not any(call.method == "delete_bookmark" for call in state.effects)
         mock_process.assert_not_called()
 
-    def test_startup_creates_resolve_bookmark_and_new_change(
-        self,
-        mm_home_with_projects: Path,
-        mock_resolve_fresh: dict,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        state = mock_resolve_fresh["vcs_state"]
-        state.clear_calls()
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["resolve", "vulnerable"])
-
-        assert exc_info.value.code == 0
-        setup = [
-            call.method
-            for call in state.effects
-            if call.method in {"delete_bookmark", "create_bookmark", "new_change"}
-        ]
-        assert setup[:3] == ["delete_bookmark", "create_bookmark", "new_change"]
-
 
 class TestResolveSubmit:
-    def test_submit_success_promotes_ready_to_completed(
-        self,
-        mm_home_with_projects: Path,
-        mock_resolve_fresh: dict,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        with pytest.raises(SystemExit) as exc_info:
-            app(["resolve", "vulnerable"])
-
-        assert exc_info.value.code == 0
-        saved = load_scan_results("vulnerable")
-        assert saved.vulnerabilities == []
-        assert saved.updates == []
-
     def test_submit_failure_leaves_ready(
         self,
         mm_home_with_projects: Path,
@@ -825,24 +787,3 @@ def test_gradle_continuation_without_ledger_preserves_interrupted_outputs(
     assert exc.value.code == 4
     assert report.read_bytes() == b"preserved output"
     assert marker.exists() is owned
-
-
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        (" ALL ", "all"),
-        ("none", "none"),
-        ("VuLnS", "vulns"),
-        (" updates ", "updates"),
-        ("2,1,2", (2, 1)),
-        ("0", None),
-        ("3", None),
-        ("1,x", None),
-        ("", None),
-        ("1,", None),
-    ],
-)
-def test_selection_contract(text, expected):
-    from maintenance_man.cli import _parse_selection
-
-    assert _parse_selection(text, 2) == expected

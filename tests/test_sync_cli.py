@@ -35,9 +35,10 @@ class TestSyncCommand:
             app(["sync"])
 
         assert exc_info.value.code == ExitCode.OK
-        assert sum(call.method == "fetch" for call in state.attempts) == len(
-            load_config().projects
-        )
+        assert [call.path for call in state.attempts if call.method == "fetch"] == [
+            project.path.resolve()
+            for _, project in sorted(load_config().projects.items())
+        ]
 
     def test_syncs_named_projects_only(
         self,
@@ -50,7 +51,11 @@ class TestSyncCommand:
             app(["sync", "vulnerable", "clean"])
 
         assert exc_info.value.code == ExitCode.OK
-        assert sum(call.method == "fetch" for call in state.attempts) == 2
+        projects = load_config().projects
+        assert [call.path for call in state.attempts if call.method == "fetch"] == [
+            projects["vulnerable"].path.resolve(),
+            projects["clean"].path.resolve(),
+        ]
 
     def test_exits_nonzero_on_typed_failure(
         self,
@@ -81,7 +86,11 @@ class TestSyncCommand:
             app(["sync", "vulnerable", "clean"])
 
         assert exc_info.value.code == ExitCode.SYNC_FAILED
-        assert sum(call.method == "fetch" for call in state.attempts) == 2
+        projects = load_config().projects
+        assert [call.path for call in state.attempts if call.method == "fetch"] == [
+            projects["vulnerable"].path.resolve(),
+            projects["clean"].path.resolve(),
+        ]
 
     def test_composes_once_without_extra_vcs_context(
         self,

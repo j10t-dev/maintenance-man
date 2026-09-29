@@ -280,11 +280,15 @@ class TestDeployCommand:
         mm_home_with_projects: Path,
     ) -> None:
         """--build runs build before deploy."""
+        calls: list[str] = []
+        mock_build.side_effect = lambda *args, **kwargs: calls.append("build")
+        mock_deploy.side_effect = lambda *args, **kwargs: calls.append("deploy")
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "deployable", "--build"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
         mock_build.assert_called_once()
         mock_deploy.assert_called_once()
+        assert calls == ["build", "deploy"]
 
     @patch("maintenance_man.services.deploy.run_deploy")
     def test_build_flag_skips_when_no_build_command(
@@ -424,6 +428,7 @@ class TestDeployCheck:
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "deployable", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
+        mock_check.assert_called_once_with("http://pihost:8080", "deployable")
 
     @pytest.mark.parametrize("healthcheck_line", [None, 'healthcheck_url = ""'])
     @patch("maintenance_man.services.deploy.check_health")
@@ -489,38 +494,24 @@ class TestMassDeployCommand:
 
     @patch("maintenance_man.services.deploy.run_deploy")
     @patch("maintenance_man.services.deploy.run_build")
-    def test_deploys_all_projects_with_deploy_command(
-        self,
-        mock_build: MagicMock,
-        mock_deploy: MagicMock,
-        mm_home_with_projects: Path,
-    ) -> None:
-        """Mass deploy runs build+deploy for all projects with deploy_command."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["deploy"], exit_on_error=False)
-        assert exc_info.value.code == ExitCode.OK
-        # "deployable" has both build+deploy, "deploy-only" has deploy only
-        assert mock_deploy.call_count == 2
-        # Only "deployable" has build_command
-        assert mock_build.call_count == 1
-
-    @patch("maintenance_man.services.deploy.run_deploy")
-    @patch("maintenance_man.services.deploy.run_build")
-    def test_skips_projects_without_deploy_command(
+    def test_deploys_all_projects_and_prints_summary(
         self,
         mock_build: MagicMock,
         mock_deploy: MagicMock,
         mm_home_with_projects: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Projects without deploy_command are silently skipped."""
+        """Mass deploy runs eligible projects and reports the combined result."""
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
-        capsys.readouterr()
-        deployed_projects = [call.args[0] for call in mock_deploy.call_args_list]
-        assert "no-deploy" not in deployed_projects
-        assert "vulnerable" not in deployed_projects
+        assert mock_deploy.call_count == 2
+        assert mock_build.call_count == 1
+        assert [call.args[0] for call in mock_deploy.call_args_list] == [
+            "deploy-only",
+            "deployable",
+        ]
+        assert "Deploy Summary" in capsys.readouterr().out
 
     @patch(
         "maintenance_man.services.deploy.run_deploy",
@@ -556,21 +547,6 @@ class TestMassDeployCommand:
         assert exc_info.value.code == ExitCode.DEPLOY_FAILED
         # "deployable" build fails => deploy skipped; "deploy-only" has no build => runs
         assert mock_deploy.call_count == 1
-
-    @patch("maintenance_man.services.deploy.run_deploy")
-    @patch("maintenance_man.services.deploy.run_build")
-    def test_prints_summary_table(
-        self,
-        mock_build: MagicMock,
-        mock_deploy: MagicMock,
-        mm_home_with_projects: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Mass deploy prints a summary table."""
-        with pytest.raises(SystemExit):
-            app(["deploy"], exit_on_error=False)
-        output = capsys.readouterr().out
-        assert "Deploy Summary" in output
 
     @patch(
         "maintenance_man.services.deploy.check_health",
@@ -650,10 +626,12 @@ class TestDeployGateWiring:
     def _vcs(self, _deploy_vcs: _DeployVcs) -> None:
         pass
 
+    @patch("maintenance_man.services.deploy.record_activity")
     @patch("maintenance_man.services.deploy.run_deploy")
     def test_explicit_unchanged_skips_with_warning(
         self,
         mock_deploy: MagicMock,
+        mock_record: MagicMock,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
@@ -680,35 +658,8 @@ class TestDeployGateWiring:
             app(["deploy", "deploy-only"], exit_on_error=False)
         assert exc.value.code == ExitCode.OK
         mock_deploy.assert_not_called()
-        assert "force" in capsys.readouterr().out.lower()
-
-    @patch("maintenance_man.services.deploy.record_activity")
-    @patch("maintenance_man.services.deploy.run_deploy")
-    def test_explicit_unchanged_records_nothing(
-        self,
-        mock_deploy: MagicMock,
-        mock_record: MagicMock,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        _deploy_vcs: _DeployVcs,
-    ) -> None:
-        main_id = _deploy_vcs.main_ids["deploy-only"]
-        monkeypatch.setattr(
-            "maintenance_man.services.deploy.load_activity",
-            lambda path: {
-                "deploy-only": ProjectActivity(
-                    last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                        success=True,
-                        branch="main",
-                        commit_id=main_id,
-                    )
-                )
-            },
-        )
-        with pytest.raises(SystemExit):
-            app(["deploy", "deploy-only"], exit_on_error=False)
         mock_record.assert_not_called()
+        assert "force" in capsys.readouterr().out.lower()
 
     @patch("maintenance_man.services.deploy.record_activity")
     @patch("maintenance_man.services.deploy.run_deploy")

@@ -1039,7 +1039,6 @@ def test_update_statuses_are_persisted_after_each_finding(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
-    processor_vcs["phase"].side_effect = [None, ProcessError("unit failed")]
     findings = [make_update(), make_update(SemverTier.MINOR)]
     scan = ScanResult(
         project="demo",
@@ -1047,6 +1046,30 @@ def test_update_statuses_are_persisted_after_each_finding(
         trivy_target=str(project_config.path),
         updates=findings,
     )
+    inspected_before_second_finding: list[bool] = []
+    package_effect = processor_vcs["package"].side_effect
+    phase_effect = processor_vcs["phase"].side_effect
+    assert callable(package_effect)
+    assert callable(phase_effect)
+
+    def run_package(*args: object, **kwargs: object) -> object:
+        if processor_vcs["package"].call_count == 2:
+            saved = load_scan_results("demo")
+            assert [finding.update_status for finding in saved.updates] == [
+                UpdateStatus.READY,
+                None,
+            ]
+            inspected_before_second_finding.append(True)
+        return package_effect(*args, **kwargs)
+
+    def run_phase(*args: object, **kwargs: object) -> None:
+        phase_effect(*args, **kwargs)
+        if processor_vcs["phase"].call_count == 2:
+            msg = "unit failed"
+            raise ProcessError(msg)
+
+    processor_vcs["package"].side_effect = run_package
+    processor_vcs["phase"].side_effect = run_phase
     process_findings(
         findings,
         project_config,
@@ -1063,6 +1086,7 @@ def test_update_statuses_are_persisted_after_each_finding(
         UpdateStatus.FAILED,
     ]
     assert saved.updates[1].failed_phase == "unit"
+    assert inspected_before_second_finding == [True]
 
 
 def test_resolve_failure_status_is_persisted_before_stopping(

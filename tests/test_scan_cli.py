@@ -514,7 +514,8 @@ class TestScanSingleProject:
         with pytest.raises(SystemExit):
             app(["scan", "vulnerable"])
         output = capsys.readouterr().out
-        assert "CVE-" in output or "vuln" in output.lower()
+        assert "CVE-2024-0001" in output
+        assert "some-pkg" in output
 
     def test_scan_clean_project_exits_0(self, mm_home_with_projects: Path):
         """mm scan clean — clean, should exit 0."""
@@ -555,27 +556,21 @@ class TestScanUpdatesExitCodes:
         assert "UPDATE" in output or "update" in output.lower()
         assert "axios" in output
 
-    def test_scan_clean_still_exits_0(self, mm_home_with_projects: Path):
-        """Clean project (no vulns, no updates) still exits 0."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "clean"])
-        assert exc_info.value.code == 0
-
-    def test_scan_vulns_and_updates_exits_2(self, mm_home_with_projects: Path):
+    def test_scan_vulns_and_updates_exits_2(
+        self,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         """If project has both vulns and updates, exit 2 (vulns take precedence)."""
+        mixed = _make_vulnerable_result().model_copy(
+            update={"updates": _make_updates_only_result().updates}
+        )
+        monkeypatch.setattr(
+            "maintenance_man.services.scan.scan_project",
+            lambda *args, **kwargs: mixed,
+        )
         with pytest.raises(SystemExit) as exc_info:
             app(["scan", "vulnerable"])
-        assert exc_info.value.code == 2
-
-
-class TestScanAllWithUpdates:
-    def test_scan_all_updates_takes_precedence_over_clean(
-        self, mm_home_with_projects: Path
-    ):
-        """mm scan (all) — worst case includes updates, but vulns override."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan"])
-        # vulnerable has vulns → exit 2 takes precedence
         assert exc_info.value.code == 2
 
 
