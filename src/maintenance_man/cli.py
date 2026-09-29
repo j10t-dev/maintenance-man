@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from maintenance_man import __version__, gradle_workflow, paths, vcs_workflow
+from maintenance_man import __version__, paths, vcs_workflow
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
@@ -23,18 +23,18 @@ from maintenance_man.config import (
 )
 from maintenance_man.deployer import BuildError
 from maintenance_man.exit_codes import ExitCode
-from maintenance_man.github import CodeHostError
 from maintenance_man.models.activity import ActivityEvent
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
+    BlockersStillFailing,
     DeployStep,
     DeployStepFailed,
     DeployStepStarted,
     DeployStepSucceeded,
-    Emit,
     Event,
     FindingFailed,
     FindingPassed,
+    FindingsBlocked,
     FindingsProcessed,
     FindingStarted,
     FindingStepFailed,
@@ -55,8 +55,10 @@ from maintenance_man.models.events import (
     ProjectStarted,
     Promoted,
     PullRequestOutput,
+    ResolvePaused,
     ScanReported,
     SkipReason,
+    SubmissionBlocked,
     SyncCompleted,
     TestCommandStarted,
 )
@@ -72,15 +74,15 @@ from maintenance_man.models.scan import (
     SecretFinding,
     UpdateFinding,
     UpdateResult,
-    UpdateStatus,
     VulnFinding,
     Workflow,
     highest_fix_version,
     sort_vulns_by_severity,
 )
 from maintenance_man.process import ToolNotFoundError
-from maintenance_man.services import WorkflowError, flows
+from maintenance_man.services import WorkflowError
 from maintenance_man.services import deploy as deploy_service
+from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import scan as scan_service
 from maintenance_man.services import update as update_service
 from maintenance_man.services.scan import ScanSummary
@@ -88,26 +90,9 @@ from maintenance_man.storage import (
     NoScanResultsError,
     load_activity,
     load_scan_results,
-    save_scan_results,
 )
-from maintenance_man.updater import (
-    Finding,
-    consolidate_vulns,
-    process_findings,
-    remove_completed_findings,
-    run_test_phases,
-    sort_updates_by_risk,
-)
-from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import (
-    VcsServices,
-    ensure_main_bookmark,
-    make_vcs_services,
-    push_bookmark_and_create_pr,
-)
-from maintenance_man.vcs_workflow import (
-    prune_stale_bookmarks as prune_repository_bookmarks,
-)
+from maintenance_man.updater import run_test_phases
+from maintenance_man.vcs_workflow import make_vcs_services
 
 console = Console()
 
@@ -268,6 +253,40 @@ def _render_findings_processed(event: FindingsProcessed, batch: bool) -> None:
 def _render_promoted(event: Promoted, batch: bool) -> None:
     del batch
     console.print(f"[bold green]Promoted {escape(event.bookmark)} to main.[/]")
+
+
+@_renders(ResolvePaused)
+def _render_resolve_paused(event: ResolvePaused, batch: bool) -> None:
+    del batch
+    console.print(
+        f"  [bold yellow]Resolve paused.[/] Continue with "
+        f"[bold]mm resolve {escape(event.project)} --continue[/]."
+    )
+
+
+@_renders(FindingsBlocked)
+def _render_findings_blocked(event: FindingsBlocked, batch: bool) -> None:
+    del batch
+    for package, reason in event.findings:
+        console.print(f"  [yellow]BLOCKED[/] {escape(package)} — {escape(reason)}")
+
+
+@_renders(SubmissionBlocked)
+def _render_submission_blocked(event: SubmissionBlocked, batch: bool) -> None:
+    del event, batch
+    console.print(
+        "  [bold yellow]Not submitting:[/] blocked findings remain. "
+        "Rescan or resolve them manually."
+    )
+
+
+@_renders(BlockersStillFailing)
+def _render_blockers_still_failing(event: BlockersStillFailing, batch: bool) -> None:
+    del batch
+    console.print(
+        f"  [bold red]FAIL[/] {escape(event.phase)} — still blocking: "
+        f"{escape(', '.join(event.pkgs))}"
+    )
 
 
 @_renders(SyncCompleted)
@@ -622,204 +641,6 @@ def _print_update_summary(all_results: list[UpdateResult]) -> None:
             label = phase_labels.get(phase, phase)
             console.print(f"  [red]FAIL[/] {escape(r.pkg_name)} — {escape(label)}")
     console.print("─" * 40)
-
-
-# -- Resolve command ---------------------------------------------------------
-
-
-def _ordered_resolve_candidates(
-    scan_result: ScanResult,
-) -> list[Finding]:
-    """Return fresh + resolve-owned failed findings, ordered for processing."""
-    candidate_vulns = [
-        v
-        for v in scan_result.vulnerabilities
-        if v.actionable
-        and (
-            (v.flow is None and v.update_status is None)
-            or (v.flow == Workflow.RESOLVE and v.update_status == UpdateStatus.FAILED)
-            or flows.is_resolve_claimable_failure(v, Workflow.RESOLVE)
-        )
-    ]
-    candidate_updates = [
-        u
-        for u in scan_result.updates
-        if (u.flow is None and u.update_status is None)
-        or (u.flow == Workflow.RESOLVE and u.update_status == UpdateStatus.FAILED)
-        or flows.is_resolve_claimable_failure(u, Workflow.RESOLVE)
-    ]
-    return [
-        *consolidate_vulns(candidate_vulns),
-        *sort_updates_by_risk(candidate_updates),
-    ]
-
-
-def _ordered_failed_findings(
-    scan_result: ScanResult,
-) -> list[Finding]:
-    """Return resolve-owned FAILED findings in processing order."""
-    failed_vulns = [
-        v
-        for v in scan_result.vulnerabilities
-        if v.update_status == UpdateStatus.FAILED and v.flow == Workflow.RESOLVE
-    ]
-    failed_updates = [
-        u
-        for u in scan_result.updates
-        if u.update_status == UpdateStatus.FAILED and u.flow == Workflow.RESOLVE
-    ]
-    return [
-        *consolidate_vulns(failed_vulns),
-        *sort_updates_by_risk(failed_updates),
-    ]
-
-
-def _ordered_ready_findings(
-    scan_result: ScanResult,
-    *,
-    flow: Workflow,
-) -> list[Finding]:
-    """Return READY findings owned by *flow*, ordered for submission."""
-    ready_vulns = [
-        v
-        for v in scan_result.vulnerabilities
-        if v.update_status == UpdateStatus.READY and v.flow == flow
-    ]
-    ready_updates = [
-        u
-        for u in scan_result.updates
-        if u.update_status == UpdateStatus.READY and u.flow == flow
-    ]
-    return [
-        *consolidate_vulns(ready_vulns),
-        *sort_updates_by_risk(ready_updates),
-    ]
-
-
-def _has_ready_resolve_progress(scan_result: ScanResult) -> bool:
-    return any(
-        f.update_status == UpdateStatus.READY and f.flow == Workflow.RESOLVE
-        for f in scan_result.findings
-    )
-
-
-def _prepare_resolve_bookmark(
-    project_path: Path,
-    scan_result: ScanResult,
-    candidates: list[Finding],
-    *,
-    vcs: VcsServices,
-) -> bool:
-    """Create or resume the resolve bookmark without dropping committed progress."""
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    repo = vcs.repository(project_path)
-    try:
-        if _has_ready_resolve_progress(scan_result):
-            if not repo.bookmark_exists(bookmark=bookmark):
-                _fatal(
-                    f"resolve bookmark '{bookmark}' is missing but "
-                    "in-progress state exists — rescan or recover the bookmark manually"
-                )
-            if candidates:
-                repo.new_change(revision=bookmark)
-            return True
-
-        if repo.bookmark_exists(bookmark=bookmark):
-            repo.delete_bookmark(bookmark=bookmark)
-        repo.create_bookmark(bookmark=bookmark, revision="main")
-        repo.new_change(revision=bookmark)
-    except RevisionError as exc:
-        console.print(f"  [bold red]Resolve setup failed:[/] {escape(str(exc))}")
-        return False
-    return True
-
-
-def _run_resolve_findings(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    findings: list[Finding],
-    *,
-    vcs: VcsServices,
-) -> int:
-    """Process resolve candidates; stop on first failure, submit when all READY."""
-    results = process_findings(
-        findings,
-        proj_config,
-        flow=Workflow.RESOLVE,
-        scan_result=scan_result,
-        project_name=project,
-        on_failure="stop",
-        vcs=vcs,
-        emit=_Renderer(batch=False),
-    )
-    if any(not r.passed for r in results) or _ordered_failed_findings(scan_result):
-        console.print(
-            f"  [bold yellow]Resolve paused.[/] Continue with "
-            f"[bold]mm resolve {escape(project)} --continue[/]."
-        )
-        return ExitCode.UPDATE_FAILED
-
-    ready_findings = _ordered_ready_findings(scan_result, flow=Workflow.RESOLVE)
-    if scan_result.blocked_findings:
-        _print_blocked_findings(scan_result)
-        save_scan_results(project, scan_result)
-        return ExitCode.UPDATE_FAILED
-    if not ready_findings:
-        return ExitCode.OK
-    return _submit_resolve_bookmark(
-        project,
-        proj_config.path,
-        scan_result,
-        ready_findings,
-        vcs=vcs,
-    )
-
-
-def _submit_resolve_bookmark(
-    project: str,
-    project_path: Path,
-    scan_result: ScanResult,
-    ready_findings: list[Finding],
-    *,
-    vcs: VcsServices,
-) -> int:
-    """Push the resolve bookmark, open a PR, and promote READY findings on success."""
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    if scan_result.blocked_findings:
-        _print_blocked_findings(scan_result)
-        console.print(
-            "  [bold yellow]Not submitting:[/] blocked findings remain. "
-            "Rescan or resolve them manually."
-        )
-        save_scan_results(project, scan_result)
-        return ExitCode.UPDATE_FAILED
-    for f in ready_findings:
-        f.failed_phase = None
-
-    try:
-        output = push_bookmark_and_create_pr(
-            repo=vcs.repository(project_path),
-            host=vcs.code_host(project_path),
-            bookmark=bookmark,
-        )
-    except (RevisionError, CodeHostError) as exc:
-        save_scan_results(project, scan_result)
-        console.print(f"  [dim]{escape(str(exc))}[/]")
-        console.print(
-            f"  [bold yellow]Submit failed.[/] Keeping {bookmark} for manual recovery."
-        )
-        return ExitCode.UPDATE_FAILED
-    if output:
-        console.print(f"  [dim]{escape(output)}[/]")
-
-    for f in ready_findings:
-        f.update_status = UpdateStatus.COMPLETED
-        f.failed_phase = None
-        f.flow = None
-    remove_completed_findings(scan_result)
-    save_scan_results(project, scan_result)
-    return ExitCode.OK
 
 
 def _print_mass_update_summary(
@@ -1278,6 +1099,27 @@ def _parse_selection(text: str, count: int) -> _Selection | None:
     return tuple(dict.fromkeys(indices))
 
 
+def _selected_findings(
+    selection: _Selection,
+    numbered: list[VulnFinding | UpdateFinding],
+    selectable_vulns: list[VulnFinding],
+    selectable_updates: list[UpdateFinding],
+) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+    if selection == "all":
+        return selectable_vulns, selectable_updates
+    if selection == "vulns":
+        return selectable_vulns, []
+    if selection == "updates":
+        return [], selectable_updates
+    if selection == "none":
+        return [], []
+    selected = [numbered[index - 1] for index in selection]
+    return (
+        [finding for finding in selected if isinstance(finding, VulnFinding)],
+        [finding for finding in selected if isinstance(finding, UpdateFinding)],
+    )
+
+
 def _choose_findings(
     selectable_vulns: list[VulnFinding],
     selectable_updates: list[UpdateFinding],
@@ -1299,24 +1141,9 @@ def _choose_findings(
                 f"[bold red]Invalid selection:[/] '{escape(text)}'. Try again."
             )
             continue
-        if selection == "all":
-            return selectable_vulns, selectable_updates
-        if selection == "vulns":
-            return selectable_vulns, []
-        if selection == "updates":
-            return [], selectable_updates
-        if selection == "none":
-            return [], []
-
-        selected_vulns: list[VulnFinding] = []
-        selected_updates: list[UpdateFinding] = []
-        for index in selection:
-            finding = numbered[index - 1]
-            if isinstance(finding, VulnFinding):
-                selected_vulns.append(finding)
-            else:
-                selected_updates.append(finding)
-        return selected_vulns, selected_updates
+        return _selected_findings(
+            selection, numbered, selectable_vulns, selectable_updates
+        )
 
 
 def _choose_gradle_candidates(
@@ -1383,112 +1210,18 @@ def resolve(
     except ToolNotFoundError as e:
         _fatal(str(e))
     vcs = make_vcs_services()
-    if proj_config.package_manager == "gradle":
-        sys.exit(
-            _run_gradle_flow(
-                project,
-                proj_config,
-                Workflow.RESOLVE,
-                interactive=False,
-                minimum_age_days=minimum_age_days,
-                continue_=continue_,
-                vcs=vcs,
-            )
-        )
     try:
-        scan_result = flows.load_validated_scan(
+        outcome = resolve_service.resolve_project(
             project,
             proj_config,
-            Workflow.RESOLVE,
+            minimum_age_days=minimum_age_days,
+            continue_=continue_,
+            vcs=vcs,
             emit=_Renderer(batch=False),
         )
-    except flows.FlowConflictError as exc:
+    except WorkflowError as exc:
         _fatal(str(exc))
-    if scan_result is None:
-        sys.exit(ExitCode.OK)
-    if continue_:
-        sys.exit(_handle_resolve_continue(project, proj_config, scan_result, vcs=vcs))
-    candidates = _ordered_resolve_candidates(scan_result)
-    try:
-        repo = vcs.repository(proj_config.path)
-        prune_repository_bookmarks(repo=repo, host=vcs.code_host(proj_config.path))
-        ensure_main_bookmark(repo=repo)
-        if _ordered_failed_findings(scan_result):
-            _fatal(f"resolve already paused for {project} — rerun with --continue")
-        if not _prepare_resolve_bookmark(
-            proj_config.path, scan_result, candidates, vcs=vcs
-        ):
-            _fatal(f"aborted resolve for {project}")
-    except (RevisionError, CodeHostError) as exc:
-        _fatal(str(exc))
-    sys.exit(
-        _run_resolve_findings(
-            project,
-            proj_config,
-            scan_result,
-            candidates,
-            vcs=vcs,
-        )
-    )
-
-
-def _handle_resolve_continue(
-    project: str,
-    proj_config: ProjectConfig,
-    scan_result: ScanResult,
-    *,
-    vcs: VcsServices,
-) -> int:
-    """Retest the paused blocker on the resolve bookmark."""
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    repo = vcs.repository(proj_config.path)
-    try:
-        if not repo.is_ancestor(ancestor=bookmark, descendant="@"):
-            _fatal(f"--continue requires current jj change to descend from {bookmark}")
-        has_changes = repo.has_changes()
-    except RevisionError as exc:
-        _fatal(f"Cannot inspect resolve work: {exc}")
-    if has_changes:
-        _fatal(
-            "--continue requires an empty current jj change — commit or discard "
-            "manual changes first"
-        )
-    failed = _ordered_failed_findings(scan_result)
-    if failed:
-        passed, failed_phase = run_test_phases(
-            proj_config, proj_config.path, emit=_Renderer(batch=False)
-        )
-        for blocker in failed:
-            blocker.flow = Workflow.RESOLVE
-            if not passed:
-                blocker.update_status = UpdateStatus.FAILED
-                blocker.failed_phase = failed_phase
-        if not passed:
-            save_scan_results(project, scan_result)
-            names = ", ".join(b.pkg_name for b in failed)
-            console.print(
-                f"  [bold red]FAIL[/] {escape(failed_phase or '')} — "
-                f"still blocking: {escape(names)}"
-            )
-            return ExitCode.UPDATE_FAILED
-        try:
-            repo.set_bookmark(bookmark=bookmark, revision="@-")
-        except RevisionError:
-            save_scan_results(project, scan_result)
-            _fatal(f"could not move {bookmark} to the committed manual fix")
-        for blocker in failed:
-            blocker.update_status = UpdateStatus.READY
-            blocker.failed_phase = None
-        save_scan_results(project, scan_result)
-        for blocker in failed:
-            console.print(f"  [bold green]PASS[/] {escape(blocker.pkg_name)}")
-    return _run_resolve_findings(
-        project,
-        proj_config,
-        scan_result,
-        _ordered_resolve_candidates(scan_result),
-        vcs=vcs,
-    )
+    sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)
 
 
 def _print_gradle_run_summary(run: GradleRun) -> None:
@@ -1649,36 +1382,3 @@ def _print_update_table(updates: list[UpdateFinding]) -> None:
             age,
         )
     console.print(table)
-
-
-def _print_blocked_findings(scan_result: ScanResult) -> None:
-    """Explain why an explicit update or resolve operation cannot proceed."""
-    for finding in scan_result.blocked_findings:
-        console.print(
-            f"  [yellow]BLOCKED[/] {escape(finding.pkg_name)} — "
-            f"{escape(finding.blocked_reason or '')}"
-        )
-
-
-def _run_gradle_flow(
-    project_name: str,
-    project: ProjectConfig,
-    flow: Workflow,
-    *,
-    interactive: bool,
-    minimum_age_days: int,
-    continue_: bool = False,
-    vcs: VcsServices,
-    emit: Emit | None = None,
-) -> int:
-    outcome = gradle_workflow.run_gradle_flow(
-        project_name,
-        project,
-        flow,
-        minimum_age_days=minimum_age_days,
-        continue_=continue_,
-        choose=_choose_gradle_candidates if interactive else None,
-        emit=emit or _Renderer(batch=False),
-        vcs=vcs,
-    )
-    return ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED

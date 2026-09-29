@@ -370,7 +370,7 @@ def mock_resolve_cli_deps(
         project_scan.project = project_name
         save_scan_results(project_name, project_scan)
     processor = FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)})
-    monkeypatch.setattr("maintenance_man.cli.process_findings", processor)
+    monkeypatch.setattr("maintenance_man.services.resolve.process_findings", processor)
     return fixture
 
 

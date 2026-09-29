@@ -3,14 +3,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from maintenance_man.cli import (
-    ExitCode,
-    _ordered_failed_findings,
-    _ordered_ready_findings,
-    _ordered_resolve_candidates,
-    app,
-)
+from maintenance_man import cli
+from maintenance_man.cli import ExitCode, app
 from maintenance_man.github import CodeHostError
+from maintenance_man.models.events import (
+    BlockersStillFailing,
+    FindingsBlocked,
+    ResolvePaused,
+    SubmissionBlocked,
+)
 from maintenance_man.models.scan import (
     ScanResult,
     UpdateResult,
@@ -30,6 +31,22 @@ from tests.fakes import FakeFindingProcessor
 _RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
 
+def test_resolve_events_render_in_order(capsys: pytest.CaptureFixture[str]) -> None:
+    render = cli._Renderer(batch=False)
+
+    render(ResolvePaused("a[b]"))
+    render(FindingsBlocked((("pkg[one]", "reason[two]"),)))
+    render(SubmissionBlocked("a[b]"))
+    render(BlockersStillFailing("unit", ("pkg[one]", "pkg-two")))
+
+    assert capsys.readouterr().out.splitlines() == [
+        "  Resolve paused. Continue with mm resolve a[b] --continue.",
+        "  BLOCKED pkg[one] — reason[two]",
+        "  Not submitting: blocked findings remain. Rescan or resolve them manually.",
+        "  FAIL unit — still blocking: pkg[one], pkg-two",
+    ]
+
+
 def _clear_resolve_progress(scan_result: ScanResult) -> None:
     for f in (*scan_result.vulnerabilities, *scan_result.updates):
         f.update_status = None
@@ -43,107 +60,6 @@ def mock_resolve_fresh(mock_resolve_cli_deps: dict) -> dict[str, object]:
     _clear_resolve_progress(mock_resolve_cli_deps["scan_result"])
     mock_resolve_cli_deps["save_scan"]()
     return mock_resolve_cli_deps
-
-
-class TestResolveCandidates:
-    def test_ordered_resolve_candidates_excludes_other_flows(self):
-        scan_result = make_scan_result(
-            vulns=[
-                make_vuln(pkg_name="pkg-a", vuln_id="CVE-1"),
-                make_vuln(
-                    pkg_name="pkg-b",
-                    vuln_id="CVE-2",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.RESOLVE,
-                ),
-            ],
-            updates=[
-                make_update(
-                    pkg_name="pkg-c",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.UPDATE,
-                    failed_phase="apply",
-                ),
-                make_update(
-                    pkg_name="pkg-d",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                ),
-                make_update(pkg_name="pkg-e"),
-            ],
-        )
-
-        candidates = _ordered_resolve_candidates(scan_result)
-
-        assert {f.pkg_name for f in candidates} == {"pkg-a", "pkg-b", "pkg-e"}
-
-    def test_ordered_resolve_candidates_include_update_owned_test_failures(self):
-        scan_result = make_scan_result(
-            updates=[
-                make_update(
-                    pkg_name="pkg-a",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.UPDATE,
-                    failed_phase="unit",
-                )
-            ],
-            vulns=[],
-        )
-
-        candidates = _ordered_resolve_candidates(scan_result)
-
-        assert [f.pkg_name for f in candidates] == ["pkg-a"]
-
-    def test_ordered_failed_findings_only_resolve_failed(self):
-        scan_result = make_scan_result(
-            updates=[
-                make_update(
-                    pkg_name="keep",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.RESOLVE,
-                ),
-                make_update(
-                    pkg_name="skip-flow",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.UPDATE,
-                ),
-                make_update(
-                    pkg_name="skip-status",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                ),
-                make_update(pkg_name="skip-none"),
-            ],
-        )
-
-        failed = _ordered_failed_findings(scan_result)
-
-        assert [f.pkg_name for f in failed] == ["keep"]
-
-    def test_ordered_ready_findings_only_resolve_ready(self):
-        scan_result = make_scan_result(
-            updates=[
-                make_update(
-                    pkg_name="keep",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                ),
-                make_update(
-                    pkg_name="skip-update-ready",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.UPDATE,
-                ),
-                make_update(
-                    pkg_name="skip-failed",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.RESOLVE,
-                ),
-            ],
-        )
-
-        ready = _ordered_ready_findings(scan_result, flow=Workflow.RESOLVE)
-
-        assert [f.pkg_name for f in ready] == ["keep"]
 
 
 class TestResolvePreChecks:
@@ -192,7 +108,9 @@ class TestResolvePreChecks:
                 )
             ]
         )
-        monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
+        monkeypatch.setattr(
+            "maintenance_man.services.resolve.process_findings", mock_process
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
@@ -253,7 +171,7 @@ class TestResolveFlow:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.process_findings",
+            "maintenance_man.services.resolve.process_findings",
             FakeFindingProcessor({"some-pkg": (False, "unit"), "pkg-a": (True, None)}),
         )
         host = mock_resolve_fresh["vcs_state"].code_host(
@@ -320,7 +238,9 @@ class TestResolveFlow:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         mock_process = MagicMock()
-        monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
+        monkeypatch.setattr(
+            "maintenance_man.services.resolve.process_findings", mock_process
+        )
         state = mock_resolve_cli_deps["vcs_state"]
         state.clear_calls()
 
@@ -452,7 +372,7 @@ class TestResolveContinue:
         state = mock_resolve_cli_deps["vcs_state"]
         state.fail("has_changes", error=RevisionError("cannot inspect"), path=path)
         tests = MagicMock()
-        monkeypatch.setattr("maintenance_man.cli.run_test_phases", tests)
+        monkeypatch.setattr("maintenance_man.services.resolve.run_test_phases", tests)
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable", "--continue"])
@@ -487,7 +407,9 @@ class TestResolveContinue:
         mock_tests = MagicMock()
         project_path = mock_resolve_cli_deps["project_paths"]["vulnerable"]
         (project_path / "dep.txt").write_text("dirty\n", encoding="utf-8")
-        monkeypatch.setattr("maintenance_man.cli.run_test_phases", mock_tests)
+        monkeypatch.setattr(
+            "maintenance_man.services.resolve.run_test_phases", mock_tests
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable", "--continue"])
@@ -507,11 +429,11 @@ class TestResolveContinue:
         mock_apply = MagicMock(return_value=True)
         monkeypatch.setattr(updater, "_apply_update", mock_apply)
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda cfg, p, *, emit: (True, None),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.process_findings",
+            "maintenance_man.services.resolve.process_findings",
             MagicMock(return_value=[]),
         )
 
@@ -538,11 +460,11 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda cfg, p, *, emit: (True, None),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.process_findings",
+            "maintenance_man.services.resolve.process_findings",
             MagicMock(return_value=[]),
         )
 
@@ -590,7 +512,7 @@ class TestResolveContinue:
         state = mock_resolve_cli_deps["vcs_state"]
         state.clear_calls()
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda _cfg, _path, *, emit: (True, None),
         )
         monkeypatch.setattr(
@@ -619,7 +541,7 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda cfg, p, *, emit: (True, None),
         )
 
@@ -628,7 +550,9 @@ class TestResolveContinue:
         mock_resolve_cli_deps["save_scan"]()
 
         mock_process = MagicMock(return_value=[])
-        monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
+        monkeypatch.setattr(
+            "maintenance_man.services.resolve.process_findings", mock_process
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable", "--continue"])
@@ -648,7 +572,7 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda cfg, p, *, emit: (True, None),
         )
 
@@ -681,12 +605,14 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda cfg, p, *, emit: (True, None),
         )
 
         mock_process = MagicMock(return_value=[])
-        monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
+        monkeypatch.setattr(
+            "maintenance_man.services.resolve.process_findings", mock_process
+        )
 
         with pytest.raises(SystemExit):
             app(["resolve", "vulnerable", "--continue"])
@@ -701,7 +627,7 @@ class TestResolveContinue:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda cfg, p, *, emit: (False, "unit"),
         )
 
@@ -712,7 +638,9 @@ class TestResolveContinue:
         mock_resolve_cli_deps["save_scan"]()
 
         mock_process = MagicMock()
-        monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
+        monkeypatch.setattr(
+            "maintenance_man.services.resolve.process_findings", mock_process
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable", "--continue"])
@@ -733,7 +661,7 @@ class TestResolveContinue:
         """A commit-phase failure can become READY when the bookmark is clean
         and tests pass (operator committed the fix manually)."""
         monkeypatch.setattr(
-            "maintenance_man.cli.run_test_phases",
+            "maintenance_man.services.resolve.run_test_phases",
             lambda cfg, p, *, emit: (True, None),
         )
 
@@ -744,7 +672,8 @@ class TestResolveContinue:
         mock_resolve_cli_deps["save_scan"]()
 
         monkeypatch.setattr(
-            "maintenance_man.cli.process_findings", MagicMock(return_value=[])
+            "maintenance_man.services.resolve.process_findings",
+            MagicMock(return_value=[]),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -767,9 +696,12 @@ class TestResolveContinue:
         mock_resolve_cli_deps["save_scan"]()
 
         mock_tests = MagicMock()
-        monkeypatch.setattr("maintenance_man.cli.run_test_phases", mock_tests)
         monkeypatch.setattr(
-            "maintenance_man.cli.process_findings", MagicMock(return_value=[])
+            "maintenance_man.services.resolve.run_test_phases", mock_tests
+        )
+        monkeypatch.setattr(
+            "maintenance_man.services.resolve.process_findings",
+            MagicMock(return_value=[]),
         )
 
         with pytest.raises(SystemExit) as exc_info:

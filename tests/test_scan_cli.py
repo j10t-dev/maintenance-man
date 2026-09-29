@@ -15,6 +15,7 @@ from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Event,
+    FindingsBlocked,
     GradleFlowFailed,
     GradleRunArchived,
     GradleWithheld,
@@ -681,12 +682,7 @@ def test_scan_wraps_long_package_names_without_crowding_out_cves(monkeypatch):
 
 
 def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
-    result = make_scan_result(
-        vulns=[],
-        updates=[make_update(pkg_name="example", blocked_reason="apply failed")],
-    )
-
-    cli._print_blocked_findings(result)
+    cli._Renderer(batch=False)(FindingsBlocked((("example", "apply failed"),)))
 
     out = capsys.readouterr().out
     assert "BLOCKED example" in out

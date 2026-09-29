@@ -98,6 +98,27 @@ class Promoted:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvePaused:
+    project: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindingsBlocked:
+    findings: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionBlocked:
+    project: str
+
+
+@dataclass(frozen=True, slots=True)
+class BlockersStillFailing:
+    phase: str
+    pkgs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SyncCompleted:
     project: str
     action: str
@@ -208,6 +229,10 @@ type Event = (
     | ProcessingStarted
     | FindingsProcessed
     | Promoted
+    | ResolvePaused
+    | FindingsBlocked
+    | SubmissionBlocked
+    | BlockersStillFailing
     | SyncCompleted
     | DeployStepStarted
     | DeployStepSucceeded

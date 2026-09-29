@@ -450,6 +450,53 @@ def test_rich_contract_has_no_exceptions() -> None:
     assert "ignore_imports" not in rich_cli_only
 
 
+def test_workflow_code_passes_complexity_limit() -> None:
+    result = run_tool(
+        "ruff",
+        "check",
+        "--no-cache",
+        "--no-fix",
+        "--select",
+        "C901",
+        "src/maintenance_man/cli.py",
+        "src/maintenance_man/services",
+        "src/maintenance_man/updater.py",
+    )
+    assert result.returncode == 0, result.stdout
+
+
+_WORKFLOW_OPERATIONS = frozenset(
+    {
+        "save_scan_results",
+        "process_findings",
+        "run_gradle_flow",
+        "scan_project",
+        "run_build",
+        "run_deploy",
+        "check_health",
+        "record_activity",
+        "sync_main",
+        "prune_stale_bookmarks",
+        "ensure_main_bookmark",
+        "create_workspace",
+        "remove_workspace",
+        "push_bookmark_and_create_pr",
+        "refresh_working_copy_from_main",
+    }
+)
+
+
+def test_cli_imports_no_workflow_operation() -> None:
+    tree = ast.parse((PACKAGE_DIR / "cli.py").read_text(encoding="utf-8"))
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert imported & _WORKFLOW_OPERATIONS == set()
+
+
 def test_package_directories_are_regular_packages() -> None:
     # grimp leaves namespace packages out of the graph, so no contract sees them.
     namespace = sorted(
