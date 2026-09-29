@@ -50,6 +50,7 @@ from maintenance_man.models.gradle import (
     GradleCandidate,
     GradleRun,
     GradleSnapshot,
+    IncomparableComparison,
     IncompleteResolution,
     ModuleId,
     PlannedAttempt,
@@ -185,29 +186,9 @@ def snapshot(resolution, findings, context="ctx", tree="tree"):
     )
 
 
-@pytest.mark.parametrize(
-    "case,expected",
-    [
-        ("same", "verified"),
-        ("changed-version", "verified"),
-        ("removed", "verified"),
-        ("new", "rejected"),
-        ("higher-severity", "rejected"),
-        ("more-versions", "rejected"),
-        ("unknown-to-known", "incomparable"),
-        ("known-to-unknown", "incomparable"),
-        ("unknown-same", "verified"),
-        ("unknown-removed", "verified"),
-        ("context-changed", "incomparable"),
-        ("dropped-scope", "incomparable"),
-        ("additional-scope", "rejected"),
-    ],
-)
-def test_comparison_policy(scope, resolution, candidate, case, expected):
+def _comparison_findings(scope, case):
     old = evidence(scope)
     current = old
-    before_resolution = resolution
-    after_resolution = resolution
     if case.startswith("unknown"):
         old = evidence(scope, severity=Severity.UNKNOWN)
         current = old
@@ -227,11 +208,17 @@ def test_comparison_policy(scope, resolution, candidate, case, expected):
                 "rows": (*old.rows, *second.rows),
             }
         )
-    after_rows = [] if case in {"removed", "unknown-removed"} else [current]
+    after = [] if case in {"removed", "unknown-removed"} else [current]
     if case == "new":
-        after_rows.append(evidence(scope, advisory="CVE-2"))
+        after.append(evidence(scope, advisory="CVE-2"))
+    return old, after
+
+
+def _comparison_resolutions(scope, resolution, case):
+    before = resolution
+    after = resolution
     if case == "dropped-scope":
-        after_resolution = CompleteResolution(
+        after = CompleteResolution(
             report=resolution.report.model_copy(
                 update={"selected_scopes": (), "scopes": ()}
             )
@@ -247,7 +234,35 @@ def test_comparison_policy(scope, resolution, candidate, case, expected):
                 ),
             }
         )
-        before_resolution = after_resolution = CompleteResolution(report=report)
+        before = after = CompleteResolution(report=report)
+    return before, after
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("same", "verified"),
+        ("changed-version", "verified"),
+        ("removed", "verified"),
+        ("new", "rejected"),
+        ("higher-severity", "rejected"),
+        ("more-versions", "rejected"),
+        ("unknown-to-known", "incomparable"),
+        ("known-to-unknown", "incomparable"),
+        ("unknown-same", "verified"),
+        ("unknown-removed", "verified"),
+        ("context-changed", "incomparable"),
+        ("dropped-scope", "incomparable"),
+        ("additional-scope", "rejected"),
+    ],
+)
+def test_comparison_policy(scope, resolution, candidate, case, expected):
+    old, after_rows = _comparison_findings(scope, case)
+    before_resolution, after_resolution = _comparison_resolutions(
+        scope, resolution, case
+    )
+    if case == "additional-scope":
+        extra = scope.model_copy(update={"configuration": "testRuntimeClasspath"})
         after_rows.append(evidence(extra))
     before = snapshot(before_resolution, [old])
     after = snapshot(
@@ -261,6 +276,37 @@ def test_comparison_policy(scope, resolution, candidate, case, expected):
             frozenset({old.key}) if not after_rows else frozenset()
         )
         assert result.residual == frozenset(row.key for row in after_rows)
+
+
+def test_context_mismatch_precedes_new_finding(scope, resolution, candidate):
+    result = verification.compare_gradle_snapshots(
+        snapshot(resolution, [evidence(scope)]),
+        snapshot(
+            resolution,
+            [evidence(scope), evidence(scope, advisory="CVE-2")],
+            context="changed",
+        ),
+        candidate,
+    )
+    assert isinstance(result, IncomparableComparison)
+    assert result.reasons == ("scanner inputs changed",)
+
+
+def test_unknown_change_precedes_regression(scope, resolution, candidate):
+    result = verification.compare_gradle_snapshots(
+        snapshot(resolution, [evidence(scope, severity=Severity.UNKNOWN)]),
+        snapshot(
+            resolution,
+            [
+                evidence(scope, severity=Severity.HIGH),
+                evidence(scope, advisory="CVE-2"),
+            ],
+        ),
+        candidate,
+    )
+    assert isinstance(result, IncomparableComparison)
+    assert result.reasons[0] == "UNKNOWN severity changed"
+    assert len(result.reasons) == 2
 
 
 @pytest.mark.parametrize(
@@ -4265,10 +4311,7 @@ def test_gradle_empty_discovery_checks_fresh_security_findings(
     assert not {"apply", "commit", "promote", "refresh"} & set(driver.effects)
 
 
-@pytest.mark.parametrize("inventory_state", ["marked", "unmarked", "cleanup-error"])
-def test_gradle_run_applies_shared_target_once_after_owned_output_cleanup(
-    workflow, monkeypatch, inventory_state
-):
+def _prepare_shared_target_baseline(workflow):
     from maintenance_man import gradle
 
     root = workflow.project.path
@@ -4316,6 +4359,14 @@ def test_gradle_run_applies_shared_target_once_after_owned_output_cleanup(
     run = begin_workflow(workflow, Workflow.RESOLVE, candidate)
     workflow.vcs_state.clear_calls()
     workflow.effects.clear()
+    return gradle, root, catalogue, run
+
+
+@pytest.mark.parametrize("inventory_state", ["marked", "unmarked", "cleanup-error"])
+def test_gradle_run_applies_shared_target_once_after_owned_output_cleanup(
+    workflow, monkeypatch, inventory_state
+):
+    gradle, root, catalogue, run = _prepare_shared_target_baseline(workflow)
     inventory = root / gradle.GRADLE_INVENTORY_RELPATH
     inventory.mkdir()
     (inventory / "bom.json").write_bytes(b"retained inventory")

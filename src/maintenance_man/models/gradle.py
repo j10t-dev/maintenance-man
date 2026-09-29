@@ -258,29 +258,32 @@ class CandidateValidationBatch(GradleRecord):
     results: tuple[CandidateValidation, ...]
 
 
-def content_identity(value: BaseModel) -> str:
-    def canonical(item):
-        if isinstance(item, BaseModel):
-            return {
-                name: canonical(getattr(item, name)) for name in type(item).model_fields
-            }
-        if isinstance(item, dict):
-            return {str(key): canonical(val) for key, val in item.items()}
-        if isinstance(item, (set, frozenset)):
-            return sorted(
-                (canonical(val) for val in item),
-                key=lambda val: json.dumps(val, sort_keys=True),
-            )
-        if isinstance(item, (tuple, list)):
-            return [canonical(val) for val in item]
-        if isinstance(item, (datetime, Path)):
-            return str(item)
-        if isinstance(item, Enum):
-            return item.value
-        return item
+def _canonical_sequence(item: tuple | list | set | frozenset) -> list:
+    values = [_canonical(value) for value in item]
+    if isinstance(item, (set, frozenset)):
+        values.sort(key=lambda value: json.dumps(value, sort_keys=True))
+    return values
 
+
+def _canonical(item):
+    if isinstance(item, BaseModel):
+        return {
+            name: _canonical(getattr(item, name)) for name in type(item).model_fields
+        }
+    if isinstance(item, dict):
+        return {str(key): _canonical(val) for key, val in item.items()}
+    if isinstance(item, (tuple, list, set, frozenset)):
+        return _canonical_sequence(item)
+    if isinstance(item, (datetime, Path)):
+        return str(item)
+    if isinstance(item, Enum):
+        return item.value
+    return item
+
+
+def content_identity(value: BaseModel) -> str:
     return hashlib.sha256(
-        json.dumps(canonical(value), sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(_canonical(value), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 

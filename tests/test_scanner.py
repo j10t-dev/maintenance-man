@@ -1283,6 +1283,7 @@ def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
         {"Results": []},
         {"Results": [{"Class": "lang-pkgs"}]},
         {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": None}]},
+        {"Results": [{"Class": "os-pkgs", "Vulnerabilities": [{"PkgName": 3}]}]},
     ],
 )
 def test_gradle_trivy_absent_optional_or_null_vulnerabilities_is_clean(payload):

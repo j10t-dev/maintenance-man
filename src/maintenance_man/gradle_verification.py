@@ -13,6 +13,8 @@ from maintenance_man.models.gradle import (
     ComparisonContext,
     ComparisonResult,
     CompleteResolution,
+    FindingEvidence,
+    FindingKey,
     GradleCandidate,
     GradleSnapshot,
     IncomparableComparison,
@@ -149,26 +151,30 @@ def context_inputs_valid(
         return False
     if not timedelta(0) <= now - context.created_at < timedelta(hours=24):
         return False
-    cache = context.private_cache_path
     try:
-        if cache.is_symlink() or (cache / _MARKER).is_symlink():
-            return False
-        if (cache / _MARKER).read_text() != context.owner_token:
-            return False
-        if (
-            hashlib.sha256(_policy(project)).hexdigest()
-            != context.loaded_input_digests["ignore"]
-        ):
-            return False
-        actual = _database_digests(cache)
-        actual["config.json"] = _digest(cache / "config.json")
-        actual["ignore"] = _digest(cache / "ignore")
-        for key in context.loaded_input_digests:
-            if key.startswith("binary:"):
-                actual[key] = _digest(Path(key.removeprefix("binary:")))
-        return actual == context.loaded_input_digests
+        return _context_inputs_match(context, project)
     except OSError, KeyError, GradleError:
         return False
+
+
+def _context_inputs_match(context: ComparisonContext, project: ProjectConfig) -> bool:
+    cache = context.private_cache_path
+    if cache.is_symlink() or (cache / _MARKER).is_symlink():
+        return False
+    if (cache / _MARKER).read_text() != context.owner_token:
+        return False
+    if (
+        hashlib.sha256(_policy(project)).hexdigest()
+        != context.loaded_input_digests["ignore"]
+    ):
+        return False
+    actual = _database_digests(cache)
+    actual["config.json"] = _digest(cache / "config.json")
+    actual["ignore"] = _digest(cache / "ignore")
+    for key in context.loaded_input_digests:
+        if key.startswith("binary:"):
+            actual[key] = _digest(Path(key.removeprefix("binary:")))
+    return actual == context.loaded_input_digests
 
 
 def release_comparison_context(context: ComparisonContext) -> None:
@@ -209,12 +215,7 @@ def compare_gradle_snapshots(
     )
     if unknown:
         return IncomparableComparison(reasons=("UNKNOWN severity changed", *unknown))
-    regressions = [f"new finding: {key}" for key in new.keys() - old.keys()]
-    for key in old.keys() & new.keys():
-        if new[key].severity.rank > old[key].severity.rank:
-            regressions.append(f"severity increased: {key}")
-        if len(new[key].affected_versions) > len(old[key].affected_versions):
-            regressions.append(f"affected version count increased: {key}")
+    regressions = _comparison_regressions(old, new)
     if regressions:
         return RejectedComparison(reasons=tuple(sorted(regressions)))
     removed = frozenset(old.keys() - new.keys())
@@ -224,16 +225,35 @@ def compare_gradle_snapshots(
         if key.advisory_id in candidate.requested_advisories
         and key.coordinate in candidate.requested_coordinates
     )
-    if "security" in candidate.origins:
-        if "ordinary" not in candidate.origins and not requested:
-            return RejectedComparison(
-                reasons=("candidate has no scoped requested findings",)
-            )
-        if "ordinary" not in candidate.origins and not requested <= removed:
-            return RejectedComparison(
-                reasons=("security-only candidate did not fix all requested findings",)
-            )
+    if reason := _security_only_refusal(candidate, requested, removed):
+        return RejectedComparison(reasons=(reason,))
     return VerifiedComparison(removed=removed, residual=frozenset(new))
+
+
+def _comparison_regressions(
+    old: dict[FindingKey, FindingEvidence], new: dict[FindingKey, FindingEvidence]
+) -> list[str]:
+    regressions = [f"new finding: {key}" for key in new.keys() - old.keys()]
+    for key in old.keys() & new.keys():
+        if new[key].severity.rank > old[key].severity.rank:
+            regressions.append(f"severity increased: {key}")
+        if len(new[key].affected_versions) > len(old[key].affected_versions):
+            regressions.append(f"affected version count increased: {key}")
+    return regressions
+
+
+def _security_only_refusal(
+    candidate: GradleCandidate,
+    requested: frozenset[FindingKey],
+    removed: frozenset[FindingKey],
+) -> str | None:
+    if "security" not in candidate.origins or "ordinary" in candidate.origins:
+        return None
+    if not requested:
+        return "candidate has no scoped requested findings"
+    if not requested <= removed:
+        return "security-only candidate did not fix all requested findings"
+    return None
 
 
 def snapshot_vulnerabilities(snapshot: GradleSnapshot) -> list[VulnFinding]:

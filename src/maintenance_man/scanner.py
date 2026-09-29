@@ -194,6 +194,44 @@ def _is_trivy_object(value: object) -> TypeGuard[dict[str, object]]:
     return isinstance(value, dict) and all(isinstance(key, str) for key in value)
 
 
+def _validate_gradle_trivy_vulnerability(
+    row: object, label: str, *, consumed: bool
+) -> None:
+    if not _is_trivy_object(row):
+        raise ScanError(f"Malformed {label}: expected an object")
+    if not consumed:
+        return
+    for field in ("VulnerabilityID", "PkgName", "InstalledVersion"):
+        if not isinstance(row.get(field), str) or not row[field]:
+            raise ScanError(f"Malformed {label}.{field}: expected a nonempty string")
+    for field in ("Severity", "Title", "Description", "Status"):
+        if field in row and not isinstance(row[field], str):
+            raise ScanError(f"Malformed {label}.{field}: expected a string")
+    for field in ("FixedVersion", "PrimaryURL", "PublishedDate"):
+        if field in row and row[field] is not None and not isinstance(row[field], str):
+            raise ScanError(f"Malformed {label}.{field}: expected a string or null")
+
+
+def _validate_gradle_trivy_result(result: object, index: int) -> dict[str, object]:
+    label = f"Trivy SBOM Results[{index}]"
+    if not _is_trivy_object(result):
+        raise ScanError(f"Malformed {label}: expected an object")
+    if "Class" in result and not isinstance(result["Class"], str):
+        raise ScanError(f"Malformed {label}.Class: expected a string")
+    vulnerabilities = result.get("Vulnerabilities")
+    if vulnerabilities is None:
+        return result
+    if not isinstance(vulnerabilities, list):
+        raise ScanError(f"Malformed {label}.Vulnerabilities: expected an array")
+    for row_index, row in enumerate(vulnerabilities):
+        _validate_gradle_trivy_vulnerability(
+            row,
+            f"{label}.Vulnerabilities[{row_index}]",
+            consumed=result.get("Class") == "lang-pkgs",
+        )
+    return result
+
+
 def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
     """Validate consumed SBOM response fields before using the common parser."""
     try:
@@ -205,42 +243,10 @@ def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
     results = output.get("Results", [])
     if not isinstance(results, list):
         raise ScanError("Malformed Trivy SBOM Results: expected an array")
-    validated_results: list[dict[str, object]] = []
-    for index, result in enumerate(results):
-        label = f"Trivy SBOM Results[{index}]"
-        if not _is_trivy_object(result):
-            raise ScanError(f"Malformed {label}: expected an object")
-        validated_results.append(result)
-        if "Class" in result and not isinstance(result["Class"], str):
-            raise ScanError(f"Malformed {label}.Class: expected a string")
-        vulnerabilities = result.get("Vulnerabilities")
-        if vulnerabilities is None:
-            continue
-        if not isinstance(vulnerabilities, list):
-            raise ScanError(f"Malformed {label}.Vulnerabilities: expected an array")
-        for row_index, row in enumerate(vulnerabilities):
-            row_label = f"{label}.Vulnerabilities[{row_index}]"
-            if not _is_trivy_object(row):
-                raise ScanError(f"Malformed {row_label}: expected an object")
-            if result.get("Class") != "lang-pkgs":
-                continue
-            for field in ("VulnerabilityID", "PkgName", "InstalledVersion"):
-                if not isinstance(row.get(field), str) or not row[field]:
-                    raise ScanError(
-                        f"Malformed {row_label}.{field}: expected a nonempty string"
-                    )
-            for field in ("Severity", "Title", "Description", "Status"):
-                if field in row and not isinstance(row[field], str):
-                    raise ScanError(f"Malformed {row_label}.{field}: expected a string")
-            for field in ("FixedVersion", "PrimaryURL", "PublishedDate"):
-                if (
-                    field in row
-                    and row[field] is not None
-                    and not isinstance(row[field], str)
-                ):
-                    raise ScanError(
-                        f"Malformed {row_label}.{field}: expected a string or null"
-                    )
+    validated_results = [
+        _validate_gradle_trivy_result(result, index)
+        for index, result in enumerate(results)
+    ]
     try:
         return _parse_vulns(validated_results)
     except ValidationError as e:

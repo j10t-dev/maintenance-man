@@ -1,3 +1,9 @@
+from datetime import UTC, datetime
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from maintenance_man.models.gradle import content_identity
 from maintenance_man.models.scan import (
     SemverTier,
     Severity,
@@ -6,6 +12,28 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
+
+
+def test_content_identity_keeps_canonical_bytes():
+    class Probe(BaseModel):
+        at: datetime
+        path: Path
+        tags: frozenset[str]
+        values: tuple[int, ...]
+        phase: Workflow
+        nested: dict[str, int]
+
+    value = Probe(
+        at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        path=Path("gradle/libs.versions.toml"),
+        tags=frozenset({"z", "a"}),
+        values=(2, 1),
+        phase=Workflow.UPDATE,
+        nested={"b": 2, "a": 1},
+    )
+    assert content_identity(value) == (
+        "e318569d6e758716db6146f979d2c5fd7bb87482206c54f75125e5e2170dc852"
+    )
 
 
 class TestWorkflow:
