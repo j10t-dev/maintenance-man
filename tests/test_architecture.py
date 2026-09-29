@@ -597,6 +597,7 @@ def test_ruff_policy_configuration() -> None:
     assert "ignore" not in config
     assert ruff["extend-exclude"] == ["tests/fixtures"]
     assert ruff.get("preview", False) is False
+    assert config.get("preview", False) is False
     assert config["mccabe"] == {"max-complexity": 10}
     assert config["pylint"] == {
         "max-returns": 6,

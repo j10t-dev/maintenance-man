@@ -198,17 +198,17 @@ def test_local_gradle_producer_fixture_is_complete(tmp_path):
         "<versions><version>1.0</version><version>2.0</version></versions>"
         "</versioning></metadata>"
     )
-    marker = (
-        repository / "mm/fixture/plugin/mm.fixture.plugin.gradle.plugin/1.0/"
-        "mm.fixture.plugin.gradle.plugin-1.0.pom"
-    ).read_text()
-    assert (
-        "<dependency><groupId>g</groupId><artifactId>a</artifactId>"
-        "<version>1.0</version></dependency>"
-    ) in marker
-    marker_metadata = repository / (
-        "mm/fixture/plugin/mm.fixture.plugin.gradle.plugin/maven-metadata.xml"
-    )
+    marker_root = repository / "mm/fixture/plugin/mm.fixture.plugin.gradle.plugin"
+    for version in ("1.0", "2.0"):
+        marker = (
+            marker_root / version / f"mm.fixture.plugin.gradle.plugin-{version}.pom"
+        ).read_text()
+        assert f"<version>{version}</version><packaging>pom</packaging>" in marker
+        assert (
+            "<dependency><groupId>g</groupId><artifactId>a</artifactId>"
+            "<version>1.0</version></dependency>"
+        ) in marker
+    marker_metadata = marker_root / "maven-metadata.xml"
     assert "<version>1.0</version><version>2.0</version>" in marker_metadata.read_text()
     uri = repository.as_uri()
     assert f"url = uri('{uri}')" in (root / "settings.gradle").read_text()

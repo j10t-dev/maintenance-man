@@ -934,9 +934,7 @@ def _inject_scan_filesystem_failure(monkeypatch, phase: str, root: Path) -> None
     from maintenance_man.gradle import (
         GRADLE_INVENTORY_MARKER_RELPATH,
         GRADLE_INVENTORY_RELPATH,
-        GRADLE_UPDATE_REPORT_RELPATH,
     )
-    from tests.conftest import GRADLE_FIXTURES
 
     if phase == "inventory-mkdir":
         mkdir = Path.mkdir
@@ -966,16 +964,16 @@ def _inject_scan_filesystem_failure(monkeypatch, phase: str, root: Path) -> None
 
         monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
     else:
-        _inject_report_cleanup_failure(
-            monkeypatch, root, GRADLE_UPDATE_REPORT_RELPATH, GRADLE_FIXTURES
-        )
+        _inject_report_cleanup_failure(monkeypatch, root)
 
 
-def _inject_report_cleanup_failure(monkeypatch, root, report_path, fixtures) -> None:
+def _inject_report_cleanup_failure(monkeypatch, root: Path) -> None:
+    from maintenance_man.gradle import GRADLE_UPDATE_REPORT_RELPATH
     from maintenance_man.gradle_resolution import parse_resolution_report
+    from tests.conftest import GRADLE_FIXTURES
 
     resolution = parse_resolution_report(
-        (fixtures / "resolution/empty.json").read_text()
+        (GRADLE_FIXTURES / "resolution/empty.json").read_text()
     )
     monkeypatch.setattr(
         "maintenance_man.scanner.scan_gradle",
@@ -984,7 +982,7 @@ def _inject_report_cleanup_failure(monkeypatch, root, report_path, fixtures) -> 
     unlink = Path.unlink
 
     def fail(path, *args, **kwargs):
-        if path == root / report_path:
+        if path == root / GRADLE_UPDATE_REPORT_RELPATH:
             msg = "cleanup denied"
             raise PermissionError(msg)
         return unlink(path, *args, **kwargs)

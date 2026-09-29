@@ -230,15 +230,19 @@ Configured projects are expected to be colocated jj/Git repositories with a GitH
 
 ## Contributing 
 
+Put bluntly - I probably don't want your contribution. This is primarily a personal tool and I have no aspirations of trying to expand it to support every language, tool chain or use-case. You are encouraged to fork the project if you want to use tools I don't. I offer no guarantee of reading your issues or responding to your PRs. I do not wish to interact with your LLM agents or humans regurgitating LLM output. Please communicate in your own words or don't contact me at all.
+
+### Development checks
+
 Run the default test suite and each static check directly before submitting a
 change:
 
 ```sh
-UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline pytest -q
-UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline ruff check .
-UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline ruff format --check .
-UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline ty check
-UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline lint-imports
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check
+uv run lint-imports
 ```
 
 Repository functions are limited to a McCabe complexity of 10, six returns,
@@ -254,10 +258,14 @@ deferred until dependency ownership policy is designed.
 The local real-jj contract can be checked separately:
 
 ```sh
-UV_CACHE_DIR=/tmp/mm-b3-uv-cache uv run --offline pytest tests/test_repository_contract.py tests/test_jj_integration.py -m integration -q
+uv run pytest tests/test_repository_contract.py tests/test_jj_integration.py -m integration -q
 ```
 
-Optional real-Gradle integration tests are separate from the default suite and
-require the documented local Gradle wrapper or executable environment.
+The real-Gradle producer test is also separate from the default suite. It is
+skipped unless `MM_GRADLE_WRAPPER` points to an executable `gradlew` whose
+directory also contains `gradle/wrapper`. It needs JDK 21 and network access to
+the Gradle plugin portal:
 
-Put bluntly - I probably don't want your contribution. This is primarily a personal tool and I have no aspirations of trying to expand it to support every language, tool chain or use-case. You are encouraged to fork the project if you want to use tools I don't. I offer no guarantee of reading your issues or responding to your PRs. I do not wish to interact with your LLM agents or humans regurgitating LLM output. Please communicate in your own words or don't contact me at all.
+```sh
+MM_GRADLE_WRAPPER=/path/to/project/gradlew uv run pytest tests/test_gradle_package.py -m integration -q
+```
