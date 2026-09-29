@@ -1,6 +1,7 @@
 """Structural guardrails: lint, import contracts and private-name access."""
 
 import ast
+import json
 import os
 import subprocess
 import sys
@@ -25,9 +26,6 @@ class PrivateAccessSite:
     path: str  # repository-relative source path
     line: int
 
-
-# Each entry names the consolidation design that removes it.
-ALLOWED_PRIVATE_ACCESS: frozenset[PrivateAccess] = frozenset()
 
 type _Def = ast.FunctionDef | ast.AsyncFunctionDef
 type _Function = _Def | ast.Lambda
@@ -164,23 +162,28 @@ class _Scanner:
     def targets(self, module: str | None) -> frozenset[str]:
         return frozenset({module}) if module in self.modules else _NOT_A_MODULE
 
+    def import_bindings(
+        self, node: ast.Import | ast.ImportFrom
+    ) -> Iterator[tuple[str, frozenset[str]]]:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname is None:
+                    top = alias.name.partition(".")[0]
+                    yield top, self.targets("" if top == PACKAGE else None)
+                else:
+                    yield alias.asname, self.targets(_relative(alias.name))
+            return
+        base = self.import_base(node)
+        for alias in node.names:
+            if alias.name != "*":
+                target = None if base is None else _join(base, alias.name)
+                yield alias.asname or alias.name, self.targets(target)
+
     def bindings(self, node: ast.AST) -> Iterator[tuple[str, frozenset[str]]]:
         """Yield (name, project modules it binds) for one node."""
         match node:
-            case ast.Import():
-                for alias in node.names:
-                    if alias.asname is None:
-                        top = alias.name.partition(".")[0]
-                        yield top, self.targets("" if top == PACKAGE else None)
-                    else:
-                        yield alias.asname, self.targets(_relative(alias.name))
-            case ast.ImportFrom():
-                base = self.import_base(node)
-                for alias in node.names:
-                    if alias.name == "*":
-                        continue
-                    target = None if base is None else _join(base, alias.name)
-                    yield alias.asname or alias.name, self.targets(target)
+            case ast.Import() | ast.ImportFrom():
+                yield from self.import_bindings(node)
             case ast.Name(ctx=ast.Store() | ast.Del()):
                 yield node.id, _NOT_A_MODULE
             case ast.arg():
@@ -327,6 +330,19 @@ class _Scanner:
                 if owner in self.modules:
                     self.report(owner, name, alias.lineno)
 
+    def report_access(self, node: ast.AST, env: _Env) -> None:
+        match node:
+            case ast.Import():
+                self.visit_import(node)
+            case ast.ImportFrom():
+                base = self.import_base(node)
+                if base is not None and base in self.modules:
+                    for alias in node.names:
+                        self.report(base, alias.name, alias.lineno)
+            case ast.Attribute(value=value, attr=attr):
+                for owner in sorted(self.resolve(value, env)):
+                    self.report(owner, attr, node.lineno)
+
     def visit(self, node: ast.AST, env: _Env) -> None:
         match node:
             case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.Lambda():
@@ -341,16 +357,7 @@ class _Scanner:
             case ast.ListComp() | ast.SetComp() | ast.DictComp() | ast.GeneratorExp():
                 self.visit_comprehension(node, env)
                 return
-            case ast.Import():
-                self.visit_import(node)
-            case ast.ImportFrom():
-                base = self.import_base(node)
-                if base is not None and base in self.modules:
-                    for alias in node.names:
-                        self.report(base, alias.name, alias.lineno)
-            case ast.Attribute(value=value, attr=attr):
-                for owner in sorted(self.resolve(value, env)):
-                    self.report(owner, attr, node.lineno)
+        self.report_access(node, env)
         for child in ast.iter_child_nodes(node):
             self.visit(child, env)
 
@@ -368,18 +375,6 @@ def find_private_accesses(
     return sites
 
 
-def unallowed_sites(
-    sites: list[PrivateAccessSite], allowed: frozenset[PrivateAccess]
-) -> list[PrivateAccessSite]:
-    return [site for site in sites if site.access not in allowed]
-
-
-def stale_allowlist_entries(
-    sites: list[PrivateAccessSite], allowed: frozenset[PrivateAccess]
-) -> set[PrivateAccess]:
-    return set(allowed) - {site.access for site in sites}
-
-
 def package_sources() -> dict[str, tuple[str, str]]:
     sources: dict[str, tuple[str, str]] = {}
     for path in sorted(PACKAGE_DIR.rglob("*.py")):
@@ -393,7 +388,9 @@ def package_sources() -> dict[str, tuple[str, str]]:
     return sources
 
 
-def run_tool(name: str, *args: str) -> subprocess.CompletedProcess[str]:
+def run_tool(
+    name: str, *args: str, input_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
     # Not resolved: resolving follows the interpreter symlink out of .venv/bin.
     executable = Path(sys.executable).parent / name
     assert executable.is_file(), f"{executable} not found; run uv sync"
@@ -404,14 +401,187 @@ def run_tool(name: str, *args: str) -> subprocess.CompletedProcess[str]:
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        input=input_text,
         text=True,
         check=False,
     )
 
 
+def _ruff_codes(
+    source: str, filename: str = "src/maintenance_man/_lint_probe.py"
+) -> tuple[int, set[str]]:
+    result = run_tool(
+        "ruff",
+        "check",
+        "--no-cache",
+        "--no-fix",
+        "--config",
+        str(PYPROJECT),
+        "--output-format",
+        "json",
+        "--stdin-filename",
+        filename,
+        "-",
+        input_text=source,
+    )
+    assert result.returncode in {0, 1}, result.stdout
+    diagnostics = json.loads(result.stdout)
+    return result.returncode, {diagnostic["code"] for diagnostic in diagnostics}
+
+
 def test_ruff_clean() -> None:
-    result = run_tool("ruff", "check", "--no-cache", "--no-fix")
+    result = run_tool(
+        "ruff", "check", "--no-cache", "--no-fix", "--config", str(PYPROJECT)
+    )
     assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'import subprocess\nsubprocess.run(["jj"])\n',
+        'import subprocess\nsubprocess.Popen(["jj"])\n',
+        'import subprocess\nsubprocess.call(["jj"])\n',
+        'import subprocess\nsubprocess.check_call(["jj"])\n',
+        'import subprocess\nsubprocess.check_output(["jj"])\n',
+        'import subprocess\nsubprocess.getoutput("jj")\n',
+        'import subprocess\nsubprocess.getstatusoutput("jj")\n',
+        'import os\nos.system("jj")\n',
+        'import os\nos.popen("jj")\n',
+        'import os\nos.posix_spawn("jj", ["jj"], {})\n',
+        'import os\nos.posix_spawnp("jj", ["jj"], {})\n',
+        'import shutil\nshutil.which("jj")\n',
+        'from subprocess import run as launch\nlaunch(["jj"])\n',
+        'from shutil import which\nwhich("jj")\n',
+    ],
+)
+def test_process_bypasses_are_rejected(source: str) -> None:
+    status, codes = _ruff_codes(source)
+    assert status == 1
+    assert "TID251" in codes
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["src/maintenance_man/process.py", "tests/probe.py"],
+)
+def test_process_bypasses_are_allowed_in_owner_and_tests(filename: str) -> None:
+    _, codes = _ruff_codes(
+        'import subprocess\nsubprocess.run(["jj"])\n', filename=filename
+    )
+    assert "TID251" not in codes
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from maintenance_man.process import run_captured\n",
+        "import subprocess\n"
+        "result: subprocess.CompletedProcess[str]\n"
+        "stream = subprocess.PIPE\n",
+    ],
+)
+def test_process_types_constants_and_shared_runner_are_allowed(source: str) -> None:
+    _, codes = _ruff_codes(source)
+    assert "TID251" not in codes
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ('message = "bad"\nraise Exception(message)\n', "TRY002"),
+        (
+            "try:\n"
+            "    raise ValueError\n"
+            "except ValueError as error:\n"
+            "    raise error\n",
+            "TRY201",
+        ),
+        (
+            "import logging\n"
+            "try:\n"
+            "    raise RuntimeError\n"
+            "except RuntimeError:\n"
+            '    logging.error("failure")\n',
+            "TRY400",
+        ),
+        (
+            "try:\n"
+            "    raise ValueError\n"
+            "except ValueError:\n"
+            '    raise RuntimeError("bad")\n',
+            "B904",
+        ),
+    ],
+)
+def test_exception_policy_is_enforced(source: str, expected: str) -> None:
+    status, codes = _ruff_codes(source)
+    assert status == 1
+    assert expected in codes
+
+
+def test_staged_ruff_policy_configuration() -> None:
+    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["ruff"][
+        "lint"
+    ]
+    assert set(config["select"]) == {
+        "E",
+        "F",
+        "I",
+        "W",
+        "B",
+        "SIM",
+        "C4",
+        "UP",
+        "RUF",
+        "PERF",
+        "RET",
+        "PIE",
+        "PTH",
+        "FURB",
+        "RSE",
+        "ERA",
+        "PLE",
+        "N",
+        "TRY002",
+        "TRY201",
+        "TRY203",
+        "TRY400",
+        "TRY401",
+        "TID251",
+    }
+    assert {
+        "PLR0913",
+        "TRY003",
+        "TRY004",
+        "TRY200",
+        "TRY300",
+        "TRY301",
+        "PLR0904",
+        "PLR0914",
+        "PLR0916",
+        "PLR0917",
+    }.isdisjoint(config["select"])
+    assert config["per-file-ignores"] == {
+        "src/maintenance_man/process.py": ["TID251"],
+        "tests/**": ["TID251"],
+    }
+    launch_message = "Use maintenance_man.process.run_captured or run_live instead."
+    which_message = "Use maintenance_man.process.require_tool instead."
+    assert config["flake8-tidy-imports"]["banned-api"] == {
+        "subprocess.run": {"msg": launch_message},
+        "subprocess.Popen": {"msg": launch_message},
+        "subprocess.call": {"msg": launch_message},
+        "subprocess.check_call": {"msg": launch_message},
+        "subprocess.check_output": {"msg": launch_message},
+        "subprocess.getoutput": {"msg": launch_message},
+        "subprocess.getstatusoutput": {"msg": launch_message},
+        "os.system": {"msg": launch_message},
+        "os.popen": {"msg": launch_message},
+        "os.posix_spawn": {"msg": launch_message},
+        "os.posix_spawnp": {"msg": launch_message},
+        "shutil.which": {"msg": which_message},
+    }
 
 
 def test_import_contracts() -> None:
@@ -533,24 +703,9 @@ def _site_lines(sites: list[PrivateAccessSite]) -> str:
     )
 
 
-def test_private_access_allowlist_is_empty() -> None:
-    assert not ALLOWED_PRIVATE_ACCESS
-
-
 def test_no_new_private_access() -> None:
-    sites = unallowed_sites(
-        find_private_accesses(package_sources()), ALLOWED_PRIVATE_ACCESS
-    )
+    sites = find_private_accesses(package_sources())
     assert sites == [], _site_lines(sites)
-
-
-def test_no_stale_private_allowlist() -> None:
-    stale = stale_allowlist_entries(
-        find_private_accesses(package_sources()), ALLOWED_PRIVATE_ACCESS
-    )
-    assert stale == set(), "\n".join(
-        f"stale allowlist entry, delete it: {entry}" for entry in sorted(stale)
-    )
 
 
 # -- scanner self-tests ------------------------------------------------------
@@ -852,15 +1007,6 @@ _TOP = "src/maintenance_man/probe.py"
 )
 def test_private_access_scanner(module, path, text, expected):
     assert _accesses(module, path, text) == expected
-
-
-def test_stale_allowlist_entry_is_reported():
-    sites = find_private_accesses(
-        {**_OWNERS, "probe": (_TOP, "from maintenance_man.vcs import _run\n")}
-    )
-    allowed = frozenset({("probe", "vcs", "_run"), ("probe", "gradle", "_gone")})
-    assert stale_allowlist_entries(sites, allowed) == {("probe", "gradle", "_gone")}
-    assert unallowed_sites(sites, allowed) == []
 
 
 def test_private_access_site_is_the_alias_line():

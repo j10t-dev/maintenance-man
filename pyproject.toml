@@ -31,7 +31,25 @@ line-length = 88
 extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N"]
+select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N", "TRY002", "TRY201", "TRY203", "TRY400", "TRY401", "TID251"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/maintenance_man/process.py" = ["TID251"]
+"tests/**" = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"subprocess.run" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.Popen" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.call" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.check_call" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.check_output" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.getoutput" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.getstatusoutput" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.system" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.popen" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.posix_spawn" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.posix_spawnp" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"shutil.which" = { msg = "Use maintenance_man.process.require_tool instead." }
 
 [tool.ty.src]
 include = ["src/**/*.py", "tests/**/*.py"]
