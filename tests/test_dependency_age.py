@@ -4,6 +4,7 @@ import json
 import subprocess
 import threading
 import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.message import Message
@@ -1907,3 +1908,165 @@ def test_npm_ignores_a_planted_cache_file_and_reruns_each_context(
         datetime(2024, 1, 1, tzinfo=UTC),
         datetime(2026, 9, 17, tzinfo=UTC),
     ]
+
+
+_V6_DEAD = ("2001:db8::1", 443, 0, 0)
+_V6_SECOND = ("2001:db8::2", 443, 0, 0)
+_V4_LIVE = ("192.0.2.1", 443)
+
+
+def _address_infos():
+    import socket
+
+    return [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", _V6_DEAD),
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", _V6_SECOND),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", _V4_LIVE),
+    ]
+
+
+def _fake_network(
+    monkeypatch, now, *, refused=(), infos=None, no_ipv6=False, connect_cost=0.0
+):
+    """Fake resolver and sockets: IPv6 connects time out, IPv4 connects succeed."""
+    import errno
+    import socket
+
+    from maintenance_man import dependency_age as age
+
+    network = SimpleNamespace(attempts=[], closed=[])
+
+    class FakeSocket:
+        def __init__(self, family, kind, proto):
+            if no_ipv6 and family == socket.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "Address family not supported")
+            self.timeouts = []
+            self.address = ("", 0)
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+        def connect(self, address):
+            self.address = address
+            network.attempts.append((address[0], self.timeouts[-1]))
+            now[0] += connect_cost
+            if address in refused:
+                msg = "refused"
+                raise ConnectionRefusedError(msg)
+            if ":" in address[0]:
+                msg = "timed out"
+                raise TimeoutError(msg)
+
+        def close(self):
+            network.closed.append(self.address[0])
+
+    resolved = _address_infos() if infos is None else infos
+    monkeypatch.setattr(age.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(age.socket, "getaddrinfo", lambda *a, **k: resolved)
+    monkeypatch.setattr(age.socket, "socket", FakeSocket)
+    return network
+
+
+@pytest.mark.parametrize(
+    "deadline, attempt, final",
+    [(115.0, 3.0, 12.0), (101.5, 1.5, 1.5)],
+    ids=["attempt-cap", "remaining-deadline"],
+)
+def test_publication_connect_alternates_families_within_the_deadline(
+    monkeypatch, deadline, attempt, final
+):
+    from maintenance_man import dependency_age as age
+
+    network = _fake_network(monkeypatch, [100.0])
+    sock = age._deadline_connect(deadline)(("pypi.org", 443), 12.0)
+    assert network.attempts == [("2001:db8::1", attempt), ("192.0.2.1", attempt)]
+    assert network.closed == ["2001:db8::1"]
+    assert sock.timeouts[-1] == final
+
+
+def test_publication_connect_stops_at_the_deadline(monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    network = _fake_network(monkeypatch, [100.0])
+    with pytest.raises(PublicationError, match="publication lookup timed out"):
+        age._deadline_connect(100.0)(("pypi.org", 443), 12.0)
+    assert network.attempts == []
+
+
+def test_publication_connect_expiring_during_connect_closes_the_socket(monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    infos = [row for row in _address_infos() if row[4] == _V4_LIVE]
+    network = _fake_network(monkeypatch, [100.0], infos=infos, connect_cost=2.0)
+    with pytest.raises(PublicationError, match="publication lookup timed out"):
+        age._deadline_connect(101.0)(("pypi.org", 443), 12.0)
+    assert network.closed == ["192.0.2.1"]
+
+
+def test_publication_connect_skips_an_unsupported_family(monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    network = _fake_network(monkeypatch, [100.0], no_ipv6=True)
+    age._deadline_connect(115.0)(("pypi.org", 443), 12.0)
+    assert network.attempts == [("192.0.2.1", 3.0)]
+
+
+def test_publication_connect_reports_the_last_failure(monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    network = _fake_network(monkeypatch, [100.0], refused=(_V4_LIVE, _V6_SECOND))
+    with pytest.raises(ConnectionRefusedError):
+        age._deadline_connect(115.0)(("pypi.org", 443), 12.0)
+    assert [address for address, _ in network.attempts] == [
+        "2001:db8::1",
+        "192.0.2.1",
+        "2001:db8::2",
+    ]
+    assert network.closed == ["2001:db8::1", "192.0.2.1", "2001:db8::2"]
+
+
+def test_publication_connect_without_addresses_fails(monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    _fake_network(monkeypatch, [100.0], infos=[])
+    with pytest.raises(PublicationError, match=r"no address for pypi\.org"):
+        age._deadline_connect(115.0)(("pypi.org", 443), 12.0)
+
+
+def test_publication_https_handler_verifies_and_uses_its_deadline(monkeypatch):
+    import ssl
+
+    from maintenance_man import dependency_age as age
+
+    now = [113.5]
+    network = _fake_network(monkeypatch, now)
+    handler = age._DeadlineHTTPSHandler(115.0)
+    assert handler.context.verify_mode is ssl.CERT_REQUIRED
+    assert handler.context.check_hostname is True
+    connection = handler.connection("pypi.org", timeout=12.0)
+    connection._create_connection(("pypi.org", 443), 12.0)
+    assert network.attempts == [("2001:db8::1", 1.5), ("192.0.2.1", 1.5)]
+
+
+def test_publication_transport_installs_the_deadline_handler(monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    handlers = []
+
+    def capture(*args):
+        handlers.extend(args)
+        return SimpleNamespace(open=lambda *a, **k: pytest.fail("no request"))
+
+    monkeypatch.setattr(age.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(age.urllib.request, "build_opener", capture)
+    with pytest.raises(PublicationError):
+        _publication_http(
+            "https://evil.test/pypi/pkg/1.0/json",
+            "pypi",
+            "pypi/pkg/1.0/json",
+            lambda: None,
+        )
+    deadlines = [
+        h.deadline for h in handlers if isinstance(h, age._DeadlineHTTPSHandler)
+    ]
+    assert deadlines == [115.0]
