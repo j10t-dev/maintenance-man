@@ -1,41 +1,39 @@
 import hashlib
 import os
 import shutil
-import subprocess
 import tempfile
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from maintenance_man.gradle import GradleError
+from maintenance_man.clock import Clock, utc_now
+from maintenance_man.gradle import GradleError, file_digest
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     ComparisonContext,
     ComparisonResult,
     CompleteResolution,
+    FindingEvidence,
+    FindingKey,
     GradleCandidate,
     GradleSnapshot,
     IncomparableComparison,
     RejectedComparison,
     VerifiedComparison,
 )
-from maintenance_man.models.scan import Severity
+from maintenance_man.models.scan import VulnFinding
+from maintenance_man.process import require_tool, run_captured
 
 _MARKER = ".mm-comparison-owner"
 _POLICY_FILES = ("trivy.yaml", "trivy.yml", ".trivyignore.yaml", ".trivyignore.yml")
-_SEVERITY = {
-    Severity.LOW: 1,
-    Severity.MEDIUM: 2,
-    Severity.HIGH: 3,
-    Severity.CRITICAL: 4,
-    Severity.UNKNOWN: 0,
-}
+TRIVY_INSTALL_HINT = "Install it from https://trivy.dev/"
 
 
 def _digest(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
-        raise GradleError(f"Comparison input is not a regular file: {path}")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+        msg = f"Comparison input is not a regular file: {path}"
+        raise GradleError(msg)
+    return file_digest(path)
 
 
 def _policy(project: ProjectConfig) -> bytes:
@@ -48,25 +46,23 @@ def _policy(project: ProjectConfig) -> bytes:
     for filename in _POLICY_FILES:
         path = Path(project.path) / filename
         if path.exists() or path.is_symlink():
-            raise GradleError(
-                f"Automatic comparison cannot freeze custom policy: {path}"
-            )
+            msg = f"Automatic comparison cannot freeze custom policy: {path}"
+            raise GradleError(msg)
     ignore = Path(project.path) / ".trivyignore"
     if ignore.is_symlink():
-        raise GradleError("Refusing symlinked Trivy ignore input")
+        msg = "Refusing symlinked Trivy ignore input"
+        raise GradleError(msg)
     return ignore.read_bytes() if ignore.exists() else b""
 
 
 def _run(command: list[str], cwd: Path) -> str:
-    try:
-        result = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True, timeout=600
-        )
-    except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
-        raise GradleError(f"Comparison context command failed: {exc}") from exc
-    if result.returncode != 0:
-        raise GradleError(f"Comparison context command failed: {result.stderr.strip()}")
-    return result.stdout
+    return run_captured(
+        command,
+        cwd,
+        timeout=600,
+        label="Trivy comparison setup",
+        error=GradleError,
+    ).stdout
 
 
 def _database_digests(cache: Path) -> dict[str, str]:
@@ -74,23 +70,31 @@ def _database_digests(cache: Path) -> dict[str, str]:
     for directory in ("db", "java-db"):
         base = cache / directory
         if base.is_symlink() or not base.is_dir():
-            raise GradleError(f"Missing private Trivy database: {directory}")
+            msg = f"Missing private Trivy database: {directory}"
+            raise GradleError(msg)
         for path in sorted(base.rglob("*")):
             if path.is_symlink():
-                raise GradleError("Symlink in private Trivy database")
+                msg = "Symlink in private Trivy database"
+                raise GradleError(msg)
             if path.is_file():
                 result[str(path.relative_to(cache))] = _digest(path)
     if "db/trivy.db" not in result or "java-db/trivy-java.db" not in result:
-        raise GradleError("Private Trivy databases are incomplete")
+        msg = "Private Trivy databases are incomplete"
+        raise GradleError(msg)
     return result
 
 
 def initialize_comparison_context(
-    project: ProjectConfig, resolution: CompleteResolution, run_cache_parent: Path
+    project: ProjectConfig,
+    resolution: CompleteResolution,
+    run_cache_parent: Path,
+    *,
+    clock: Clock = utc_now,
 ) -> ComparisonContext:
     policy = _policy(project)
     if run_cache_parent.is_symlink():
-        raise GradleError("Refusing symlinked comparison cache parent")
+        msg = "Refusing symlinked comparison cache parent"
+        raise GradleError(msg)
     run_cache_parent.mkdir(parents=True, exist_ok=True)
     cache = Path(tempfile.mkdtemp(prefix="gradle-comparison-", dir=run_cache_parent))
     token = uuid.uuid4().hex
@@ -98,10 +102,7 @@ def initialize_comparison_context(
     try:
         (cache / "config.json").write_text("{}\n", encoding="utf-8")
         (cache / "ignore").write_bytes(policy)
-        executable = shutil.which("trivy")
-        if executable is None:
-            raise GradleError("Trivy is not installed")
-        executable_path = Path(executable).resolve(strict=True)
+        executable_path = require_tool("trivy", TRIVY_INSTALL_HINT).resolve(strict=True)
         version = _run([str(executable_path), "--version"], cache).strip()
         common = [
             str(executable_path),
@@ -138,7 +139,7 @@ def initialize_comparison_context(
             selected_scopes=resolution.report.selected_scopes,
             producer_versions=resolution.report.producer_versions,
             scanner_flags=flags,
-            created_at=datetime.now(timezone.utc),
+            created_at=clock(),
             private_cache_path=cache,
             owner_token=token,
         )
@@ -155,26 +156,30 @@ def context_inputs_valid(
         return False
     if not timedelta(0) <= now - context.created_at < timedelta(hours=24):
         return False
-    cache = context.private_cache_path
     try:
-        if cache.is_symlink() or (cache / _MARKER).is_symlink():
-            return False
-        if (cache / _MARKER).read_text() != context.owner_token:
-            return False
-        if (
-            hashlib.sha256(_policy(project)).hexdigest()
-            != context.loaded_input_digests["ignore"]
-        ):
-            return False
-        actual = _database_digests(cache)
-        actual["config.json"] = _digest(cache / "config.json")
-        actual["ignore"] = _digest(cache / "ignore")
-        for key in context.loaded_input_digests:
-            if key.startswith("binary:"):
-                actual[key] = _digest(Path(key.removeprefix("binary:")))
-        return actual == context.loaded_input_digests
+        return _context_inputs_match(context, project)
     except OSError, KeyError, GradleError:
         return False
+
+
+def _context_inputs_match(context: ComparisonContext, project: ProjectConfig) -> bool:
+    cache = context.private_cache_path
+    if cache.is_symlink() or (cache / _MARKER).is_symlink():
+        return False
+    if (cache / _MARKER).read_text() != context.owner_token:
+        return False
+    if (
+        hashlib.sha256(_policy(project)).hexdigest()
+        != context.loaded_input_digests["ignore"]
+    ):
+        return False
+    actual = _database_digests(cache)
+    actual["config.json"] = _digest(cache / "config.json")
+    actual["ignore"] = _digest(cache / "ignore")
+    for key in context.loaded_input_digests:
+        if key.startswith("binary:"):
+            actual[key] = _digest(Path(key.removeprefix("binary:")))
+    return actual == context.loaded_input_digests
 
 
 def release_comparison_context(context: ComparisonContext) -> None:
@@ -183,9 +188,11 @@ def release_comparison_context(context: ComparisonContext) -> None:
         return
     marker = cache / _MARKER
     if cache.is_symlink() or marker.is_symlink() or not marker.is_file():
-        raise GradleError("Refusing unowned comparison cache cleanup")
+        msg = "Refusing unowned comparison cache cleanup"
+        raise GradleError(msg)
     if marker.read_text() != context.owner_token:
-        raise GradleError("Comparison cache ownership changed")
+        msg = "Comparison cache ownership changed"
+        raise GradleError(msg)
     shutil.rmtree(cache)
 
 
@@ -215,12 +222,7 @@ def compare_gradle_snapshots(
     )
     if unknown:
         return IncomparableComparison(reasons=("UNKNOWN severity changed", *unknown))
-    regressions = [f"new finding: {key}" for key in new.keys() - old.keys()]
-    for key in old.keys() & new.keys():
-        if _SEVERITY[new[key].severity] > _SEVERITY[old[key].severity]:
-            regressions.append(f"severity increased: {key}")
-        if len(new[key].affected_versions) > len(old[key].affected_versions):
-            regressions.append(f"affected version count increased: {key}")
+    regressions = _comparison_regressions(old, new)
     if regressions:
         return RejectedComparison(reasons=tuple(sorted(regressions)))
     removed = frozenset(old.keys() - new.keys())
@@ -230,13 +232,55 @@ def compare_gradle_snapshots(
         if key.advisory_id in candidate.requested_advisories
         and key.coordinate in candidate.requested_coordinates
     )
-    if "security" in candidate.origins:
-        if "ordinary" not in candidate.origins and not requested:
-            return RejectedComparison(
-                reasons=("candidate has no scoped requested findings",)
-            )
-        if "ordinary" not in candidate.origins and not requested <= removed:
-            return RejectedComparison(
-                reasons=("security-only candidate did not fix all requested findings",)
-            )
+    if reason := _security_only_refusal(candidate, requested, removed):
+        return RejectedComparison(reasons=(reason,))
     return VerifiedComparison(removed=removed, residual=frozenset(new))
+
+
+def _comparison_regressions(
+    old: dict[FindingKey, FindingEvidence], new: dict[FindingKey, FindingEvidence]
+) -> list[str]:
+    regressions = [f"new finding: {key}" for key in new.keys() - old.keys()]
+    for key in old.keys() & new.keys():
+        if new[key].severity.rank > old[key].severity.rank:
+            regressions.append(f"severity increased: {key}")
+        if len(new[key].affected_versions) > len(old[key].affected_versions):
+            regressions.append(f"affected version count increased: {key}")
+    return regressions
+
+
+def _security_only_refusal(
+    candidate: GradleCandidate,
+    requested: frozenset[FindingKey],
+    removed: frozenset[FindingKey],
+) -> str | None:
+    if "security" not in candidate.origins or "ordinary" in candidate.origins:
+        return None
+    if not requested:
+        return "candidate has no scoped requested findings"
+    if not requested <= removed:
+        return "security-only candidate did not fix all requested findings"
+    return None
+
+
+def snapshot_vulnerabilities(snapshot: GradleSnapshot) -> list[VulnFinding]:
+    """Project scoped evidence into unique advisory rows without update status."""
+    rows: dict[str, VulnFinding] = {}
+    for finding in snapshot.findings:
+        scope = finding.key.scope
+        label = f"{scope.project_path}/{scope.domain}/{scope.configuration}"
+        for row in finding.rows:
+            key = row.model_dump_json(
+                exclude={"gradle_scopes", "update_status", "flow", "failed_phase"}
+            )
+            previous = rows.get(key)
+            scopes = set(previous.gradle_scopes) if previous else set()
+            rows[key] = row.model_copy(
+                update={
+                    "gradle_scopes": tuple(sorted(scopes | {label})),
+                    "update_status": None,
+                    "flow": None,
+                    "failed_phase": None,
+                }
+            )
+    return list(rows.values())

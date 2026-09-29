@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from maintenance_man.env import project_env
+from maintenance_man.process import run_live
 
 
 class BuildError(Exception):
@@ -27,21 +26,13 @@ def _run_script(
     label: str,
 ) -> None:
     """Run a shell command with live output. Raises error_cls on failure."""
-    try:
-        result = subprocess.run(
-            command,
-            cwd=project_path,
-            shell=True,
-            executable="/bin/bash",
-            env=project_env(),
-            timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        msg = f"{label} timed out for {project_name} (exceeded 600s)"
-        raise error_cls(msg) from None
-    if result.returncode != 0:
-        msg = f"{label} failed for {project_name} (exit code {result.returncode})"
-        raise error_cls(msg)
+    run_live(
+        command,
+        project_path,
+        timeout=600,
+        label=f"{label} for {project_name}",
+        error=error_cls,
+    )
 
 
 def run_build(project_name: str, build_command: str, project_path: Path) -> None:

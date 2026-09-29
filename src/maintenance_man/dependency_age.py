@@ -1,295 +1,46 @@
-import dbm
 import functools
 import hashlib
 import http.client
+import itertools
 import json
 import logging
-import os
-import subprocess
+import socket
+import ssl
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+from packaging.version import Version
 from pydantic import ValidationError
 
+from maintenance_man.clock import Clock, utc_now
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     AgeBlock,
+    CompleteResolution,
     ModuleId,
     PublicationEvidence,
     PublicationFact,
     PublicationRequest,
+    RepositoryId,
 )
-from maintenance_man.models.scan import (
-    GradleBlock,
-    GradleMember,
-    GradleUpdateTarget,
-    UpdateFinding,
+from maintenance_man.models.publication import (
+    PublicationSource,
+    Registry,
+    RegistryFact,
 )
-
-
-def gradle_lookup_coordinate(member: GradleMember) -> str:
-    """Return the Maven coordinate that carries *member*'s publication timestamp.
-
-    Plugins are published as marker artifacts, not under their plugin id.
-    """
-    if member.kind == "plugin":
-        return f"{member.coordinate}:{member.coordinate}.gradle.plugin"
-    return member.coordinate
-
-
-def check_gradle_update_age(
-    target: GradleUpdateTarget, minimum_age_days: int
-) -> GradleBlock | None:
-    """Return an age block, or None when every member has sufficient evidence."""
-    return evaluate_gradle_group_age(target, minimum_age_days)[0]
-
-
-def evaluate_gradle_group_age(
-    target: GradleUpdateTarget, minimum_age_days: int
-) -> tuple[GradleBlock | None, datetime | None]:
-    """Resolve publication evidence for every member changed by *target*.
-
-    Returns ``(block, youngest_verified_date)``.  One missing, failed or
-    too-recent lookup blocks the whole group: for Gradle, unknown release age is
-    never treated as eligible, and ``minimum_age_days == 0`` removes only the
-    waiting period, not the evidence requirement.
-    """
-    if not target.members:
-        # target.display_name indexes members[0] when version_ref is unset, so
-        # it cannot be used here without risking the same empty-list failure.
-        name = target.version_ref or "inline target"
-        return (
-            GradleBlock(
-                kind="age",
-                reason=(
-                    f"{name} {target.target_version} has no members to verify; "
-                    f"rescan to refresh this target"
-                ),
-            ),
-            None,
-        )
-
-    dated: list[tuple[str, datetime]] = []
-    for member in target.members:
-        coordinate = gradle_lookup_coordinate(member)
-        try:
-            published = _get_maven_publish_date(coordinate, target.target_version)
-        except Exception as e:
-            return (
-                GradleBlock(
-                    kind="age",
-                    reason=(
-                        f"publication lookup failed for {coordinate} "
-                        f"{target.target_version}: {type(e).__name__}; "
-                        f"release age cannot be verified"
-                    ),
-                ),
-                None,
-            )
-        if published is None:
-            return (
-                GradleBlock(
-                    kind="age",
-                    reason=(
-                        f"no Maven Central publication date for {coordinate} "
-                        f"{target.target_version}; mm does not update on unknown "
-                        f"release age"
-                    ),
-                ),
-                None,
-            )
-        dated.append((coordinate, published))
-
-    coordinate, youngest = max(dated, key=lambda item: item[1])
-    now = _utcnow()
-    cutoff = now - timedelta(days=minimum_age_days)
-    if minimum_age_days > 0 and youngest >= cutoff:
-        age_days = (now - youngest).days
-        return (
-            GradleBlock(
-                kind="age",
-                reason=(
-                    f"{coordinate} {target.target_version} was published "
-                    f"{age_days} day(s) ago; minimum is {minimum_age_days}"
-                ),
-            ),
-            youngest,
-        )
-    return (None, youngest)
-
-
-def filter_by_age(
-    updates: list[UpdateFinding],
-    manager: str,
-    min_age_days: int,
-    project_path: str | Path | None = None,
-) -> list[UpdateFinding]:
-    """Filter out updates where the target version is younger than min_age_days.
-
-    Sets published_date on each update. Returns only updates that pass the age gate.
-    If min_age_days is 0, returns all updates unmodified (no registry lookups).
-    """
-    if min_age_days == 0 or not updates:
-        return list(updates)
-
-    lookup_fn = _REGISTRY_LOOKUPS.get(manager)
-    if lookup_fn is None:
-        return list(updates)
-
-    # bun info needs a cwd with a package.json
-    if manager == "bun" and project_path:
-        lookup_fn = functools.partial(lookup_fn, cwd=project_path)  # type: ignore
-
-    cutoff = _utcnow() - timedelta(days=min_age_days)
-
-    def _lookup_one(update: UpdateFinding) -> tuple[UpdateFinding, datetime | None]:
-        try:
-            return update, lookup_fn(update.pkg_name, update.latest_version)
-        except Exception:
-            return update, None
-
-    pool = ThreadPoolExecutor(max_workers=8)
-    try:
-        lookups = list(pool.map(_lookup_one, updates))
-    finally:
-        pool.shutdown(cancel_futures=True)
-
-    result: list[UpdateFinding] = []
-    for update, pub_date in lookups:
-        if pub_date is not None:
-            update = update.model_copy(update={"published_date": pub_date})
-            if pub_date >= cutoff:
-                continue
-        result.append(update)
-
-    return result
-
-
-def _get_npm_publish_date(
-    pkg: str,
-    version: str,
-    *,
-    cwd: str | Path | None = None,
-) -> datetime | None:
-    """Fetch publish date via ``bun info``."""
-    try:
-        completed = subprocess.run(
-            ["bun", "info", f"{pkg}@{version}"],
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-
-    ts = next(
-        (
-            line.removeprefix("Published:").strip()
-            for line in completed.stdout.splitlines()
-            if line.startswith("Published:")
-        ),
-        None,
-    )
-    return datetime.fromisoformat(ts) if ts else None
-
-
-def _get_pypi_publish_date(pkg: str, version: str) -> datetime | None:
-    """Look up publish date, checking a local dbm cache before hitting PyPI."""
-    key = f"{pkg}:{version}"
-    cache_file = str(_pypi_cache_dir() / "pypi-publish-dates")
-
-    with _pypi_cache_lock:
-        try:
-            with dbm.open(cache_file, "c") as db:
-                if cached := db.get(key.encode()):
-                    return datetime.fromisoformat(cached.decode())
-        except OSError:
-            pass
-
-    quote = functools.partial(urllib.parse.quote, safe="")
-    data = _fetch_json(f"https://pypi.org/pypi/{quote(pkg)}/{quote(version)}/json")
-
-    ts = next(
-        (
-            u.get("upload_time_iso_8601")
-            for u in data.get("urls", [])
-            if u.get("upload_time_iso_8601")
-        ),
-        None,
-    )
-    if ts is None:
-        return None
-
-    dt = datetime.fromisoformat(ts)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-
-    with _pypi_cache_lock:
-        try:
-            with dbm.open(cache_file, "c") as db:
-                db[key] = dt.isoformat()
-        except OSError:
-            pass
-
-    return dt
-
-
-def _get_maven_publish_date(pkg: str, version: str) -> datetime | None:
-    """Fetch publish date from Maven Central.
-
-    pkg is in the format "groupId:artifactId".
-    """
-    group_id, artifact_id = pkg.split(":", 1)
-    quote = functools.partial(urllib.parse.quote, safe="")
-    url = (
-        f"https://search.maven.org/solrsearch/select?"
-        f"q=g:{quote(group_id)}+AND+a:{quote(artifact_id)}+AND+v:{quote(version)}"
-        f"&rows=1&wt=json"
-    )
-    data = _fetch_json(url)
-    if docs := data.get("response", {}).get("docs", []):
-        if ts_ms := docs[0].get("timestamp"):
-            return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-    return None
-
-
-_REGISTRY_LOOKUPS = {
-    "bun": _get_npm_publish_date,
-    "uv": _get_pypi_publish_date,
-    "mvn": _get_maven_publish_date,
-}
-
-
-def _utcnow() -> datetime:
-    """Return current UTC time. Extracted for testability."""
-    return datetime.now(timezone.utc)
-
-
-def _fetch_json(url: str) -> dict:
-    """Fetch JSON from a URL using stdlib urllib."""
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
-
-
-def _pypi_cache_dir() -> Path:
-    """Return (and create) the maintenance-man cache directory."""
-    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
-    d = base / "maintenance-man"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-_pypi_cache_lock = threading.Lock()
-
+from maintenance_man.models.scan import UpdateFinding
+from maintenance_man.process import ProcessError, run_captured
+from maintenance_man.storage import atomic_write_text
+from maintenance_man.uv_dependencies import normalise_pkg_name
 
 _ROOTS = {
     "central": "https://repo.maven.apache.org/maven2",
@@ -306,6 +57,7 @@ _ALIASES = {
 _REDIRECT_HOSTS = {
     "central": {"repo.maven.apache.org", "repo1.maven.org"},
     "google": {"dl.google.com"},
+    "pypi": {"pypi.org"},
     "portal": {
         "plugins.gradle.org",
         "plugins-artifacts.gradle.org",
@@ -349,8 +101,116 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class PublicationFailure(Exception):
+class PublicationError(Exception):
     """Publication evidence could not be trusted or obtained."""
+
+
+# One unreachable address must not consume the whole lookup deadline.
+_CONNECT_ATTEMPT_SECONDS = 3.0
+
+
+def _interleaved(infos):
+    """Alternate address families, keeping resolver order within each family."""
+    families = {}
+    for info in infos:
+        families.setdefault(info[0], []).append(info)
+    return [
+        info
+        for group in itertools.zip_longest(*families.values())
+        for info in group
+        if info is not None
+    ]
+
+
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        msg = "publication lookup timed out"
+        raise PublicationError(msg)
+    return remaining
+
+
+def _deadline_connect(deadline):
+    """Return a ``create_connection`` bounded per address and by *deadline*.
+
+    The returned socket's timeout never outlasts *deadline*, so the TLS
+    handshake that follows stays inside the lookup's bound.
+    """
+
+    def create_connection(address, timeout=None, source_address=None):
+        host, port = address
+        error = None
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        for family, kind, proto, _, sockaddr in _interleaved(infos):
+            try:
+                remaining = _remaining(deadline)
+            except PublicationError as expired:
+                raise expired from error
+            sock = None
+            try:
+                sock = socket.socket(family, kind, proto)
+                sock.settimeout(min(remaining, _CONNECT_ATTEMPT_SECONDS))
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(sockaddr)
+            except OSError as failure:
+                if sock is not None:
+                    sock.close()
+                error = failure
+                continue
+            try:
+                limit = _remaining(deadline)
+            except PublicationError:
+                sock.close()
+                raise
+            numeric = isinstance(timeout, int | float)
+            sock.settimeout(min(timeout, limit) if numeric else limit)
+            return sock
+        if error is None:
+            msg = f"no address for {host}"
+            raise PublicationError(msg)
+        raise error
+
+    return create_connection
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *, deadline, **kwargs):
+        super().__init__(host, **kwargs)
+        self._create_connection = _deadline_connect(deadline)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS handler whose connections share one transport deadline."""
+
+    def __init__(self, deadline):
+        context = ssl.create_default_context()
+        # Match http.client's default HTTPS context.
+        context.set_alpn_protocols(["http/1.1"])
+        context.post_handshake_auth = True
+        super().__init__(context=context)
+        self.context = context
+        self.deadline = deadline
+
+    def connection(self, host, **kwargs):
+        return _DeadlineHTTPSConnection(host, deadline=self.deadline, **kwargs)
+
+    def https_open(self, req):
+        return self.do_open(self.connection, req, context=self.context)
+
+
+_LOOKUP_ERRORS = (
+    http.client.HTTPException,
+    OSError,
+    ValueError,
+    OverflowError,
+    KeyError,
+    TypeError,
+    ET.ParseError,
+    urllib.error.URLError,
+    PublicationError,
+    ProcessError,
+)
 
 
 def _public_url(url, repository, suffix=None):
@@ -370,23 +230,27 @@ def _public_url(url, repository, suffix=None):
         or parsed.query
         or parsed.fragment
     ):
-        raise PublicationFailure("untrusted publication redirect")
+        msg = "untrusted publication redirect"
+        raise PublicationError(msg)
     if suffix is not None and not parsed.path.endswith("/" + suffix):
-        raise PublicationFailure("redirect changed exact artifact path")
+        msg = "redirect changed exact artifact path"
+        raise PublicationError(msg)
 
 
 def _publication_http(url, repository, suffix, count):
     """Fetch *url* under the 15-second/five-redirect/1 MiB trust bounds."""
-    opener = urllib.request.build_opener(_NoRedirect())
     deadline = time.monotonic() + 15
+    opener = urllib.request.build_opener(_NoRedirect(), _DeadlineHTTPSHandler(deadline))
     for redirects in range(6):
         if suffix is not None:
             _public_url(url, repository, suffix)
         elif urllib.parse.urlsplit(url).netloc != "search.maven.org":
-            raise PublicationFailure("untrusted Central timestamp endpoint")
+            msg = "untrusted Central timestamp endpoint"
+            raise PublicationError(msg)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise PublicationFailure("publication timeout")
+            msg = "publication lookup timed out"
+            raise PublicationError(msg)
         count()
         try:
             response = opener.open(urllib.request.Request(url), timeout=remaining)
@@ -397,84 +261,199 @@ def _publication_http(url, repository, suffix, count):
             if error.code in (301, 302, 303, 307, 308):
                 location = error.headers.get("Location")
                 error.close()
-                if suffix is None or redirects == 5 or not location:
-                    raise PublicationFailure(
-                        "publication redirect limit or invalid redirect"
-                    )
+                if (
+                    suffix is None
+                    or repository == "pypi"
+                    or redirects == 5
+                    or not location
+                ):
+                    msg = "publication redirect limit or invalid redirect"
+                    raise PublicationError(msg) from error
                 url = urllib.parse.urljoin(url, location)
                 _public_url(url, repository, suffix)
                 continue
             error.close()
-            raise PublicationFailure(f"publication HTTP {error.code}") from error
+            msg = f"publication HTTP {error.code}"
+            raise PublicationError(msg) from error
         with response:
             if response.status != 200:
-                raise PublicationFailure(f"publication HTTP {response.status}")
-            chunks = []
-            size = 0
-            while size <= _MAX_BYTES:
-                if response.fp is None:
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise PublicationFailure("publication timeout")
-                # HTTPResponse.read1 performs at most one underlying read.
-                # Bound that read by the remaining operation deadline.
-                response.fp.raw._sock.settimeout(remaining)
-                chunk = response.read1(min(65536, _MAX_BYTES + 1 - size))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-            body = b"".join(chunks)
-            if len(body) > _MAX_BYTES or time.monotonic() > deadline:
-                raise PublicationFailure("publication response exceeds limit")
+                msg = f"publication HTTP {response.status}"
+                raise PublicationError(msg)
+            body = _read_publication_body(response, deadline)
             return body, dict(response.headers.items()), url
-    raise PublicationFailure("publication redirect limit")
+    msg = "publication redirect limit"
+    raise PublicationError(msg)
+
+
+def _read_publication_body(response, deadline):
+    chunks = []
+    size = 0
+    while size <= _MAX_BYTES:
+        if response.fp is None:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            msg = "publication lookup timed out"
+            raise PublicationError(msg)
+        # HTTPResponse.read1 performs at most one underlying read.
+        # Bound that read by the remaining operation deadline.
+        response.fp.raw._sock.settimeout(remaining)
+        chunk = response.read1(min(65536, _MAX_BYTES + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    body = b"".join(chunks)
+    if len(body) > _MAX_BYTES or time.monotonic() > deadline:
+        msg = "publication response exceeds limit"
+        raise PublicationError(msg)
+    return body
+
+
+def _pom_coordinate(node, namespace, *, inherit=False):
+    values = []
+    for field in ("groupId", "artifactId", "version"):
+        matches = node.findall(namespace + field)
+        if not matches and inherit and field in {"groupId", "version"}:
+            parents = node.findall(namespace + "parent")
+            if len(parents) == 1:
+                parent = _pom_coordinate(parents[0], namespace)
+                values.append(parent.group if field == "groupId" else parent.version)
+                continue
+        value = (matches[0].text or "").strip() if len(matches) == 1 else ""
+        if not value or "${" in value:
+            msg = "unresolved or ambiguous POM identity"
+            raise PublicationError(msg)
+        values.append(value)
+    return ModuleId(group=values[0], artifact=values[1], version=values[2])
 
 
 def _pom_identity(body, module):
-    """Validate that *body* is an exact, self-contained POM for *module*.
+    """Validate literal POM coordinates, including group/version from a parent.
 
-    Returns the plugin marker's implementation ``ModuleId`` when present.
+    Property expansion remains unsupported. Returns the plugin marker's exact
+    implementation ``ModuleId`` when present.
     """
     # UTF-16/32 could hide the lexical declaration guard: unsupported encodings
     # fail closed before parsing. UTF-8 POMs are the supported trust-v1 format.
     text = body.decode("utf-8-sig")
     if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
-        raise PublicationFailure("POM entity declarations are unsupported")
+        msg = "POM entity declarations are unsupported"
+        raise PublicationError(msg)
     root = ET.fromstring(text)
     if root.tag not in ("project", "{http://maven.apache.org/POM/4.0.0}project"):
-        raise PublicationFailure("invalid POM root")
+        msg = "invalid POM root"
+        raise PublicationError(msg)
     ns = "{http://maven.apache.org/POM/4.0.0}" if root.tag.startswith("{") else ""
 
-    def identity(node):
-        values = []
-        for field in ("groupId", "artifactId", "version"):
-            matches = node.findall(ns + field)
-            value = (matches[0].text or "").strip() if len(matches) == 1 else ""
-            if not value or "${" in value:
-                raise PublicationFailure("unresolved or inherited POM identity")
-            values.append(value)
-        return ModuleId(group=values[0], artifact=values[1], version=values[2])
-
-    if identity(root) != module:
-        raise PublicationFailure("POM identity mismatch")
+    if _pom_coordinate(root, ns, inherit=True) != module:
+        msg = "POM identity mismatch"
+        raise PublicationError(msg)
     implementation = None
     if module.artifact.endswith(".gradle.plugin"):
         dependencies = root.findall(ns + "dependencies/" + ns + "dependency")
         if len(dependencies) != 1:
-            raise PublicationFailure("unsupported plugin marker mapping")
-        implementation = identity(dependencies[0])
+            msg = "unsupported plugin marker mapping"
+            raise PublicationError(msg)
+        implementation = _pom_coordinate(dependencies[0], ns)
     return implementation
 
 
-class PublicationLookupContext:
-    """Command-scoped cache, shared pool and disk cache for publication facts."""
+def _parse_central_timestamp(body, module):
+    data = json.loads(body)
+    docs = data["response"]["docs"]
+    if not isinstance(docs, list) or not docs:
+        msg = "Central timestamp missing"
+        raise PublicationError(msg)
+    dates = []
+    for doc in docs:
+        if (doc["g"], doc["a"], doc["v"]) != (
+            module.group,
+            module.artifact,
+            module.version,
+        ):
+            msg = "Central timestamp identity mismatch"
+            raise PublicationError(msg)
+        milliseconds = doc["timestamp"]
+        if (
+            isinstance(milliseconds, bool)
+            or not isinstance(milliseconds, int)
+            or not 0 < milliseconds <= _MAX_EPOCH_MS
+        ):
+            msg = "invalid Central timestamp"
+            raise PublicationError(msg)
+        dates.append(datetime.fromtimestamp(milliseconds / 1000, UTC))
+    return max(dates)
 
-    def __init__(self, cache_dir, transport=None, now=_utcnow):
+
+def _registry_timestamp(value):
+    if not isinstance(value, str):
+        msg = "invalid registry timestamp"
+        raise PublicationError(msg)
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _pypi_release(data):
+    """Return (name, version, urls) from a PyPI release document."""
+    info = data.get("info") if isinstance(data, dict) else None
+    urls = data.get("urls") if isinstance(data, dict) else None
+    if (
+        not isinstance(info, dict)
+        or not isinstance(info.get("name"), str)
+        or not isinstance(info.get("version"), str)
+        or not isinstance(urls, list)
+        or not all(isinstance(entry, dict) for entry in urls)
+    ):
+        msg = "unexpected PyPI response shape"
+        raise PublicationError(msg)
+    return info["name"], info["version"], urls
+
+
+def _pypi_timestamp(body, package, version):
+    name, released, urls = _pypi_release(json.loads(body))
+    if normalise_pkg_name(name) != normalise_pkg_name(package) or Version(
+        released
+    ) != Version(version):
+        msg = "PyPI identity mismatch"
+        raise PublicationError(msg)
+    uploads = [
+        _registry_timestamp(entry["upload_time_iso_8601"])
+        for entry in urls
+        if entry.get("upload_time_iso_8601") is not None
+    ]
+    if not uploads:
+        msg = "PyPI upload time missing"
+        raise PublicationError(msg)
+    return min(uploads)
+
+
+def _npm_timestamp(package, version, project_path):
+    completed = run_captured(
+        ["bun", "info", f"{package}@{version}"],
+        project_path,
+        timeout=30,
+        label="bun info",
+        ok_codes=None,
+    )
+    value = next(
+        (
+            line.removeprefix("Published:").strip()
+            for line in completed.stdout.splitlines()
+            if line.startswith("Published:")
+        ),
+        None,
+    )
+    return _registry_timestamp(value) if value else None
+
+
+class PublicationLookupContext:
+    """Publication lookups for one scan or Gradle flow: pool, dedupe and cache."""
+
+    def __init__(self, cache_dir, transport=None, clock: Clock = utc_now):
         self.cache_dir = Path(cache_dir)
         self.transport = transport or _publication_http
-        self.now = now
+        self.clock = clock
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.lock = threading.Lock()
         self.inflight = {}
@@ -490,7 +469,7 @@ class PublicationLookupContext:
     def __exit__(self, *args):
         self.pool.shutdown(wait=True, cancel_futures=True)
         logging.getLogger(__name__).info(
-            "Gradle publication %.3fs; requests=%d cache_hits=%d worker_seconds=%.3f",
+            "Publication lookup %.3fs; requests=%d cache_hits=%d worker_seconds=%.3f",
             time.monotonic() - self.started,
             self.requests,
             self.cache_hits,
@@ -508,6 +487,9 @@ class PublicationLookupContext:
         digest = hashlib.sha256(json.dumps((1, *key, method)).encode()).hexdigest()
         return self.cache_dir / (digest + ".json")
 
+    def _fresh(self, checked_at):
+        return timedelta(0) <= self.clock() - checked_at < timedelta(hours=24)
+
     def _cached(self, key):
         repository, group, artifact, version = key
         module = ModuleId(group=group, artifact=artifact, version=version)
@@ -518,39 +500,47 @@ class PublicationLookupContext:
                 )
                 suffix = _artifact_suffix(module)
                 _public_url(fact.source_url, repository, suffix)
-                fresh = (
-                    timedelta(0) <= self.now() - fact.checked_at < timedelta(hours=24)
-                )
                 if (
                     fact.repository != repository
                     or fact.module != module
                     or fact.method != method
-                    or fact.timestamp > self.now()
-                    or not fresh
+                    or fact.timestamp > self.clock()
+                    or not self._fresh(fact.checked_at)
                 ):
                     continue
                 with self.lock:
                     self.cache_hits += 1
                 return fact
-            except OSError, ValueError, ValidationError, PublicationFailure:
+            except OSError, ValueError, ValidationError, PublicationError:
                 continue
         return None
 
-    def submit(self, repository, module):
-        key = self._key(repository, module)
+    def _submit(self, key, fetch, *args):
         with self.lock:
             prior = self.inflight.get(key)
             if prior is not None:
                 if not prior.done():
                     return prior
                 value = prior.result()
-                if not isinstance(value, PublicationFact) or (
-                    timedelta(0) <= self.now() - value.checked_at < timedelta(hours=24)
-                ):
+                if not isinstance(
+                    value, (PublicationFact, RegistryFact)
+                ) or self._fresh(value.checked_at):
                     return prior
-            future = self.pool.submit(self._fetch, key, module)
+            future = self.pool.submit(fetch, *args)
             self.inflight[key] = future
             return future
+
+    def submit(
+        self, repository: RepositoryId, module: ModuleId
+    ) -> Future[PublicationFact | AgeBlock | None]:
+        key = self._key(repository, module)
+        return self._submit(key, self._fetch, key, module)
+
+    def submit_registry(
+        self, registry: Registry, package: str, version: str, project_path: Path
+    ) -> Future[RegistryFact | AgeBlock | None]:
+        key = ("registry", registry, package, version)
+        return self._submit(key, self._fetch_registry, key, project_path)
 
     def prefetch(self, requests):
         for request in requests:
@@ -559,6 +549,57 @@ class PublicationLookupContext:
                     continue
                 for repository in request.repositories:
                     self.submit(repository, module)
+
+    def _publication_timestamp(self, repository, module, headers):
+        raw = headers.get("last-modified")
+        if raw is not None:
+            timestamp = parsedate_to_datetime(raw)
+            if timestamp.tzinfo is None:
+                msg = "publication timestamp lacks timezone"
+                raise PublicationError(msg)
+            return "last_modified", timestamp
+        if repository != "central":
+            msg = "publication timestamp missing"
+            raise PublicationError(msg)
+        query = urllib.parse.urlencode(
+            {
+                "q": (
+                    f'g:"{module.group}" AND a:"{module.artifact}" '
+                    f'AND v:"{module.version}"'
+                ),
+                "rows": 20,
+                "wt": "json",
+            }
+        )
+        result = self.transport(
+            "https://search.maven.org/solrsearch/select?" + query,
+            repository,
+            None,
+            self._count,
+        )
+        if result is None:
+            msg = "Central timestamp unavailable"
+            raise PublicationError(msg)
+        return "central_timestamp", _parse_central_timestamp(result[0], module)
+
+    def _store(self, path, fact):
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(path, fact.model_dump_json())
+        except OSError:
+            # Evidence was verified live; disk errors cannot supply evidence.
+            pass
+
+    def _lookup_failed(self, label, error):
+        logging.getLogger(__name__).debug(
+            "Publication lookup failed for %s", label, exc_info=True
+        )
+        reason = (
+            str(error)
+            if isinstance(error, PublicationError)
+            else "publication lookup failed"
+        )
+        return AgeBlock(reason=f"{label}: {reason}")
 
     def _fetch(self, key, module):
         started = time.monotonic()
@@ -574,61 +615,15 @@ class PublicationLookupContext:
             body, headers, final_url = response
             _public_url(final_url, repository, suffix)
             if len(body) > _MAX_BYTES:
-                raise PublicationFailure("POM exceeds size limit")
+                msg = "POM exceeds size limit"
+                raise PublicationError(msg)
             implementation = _pom_identity(body, module)
             headers = {k.lower(): v for k, v in headers.items()}
-            method = "last_modified"
-            raw = headers.get("last-modified")
-            if raw is not None:
-                timestamp = parsedate_to_datetime(raw)
-                if timestamp.tzinfo is None:
-                    raise PublicationFailure("publication timestamp lacks timezone")
-            elif repository == "central":
-                method = "central_timestamp"
-                query = urllib.parse.urlencode(
-                    {
-                        "q": (
-                            f'g:"{module.group}" AND a:"{module.artifact}" '
-                            f'AND v:"{module.version}"'
-                        ),
-                        "rows": 20,
-                        "wt": "json",
-                    }
-                )
-                result = self.transport(
-                    "https://search.maven.org/solrsearch/select?" + query,
-                    repository,
-                    None,
-                    self._count,
-                )
-                if result is None:
-                    raise PublicationFailure("Central timestamp unavailable")
-                data = json.loads(result[0])
-                docs = data["response"]["docs"]
-                if not isinstance(docs, list) or not docs:
-                    raise PublicationFailure("Central timestamp missing")
-                dates = []
-                for doc in docs:
-                    if (doc["g"], doc["a"], doc["v"]) != (
-                        module.group,
-                        module.artifact,
-                        module.version,
-                    ):
-                        raise PublicationFailure("Central timestamp identity mismatch")
-                    ms = doc["timestamp"]
-                    if (
-                        isinstance(ms, bool)
-                        or not isinstance(ms, int)
-                        or not 0 < ms <= _MAX_EPOCH_MS
-                    ):
-                        raise PublicationFailure("invalid Central timestamp")
-                    dates.append(datetime.fromtimestamp(ms / 1000, timezone.utc))
-                timestamp = max(dates)
-            else:
-                raise PublicationFailure("publication timestamp missing")
-            timestamp = timestamp.astimezone(timezone.utc)
-            if timestamp > self.now():
-                raise PublicationFailure("future publication timestamp")
+            method, timestamp = self._publication_timestamp(repository, module, headers)
+            timestamp = timestamp.astimezone(UTC)
+            if timestamp > self.clock():
+                msg = "future publication timestamp"
+                raise PublicationError(msg)
             fact = PublicationFact(
                 repository=repository,
                 module=module,
@@ -636,38 +631,86 @@ class PublicationLookupContext:
                 method=method,
                 artifact_digest=hashlib.sha256(body).hexdigest(),
                 timestamp=timestamp,
-                checked_at=self.now(),
+                checked_at=self.clock(),
                 implementation=implementation,
             )
-            try:
-                self.cache_dir.mkdir(parents=True, exist_ok=True)
-                path = self._path(key, method)
-                temporary = path.with_suffix(
-                    f".{os.getpid()}.{threading.get_ident()}.tmp"
-                )
-                temporary.write_text(fact.model_dump_json())
-                temporary.replace(path)
-            except OSError:
-                # Evidence was verified live; disk errors cannot supply evidence.
-                pass
+            self._store(self._path(key, method), fact)
             return fact
-        except (
-            http.client.HTTPException,
-            OSError,
-            ValueError,
-            OverflowError,
-            KeyError,
-            TypeError,
-            ET.ParseError,
-            urllib.error.URLError,
-            PublicationFailure,
-        ) as error:
-            return AgeBlock(
-                reason=(
-                    f"{module.coordinate}:{module.version}: "
-                    f"{type(error).__name__}: {error}"
-                )
+        except _LOOKUP_ERRORS as error:
+            return self._lookup_failed(f"{module.coordinate}:{module.version}", error)
+        finally:
+            with self.lock:
+                self.seconds += time.monotonic() - started
+
+    def _registry_path(self, key):
+        digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+        return self.cache_dir / (digest + ".json")
+
+    def _cached_registry(self, key):
+        _, registry, package, version = key
+        try:
+            fact = RegistryFact.model_validate_json(
+                self._registry_path(key).read_bytes()
             )
+        except OSError, ValueError:
+            return None
+        if (
+            (fact.registry, fact.package, fact.version) != (registry, package, version)
+            or fact.timestamp > self.clock()
+            or not self._fresh(fact.checked_at)
+        ):
+            return None
+        with self.lock:
+            self.cache_hits += 1
+        return fact
+
+    def _pypi_lookup(self, package, version):
+        quote = functools.partial(urllib.parse.quote, safe="")
+        suffix = f"pypi/{quote(package)}/{quote(version)}/json"
+        url = "https://pypi.org/" + suffix
+        response = self.transport(url, "pypi", suffix, self._count)
+        if response is None:
+            return None
+        body, _headers, final_url = response
+        if final_url != url:
+            msg = "PyPI response URL changed"
+            raise PublicationError(msg)
+        if len(body) > _MAX_BYTES:
+            msg = "PyPI response exceeds size limit"
+            raise PublicationError(msg)
+        return _pypi_timestamp(body, package, version)
+
+    def _registry_lookup(self, registry, package, version, project_path):
+        if registry == "pypi":
+            return self._pypi_lookup(package, version)
+        self._count()
+        return _npm_timestamp(package, version, project_path)
+
+    def _fetch_registry(self, key, project_path):
+        started = time.monotonic()
+        _, registry, package, version = key
+        try:
+            if registry == "pypi" and (cached := self._cached_registry(key)):
+                return cached
+            timestamp = self._registry_lookup(registry, package, version, project_path)
+            if timestamp is None:
+                return None
+            timestamp = timestamp.astimezone(UTC)
+            if timestamp > self.clock():
+                msg = "future publication timestamp"
+                raise PublicationError(msg)
+            fact = RegistryFact(
+                registry=registry,
+                package=package,
+                version=version,
+                timestamp=timestamp,
+                checked_at=self.clock(),
+            )
+            if registry == "pypi":
+                self._store(self._registry_path(key), fact)
+            return fact
+        except _LOOKUP_ERRORS as error:
+            return self._lookup_failed(f"{package}:{version}", error)
         finally:
             with self.lock:
                 self.seconds += time.monotonic() - started
@@ -691,7 +734,8 @@ def _artifact_suffix(module):
     if any(
         not p or "/" in p or "\\" in p or "${" in p or p in (".", "..") for p in parts
     ):
-        raise PublicationFailure("unsupported artifact identity")
+        msg = "unsupported artifact identity"
+        raise PublicationError(msg)
     quote = functools.partial(urllib.parse.quote, safe="")
     return "/".join(
         [
@@ -748,27 +792,183 @@ def lookup_gradle_publication(request, context):
 
 
 def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
-    """Return an ``AgeBlock`` unless every publication request is proven old enough.
-
-    Reliable exact-artifact evidence is required even when ``minimum_age_days``
-    is zero: an unresolved lookup withholds the candidate rather than passing it.
-    """
+    """Withhold only releases with a known date inside the waiting period."""
     if now.tzinfo is None or minimum_age_days < 0:
-        raise ValueError("current UTC date and nonnegative minimum age required")
+        msg = "current UTC date and nonnegative minimum age required"
+        raise ValueError(msg)
+    if minimum_age_days == 0:
+        return None
     requests = candidate.publication_requests
-    if not requests:
-        return AgeBlock(reason="candidate has no publication requests")
     context.prefetch(requests)
     for request in requests:
         result = lookup_gradle_publication(request, context)
         if isinstance(result, AgeBlock):
-            return result
-        if result.timestamp > now:
-            return AgeBlock(reason="publication evidence is in the future")
-        if minimum_age_days and result.timestamp > now - timedelta(
-            days=minimum_age_days
-        ):
+            continue
+        if result.timestamp >= now - timedelta(days=minimum_age_days):
             return AgeBlock(
-                reason=f"publication younger than required {minimum_age_days} days"
+                reason=f"release younger than required {minimum_age_days} days"
             )
     return None
+
+
+type _Member = (
+    tuple[Future[PublicationFact | AgeBlock | None], ...]
+    | tuple[Future[RegistryFact | AgeBlock | None], ...]
+)
+
+
+def _filter_by_age(
+    updates: list[UpdateFinding],
+    schedule: Callable[[UpdateFinding], tuple[list[_Member], int]],
+    cutoff: datetime,
+) -> list[UpdateFinding]:
+    """Apply the one scan age rule; every update is scheduled before any wait."""
+    pending = [(update, *schedule(update)) for update in updates]
+    assessed = (
+        _assess_publication(update, members, expected, cutoff)
+        for update, members, expected in pending
+    )
+    return [update for update in assessed if update is not None]
+
+
+def _assess_publication(
+    update: UpdateFinding,
+    members: list[_Member],
+    expected: int,
+    cutoff: datetime,
+) -> UpdateFinding | None:
+    dates: list[datetime] = []
+    complete = bool(members) and len(members) == expected
+    for futures in members:
+        results = [future.result() for future in futures]
+        known = [
+            result
+            for result in results
+            if isinstance(result, (PublicationFact, RegistryFact))
+        ]
+        digests = {
+            result.artifact_digest
+            for result in known
+            if isinstance(result, PublicationFact)
+        }
+        dates.extend(fact.timestamp for fact in known)
+        if (
+            not known
+            or any(isinstance(result, AgeBlock) for result in results)
+            or len(digests) > 1
+        ):
+            complete = False
+    if dates and max(dates) >= cutoff:
+        return None
+    return update.model_copy(
+        update={"published_date": max(dates) if complete else None}
+    )
+
+
+def _gradle_members(
+    update: UpdateFinding,
+    resolution: CompleteResolution,
+    context: PublicationLookupContext,
+) -> list[_Member]:
+    requests: list[_Member] = []
+    if update.gradle_target is None:
+        return requests
+    for member in update.gradle_target.members:
+        if member.kind == "plugin":
+            module = ModuleId(
+                group=member.coordinate,
+                artifact=member.coordinate + ".gradle.plugin",
+                version=update.latest_version,
+            )
+        else:
+            parts = member.coordinate.split(":")
+            if len(parts) != 2:
+                continue
+            module = ModuleId(
+                group=parts[0], artifact=parts[1], version=update.latest_version
+            )
+        repositories = tuple(
+            repository
+            for repository in resolution.report.repositories
+            if repository.domain == member.kind
+        )
+        request = publication_request(module, repositories)
+        if request.routing_supported:
+            requests.append(
+                tuple(
+                    context.submit(repository, module)
+                    for repository in request.repositories
+                )
+            )
+    return requests
+
+
+def filter_gradle_updates_by_age(
+    updates: list[UpdateFinding],
+    project: ProjectConfig,
+    resolution: CompleteResolution,
+    min_age_days: int,
+    context: PublicationLookupContext,
+) -> list[UpdateFinding]:
+    """Filter known young catalogue proposals; unknown dates remain eligible.
+
+    Scan-time lookups use catalogue coordinates and declared repositories only.
+    Native candidate validation remains part of the update workflow.
+    """
+    if (
+        not updates
+        or min_age_days == 0
+        or project.gradle_repository_routing != "standard-public"
+    ):
+        return list(updates)
+    cutoff = context.clock() - timedelta(days=min_age_days)
+    return _filter_by_age(
+        updates,
+        lambda update: (
+            _gradle_members(update, resolution, context),
+            len(update.gradle_target.members) if update.gradle_target else 0,
+        ),
+        cutoff,
+    )
+
+
+def _registry_members(
+    update: UpdateFinding,
+    source: PublicationSource,
+    project_path: Path,
+    context: PublicationLookupContext,
+) -> list[_Member]:
+    if source != "central":
+        return [
+            (
+                context.submit_registry(
+                    source, update.pkg_name, update.latest_version, project_path
+                ),
+            )
+        ]
+    group, separator, artifact = update.pkg_name.partition(":")
+    if not group or not separator or not artifact or ":" in artifact:
+        return []
+    module = ModuleId(group=group, artifact=artifact, version=update.latest_version)
+    return [(context.submit("central", module),)]
+
+
+def filter_registry_updates_by_age(
+    updates: list[UpdateFinding],
+    source: PublicationSource,
+    project_path: Path,
+    min_age_days: int,
+    context: PublicationLookupContext,
+) -> list[UpdateFinding]:
+    """Filter known young registry releases; unknown dates remain eligible."""
+    if not updates or min_age_days == 0:
+        return list(updates)
+    cutoff = context.clock() - timedelta(days=min_age_days)
+    return _filter_by_age(
+        updates,
+        lambda update: (
+            _registry_members(update, source, project_path, context),
+            1,
+        ),
+        cutoff,
+    )

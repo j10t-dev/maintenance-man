@@ -1,3 +1,12 @@
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import BaseModel, ValidationError
+
+from maintenance_man.models.gradle import content_identity
+from maintenance_man.models.publication import RegistryFact
 from maintenance_man.models.scan import (
     SemverTier,
     Severity,
@@ -6,6 +15,56 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
+
+_FACT: dict[str, Any] = {
+    "registry": "pypi",
+    "package": "requests",
+    "version": "2.31.0",
+    "timestamp": datetime(2025, 12, 31, 1, tzinfo=timezone(timedelta(hours=1))),
+    "checked_at": datetime(2026, 1, 1, tzinfo=UTC),
+}
+
+
+def test_registry_fact_stores_utc():
+    fact = RegistryFact(**_FACT)
+    assert fact.timestamp == datetime(2025, 12, 31, tzinfo=UTC)
+    assert fact.timestamp.utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"timestamp": datetime(2025, 12, 31)},
+        {"checked_at": datetime(2026, 1, 1)},
+        {"registry": "central"},
+        {"source": "bun"},
+    ],
+)
+def test_registry_fact_rejects_invalid_values(change):
+    with pytest.raises(ValidationError):
+        RegistryFact(**(_FACT | change))
+
+
+def test_content_identity_keeps_canonical_bytes():
+    class Probe(BaseModel):
+        at: datetime
+        path: Path
+        tags: frozenset[str]
+        values: tuple[int, ...]
+        phase: Workflow
+        nested: dict[str, int]
+
+    value = Probe(
+        at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        path=Path("gradle/libs.versions.toml"),
+        tags=frozenset({"z", "a"}),
+        values=(2, 1),
+        phase=Workflow.UPDATE,
+        nested={"b": 2, "a": 1},
+    )
+    assert content_identity(value) == (
+        "e318569d6e758716db6146f979d2c5fd7bb87482206c54f75125e5e2170dc852"
+    )
 
 
 class TestWorkflow:

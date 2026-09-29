@@ -36,6 +36,10 @@ mm update -n api worker   # batch update all except api and worker
 mm update api -n worker   # same exclusion mode; flag position does not matter
 ```
 
+`mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed.
+
+If jj or gh is missing, `mm scan` warns and skips bookmark pruning; `mm update` and `mm resolve` still require both.
+
 ```bash
 ➜  maintenance-man git:(main) ✗ mm --help
 Usage: mm COMMAND
@@ -86,6 +90,8 @@ build_command = "" # optional, path to a script defining the build process, rela
 deploy_command = "scripts/deploy.sh" # optional, path to script defining the deploy process, relative to projects home dir
 scan_skip_dirs = ["tests/fixtures"] # optional, an array of relative directories that trivy should ignore in its scans.
 ```
+
+Test, build and deploy commands run through `/bin/bash` in the project directory, so shell syntax such as `&&`, pipes, redirects and quoting works. A pipeline's status is its last command's status unless the command sets `set -o pipefail`. Gradle verification runs the configured test commands the same way. Test commands were previously split into arguments without a shell, so a test command containing literal shell characters may now need quoting.
 
 The following defaults can be globally configured: 
 
@@ -162,15 +168,23 @@ A direct security fix requires an exact advisory fix version, or one unambiguous
 
 ### Release-age and verification policy
 
-Automatic Gradle publication eligibility requires the project declaration `gradle_repository_routing = "standard-public"`. Set it only when relevant public repositories have no credentials or custom content/exclusive routing. mm relies on this operator declaration and does not infer it from a URL or successful resolution. Existing configurations without the declaration remain valid for scanning and reporting, with automatic candidates withheld.
+Every package manager uses the same age policy: known releases younger than `min_version_age_days` are withheld; unknown or unavailable dates do not prevent updates. Setting `min_version_age_days = 0` skips publication lookups entirely. PyPI dates come from `pypi.org` with the exact package name and version checked, mvn and Gradle dates come from exact POMs, and those dates are cached under `~/.mm/publications` for 24 hours. npm dates come from `bun info` in the project and are looked up on every scan, because bun's registry configuration can change without mm noticing.
 
-Every changed member needs reliable publication evidence from its exact POM on a relevant configured trusted repository. Supported repositories are Maven Central, Google Maven and Plugin Portal. A reliable Last-Modified header is accepted as repository availability evidence; an exact matching Central timestamp is also supported. Missing, invalid or conflicting evidence blocks the group. When identical artifacts have different valid dates, mm uses the youngest. Setting `min_version_age_days = 0` removes the waiting period and still requires evidence. Custom URLs and unsupported redirects remain blocked. Plugin updates require evidence for both the standard marker and its exact implementation artifact.
+Set `gradle_repository_routing = "standard-public"` only when relevant public repositories have no credentials or custom content/exclusive routing. This declaration enables trusted publication lookups from Maven Central, Google Maven and Plugin Portal. Missing declarations, custom repositories, unavailable metadata and unsupported redirects leave dates unknown. Native catalogue validation, build/test checks and security snapshot comparisons still govern whether a change can be accepted.
+
+POM group and version fields may inherit literal values from a parent with complete coordinates. For mvn and Gradle alike, unresolved properties, ambiguous declarations, mismatched coordinates and non-UTF-8 POMs leave the publication date unknown.
 
 Configure `build_command` and at least one test phase for automatic acceptance. For Android, use debug assembly plus unit tests and lint. Complete before/after scans use one frozen Trivy database and policy context. Failed checks, incomplete or incomparable coverage, and new or worsened findings block acceptance. An ordinary catalogue update may complete with unchanged residual advisories. A candidate proposed solely as a security fix must remove every requested scoped finding. Saved scan results retain residual CVEs without marking them completed.
+
+Scans report vulnerabilities and available updates without running native candidate validation or adding update-planning diagnostics. Known too-young updates are filtered out, while findings with unknown dates remain visible.
+
+Fresh update runs scan current vulnerabilities even when the update plugin proposes no catalogue changes. Candidate selection, native validation, and publication eligibility run before baseline builds, tests, and private scanner database downloads. Runs with no eligible candidates report their findings without those acceptance checks.
 
 Verified changes can be promoted or submitted while unrelated advisories or withheld candidates remain. An actual failed or interrupted attempt prevents final promotion in that run. mm rechecks publication facts, checked trees, comparison inputs and the expected main/bookmark revisions before finalization. Update failure restores the last accepted workspace tree; resolve failure preserves the repair workspace.
 
 Interrupted work is tracked separately from scans in `~/.mm/gradle-runs`. Update recovery rolls back an unverified attempt before a later fresh invocation. `mm resolve PROJECT --continue` verifies a committed repair, including intended catalogue versions, age, build/tests and a comparable scan, without applying the update again. READY recovery reuses valid evidence or rebuilds it without reapplying. A failed refresh after promotion retries the refresh. Do not delete the ledger to bypass unsafe work; a fresh scan cannot erase it.
+
+Preparation saves the complete plan and checked baseline together. A preparation failure retries from scratch. Empty preparation ledgers and runs containing only withheld changes are replanned on the next invocation, after verifying the recorded workspace and revisions. Runs with applied changes keep their recovery checks.
 
 Private Trivy database caches are released after a run completes or replacement evidence is durably saved. The ledger retains the recorded snapshots and receipts. Unfinished runs keep the cache needed for recovery.
 
@@ -200,7 +214,7 @@ Configured projects are expected to be colocated jj/Git repositories with a GitH
 
 ## Requirements
 
-* trivy
+* trivy, except for uv projects with `scan_secrets = false`
 * jj
 * gh
 * Python 3.14
@@ -217,3 +231,41 @@ Configured projects are expected to be colocated jj/Git repositories with a GitH
 ## Contributing 
 
 Put bluntly - I probably don't want your contribution. This is primarily a personal tool and I have no aspirations of trying to expand it to support every language, tool chain or use-case. You are encouraged to fork the project if you want to use tools I don't. I offer no guarantee of reading your issues or responding to your PRs. I do not wish to interact with your LLM agents or humans regurgitating LLM output. Please communicate in your own words or don't contact me at all.
+
+### Development checks
+
+Run the default test suite and each static check directly before submitting a
+change:
+
+```sh
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check
+uv run lint-imports
+```
+
+Repository functions are limited to a McCabe complexity of 10, six returns,
+12 branches, and 50 statements. Process launches must go through
+`maintenance_man.process`; that owner module and tests are exempt from the
+direct-process import ban so the adapter can be implemented and test fixtures
+can exercise subprocess boundaries. Parameter-count rule PLR0913 stays off
+because the codebase preserves explicit dependency injection. TRY003, TRY004,
+TRY300, and TRY301 stay off because they would change established exception
+boundaries and message contracts. Ruff preview rules are disabled. Deptry is
+deferred until dependency ownership policy is designed.
+
+The local real-jj contract can be checked separately:
+
+```sh
+uv run pytest tests/test_repository_contract.py tests/test_jj_integration.py -m integration -q
+```
+
+The real-Gradle producer test is also separate from the default suite. It is
+skipped unless `MM_GRADLE_WRAPPER` points to an executable `gradlew` whose
+directory also contains `gradle/wrapper`. It needs JDK 21 and network access to
+the Gradle plugin portal:
+
+```sh
+MM_GRADLE_WRAPPER=/path/to/project/gradlew uv run pytest tests/test_gradle_package.py -m integration -q
+```

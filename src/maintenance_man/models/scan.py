@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum, auto
 from typing import Any, Literal
@@ -12,6 +14,20 @@ class Severity(StrEnum):
     MEDIUM = "MEDIUM"
     LOW = "LOW"
     UNKNOWN = "UNKNOWN"
+
+    @property
+    def rank(self) -> int:
+        """Higher is more severe; UNKNOWN ranks lowest."""
+        return _SEVERITY_RANK[self]
+
+
+_SEVERITY_RANK = {
+    Severity.UNKNOWN: 0,
+    Severity.LOW: 1,
+    Severity.MEDIUM: 2,
+    Severity.HIGH: 3,
+    Severity.CRITICAL: 4,
+}
 
 
 class SemverTier(StrEnum):
@@ -52,8 +68,25 @@ class Workflow(StrEnum):
     RESOLVE = "resolve"
 
 
+WORKFLOW_BOOKMARKS: Mapping[Workflow, str] = {
+    Workflow.UPDATE: "mm/update-dependencies",
+    Workflow.RESOLVE: "mm/resolve-dependencies",
+}
+
+
 type GradleKind = Literal["library", "plugin"]
 type GradleBlockKind = Literal["age", "mapping", "conflict", "stale"]
+type UpdateKind = Literal["vuln", "update"]
+
+
+@dataclass(slots=True)
+class UpdateResult:
+    """Outcome of one dependency update attempt."""
+
+    pkg_name: str
+    kind: UpdateKind
+    passed: bool
+    failed_phase: str | None = None
 
 
 class GradleMember(BaseModel):
@@ -118,7 +151,8 @@ class VulnFinding(BaseModel):
     @property
     def target_version(self) -> str:
         if self.fixed_version is None:
-            raise ValueError("No fixed version available")
+            msg = "No fixed version available"
+            raise ValueError(msg)
         return self.fixed_version
 
     @property
@@ -173,22 +207,13 @@ class ScanResult(BaseModel):
         return bool(self.updates)
 
     @property
+    def findings(self) -> tuple[VulnFinding | UpdateFinding, ...]:
+        return (*self.vulnerabilities, *self.updates)
+
+    @property
     def blocked_findings(self) -> list[VulnFinding | UpdateFinding]:
         """Findings withheld by current policy. Orthogonal to update lifecycle."""
-        return [
-            f
-            for f in (*self.vulnerabilities, *self.updates)
-            if f.blocked_reason is not None
-        ]
-
-
-_SEVERITY_ORDER: dict[Severity, int] = {
-    Severity.CRITICAL: 0,
-    Severity.HIGH: 1,
-    Severity.MEDIUM: 2,
-    Severity.LOW: 3,
-    Severity.UNKNOWN: 4,
-}
+        return [f for f in self.findings if f.blocked_reason is not None]
 
 
 def _fix_version_key(v: VulnFinding) -> Version:
@@ -199,6 +224,16 @@ def _fix_version_key(v: VulnFinding) -> Version:
         return Version("0")
 
 
+def highest_fix_version(vulns: list[VulnFinding]) -> str:
+    """Return the ``fixed_version`` of the first finding with the highest version.
+
+    Missing and unparsable versions rank as ``0``. When that finding has no
+    ``fixed_version``, fall back to the last finding's, then ``""``.
+    """
+    best = max(vulns, key=_fix_version_key)
+    return best.fixed_version or vulns[-1].fixed_version or ""
+
+
 def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
     """Sort by package (grouped), with groups ordered by worst severity.
 
@@ -206,10 +241,10 @@ def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
     then fix version descending.  This keeps all vulns for a package together
     so the "fix" marker is easy to follow.
     """
-    # Build a lookup of worst (lowest ordinal) severity per package.
+    # Build a lookup of worst (lowest negative rank) severity per package.
     worst: dict[str, int] = {}
     for v in vulns:
-        order = _SEVERITY_ORDER[v.severity]
+        order = -v.severity.rank
         if v.pkg_name not in worst or order < worst[v.pkg_name]:
             worst[v.pkg_name] = order
 
@@ -217,7 +252,7 @@ def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
         return (
             worst[v.pkg_name],
             v.pkg_name,
-            _SEVERITY_ORDER[v.severity],
+            -v.severity.rank,
         )
 
     # Two-pass stable sort: version desc first, then the composite key.

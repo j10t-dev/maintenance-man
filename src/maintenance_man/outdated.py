@@ -1,11 +1,12 @@
 import json
 import re
-import subprocess
 from pathlib import Path
 
-from maintenance_man.gradle import discover_gradle_updates
+from pydantic import ValidationError
+
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import UpdateFinding, classify_semver
+from maintenance_man.process import run_captured
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     get_uv_direct_dep_names,
@@ -17,20 +18,6 @@ class OutdatedCheckError(Exception):
     pass
 
 
-def get_outdated(project: ProjectConfig) -> list[UpdateFinding]:
-    """Run the appropriate outdated check for the project's package manager."""
-    checker = _CHECKERS.get(project.package_manager)
-    if checker is None:
-        raise OutdatedCheckError(
-            f"No outdated checker for package manager: {project.package_manager}"
-        )
-    return checker(project)
-
-
-def _normalise_pkg_name(name: str) -> str:
-    return normalise_pkg_name(name)
-
-
 def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
     try:
         return get_uv_direct_dep_names(project_path)
@@ -40,56 +27,84 @@ def _get_uv_direct_dep_names(project_path: Path) -> set[str]:
 
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `uv pip list --outdated --format json` and parse results."""
-    _run_checked(
+    run_captured(
         ["uv", "sync", "--locked"],
-        cwd=project.path,
+        project.path,
         timeout=300,
         label="uv sync --locked",
+        error=OutdatedCheckError,
     )
     venv_python = Path(project.path) / ".venv" / "bin" / "python"
     cmd = ["uv", "pip", "list", "--outdated", "--format", "json"]
     if venv_python.exists():
         cmd += ["--python", str(venv_python)]
-    completed = _run_checked(
+    completed = run_captured(
         cmd,
-        cwd=project.path,
+        project.path,
         timeout=120,
         label="uv pip list --outdated",
+        error=OutdatedCheckError,
     )
 
     try:
         entries = json.loads(completed.stdout)
     except json.JSONDecodeError as e:
-        raise OutdatedCheckError(f"Failed to parse uv output: {e}") from e
+        msg = f"Failed to parse uv output: {e}"
+        raise OutdatedCheckError(msg) from e
+
+    if not isinstance(entries, list) or not all(
+        isinstance(entry, dict)
+        and all(
+            isinstance(entry.get(key), str)
+            for key in ("name", "version", "latest_version")
+        )
+        for entry in entries
+    ):
+        msg = (
+            "Unexpected uv output: expected a list of objects with string "
+            "name, version and latest_version"
+        )
+        raise OutdatedCheckError(msg)
 
     direct_deps = _get_uv_direct_dep_names(Path(project.path))
 
-    return [
-        UpdateFinding(
-            pkg_name=entry["name"],
-            installed_version=entry["version"],
-            latest_version=entry["latest_version"],
-            semver_tier=classify_semver(entry["version"], entry["latest_version"]),
-        )
-        for entry in entries
-        if (cur := entry.get("version"))
-        and (lat := entry.get("latest_version"))
-        and cur != lat
-        and _normalise_pkg_name(entry["name"]) in direct_deps
-    ]
+    try:
+        return [
+            UpdateFinding(
+                pkg_name=entry["name"],
+                installed_version=entry["version"],
+                latest_version=entry["latest_version"],
+                semver_tier=classify_semver(entry["version"], entry["latest_version"]),
+            )
+            for entry in entries
+            if (cur := entry.get("version"))
+            and (lat := entry.get("latest_version"))
+            and cur != lat
+            and normalise_pkg_name(entry["name"]) in direct_deps
+        ]
+    except ValidationError as e:
+        msg = f"Unexpected uv output: {e}"
+        raise OutdatedCheckError(msg) from e
 
 
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `bun outdated` without progress output and parse the table output."""
     cmd = ["bun", "outdated", "--no-progress"]
-    completed = _run_checked(
+    completed = run_captured(
         cmd,
-        cwd=project.path,
+        project.path,
         timeout=120,
         label="bun outdated",
-        allow_nonzero_with_stdout=True,
+        error=OutdatedCheckError,
+        ok_codes=None,
     )
 
+    if completed.returncode != 0 and not completed.stdout.strip():
+        msg = (
+            f"bun outdated failed (exit {completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
+        raise OutdatedCheckError(msg)
     if not completed.stdout.strip():
         return []
 
@@ -113,11 +128,12 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         "versions:display-dependency-updates",
         "-DprocessDependencyManagement=false",
     ]
-    completed = _run_checked(
+    completed = run_captured(
         cmd,
-        cwd=project.path,
+        project.path,
         timeout=300,
         label="mvn versions:display-dependency-updates",
+        error=OutdatedCheckError,
     )
 
     return [
@@ -130,44 +146,6 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         for line in completed.stdout.splitlines()
         if (m := _MVN_UPDATE_RE.match(line))
     ]
-
-
-_CHECKERS = {
-    "bun": bun_outdated,
-    "uv": uv_outdated,
-    "mvn": mvn_outdated,
-    "gradle": discover_gradle_updates,
-}
-
-
-def _run_checked(
-    cmd: list[str],
-    cwd: str | Path,
-    timeout: int,
-    *,
-    label: str,
-    allow_nonzero_with_stdout: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess with common error handling."""
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise OutdatedCheckError(f"{label} timed out") from e
-
-    if completed.returncode != 0:
-        if allow_nonzero_with_stdout and completed.stdout.strip():
-            return completed
-        raise OutdatedCheckError(
-            f"{label} failed (exit {completed.returncode}): {completed.stderr.strip()}"
-        )
-    return completed
 
 
 def _parse_bun_table(output: str) -> list[dict[str, str]]:

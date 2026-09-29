@@ -4,21 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man.vcs import (
-    RevisionCheck,
-    bookmark_exists,
-    commit_current_change,
-    create_or_reset_bookmark,
-    current_change_has_changes,
-    delete_bookmark,
-    edit_new_change,
-    exact_commit_id,
-    is_ancestor,
-    main_commit_id,
-    promote_bookmark_to_main,
-    refresh_working_copy_from_main,
-    same_revision,
-)
+from maintenance_man.vcs import ExpectedRevisions, JjRepository, RevisionError
+from maintenance_man.vcs_workflow import refresh_working_copy_from_main
 
 pytestmark = [
     pytest.mark.integration,
@@ -45,21 +32,24 @@ def init_repo(tmp_path: Path) -> Path:
 
 
 def test_commit_then_move_bookmark_to_finished_commit(tmp_path: Path):
-    repo = init_repo(tmp_path)
-    assert create_or_reset_bookmark("mm/update-dependencies", repo, "main") is True
-    assert edit_new_change(repo, "mm/update-dependencies") is True
-    (repo / "README.md").write_text("changed\n")
-    assert current_change_has_changes(repo) is True
-    assert commit_current_change(repo, "change readme") is True
-    assert create_or_reset_bookmark("mm/update-dependencies", repo, "@-") is True
-    assert bookmark_exists("mm/update-dependencies", repo) is True
-    assert delete_bookmark("mm/update-dependencies", repo) is True
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
+    bookmark = "mm/update-dependencies"
+    repo.create_bookmark(bookmark=bookmark, revision="main")
+    repo.new_change(revision=bookmark)
+    (path / "README.md").write_text("changed\n")
+    assert repo.has_changes()
+    repo.commit(message="change readme")
+    repo.set_bookmark(bookmark=bookmark, revision="@-")
+    assert repo.bookmark_exists(bookmark=bookmark)
+    repo.delete_bookmark(bookmark=bookmark)
+    assert not repo.bookmark_exists(bookmark=bookmark)
 
 
 def test_promote_then_refresh_default_workspace_updates_files(tmp_path: Path):
-    repo = init_repo(tmp_path)
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
     workspace = tmp_path / "workspace"
-
     assert (
         run(
             [
@@ -72,172 +62,157 @@ def test_promote_then_refresh_default_workspace_updates_files(tmp_path: Path):
                 "-r",
                 "main",
             ],
-            repo,
+            path,
         ).returncode
         == 0
     )
-    assert create_or_reset_bookmark("mm/update-dependencies", repo, "main") is True
-    assert edit_new_change(workspace, "mm/update-dependencies") is True
+    base = repo.resolve_revision(revision="main")
+    bookmark = "mm/update-dependencies"
+    update = JjRepository(workspace)
+    update.new_change(revision="main")
+    update.create_bookmark(bookmark=bookmark, revision="main")
     (workspace / "README.md").write_text("updated\n")
-    assert commit_current_change(workspace, "update readme") is True
-    assert create_or_reset_bookmark("mm/update-dependencies", workspace, "@-") is True
+    update.commit(message="update readme")
+    update.set_bookmark(bookmark=bookmark, revision="@-")
+    tip = update.resolve_revision(revision=bookmark)
 
-    assert promote_bookmark_to_main(repo, "mm/update-dependencies") is True
-    assert repo.joinpath("README.md").read_text() == "initial\n"
+    repo.promote_bookmark_to_main(
+        bookmark=bookmark, expected=ExpectedRevisions(base=base, tip=tip)
+    )
+    assert path.joinpath("README.md").read_text() == "initial\n"
 
-    assert refresh_working_copy_from_main(repo) is True
-
-    assert repo.joinpath("README.md").read_text() == "updated\n"
-
-
-def test_revision_relationship_helpers_with_real_jj_repo(tmp_path: Path):
-    repo = init_repo(tmp_path)
-    assert _jj(repo, "bookmark", "set", "main", "-r", "@").returncode == 0
-    assert _jj(repo, "new", "main").returncode == 0
-    assert _jj(repo, "describe", "-m", "child").returncode == 0
-    assert _jj(repo, "bookmark", "set", "child", "-r", "@").returncode == 0
-
-    assert same_revision(repo, "main", "main") == RevisionCheck(ok=True, value=True)
-    assert same_revision(repo, "main", "child") == RevisionCheck(ok=True, value=False)
-    assert is_ancestor(repo, "main", "child") == RevisionCheck(ok=True, value=True)
-    assert is_ancestor(repo, "child", "main") == RevisionCheck(ok=True, value=False)
+    refresh_working_copy_from_main(repo=repo)
+    assert path.joinpath("README.md").read_text() == "updated\n"
 
 
-def test_main_commit_id_tracks_content_changes(tmp_path: Path):
-    repo = init_repo(tmp_path)
+def test_revision_relationship_methods_with_real_jj_repo(tmp_path: Path):
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
+    assert _jj(path, "bookmark", "set", "main", "-r", "@").returncode == 0
+    assert _jj(path, "new", "main").returncode == 0
+    assert _jj(path, "describe", "-m", "child").returncode == 0
+    assert _jj(path, "bookmark", "set", "child", "-r", "@").returncode == 0
 
-    first = main_commit_id(repo)
-    assert first.ok is True
-    assert first.commit_id
-
-    assert _jj(repo, "new", "main").returncode == 0
-    (repo / "README.md").write_text("v2\n")
-    assert _jj(repo, "commit", "-m", "v2").returncode == 0
-    assert _jj(repo, "bookmark", "set", "main", "-r", "@-").returncode == 0
-
-    second = main_commit_id(repo)
-    assert second.ok is True
-    assert second.commit_id != first.commit_id
-
-    # No change between two resolves → stable identity (no spurious redeploy).
-    third = main_commit_id(repo)
-    assert third.commit_id == second.commit_id
+    assert repo.same_revision(left="main", right="main")
+    assert not repo.same_revision(left="main", right="child")
+    assert repo.is_ancestor(ancestor="main", descendant="child")
+    assert not repo.is_ancestor(ancestor="child", descendant="main")
 
 
-def test_main_commit_id_changes_on_amend(tmp_path: Path):
-    """Amending the deployed tip changes commit_id (why change_id was rejected)."""
-    repo = init_repo(tmp_path)
-    before = main_commit_id(repo)
+def test_main_revision_tracks_content_changes(tmp_path: Path):
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
+    first = repo.resolve_revision(revision="main")
 
-    assert _jj(repo, "edit", "main").returncode == 0
-    (repo / "README.md").write_text("amended\n")
+    assert _jj(path, "new", "main").returncode == 0
+    (path / "README.md").write_text("v2\n")
+    assert _jj(path, "commit", "-m", "v2").returncode == 0
+    assert _jj(path, "bookmark", "set", "main", "-r", "@-").returncode == 0
 
-    # The next main_commit_id call runs jj, which snapshots the working copy
-    # and auto-amends the edited commit — that is what changes the commit_id.
-    after = main_commit_id(repo)
-    assert after.ok is True
-    assert after.commit_id != before.commit_id
+    second = repo.resolve_revision(revision="main")
+    assert second != first
+    assert repo.resolve_revision(revision="main") == second
 
 
-def test_main_commit_id_unresolved_without_bookmark(tmp_path: Path):
-    repo = tmp_path / "repo-no-main"
-    repo.mkdir()
-    run(["jj", "git", "init", "--colocate"], repo)
-    result = main_commit_id(repo)
-    assert result.ok is False
+def test_main_revision_changes_on_amend(tmp_path: Path):
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
+    before = repo.resolve_revision(revision="main")
+
+    assert _jj(path, "edit", "main").returncode == 0
+    (path / "README.md").write_text("amended\n")
+
+    after = repo.resolve_revision(revision="main")
+    assert after != before
+
+
+def test_resolve_main_raises_without_bookmark(tmp_path: Path):
+    path = tmp_path / "repo-no-main"
+    path.mkdir()
+    run(["jj", "git", "init", "--colocate"], path)
+    with pytest.raises(RevisionError):
+        JjRepository(path).resolve_revision(revision="main")
 
 
 def test_refresh_rebases_reusable_empty_working_copy(tmp_path: Path):
-    repo = init_repo(tmp_path)
-    assert _jj(repo, "bookmark", "set", "main", "-r", "@").returncode == 0
-    assert _jj(repo, "new", "main").returncode == 0
-    before = _jj(repo, "log", "-r", "@", "--no-graph", "-T", "change_id").stdout.strip()
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
+    assert _jj(path, "bookmark", "set", "main", "-r", "@").returncode == 0
+    assert _jj(path, "new", "main").returncode == 0
+    before = repo.change_id()
 
-    assert refresh_working_copy_from_main(repo) is True
-    assert (
-        _jj(repo, "log", "-r", "@", "--no-graph", "-T", "change_id").stdout.strip()
-        == before
-    )
+    refresh_working_copy_from_main(repo=repo)
+    assert repo.change_id() == before
 
-    workspace = tmp_path / "advance-workspace"
-    assert (
-        _jj(
-            repo, "workspace", "add", "--name", "advance", str(workspace), "-r", "main"
-        ).returncode
-        == 0
-    )
-    test_file = workspace / "sync.txt"
-    test_file.write_text("sync\n")
-    assert _jj(workspace, "describe", "-m", "advance main").returncode == 0
-    assert _jj(workspace, "bookmark", "set", "main", "-r", "@").returncode == 0
+    repo.create_bookmark(bookmark="keep-empty", revision="@")
+    assert _jj(path, "new", "main").returncode == 0
+    (path / "sync.txt").write_text("sync\n")
+    assert _jj(path, "describe", "-m", "advance main").returncode == 0
+    assert _jj(path, "bookmark", "set", "main", "-r", "@").returncode == 0
+    assert _jj(path, "edit", "keep-empty").returncode == 0
+    repo.delete_bookmark(bookmark="keep-empty")
 
-    assert refresh_working_copy_from_main(repo) is True
-
-    after = _jj(repo, "log", "-r", "@", "--no-graph", "-T", "change_id").stdout.strip()
-    parent_bookmarks = _jj(
-        repo, "log", "-r", "@-", "--no-graph", "-T", 'bookmarks.join(" ")'
-    ).stdout.strip()
-
-    assert after == before
-    assert "main" in parent_bookmarks
+    refresh_working_copy_from_main(repo=repo)
+    assert repo.change_id() == before
+    assert "main" in repo.revision_bookmarks(revision="@-")
 
 
 @pytest.mark.parametrize("mutation", ["none", "main", "tip", "conflict"])
 def test_gradle_promotion_checks_exact_base_and_tip_in_operation(tmp_path, mutation):
-    repo = init_repo(tmp_path)
-    base = exact_commit_id(repo, "main")
-    (repo / "README.md").write_text("accepted update\n")
-    assert commit_current_change(repo, "accepted update")
-    tip = exact_commit_id(repo, "@-")
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
+    base = repo.resolve_revision(revision="main")
+    (path / "README.md").write_text("accepted update\n")
+    repo.commit(message="accepted update")
+    tip = repo.resolve_revision(revision="@-")
     bookmark = "mm/update-dependencies"
-    assert create_or_reset_bookmark(bookmark, repo, tip)
+    repo.create_bookmark(bookmark=bookmark, revision=tip)
     if mutation == "main":
-        assert create_or_reset_bookmark("main", repo, tip)
+        repo.set_bookmark(bookmark="main", revision=tip)
     elif mutation == "tip":
         assert (
             _jj(
-                repo, "bookmark", "set", bookmark, "-r", base, "--allow-backwards"
+                path, "bookmark", "set", bookmark, "-r", base, "--allow-backwards"
             ).returncode
             == 0
         )
     elif mutation == "conflict":
-        assert _jj(repo, "new", base).returncode == 0
-        (repo / "README.md").write_text("side\n")
-        assert commit_current_change(repo, "side")
-        side = exact_commit_id(repo, "@-")
+        assert _jj(path, "new", base).returncode == 0
+        (path / "README.md").write_text("side\n")
+        repo.commit(message="side")
+        side = repo.resolve_revision(revision="@-")
         op = _jj(
-            repo, "op", "log", "--limit", "1", "--no-graph", "-T", "id"
+            path, "op", "log", "--limit", "1", "--no-graph", "-T", "id"
         ).stdout.strip()
-        assert _jj(repo, "bookmark", "set", "main", "-r", tip).returncode == 0
+        assert _jj(path, "bookmark", "set", "main", "-r", tip).returncode == 0
         assert (
-            _jj(repo, "--at-op", op, "bookmark", "set", "main", "-r", side).returncode
+            _jj(path, "--at-op", op, "bookmark", "set", "main", "-r", side).returncode
             == 0
         )
-        reconciled = _jj(repo, "bookmark", "list", "main")
-        assert reconciled.returncode == 0
-        assert "conflict" in reconciled.stdout
-    before = _jj(repo, "bookmark", "list", "main").stdout
-    promoted = promote_bookmark_to_main(
-        repo, bookmark, expected_base=base, expected_tip=tip
-    )
-    assert promoted is (mutation == "none")
+        assert "conflict" in _jj(path, "bookmark", "list", "main").stdout
+    before = _jj(path, "bookmark", "list", "main").stdout
     if mutation == "none":
-        assert exact_commit_id(repo, "main") == tip
+        repo.promote_bookmark_to_main(
+            bookmark=bookmark, expected=ExpectedRevisions(base=base, tip=tip)
+        )
+        assert repo.resolve_revision(revision="main") == tip
     else:
-        assert _jj(repo, "bookmark", "list", "main").stdout == before
+        with pytest.raises(RevisionError):
+            repo.promote_bookmark_to_main(
+                bookmark=bookmark, expected=ExpectedRevisions(base=base, tip=tip)
+            )
+        assert _jj(path, "bookmark", "list", "main").stdout == before
 
 
-def test_gradle_revision_tree_identity_tracks_content_not_commit_metadata(tmp_path):
-    from maintenance_man.vcs import revision_tree_id
-
-    repo = init_repo(tmp_path)
-    original = revision_tree_id(repo, "main")
-    assert original == revision_tree_id(repo)
-    assert _jj(repo, "describe", "-m", "metadata only").returncode == 0
-    assert original == revision_tree_id(repo)
-    (repo / "README.md").write_text("different content\n")
-    changed = revision_tree_id(repo)
-    assert changed != original
-    assert original == revision_tree_id(repo, "main")
-    (repo / "README.md").write_text("initial\n")
-    assert revision_tree_id(repo) == original
+def test_gradle_tree_identity_tracks_content_not_commit_metadata(tmp_path):
+    path = init_repo(tmp_path)
+    repo = JjRepository(path)
+    original = repo.tree_id(revision="main")
+    assert original == repo.tree_id()
+    assert _jj(path, "describe", "-m", "metadata only").returncode == 0
+    assert original == repo.tree_id()
+    (path / "README.md").write_text("different content\n")
+    assert repo.tree_id() != original
+    assert repo.tree_id(revision="main") == original
+    (path / "README.md").write_text("initial\n")
+    assert repo.tree_id() == original

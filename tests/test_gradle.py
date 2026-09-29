@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -16,23 +17,22 @@ from maintenance_man.gradle import (
     apply_gradle_update,
     claim_owned_dir,
     discover_gradle_updates,
-    generate_gradle_inventory,
     normalise_alias,
+    owned_gradle_inventory,
     parse_catalogue,
     render_selected_report,
-    resolve_gradle_vulnerability_target,
     validate_gradle_recovery,
     validate_gradle_target,
     workspace_environment_reason,
 )
+from maintenance_man.gradle_resolution import generate_gradle_report
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
-    GradleBlock,
     GradleMember,
     GradleUpdateTarget,
     SemverTier,
 )
-from tests.conftest import GRADLE_FIXTURES, make_gradle_target, make_vuln
+from tests.conftest import GRADLE_FIXTURES, fixture_runner, make_gradle_target
 
 
 def _digest(path: Path) -> str:
@@ -76,6 +76,16 @@ def _clean_report() -> str:
 _NO_UPDATES_OUTPUT = "There are no updates available\n"
 
 
+def _parse_fixture_catalogue(mode: str):
+    from maintenance_man.gradle import parse_catalogue_text
+
+    path = GRADLE_FIXTURES / "libs.versions.toml"
+    if mode == "file":
+        return parse_catalogue(path)
+    return parse_catalogue_text(path.read_text(encoding="utf-8"), source=str(path))
+
+
+@pytest.mark.parametrize("mode", ["file", "text"])
 class TestParseCatalogue:
     @pytest.mark.parametrize(
         "kind, alias, coordinate, version_ref, inline_version, unsupported",
@@ -102,9 +112,9 @@ class TestParseCatalogue:
         ],
     )
     def test_supported_declarations(
-        self, kind, alias, coordinate, version_ref, inline_version, unsupported
+        self, mode, kind, alias, coordinate, version_ref, inline_version, unsupported
     ):
-        catalogue = parse_catalogue(GRADLE_FIXTURES / "libs.versions.toml")
+        catalogue = _parse_fixture_catalogue(mode)
         entry = catalogue.entries[(kind, normalise_alias(alias))]
 
         assert entry.coordinate == coordinate
@@ -112,22 +122,107 @@ class TestParseCatalogue:
         assert entry.inline_version == inline_version
         assert entry.unsupported == unsupported
 
-    def test_rich_version_reference_is_unsupported(self):
-        catalogue = parse_catalogue(GRADLE_FIXTURES / "libs.versions.toml")
+    def test_rich_version_reference_is_unsupported(self, mode):
+        catalogue = _parse_fixture_catalogue(mode)
 
         assert catalogue.versions["okhttp"].value is None
         assert "rich version" in (catalogue.versions["okhttp"].unsupported or "")
 
-    def test_missing_catalogue_raises(self, tmp_path):
-        with pytest.raises(GradleError, match="not found"):
-            parse_catalogue(tmp_path / "gradle" / "libs.versions.toml")
+    def test_malformed_catalogue_raises(self, mode, tmp_path):
+        from maintenance_man.gradle import parse_catalogue_text
 
-    def test_malformed_catalogue_raises(self, tmp_path):
         bad = tmp_path / "libs.versions.toml"
         bad.write_text("[versions\nroom = ", encoding="utf-8")
 
-        with pytest.raises(GradleError, match="Failed to parse"):
-            parse_catalogue(bad)
+        with pytest.raises(GradleError, match="Failed to parse") as caught:
+            if mode == "file":
+                parse_catalogue(bad)
+            else:
+                parse_catalogue_text(bad.read_text(encoding="utf-8"), source=str(bad))
+        assert isinstance(caught.value.__cause__, tomllib.TOMLDecodeError)
+
+
+@pytest.mark.parametrize("version", ['"1.2"', '{ strictly = "1.2" }'])
+def test_catalogue_text_preserves_supported_and_rich_versions(tmp_path, version):
+    from maintenance_man.gradle import parse_catalogue_text
+
+    text = (
+        f"[versions]\nv = {version}\n[libraries]\n"
+        'lib = { module = "g:lib", version.ref = "v" }\n'
+    )
+    path = tmp_path / "libs.versions.toml"
+    path.write_text(text, encoding="utf-8")
+    parsed = parse_catalogue_text(text, source=str(path))
+    assert parsed == parse_catalogue(path)
+    entry = parsed.entry("library", "lib")
+    assert entry is not None and entry.coordinate == "g:lib"
+    value = parsed.version_of(entry)
+    assert value is not None
+    assert value.value == ("1.2" if version == '"1.2"' else None)
+    assert (value.unsupported is not None) is (version != '"1.2"')
+
+
+@pytest.mark.parametrize(
+    "parser, text",
+    [
+        ("catalogue", "[versions]\nv =\n"),
+        ("catalogue", "libraries = []\n"),
+        ("report", '[libraries]\nlib = "g:a"\n'),
+        ("report", '[plugins]\np = "id:1:extra"\n'),
+    ],
+)
+def test_malformed_text_names_its_source(parser, text):
+    from maintenance_man.gradle import parse_catalogue_text, parse_update_report_text
+
+    parse = parse_catalogue_text if parser == "catalogue" else parse_update_report_text
+    with pytest.raises(GradleError, match="<test-source>"):
+        parse(text, source="<test-source>")
+
+
+def test_report_text_yields_library_and_plugin_proposals():
+    from maintenance_man.gradle import ReportProposal, parse_update_report_text
+
+    proposals = parse_update_report_text(
+        '[libraries]\nlib = "g:lib:2"\n[plugins]\np = "org.example:3"\n'
+    )
+    assert proposals == [
+        ReportProposal("library", "lib", "g:lib", "2"),
+        ReportProposal("plugin", "p", "org.example", "3"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "before, after, reported, raises",
+    [
+        ("a", "a", None, False),
+        ("a", "a", "a", False),
+        ("a", "b", None, True),
+        ("a", "a", "b", True),
+    ],
+)
+def test_require_catalogue_unchanged(before, after, reported, raises):
+    from maintenance_man.gradle import require_catalogue_unchanged
+
+    def call():
+        require_catalogue_unchanged(
+            before, after, message="catalogue moved", reported_digest=reported
+        )
+
+    if raises:
+        with pytest.raises(GradleError, match=r"^catalogue moved$"):
+            call()
+    else:
+        call()
+
+
+def test_file_digest_is_sha256_and_lets_oserror_escape(tmp_path):
+    from maintenance_man.gradle import file_digest
+
+    path = tmp_path / "f"
+    path.write_bytes(b"abc")
+    assert file_digest(path) == hashlib.sha256(b"abc").hexdigest()
+    with pytest.raises(FileNotFoundError):
+        file_digest(tmp_path / "missing")
 
 
 class TestDiscoverGradleUpdates:
@@ -512,109 +607,48 @@ class TestDiscoverGradleUpdates:
         assert kwargs["stdin"] is subprocess.DEVNULL
 
 
-class TestGenerateGradleInventory:
-    def _wrapper_writing(self, fixture: str | None, *, returncode: int = 0):
-        def _run(cmd, **kwargs):
-            root = Path(kwargs["cwd"])
-            if fixture is not None:
-                bom = root / GRADLE_INVENTORY_BOM_RELPATH
-                bom.parent.mkdir(parents=True, exist_ok=True)
-                bom.write_text(
-                    (GRADLE_FIXTURES / fixture).read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
-            return subprocess.CompletedProcess(
-                cmd, returncode, stdout="", stderr="boom"
-            )
+def _report_wrapper(*, returncode: int = 0):
+    """subprocess.run substitute that writes a valid BOM and exits *returncode*."""
 
-        return _run
+    def _run(cmd, **kwargs):
+        bom = Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH
+        bom.write_text(
+            (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr="boom")
 
+    return _run
+
+
+class TestGradleReportInventory:
     def test_yields_a_validated_inventory_and_releases_it(
         self, gradle_project, monkeypatch
     ):
-        calls: list[list[str]] = []
-
-        def _record(cmd, **kwargs):
-            calls.append(cmd)
-            return self._wrapper_writing("bom.json")(cmd, **kwargs)
-
-        monkeypatch.setattr(subprocess, "run", _record)
+        monkeypatch.setattr(
+            "maintenance_man.gradle_resolution.run_gradle", fixture_runner
+        )
         root = Path(gradle_project.path)
 
-        with generate_gradle_inventory(gradle_project) as bom:
+        with generate_gradle_report(gradle_project) as generated:
+            bom = generated.bom_path
             assert bom == root / GRADLE_INVENTORY_BOM_RELPATH
             assert json.loads(bom.read_text())["specVersion"] == "1.6"
 
         assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-        assert calls[0][1:] == [
-            "cyclonedxBom",
-            "--no-daemon",
-            "--console=plain",
-            "--rerun-tasks",
-            "--no-build-cache",
-        ]
 
-    @pytest.mark.parametrize(
-        "fixture, returncode, expected",
-        [
-            (None, 0, "produced no inventory"),
-            ("bom-empty.json", 0, "no components"),
-            ("bom-non-maven.json", 0, "no Maven components"),
-            ("bom.json", 1, r"failed \(exit 1\)"),
-        ],
-    )
-    def test_unusable_inventory_is_an_error_not_a_clean_scan(
-        self, gradle_project, monkeypatch, fixture, returncode, expected
+    def test_failed_wrapper_is_an_error_not_a_clean_scan(
+        self, gradle_project, monkeypatch
     ):
-        monkeypatch.setattr(
-            subprocess, "run", self._wrapper_writing(fixture, returncode=returncode)
-        )
+        monkeypatch.setattr(subprocess, "run", _report_wrapper(returncode=1))
 
-        with pytest.raises(GradleError, match=expected):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("unusable inventory must not be yielded")
+        with (
+            pytest.raises(GradleError, match=r"failed \(exit 1\): boom$"),
+            generate_gradle_report(gradle_project),
+        ):
+            pytest.fail("failed wrapper must not yield an inventory")
 
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
-
-    @pytest.mark.parametrize(
-        "spec, accepted",
-        [("1.5", True), ("1.6", True), ("1.7", True), ("1.4", False), ("junk", False)],
-    )
-    def test_spec_version_is_a_floor_not_an_equality(
-        self, gradle_project, monkeypatch, spec, accepted
-    ):
-        """A CycloneDX patch bump must not brick every Gradle scan."""
-        document = json.loads((GRADLE_FIXTURES / "bom.json").read_text())
-        document["specVersion"] = spec
-
-        def _run(cmd, **kwargs):
-            bom = Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH
-            bom.parent.mkdir(parents=True, exist_ok=True)
-            bom.write_text(json.dumps(document), encoding="utf-8")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(subprocess, "run", _run)
-
-        if accepted:
-            with generate_gradle_inventory(gradle_project) as bom:
-                assert bom.is_file()
-        else:
-            with pytest.raises(GradleError, match="1.5 or later"):
-                with generate_gradle_inventory(gradle_project):
-                    pytest.fail("unsupported spec version must not be yielded")
-
-    def test_malformed_inventory_json_is_an_error(self, gradle_project, monkeypatch):
-        def _run(cmd, **kwargs):
-            bom = Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH
-            bom.parent.mkdir(parents=True, exist_ok=True)
-            bom.write_text("{not json", encoding="utf-8")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(subprocess, "run", _run)
-
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("unreachable")
 
     def test_existing_inventory_directory_is_a_collision(
         self, gradle_project, monkeypatch
@@ -626,38 +660,13 @@ class TestGenerateGradleInventory:
             subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
         )
 
-        with pytest.raises(GradleError, match="Refusing to overwrite"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("unreachable")
+        with (
+            pytest.raises(GradleError, match="Refusing to overwrite"),
+            generate_gradle_report(gradle_project),
+        ):
+            pytest.fail("unreachable")
 
         assert (owned / "keep.txt").read_text(encoding="utf-8") == "caller owned\n"
-
-    @pytest.mark.parametrize(
-        "document",
-        [
-            [],
-            None,
-            {"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [None]},
-            {
-                "bomFormat": "CycloneDX",
-                "specVersion": "1.6",
-                "components": {"purl": "pkg:maven/g/a@1"},
-            },
-        ],
-    )
-    def test_malformed_inventory_structure_is_a_gradle_error(
-        self, gradle_project, monkeypatch, document
-    ):
-        def _run(cmd, **kwargs):
-            bom = Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH
-            bom.write_text(json.dumps(document), encoding="utf-8")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(subprocess, "run", _run)
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("malformed inventory must not be yielded")
-        assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
     @pytest.mark.parametrize("symlink_marker", [False, True])
     def test_inventory_symlinks_preserve_caller_bytes(
@@ -677,9 +686,11 @@ class TestGenerateGradleInventory:
         monkeypatch.setattr(
             subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
         )
-        with pytest.raises(GradleError, match="Refusing to overwrite"):
-            with generate_gradle_inventory(gradle_project):
-                pytest.fail("caller inventory must not be yielded")
+        with (
+            pytest.raises(GradleError, match="Refusing to overwrite"),
+            generate_gradle_report(gradle_project),
+        ):
+            pytest.fail("caller inventory must not be yielded")
         assert keep.read_bytes() == b"caller bytes\n"
         if symlink_marker:
             assert (inventory / "keep.txt").read_bytes() == b"inventory caller bytes\n"
@@ -689,135 +700,59 @@ class TestGenerateGradleInventory:
     def test_body_exception_still_releases_the_inventory(
         self, gradle_project, monkeypatch
     ):
-        monkeypatch.setattr(subprocess, "run", self._wrapper_writing("bom.json"))
+        monkeypatch.setattr(
+            "maintenance_man.gradle_resolution.run_gradle", fixture_runner
+        )
 
-        with pytest.raises(ValueError):
-            with generate_gradle_inventory(gradle_project):
-                raise ValueError("caller failed")
+        with pytest.raises(ValueError), generate_gradle_report(gradle_project):
+            msg = "caller failed"
+            raise ValueError(msg)
 
         assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
+    def test_caller_exception_propagates_unchanged(self, gradle_project, monkeypatch):
+        monkeypatch.setattr(
+            "maintenance_man.gradle_resolution.run_gradle", fixture_runner
+        )
+        error = OSError("caller failure")
+        with pytest.raises(OSError) as caught, generate_gradle_report(gradle_project):
+            raise error
+        assert caught.value is error
+        assert not (Path(gradle_project.path) / GRADLE_INVENTORY_RELPATH).exists()
 
-class TestResolveGradleVulnerabilityTarget:
-    @pytest.mark.parametrize(
-        "pkg_name, fixed, kind, reason_fragment",
-        [
-            ("com.squareup.okhttp3:okhttp", "4.12.1", "mapping", "rich version"),
-            (
-                "org.jetbrains:annotations",
-                "24.0.0",
-                "mapping",
-                "no catalogue library owns",
-            ),
-            ("androidx.compose.ui:ui", "1.9.1", "mapping", "platform/BOM managed"),
-            (
-                "androidx.room:room-runtime",
-                "2.8.5, 2.9.0",
-                "conflict",
-                "single exact fix version",
-            ),
-            (
-                "androidx.room:room-runtime",
-                ">=2.8.5",
-                "conflict",
-                "single exact fix version",
-            ),
-            (
-                "com.google.devtools.ksp",
-                "2.3.12",
-                "mapping",
-                "no catalogue library owns",
-            ),
-        ],
-    )
-    def test_unsafe_advisories_are_blocked(
-        self, gradle_project, pkg_name, fixed, kind, reason_fragment
+
+def test_report_generation_refuses_catalogue_mutation(gradle_project, monkeypatch):
+    root = Path(gradle_project.path)
+
+    def mutating(root_arg, args, *, label):
+        completed = fixture_runner(root_arg, args, label=label)
+        catalogue = root / GRADLE_CATALOGUE_RELPATH
+        catalogue.write_text(catalogue.read_text() + "# drift\n")
+        return completed
+
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", mutating)
+    with (
+        pytest.raises(GradleError, match="Catalogue changed during report generation"),
+        generate_gradle_report(gradle_project),
     ):
-        finding = make_vuln(pkg_name=pkg_name, fixed_version=fixed)
-
-        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
-
-        assert isinstance(outcome, GradleBlock)
-        assert outcome.kind == kind
-        assert reason_fragment in outcome.reason
-
-    def test_shared_reference_advisory_resolves_the_whole_group(self, gradle_project):
-        finding = make_vuln(
-            pkg_name="androidx.room:room-compiler",
-            installed_version="2.8.4",
-            fixed_version="2.8.5",
-        )
-
-        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
-
-        assert isinstance(outcome, GradleUpdateTarget)
-        assert outcome.version_ref == "room"
-        assert outcome.target_version == "2.8.5"
-        assert [m.alias for m in outcome.members] == [
-            "room-runtime",
-            "room-compiler",
-            "room-testing",
-        ]
-
-    def test_inline_advisory_resolves_one_member(self, gradle_project):
-        finding = make_vuln(
-            pkg_name="com.google.code.gson:gson",
-            installed_version="2.11.0",
-            fixed_version="2.12.0",
-        )
-
-        outcome = resolve_gradle_vulnerability_target(gradle_project, finding)
-
-        assert isinstance(outcome, GradleUpdateTarget)
-        assert outcome.version_ref is None
-        assert [m.alias for m in outcome.members] == ["gson"]
-
-
-@pytest.mark.parametrize(
-    "first_version, second_version, blocked",
-    [
-        ('version = "1.0"', 'version = "1.0"', True),
-        ('version = "1.0"', 'version = "1.1"', True),
-        ('version.ref = "shared-version"', 'version.ref = "shared_version"', False),
-        ('version.ref = "shared-version"', 'version.ref = "independent"', True),
-    ],
-)
-def test_advisory_mapping_distinguishes_independent_alias_identity(
-    gradle_project, first_version, second_version, blocked
-):
-    catalogue = Path(gradle_project.path) / "gradle/libs.versions.toml"
-    catalogue.write_text(
-        '[versions]\nshared-version = "1.0"\nindependent = "1.0"\n'
-        "[libraries]\n"
-        f'first = {{ module = "g:artifact", {first_version} }}\n'
-        f'second = {{ module = "g:artifact", {second_version} }}\n',
-        encoding="utf-8",
-    )
-    outcome = resolve_gradle_vulnerability_target(
-        gradle_project,
-        make_vuln(pkg_name="g:artifact", installed_version="1.0", fixed_version="2.0"),
-    )
-    if blocked:
-        assert isinstance(outcome, GradleBlock)
-        assert outcome.kind == "conflict"
-    else:
-        assert isinstance(outcome, GradleUpdateTarget)
-        assert [member.alias for member in outcome.members] == ["first", "second"]
+        pytest.fail("mutated catalogue must not yield a report")
+    assert not (root / GRADLE_INVENTORY_RELPATH).exists()
 
 
 def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
-    monkeypatch.setattr(
-        subprocess, "run", TestGenerateGradleInventory()._wrapper_writing("bom.json")
-    )
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", fixture_runner)
 
     def _cannot_remove(*args, **kwargs):
         if not kwargs.get("ignore_errors"):
-            raise PermissionError("cleanup denied")
+            msg = "cleanup denied"
+            raise PermissionError(msg)
 
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
-    with pytest.raises(GradleError, match="cleanup denied"):
-        with generate_gradle_inventory(gradle_project) as bom:
-            assert bom.is_file()
+    with (
+        pytest.raises(GradleError, match="cleanup denied"),
+        generate_gradle_report(gradle_project) as generated,
+    ):
+        assert generated.bom_path.is_file()
 
 
 def _apply_wrapper(edits: dict[str, str] | None = None, *, returncode: int = 0):
@@ -898,7 +833,6 @@ class TestValidateGradleTarget:
     @pytest.mark.parametrize(
         "old, new, reason_fragment",
         [
-            ('room = "2.8.4"', 'room = "2.8.9"', "expected 2.8.4"),
             (
                 'room-testing = { group = "androidx.room", name = '
                 '"room-testing", version.ref = "room" }\n',
@@ -933,6 +867,91 @@ class TestValidateGradleTarget:
         assert block is not None
         assert block.kind == "stale"
         assert reason_fragment in block.reason
+
+    @pytest.mark.parametrize(
+        "replacements,kind,reason",
+        [
+            (
+                {
+                    'room = "2.8.4"': 'room = "9.9.9"',
+                    'room-runtime = { group = "androidx.room", name = '
+                    '"room-runtime", version.ref = "room" }\n': "",
+                },
+                "stale",
+                "the catalogue no longer declares library 'room-runtime'; "
+                "rescan required",
+            ),
+            (
+                {
+                    'group = "androidx.room", name = "room-runtime"': (
+                        'group = "example.changed", name = "room-runtime"'
+                    ),
+                    'room = "2.8.4"': 'room = { strictly = "2.8.4" }',
+                },
+                "stale",
+                "'room-runtime' now resolves to example.changed:room-runtime, not "
+                "androidx.room:room-runtime; rescan required",
+            ),
+            (
+                {
+                    'room-runtime = { group = "androidx.room", name = '
+                    '"room-runtime", version.ref = "room" }': (
+                        'room-runtime = { module = "androidx.room:room-runtime", '
+                        'version = { strictly = "2.8.4" } }'
+                    )
+                },
+                "mapping",
+                "'room-runtime' uses a rich version declaration, which mm does "
+                "not edit",
+            ),
+            (
+                {'room = "2.8.4"': 'room = { strictly = "2.8.4" }'},
+                "mapping",
+                "'room-runtime' no longer has a simple catalogue version; resolve "
+                "manually",
+            ),
+            (
+                {'room = "2.8.4"': 'room = "2.8.9"'},
+                "stale",
+                "'room-runtime' is at 2.8.9, expected 2.8.4; the catalogue no "
+                "longer matches the scan; note that an uncommitted catalogue edit "
+                "is not visible in the update workspace. Rescan required",
+            ),
+            (
+                {
+                    "room-runtime = {": "room_runtime = {",
+                    'room = "2.8.4"': 'room = { strictly = "2.8.4" }',
+                },
+                "mapping",
+                "'room-runtime' no longer has a simple catalogue version; resolve "
+                "manually",
+            ),
+            (
+                {
+                    "room-runtime = {": "room_runtime = {",
+                    'room = "2.8.4"': 'room = "2.8.9"',
+                },
+                "stale",
+                "'room-runtime' is at 2.8.9, expected 2.8.4; the catalogue no "
+                "longer matches the scan; note that an uncommitted catalogue edit "
+                "is not visible in the update workspace. Rescan required",
+            ),
+        ],
+    )
+    def test_member_validation_preserves_first_failure(
+        self, gradle_project, replacements, kind, reason
+    ):
+        catalogue = Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
+        text = catalogue.read_text(encoding="utf-8")
+        for old, new in replacements.items():
+            text = text.replace(old, new, 1)
+        catalogue.write_text(text, encoding="utf-8")
+
+        block = validate_gradle_target(gradle_project, make_gradle_target())
+
+        assert block is not None
+        assert block.kind == kind
+        assert block.reason == reason
 
 
 class TestApplyGradleUpdate:
@@ -999,6 +1018,17 @@ class TestApplyGradleUpdate:
                 },
                 0,
                 "unexpected change to 'gson'",
+            ),
+            (
+                {
+                    'room = "2.8.4"': 'room = "2.8.5"',
+                    'kotlin = "2.4.10"': 'kotlin = "2.4.20"',
+                    'gson = "com.google.code.gson:gson:2.11.0"': (
+                        'gson = "com.google.code.gson:gson:2.12.0"'
+                    ),
+                },
+                0,
+                "unexpected change to 'kotlin-stdlib'",
             ),
             (
                 {
@@ -1118,7 +1148,8 @@ def test_application_preserves_bundles_and_rich_declarations(
 
 def test_apply_execution_oserror_is_an_adapter_error(gradle_project, monkeypatch):
     def unavailable(cmd, **kwargs):
-        raise OSError("wrapper unavailable")
+        msg = "wrapper unavailable"
+        raise OSError(msg)
 
     monkeypatch.setattr(subprocess, "run", unavailable)
     with pytest.raises(GradleError, match="wrapper unavailable"):
@@ -1133,7 +1164,7 @@ def test_missing_wrapper_interpreter_is_gradle_error_and_cleans_owned_artifacts(
     (root / "gradlew").write_text("#!/definitely/missing/mm-interpreter\n")
     with pytest.raises(GradleError, match=r"gradlew.*No such file"):
         if operation == "inventory":
-            with generate_gradle_inventory(gradle_project):
+            with generate_gradle_report(gradle_project):
                 pytest.fail("unlaunchable wrapper cannot yield inventory")
         else:
             discover_gradle_updates(gradle_project)
@@ -1145,7 +1176,7 @@ def test_missing_wrapper_interpreter_is_gradle_error_and_cleans_owned_artifacts(
 def test_prospective_workspace_properties_are_not_sdk_evidence(
     gradle_project, tmp_path, monkeypatch
 ):
-    monkeypatch.setattr("maintenance_man.gradle.project_env", lambda: {})
+    monkeypatch.setattr("maintenance_man.gradle.project_env", dict)
     source = Path(gradle_project.path)
     (source / "local.properties").write_text("sdk.dir=/opt/android\n")
     workspace = tmp_path / "leftover"
@@ -1262,7 +1293,7 @@ def test_owned_output_parent_symlink_refuses_before_external_mutation(
         elif operation == "apply":
             apply_gradle_update(gradle_project, make_gradle_target())
         else:
-            with generate_gradle_inventory(gradle_project):
+            with generate_gradle_report(gradle_project):
                 pytest.fail("symlink parent cannot yield inventory")
     assert commands == []
     assert report.read_bytes() == b"external report bytes"
@@ -1273,18 +1304,16 @@ def test_owned_output_parent_symlink_refuses_before_external_mutation(
 def test_discovery_keeps_active_owned_inventory_context(gradle_project, monkeypatch):
     root = Path(gradle_project.path)
 
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", fixture_runner)
+
     def run(cmd, **kwargs):
-        if cmd[1] == "cyclonedxBom":
-            (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
-                (GRADLE_FIXTURES / "bom.json").read_bytes()
-            )
-        else:
-            assert cmd[1] == "versionCatalogUpdate"
-            (root / GRADLE_UPDATE_REPORT_RELPATH).write_text(_clean_report())
+        assert cmd[1] == "versionCatalogUpdate"
+        (root / GRADLE_UPDATE_REPORT_RELPATH).write_text(_clean_report())
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    with generate_gradle_inventory(gradle_project) as bom:
+    with generate_gradle_report(gradle_project) as generated:
+        bom = generated.bom_path
         before = bom.read_bytes()
         assert discover_gradle_updates(gradle_project)
         assert bom.read_bytes() == before
@@ -1329,7 +1358,8 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
         (inventory / "bom.json").write_bytes(b"old inventory")
 
         def fail(*args, **kwargs):
-            raise PermissionError("claim denied")
+            msg = "claim denied"
+            raise PermissionError(msg)
 
         monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
     elif phase == "mkdir":
@@ -1337,7 +1367,8 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
 
         def fail(path, *args, **kwargs):
             if path == inventory:
-                raise PermissionError("mkdir denied")
+                msg = "mkdir denied"
+                raise PermissionError(msg)
             return mkdir(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "mkdir", fail)
@@ -1346,7 +1377,8 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
 
         def fail(path, content):
             if path == marker:
-                raise PermissionError("marker denied")
+                msg = "marker denied"
+                raise PermissionError(msg)
             return write(path, content)
 
         monkeypatch.setattr(Path, "write_bytes", fail)
@@ -1355,9 +1387,11 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
         pytest.fail("setup failure must not launch wrapper")
 
     monkeypatch.setattr(subprocess, "run", forbidden)
-    with pytest.raises(GradleError, match="denied"):
-        with generate_gradle_inventory(gradle_project):
-            pytest.fail("setup failure must not yield")
+    with (
+        pytest.raises(GradleError, match="denied"),
+        generate_gradle_report(gradle_project),
+    ):
+        pytest.fail("setup failure must not yield")
     if phase == "claim":
         assert (inventory / "bom.json").read_bytes() == b"old inventory"
         assert marker.exists()
@@ -1380,7 +1414,8 @@ def test_report_lifecycle_filesystem_errors_are_gradle_errors(
 
         def fail(path, content):
             if path == marker:
-                raise PermissionError("report marker denied")
+                msg = "report marker denied"
+                raise PermissionError(msg)
             return write(path, content)
 
         monkeypatch.setattr(Path, "write_bytes", fail)
@@ -1394,7 +1429,8 @@ def test_report_lifecycle_filesystem_errors_are_gradle_errors(
 
         def fail(path, *args, **kwargs):
             if path == report:
-                raise PermissionError("report unlink denied")
+                msg = "report unlink denied"
+                raise PermissionError(msg)
             return unlink(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "unlink", fail)
@@ -1426,19 +1462,15 @@ def test_owned_context_cleanup_preserves_caller_exception(
     from maintenance_man.gradle import _owned_update_report
 
     root = Path(gradle_project.path)
-    monkeypatch.setattr(
-        subprocess, "run", TestGenerateGradleInventory()._wrapper_writing("bom.json")
-    )
     context = (
-        generate_gradle_inventory(gradle_project)
+        owned_gradle_inventory(gradle_project)
         if resource == "inventory"
         else _owned_update_report(root)
     )
-    with pytest.raises(type(exception)) as caught:
-        with context as output:
-            if resource == "report":
-                output.write_bytes(b"owned report")
-            raise exception
+    with pytest.raises(type(exception)) as caught, context as output:
+        if resource == "report":
+            output.write_bytes(b"owned report")
+        raise exception
     assert caught.value is exception
     assert not (root / GRADLE_INVENTORY_RELPATH).exists()
     assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()
@@ -1452,13 +1484,12 @@ def test_adapter_filesystem_read_failure_is_actionable_and_releases_outputs(
     root = Path(gradle_project.path)
     if read == "inventory":
         monkeypatch.setattr(
-            subprocess,
-            "run",
-            TestGenerateGradleInventory()._wrapper_writing("bom.json"),
+            "maintenance_man.gradle_resolution.run_gradle", fixture_runner
         )
     else:
         monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
-    method = Path.read_bytes if read == "digest" else Path.read_text
+    reads_bytes = read in {"digest", "inventory"}
+    method = Path.read_bytes if reads_bytes else Path.read_text
     blocked = root / (
         GRADLE_CATALOGUE_RELPATH
         if read == "digest"
@@ -1469,13 +1500,14 @@ def test_adapter_filesystem_read_failure_is_actionable_and_releases_outputs(
 
     def fail(path, *args, **kwargs):
         if path == blocked:
-            raise PermissionError("read denied")
+            msg = "read denied"
+            raise PermissionError(msg)
         return method(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes" if read == "digest" else "read_text", fail)
+    monkeypatch.setattr(Path, "read_bytes" if reads_bytes else "read_text", fail)
     with pytest.raises(GradleError, match="read denied"):
         if read == "inventory":
-            with generate_gradle_inventory(gradle_project):
+            with generate_gradle_report(gradle_project):
                 pytest.fail("failed validation must not yield")
         else:
             discover_gradle_updates(gradle_project)
@@ -1515,11 +1547,24 @@ def test_library_plugin_shared_history_validates_before_manual_recovery(
         'version.ref = "shared" }\n'
         '[plugins]\nbuild = { id = "org.example.plugin", version.ref = "shared" }\n'
     )
-    vuln = make_vuln(
-        pkg_name="org.example:library", installed_version="1.0.0", fixed_version="1.0.1"
+    target = GradleUpdateTarget(
+        version_ref="shared",
+        target_version="1.0.1",
+        members=[
+            GradleMember(
+                kind="library",
+                alias="runtime",
+                coordinate="org.example:library",
+                installed_version="1.0.0",
+            ),
+            GradleMember(
+                kind="plugin",
+                alias="build",
+                coordinate="org.example.plugin",
+                installed_version="1.0.0",
+            ),
+        ],
     )
-    target = resolve_gradle_vulnerability_target(gradle_project, vuln)
-    assert isinstance(target, GradleUpdateTarget)
     if not consistent:
         target.members[1].installed_version = "9.9.9"
     if reverse:
@@ -1558,7 +1603,8 @@ def test_present_falsey_report_table_is_not_a_clean_discovery(
 
 def test_wrapper_output_decode_failure_is_gradle_error(gradle_project, monkeypatch):
     def run(*args, **kwargs):
-        raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
+        msg = "utf8"
+        raise UnicodeDecodeError(msg, b"\xff", 0, 1, "invalid")
 
     monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(GradleError, match="gradlew"):
@@ -1566,11 +1612,34 @@ def test_wrapper_output_decode_failure_is_gradle_error(gradle_project, monkeypat
     assert not (Path(gradle_project.path) / GRADLE_REPORT_MARKER_RELPATH).exists()
 
 
-@pytest.mark.parametrize("parser", ["catalogue", "report"])
-def test_toml_invalid_utf8_is_gradle_error(tmp_path, parser):
+@pytest.mark.parametrize(
+    "parser, message",
+    [
+        ("catalogue", "Failed to parse version catalogue"),
+        ("report", "malformed version catalogue update report"),
+    ],
+)
+def test_toml_invalid_utf8_is_gradle_error(tmp_path, parser, message):
     from maintenance_man.gradle import parse_update_report
 
     path = tmp_path / "invalid.toml"
     path.write_bytes(b"\xff")
-    with pytest.raises(GradleError):
+    with pytest.raises(GradleError, match=message) as caught:
         (parse_catalogue if parser == "catalogue" else parse_update_report)(path)
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+def test_missing_catalogue_is_gradle_error_with_cause(tmp_path):
+    with pytest.raises(GradleError, match="not found") as caught:
+        parse_catalogue(tmp_path / "gradle" / "libs.versions.toml")
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+
+
+def test_missing_update_report_is_gradle_error_with_cause(tmp_path):
+    from maintenance_man.gradle import parse_update_report
+
+    with pytest.raises(
+        GradleError, match="malformed version catalogue update report"
+    ) as caught:
+        parse_update_report(tmp_path / "missing.toml")
+    assert isinstance(caught.value.__cause__, FileNotFoundError)

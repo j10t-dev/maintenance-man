@@ -1,20 +1,29 @@
+import dataclasses
 import hashlib
 import json
 import shutil
 import subprocess
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from maintenance_man import gradle_resolution as candidates
+from maintenance_man import paths, scanner
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GRADLE_INVENTORY_BOM_RELPATH,
     GradleError,
 )
+from maintenance_man.gradle_inventory import (
+    CycloneDxInventory,
+    load_inventory,
+    parse_inventory_text,
+)
+from maintenance_man.gradle_resolution import GeneratedGradleReport
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
@@ -24,17 +33,145 @@ from maintenance_man.models.scan import (
     Severity,
     UpdateFinding,
 )
+from maintenance_man.outdated import OutdatedCheckError
+from maintenance_man.package_managers import PACKAGE_MANAGERS
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import (
-    TrivyNotFoundError,
+    ScanError,
     _parse_uv_audit_vulns,
-    check_trivy_available,
     scan_project,
 )
-from tests.conftest import GRADLE_FIXTURES, make_update, make_vuln
+from maintenance_man.storage import load_scan_results
+from tests.conftest import (
+    GRADLE_FIXTURES,
+    completed,
+    fixture_runner,
+    make_update,
+    make_vuln,
+    ops_with_outdated,
+)
+from tests.fakes import FakeCommands
 
-_OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
+_OLD = datetime(2024, 1, 1, tzinfo=UTC)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def _quiet_uv_scan(monkeypatch):
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
+    monkeypatch.setattr(scanner, "_check_outdated", lambda *args: [])
+
+
+def test_scan_project_saves_through_storage(mm_home, tmp_path, monkeypatch):
+    _quiet_uv_scan(monkeypatch)
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+    result = scanner.scan_project("demo", project)
+    assert load_scan_results("demo") == result
+
+
+def test_scan_project_replaces_results_symlink(mm_home, tmp_path, monkeypatch):
+    _quiet_uv_scan(monkeypatch)
+    results = mm_home / "scan-results"
+    results.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("keep")
+    (results / "demo.json").symlink_to(outside)
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+    scanner.scan_project("demo", project)
+    assert not (results / "demo.json").is_symlink()
+    assert outside.read_text() == "keep"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OutdatedCheckError("uv sync --locked failed (exit 1): lock mismatch"),
+        RuntimeError("bug"),
+    ],
+)
+@pytest.mark.parametrize("previous", [b"previous result bytes", None])
+def test_outdated_failure_fails_the_scan_and_keeps_the_saved_result(
+    mm_home, tmp_path, monkeypatch, error, previous
+):
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
+    monkeypatch.setattr(
+        scanner, "package_manager_ops", ops_with_outdated(MagicMock(side_effect=error))
+    )
+    results = mm_home / "scan-results"
+    results.mkdir(parents=True)
+    if previous is not None:
+        (results / "demo.json").write_bytes(previous)
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+    with pytest.raises(type(error)):
+        scanner.scan_project("demo", project)
+    if previous is None:
+        assert not (results / "demo.json").exists()
+    else:
+        assert (results / "demo.json").read_bytes() == previous
+
+
+def test_uv_audit_runs_isolated_and_accepts_findings_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    commands = FakeCommands()
+    commands.add(
+        ("uv", "audit", "--locked"),
+        cwd=tmp_path,
+        result=completed(("uv", "audit", "--locked"), returncode=1),
+    )
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", commands)
+    assert scanner._run_uv_audit(tmp_path) == []
+    ((cmd, cwd, kwargs),) = commands.calls
+    assert cmd == ("uv", "audit", "--locked")
+    assert cwd == tmp_path
+    assert kwargs["timeout"] == 300
+    assert "VIRTUAL_ENV" not in kwargs["env"]
+
+
+@pytest.mark.parametrize(
+    "scan, match",
+    [
+        (lambda path: scanner._run_uv_audit(path), "uv audit"),
+        (lambda path: scanner._run_trivy_scan(path, scan_secrets=False), "Trivy"),
+    ],
+)
+@pytest.mark.parametrize(
+    "raised",
+    [
+        FileNotFoundError(2, "No such file or directory", "tool"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_scanner_execution_failure_is_a_scan_error(
+    tmp_path, monkeypatch, scan, match, raised
+):
+    def run(cmd, **kwargs):
+        raise raised
+
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    with pytest.raises(ScanError, match=match):
+        scan(tmp_path)
+
+
+def test_stale_comparison_context_is_a_gradle_error(gradle_project, monkeypatch):
+    monkeypatch.setattr(scanner, "context_inputs_valid", lambda *args: False)
+    with pytest.raises(GradleError, match="Comparison context expired"):
+        scanner.capture_gradle_snapshot(gradle_project, MagicMock())
+
+
+def test_capture_checks_the_context_at_the_injected_time(gradle_project, monkeypatch):
+    from tests.conftest import FakeClock
+
+    clock = FakeClock(datetime(2032, 2, 3, 4, 5, 6, tzinfo=UTC))
+    observed = []
+
+    def stale(context, project, now):
+        observed.append(now)
+        return False
+
+    monkeypatch.setattr(scanner, "context_inputs_valid", stale)
+    with pytest.raises(GradleError, match="Comparison context expired"):
+        scanner.capture_gradle_snapshot(gradle_project, MagicMock(), clock=clock)
+    assert observed == [clock.current]
 
 
 def _make_project(
@@ -83,15 +220,56 @@ class TestUvAuditParsing:
         assert vulns[0].fixed_version == "65.5.1"
 
 
-class TestCheckTrivyAvailable:
-    def test_trivy_is_available(self):
-        # Should not raise — trivy is installed on this machine
-        check_trivy_available()
+def _missing_trivy(name, hint):
+    msg = f"{name} is not installed or not on PATH. {hint}"
+    raise ToolNotFoundError(msg)
 
-    def test_trivy_not_available(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("PATH", "/nonexistent")
-        with pytest.raises(TrivyNotFoundError):
-            check_trivy_available()
+
+@pytest.mark.parametrize(
+    "manager, secrets, needs_trivy",
+    [
+        ("uv", False, False),
+        ("uv", True, True),
+        ("bun", False, True),
+        ("mvn", False, True),
+    ],
+)
+def test_scan_requires_trivy_only_for_trivy_work(
+    mm_home, tmp_path, monkeypatch, manager, secrets, needs_trivy
+):
+    monkeypatch.setattr(scanner, "require_tool", _missing_trivy)
+    # uv audit is independent; stub it so this test isolates Trivy work.
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
+    monkeypatch.setattr(
+        scanner, "package_manager_ops", ops_with_outdated(lambda project: [])
+    )
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail(
+            "no Trivy command may run without its prerequisite check"
+        ),
+    )
+    project = ProjectConfig(
+        path=tmp_path, package_manager=manager, scan_secrets=secrets
+    )
+    if needs_trivy:
+        with pytest.raises(ToolNotFoundError, match="trivy"):
+            scanner.scan_project("demo", project)
+    else:
+        assert scanner.scan_project("demo", project).vulnerabilities == []
+
+
+def test_gradle_scan_requires_trivy_before_generating_a_report(
+    gradle_project, monkeypatch
+):
+    monkeypatch.setattr(scanner, "require_tool", _missing_trivy)
+    monkeypatch.setattr(
+        scanner,
+        "generate_gradle_report",
+        lambda *args: pytest.fail("report without trivy"),
+    )
+    with pytest.raises(ToolNotFoundError, match="trivy"):
+        scanner.scan_gradle(gradle_project)
 
 
 @pytest.mark.integration
@@ -163,8 +341,14 @@ class TestScanProjectWithUpdates:
             ),
         ]
         with (
-            patch("maintenance_man.scanner.get_outdated", return_value=fake_updates),
-            patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: fake_updates),
+            ),
+            patch(
+                "maintenance_man.scanner.filter_registry_updates_by_age",
+                return_value=fake_updates,
+            ),
         ):
             result = scan_project("clean", project)
 
@@ -207,9 +391,15 @@ class TestScanProjectWithUpdates:
             stderr="",
         )
         with (
-            patch("maintenance_man.scanner.subprocess.run", return_value=audit),
-            patch("maintenance_man.scanner.get_outdated", return_value=fake_updates),
-            patch("maintenance_man.scanner.filter_by_age", return_value=fake_updates),
+            patch("maintenance_man.process.subprocess.run", return_value=audit),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: fake_updates),
+            ),
+            patch(
+                "maintenance_man.scanner.filter_registry_updates_by_age",
+                return_value=fake_updates,
+            ),
         ):
             result = scan_project("vulnerable", project)
 
@@ -218,30 +408,6 @@ class TestScanProjectWithUpdates:
         assert "cryptography" in vuln_pkg_names
         assert "cryptography" not in update_pkg_names
         assert "brand-new-pkg" in update_pkg_names
-
-    def test_scan_outdated_failure_does_not_crash(self, scan_results_dir: Path):
-        """If the outdated check fails, scan still returns Trivy results."""
-        project = _make_project(FIXTURES_DIR / "clean-project")
-        with patch(
-            "maintenance_man.scanner.get_outdated",
-            side_effect=Exception("bun not found"),
-        ):
-            result = scan_project("clean", project)
-
-        assert isinstance(result, ScanResult)
-        assert result.updates == []
-
-    def test_scan_passes_min_version_age_days(self, scan_results_dir: Path):
-        """min_version_age_days parameter is forwarded to filter_by_age."""
-        project = _make_project(FIXTURES_DIR / "clean-project")
-        with (
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
-            patch("maintenance_man.scanner.filter_by_age", return_value=[]) as mock_age,
-        ):
-            scan_project("clean", project, min_version_age_days=14)
-
-        mock_age.assert_called_once()
-        assert mock_age.call_args.kwargs["min_age_days"] == 14
 
 
 class TestUvNativeScan:
@@ -254,8 +420,11 @@ class TestUvNativeScan:
         )
 
         with (
-            patch("maintenance_man.scanner.subprocess.run", return_value=audit) as run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch("maintenance_man.process.subprocess.run", return_value=audit) as run,
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             result = scan_project("test-proj", project)
 
@@ -295,9 +464,12 @@ class TestUvNativeScan:
 
         with (
             patch(
-                "maintenance_man.scanner.subprocess.run", side_effect=[audit, trivy]
+                "maintenance_man.process.subprocess.run", side_effect=[audit, trivy]
             ) as run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             result = scan_project("test-proj", project)
 
@@ -323,10 +495,13 @@ class TestRunTrivyScanSkipDirs:
         )
         with (
             patch(
-                "maintenance_man.scanner.subprocess.run",
+                "maintenance_man.process.subprocess.run",
                 return_value=fake_result,
             ) as mock_run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             scan_project("test-proj", project)
 
@@ -344,10 +519,13 @@ class TestRunTrivyScanSkipDirs:
         )
         with (
             patch(
-                "maintenance_man.scanner.subprocess.run",
+                "maintenance_man.process.subprocess.run",
                 return_value=fake_result,
             ) as mock_run,
-            patch("maintenance_man.scanner.get_outdated", return_value=[]),
+            patch(
+                "maintenance_man.scanner.package_manager_ops",
+                ops_with_outdated(lambda project: []),
+            ),
         ):
             scan_project("test-proj", project)
 
@@ -365,7 +543,6 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
     from maintenance_man.models.gradle import (
         CompleteResolution,
         ModuleId,
-        PublicationRequest,
         RepositoryDeclaration,
         ResolutionEdge,
         ResolutionReport,
@@ -410,16 +587,17 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
     )
     components = (
         ResolvedComponent(id="root", kind="root", module=None, variants=()),
-    ) + tuple(
-        ResolvedComponent(
-            id=module.artifact,
-            kind="module",
-            module=ModuleId(
-                group=module.group, artifact=module.artifact, version="1.0"
-            ),
-            variants=("runtime",),
-        )
-        for module in modules.values()
+        *(
+            ResolvedComponent(
+                id=module.artifact,
+                kind="module",
+                module=ModuleId(
+                    group=module.group, artifact=module.artifact, version="1.0"
+                ),
+                variants=("runtime",),
+            )
+            for module in modules.values()
+        ),
     )
     edges = tuple(
         ResolutionEdge(
@@ -455,6 +633,7 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         findings=findings,
         vulns=[],
         unknown=False,
+        young=False,
         failure=None,
         overlap=False,
         entered=set(),
@@ -478,38 +657,46 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
             f"<artifactId>{module.artifact}</artifactId>"
             f"<version>{module.version}</version></project>"
         ).encode()
-        return body, {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"}, url
+        published = (
+            "Thu, 17 Sep 2026 00:00:00 GMT"
+            if state.young and artifact == "lib0"
+            else "Tue, 01 Sep 2026 00:00:00 GMT"
+        )
+        return body, {"Last-Modified": published}, url
 
-    now = datetime(2026, 9, 18, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 18, tzinfo=UTC)
     monkeypatch.setattr(
         scanner,
         "PublicationLookupContext",
         lambda path: PublicationLookupContext(
-            path, transport=transport, now=lambda: now
+            path, transport=transport, clock=lambda: now
         ),
     )
     monkeypatch.setattr(
-        scanner, "_run_gradle_scan", lambda project: (state.vulns, resolution)
+        scanner, "scan_gradle", lambda project: (state.vulns, resolution)
     )
-    monkeypatch.setattr(scanner, "get_outdated", lambda project: state.findings)
-    monkeypatch.setattr(scanner, "validate_gradle_candidates", lambda *args: object())
-
-    def attach(candidate, resolution, batch):
-        requests = tuple(
-            PublicationRequest(
-                module=modules[member.alias],
-                repositories=("google",),
-                routing_supported=True,
-            )
-            for member in candidate.target.members
-        )
-        return candidate.model_copy(update={"publication_requests": requests})
-
-    monkeypatch.setattr(scanner, "attach_gradle_publications", attach)
+    monkeypatch.setattr(
+        scanner, "discover_gradle_updates", lambda project: state.findings
+    )
     state.project = gradle_project.model_copy(
         update={"scan_secrets": False, "gradle_repository_routing": "standard-public"}
     )
     return state
+
+
+def test_gradle_scan_opens_publications_in_the_shared_cache(
+    scoped_publication_scan, monkeypatch
+):
+    opened = []
+    factory = scanner.PublicationLookupContext
+
+    def recording(path):
+        opened.append(path)
+        return factory(path)
+
+    monkeypatch.setattr(scanner, "PublicationLookupContext", recording)
+    scan_project("android", scoped_publication_scan.project, 7)
+    assert opened == [paths.publications_dir()]
 
 
 @pytest.mark.parametrize("failure", [None, TimeoutError("unavailable")])
@@ -522,17 +709,19 @@ def test_gradle_scan_overlaps_groups_and_retains_unknown_publications(
     assert state.entered == {"lib0", "lib1"}
     assert len(result.updates) == 2
     assert result.updates[0].blocked_reason is None
-    assert result.updates[1].blocked_reason
-    assert result.updates[1].gradle_block_kind == "age"
+    assert result.updates[1].blocked_reason is None
+    assert result.updates[1].published_date is None
+    assert result.updates[0].published_date is not None
 
 
 def test_gradle_discovery_failure_is_not_swallowed(
     scoped_publication_scan, monkeypatch
 ):
     def fail(project):
-        raise GradleError("discovery failed")
+        msg = "discovery failed"
+        raise GradleError(msg)
 
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", fail)
+    monkeypatch.setattr("maintenance_man.scanner.discover_gradle_updates", fail)
     with pytest.raises(GradleError, match="discovery failed"):
         scan_project("android", scoped_publication_scan.project, 7)
 
@@ -549,101 +738,67 @@ def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
         )
     ]
     result = scan_project("android", state.project, 7)
-    assert result.updates == state.findings
-    assert result.vulnerabilities[0].gradle_target == result.updates[0].gradle_target
+    assert [row.pkg_name for row in result.updates] == [
+        "org.example:lib0",
+        "org.example:lib1",
+    ]
+    assert result.vulnerabilities[0].gradle_target is None
     assert all(row.blocked_reason is None for row in result.updates)
 
 
-def test_gradle_finding_without_target_or_reason_is_blocked_not_eligible(
+def test_gradle_scan_reports_unmapped_update_without_planning_diagnostics(
     scoped_publication_scan,
 ):
     state = scoped_publication_scan
     state.findings.append(make_update(pkg_name="unmapped", gradle_target=None))
     result = scan_project("android", state.project, 7)
-    assert result.updates[-1].blocked_reason == "no supported catalogue target"
-    assert result.updates[-1].gradle_block_kind == "mapping"
+    assert result.updates[-1].blocked_reason is None
+    assert result.updates[-1].gradle_block_kind is None
 
 
-def test_gradle_block_kind_agrees_between_update_and_vuln_rows_for_withheld_group(
-    scoped_publication_scan, monkeypatch
-):
-    """A group withheld by attach_gradle_publications must report the same
-    gradle_block_kind on its update row and its advisory row.  Before the
-    fix, the update loop classified this as "mapping" (key not in
-    eligible) while the vulnerability loop unconditionally used "age"
-    whenever blocked_reason was set.
-    """
-    from maintenance_man.models.gradle import (
-        CandidateWithheld,
-        ModuleId,
-        PublicationRequest,
-    )
-
-    state = scoped_publication_scan
-    state.vulns = [
-        make_vuln(
-            vuln_id="CVE-2030-9999",
-            pkg_name="org.example:lib1",
-            installed_version="1.0",
-            fixed_version="2.0",
-        )
-    ]
-
-    def attach(candidate, resolution, batch):
-        if candidate.target.group_key == "ref:lib1":
-            return CandidateWithheld(
-                group_key=candidate.target.group_key,
-                coordinate=candidate.target.members[0].coordinate,
-                installed_version=candidate.target.members[0].installed_version,
-                reason="native validation withheld ref:lib1",
-                advisory_ids=candidate.requested_advisories,
-            )
-        requests = tuple(
-            PublicationRequest(
-                module=ModuleId(
-                    group="org.example", artifact=member.alias, version="2.0"
-                ),
-                repositories=("google",),
-                routing_supported=True,
-            )
-            for member in candidate.target.members
-        )
-        return candidate.model_copy(update={"publication_requests": requests})
-
-    monkeypatch.setattr("maintenance_man.scanner.attach_gradle_publications", attach)
-
-    result = scan_project("android", state.project, 7)
-
-    def _for_group(rows):
-        return next(
-            row
-            for row in rows
-            if row.gradle_target and row.gradle_target.group_key == "ref:lib1"
-        )
-
-    update_row = _for_group(result.updates)
-    vuln_row = _for_group(result.vulnerabilities)
-    assert update_row.blocked_reason == "native validation withheld ref:lib1"
-    assert vuln_row.blocked_reason == "native validation withheld ref:lib1"
-    assert update_row.gradle_block_kind == vuln_row.gradle_block_kind == "mapping"
-
-
-def test_gradle_vuln_without_maven_coordinate_is_blocked_with_mapping_kind(
-    scoped_publication_scan,
-):
-    """select_gradle_candidates withholds a finding with no Maven coordinate
-    ("finding lacks Maven coordinate"); the scanner must surface it as a
-    mapping-kind block, mirroring the equivalent update-row case."""
+def test_gradle_scan_does_not_run_update_planning(scoped_publication_scan, monkeypatch):
     state = scoped_publication_scan
     state.vulns = [
         make_vuln(pkg_name="unmapped", installed_version="1.0", fixed_version="2.0")
     ]
+    monkeypatch.setattr(
+        candidates,
+        "validate_gradle_candidates",
+        lambda *args: pytest.fail("scan must not run native update validation"),
+    )
 
     result = scan_project("android", state.project, 7)
 
-    finding = next(v for v in result.vulnerabilities if v.pkg_name == "unmapped")
-    assert finding.blocked_reason == "finding lacks Maven coordinate"
-    assert finding.gradle_block_kind == "mapping"
+    assert len(result.updates) == 2
+    assert len(result.vulnerabilities) == 1
+    assert result.vulnerabilities[0].pkg_name == "unmapped"
+    assert result.vulnerabilities[0].blocked_reason is None
+
+
+def test_gradle_scan_filters_young_updates_without_hiding_vulnerabilities(
+    scoped_publication_scan,
+):
+    state = scoped_publication_scan
+    state.young = True
+    state.vulns = [make_vuln(pkg_name="org.example:lib0")]
+
+    result = scan_project("android", state.project, 7)
+
+    assert [row.pkg_name for row in result.updates] == ["org.example:lib1"]
+    assert [row.pkg_name for row in result.vulnerabilities] == ["org.example:lib0"]
+    assert not result.blocked_findings
+
+
+def test_gradle_scan_disabled_age_policy_skips_publication_lookups(
+    scoped_publication_scan,
+):
+    state = scoped_publication_scan
+
+    result = scan_project("android", state.project, 0)
+
+    assert len(result.updates) == 2
+    assert not state.entered
+    assert not result.blocked_findings
 
 
 _GRADLE_BOM_MODULES = [
@@ -700,6 +855,34 @@ def _gradle_resolution_fixture():
     return parse_resolution_report(json.dumps(_gradle_report_payload()))
 
 
+def _generated(bom, resolution):
+    payload, inventory = load_inventory(bom)
+    return GeneratedGradleReport(
+        bom_path=bom,
+        inventory_bytes=payload,
+        inventory=inventory,
+        resolution=resolution,
+    )
+
+
+def _nested_malformed_inventory() -> tuple[bytes, CycloneDxInventory]:
+    """Envelope-valid top level whose nested identity is malformed."""
+    text = json.dumps(
+        {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "components": [
+                {
+                    "type": "library",
+                    "purl": "pkg:maven/g/lib@1",
+                    "components": [{"type": "library", "purl": 42}],
+                }
+            ],
+        }
+    )
+    return text.encode(), parse_inventory_text(text, source="memory-bom")
+
+
 def _yield_fixture_bom(project):
     @contextmanager
     def _generate(_project):
@@ -709,7 +892,7 @@ def _yield_fixture_bom(project):
             (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"), encoding="utf-8"
         )
         try:
-            yield bom, _gradle_resolution_fixture()
+            yield _generated(bom, _gradle_resolution_fixture())
         finally:
             shutil.rmtree(bom.parent, ignore_errors=True)
 
@@ -727,13 +910,31 @@ def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
         assert cmd[:5] == ["trivy", "sbom", "--format", "json", "--scanners"]
         return subprocess.CompletedProcess(cmd, returncode, stdout=payload, stderr="")
 
-    monkeypatch.setattr("maintenance_man.scanner.subprocess.run", _run)
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", _run)
+
+
+def test_gradle_scan_unreadable_bom_is_gradle_error(gradle_project, monkeypatch):
+    from maintenance_man.scanner import scan_gradle
+
+    def runner(root, args, *, label):
+        completed = fixture_runner(root, args, label=label)
+        (root / GRADLE_INVENTORY_BOM_RELPATH).unlink()
+        return completed
+
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", runner)
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
+    )
+    with pytest.raises(GradleError, match="cyclonedxBom produced no inventory"):
+        scan_gradle(gradle_project)
+    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
 def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
     gradle_project, monkeypatch
 ):
-    from maintenance_man.scanner import _run_gradle_scan
+    from maintenance_man.scanner import scan_gradle
 
     payload = _gradle_report_payload()
     payload["scopes"][0]["components"] = [
@@ -756,7 +957,7 @@ def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
         )
         resolution = parse_resolution_report(json.dumps(payload))
         try:
-            yield bom, resolution
+            yield _generated(bom, resolution)
         finally:
             shutil.rmtree(bom.parent, ignore_errors=True)
 
@@ -764,13 +965,13 @@ def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
     _trivy_sbom(monkeypatch, stdout='{"Results": []}')
 
     with pytest.raises(GradleError, match="no selected resolution identity"):
-        _run_gradle_scan(gradle_project)
+        scan_gradle(gradle_project)
 
 
 def test_gradle_scan_finding_without_resolution_scope_is_error(
     gradle_project, monkeypatch
 ):
-    from maintenance_man.scanner import _run_gradle_scan
+    from maintenance_man.scanner import scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -793,7 +994,7 @@ def test_gradle_scan_finding_without_resolution_scope_is_error(
     )
 
     with pytest.raises(GradleError, match="no selected resolution scope"):
-        _run_gradle_scan(gradle_project)
+        scan_gradle(gradle_project)
 
 
 def test_gradle_scan_rejects_omitted_resolved_modules(
@@ -805,18 +1006,21 @@ def test_gradle_scan_rejects_omitted_resolved_modules(
 
     @contextmanager
     def incomplete_inventory(project):
-        with _yield_fixture_bom(project)(project) as (bom, resolution):
+        with _yield_fixture_bom(project)(project) as generated:
+            bom = generated.bom_path
             document = json.loads(bom.read_text())
             document["components"] = [
                 row for row in document["components"] if row["name"] == "gson"
             ]
             bom.write_text(json.dumps(document))
-            yield bom, resolution
+            yield _generated(bom, generated.resolution)
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report", incomplete_inventory
     )
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner.discover_gradle_updates", lambda project: []
+    )
     gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
     _trivy_sbom(monkeypatch, stdout='{"Results": []}')
     with pytest.raises(GradleError, match="resolved module missing from inventory"):
@@ -833,7 +1037,7 @@ def test_gradle_scan_records_selected_resolution_scopes(gradle_project, monkeypa
     configuration="runtimeClasspath". So the expected scope string, computed
     independently of scanner.py, is ":/project/runtimeClasspath".
     """
-    from maintenance_man.scanner import _run_gradle_scan
+    from maintenance_man.scanner import scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -841,7 +1045,7 @@ def test_gradle_scan_records_selected_resolution_scopes(gradle_project, monkeypa
     )
     _trivy_sbom(monkeypatch)
 
-    findings, _ = _run_gradle_scan(gradle_project)
+    findings, _ = scan_gradle(gradle_project)
 
     assert findings
     assert all(
@@ -857,7 +1061,8 @@ def test_gradle_scan_error_leaves_previous_results_intact(
     results_file.write_text('{"previous": true}', encoding="utf-8")
 
     def _boom(project):
-        raise GradleError("./gradlew mmGradleReport failed (exit 1): boom")
+        msg = "./gradlew mmGradleReport failed (exit 1): boom"
+        raise GradleError(msg)
 
     monkeypatch.setattr("maintenance_man.scanner.generate_gradle_report", _boom)
 
@@ -907,10 +1112,12 @@ def test_gradle_scan_runs_the_existing_secret_scan_when_enabled(
         _yield_fixture_bom(gradle_project),
     )
     _trivy_sbom(monkeypatch, stdout='{"Results": []}')
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner.discover_gradle_updates", lambda project: []
+    )
     secret_calls: list[Path] = []
     monkeypatch.setattr(
-        "maintenance_man.scanner._run_trivy_secret_scan",
+        "maintenance_man.scanner.scan_secrets",
         lambda path, skip_dirs: (secret_calls.append(path), [])[1],
     )
 
@@ -945,11 +1152,14 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
 
     def _cannot_remove(*args, **kwargs):
         if not kwargs.get("ignore_errors"):
-            raise PermissionError("cleanup denied")
+            msg = "cleanup denied"
+            raise PermissionError(msg)
 
     monkeypatch.setattr(subprocess, "run", _run)
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
-    monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
+    monkeypatch.setattr(
+        "maintenance_man.scanner.discover_gradle_updates", lambda project: []
+    )
     gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
     with pytest.raises(GradleError, match="cleanup denied"):
         scan_project("android", gradle_project, 7)
@@ -971,15 +1181,15 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
 def test_gradle_trivy_malformed_shape_is_scan_error(
     gradle_project, monkeypatch, payload
 ):
-    from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
+    from maintenance_man.scanner import ScanError, scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
     _trivy_sbom(monkeypatch, stdout=json.dumps(payload))
-    with pytest.raises(TrivyScanError, match="Trivy"):
-        _run_gradle_vuln_scan(gradle_project)
+    with pytest.raises(ScanError, match="Trivy"):
+        scan_gradle(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
@@ -994,7 +1204,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
 def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
     gradle_project, monkeypatch, failure
 ):
-    from maintenance_man.scanner import TrivyScanError, _run_gradle_vuln_scan
+    from maintenance_man.scanner import ScanError, scan_gradle
 
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
@@ -1005,8 +1215,8 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
         raise failure
 
     monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(TrivyScanError, match="Trivy"):
-        _run_gradle_vuln_scan(gradle_project)
+    with pytest.raises(ScanError, match="Trivy"):
+        scan_gradle(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
@@ -1030,7 +1240,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
     ],
 )
 def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, value):
-    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+    from maintenance_man.scanner import ScanError, _parse_gradle_trivy_output
 
     row = {
         "VulnerabilityID": "CVE-example",
@@ -1038,7 +1248,7 @@ def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, 
         "InstalledVersion": "1",
     }
     row[field] = value
-    with pytest.raises(TrivyScanError, match=field):
+    with pytest.raises(ScanError, match=field):
         _parse_gradle_trivy_output(
             json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
         )
@@ -1046,7 +1256,7 @@ def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, 
 
 @pytest.mark.parametrize("field", ["VulnerabilityID", "PkgName", "InstalledVersion"])
 def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
-    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+    from maintenance_man.scanner import ScanError, _parse_gradle_trivy_output
 
     row = {
         "VulnerabilityID": "CVE-example",
@@ -1054,7 +1264,7 @@ def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
         "InstalledVersion": "1",
     }
     del row[field]
-    with pytest.raises(TrivyScanError, match=field):
+    with pytest.raises(ScanError, match=field):
         _parse_gradle_trivy_output(
             json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
         )
@@ -1070,9 +1280,9 @@ def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
     ],
 )
 def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
-    from maintenance_man.scanner import TrivyScanError, _parse_gradle_trivy_output
+    from maintenance_man.scanner import ScanError, _parse_gradle_trivy_output
 
-    with pytest.raises(TrivyScanError):
+    with pytest.raises(ScanError):
         _parse_gradle_trivy_output(json.dumps({"Results": [result]}))
 
 
@@ -1083,6 +1293,7 @@ def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
         {"Results": []},
         {"Results": [{"Class": "lang-pkgs"}]},
         {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": None}]},
+        {"Results": [{"Class": "os-pkgs", "Vulnerabilities": [{"PkgName": 3}]}]},
     ],
 )
 def test_gradle_trivy_absent_optional_or_null_vulnerabilities_is_clean(payload):
@@ -1112,10 +1323,36 @@ def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semanti
     assert findings[0].fixed_version is None
 
 
+def test_scan_gradle_incomplete_resolution_raises_before_binding_or_trivy(
+    gradle_project, monkeypatch
+):
+    from maintenance_man.gradle_resolution import parse_resolution_report
+
+    raw = _gradle_report_payload()
+    raw["scopes"][0]["unresolved"] = ["g:missing:1.0"]
+    resolution = parse_resolution_report(json.dumps(raw))
+
+    @contextmanager
+    def capture(project):
+        yield GeneratedGradleReport(
+            bom_path=Path(project.path) / "bom.json",
+            inventory_bytes=_nested_malformed_inventory()[0],
+            inventory=_nested_malformed_inventory()[1],
+            resolution=resolution,
+        )
+
+    monkeypatch.setattr(scanner, "generate_gradle_report", capture)
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
+    )
+    with pytest.raises(GradleError, match="Incomplete Gradle resolution"):
+        scanner.scan_gradle(gradle_project)
+
+
 def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch):
     from contextlib import contextmanager
 
-    from maintenance_man import scanner
     from maintenance_man.gradle import GradleError
     from maintenance_man.gradle_resolution import parse_resolution_report
     from maintenance_man.models.config import ProjectConfig
@@ -1127,10 +1364,15 @@ def test_gradle_incomplete_capture_preserves_saved_results(tmp_path, monkeypatch
 
     @contextmanager
     def capture(project):
-        yield tmp_path / "bom.json", resolution
+        yield GeneratedGradleReport(
+            bom_path=tmp_path / "bom.json",
+            inventory_bytes=_nested_malformed_inventory()[0],
+            inventory=_nested_malformed_inventory()[1],
+            resolution=resolution,
+        )
 
     monkeypatch.setattr(scanner, "generate_gradle_report", capture)
-    monkeypatch.setattr(scanner._config, "MM_HOME", tmp_path / "mm")
+    monkeypatch.setattr(paths, "MM_HOME", tmp_path / "mm")
     saved = tmp_path / "mm/scan-results/demo.json"
     saved.parent.mkdir(parents=True)
     saved.write_text("previous findings")
@@ -1187,7 +1429,7 @@ def test_gradle_scan_checks_local_project_provenance(
         bom = Path(project.path) / "fixture-bom.json"
         bom.write_text(json.dumps(inventory))
         try:
-            yield bom, parse_resolution_report(json.dumps(payload))
+            yield _generated(bom, parse_resolution_report(json.dumps(payload)))
         finally:
             bom.unlink()
 
@@ -1216,9 +1458,115 @@ def test_gradle_scan_checks_local_project_provenance(
     else:
         _trivy_sbom(monkeypatch)
     if variant == "local":
-        findings, _ = scanner._run_gradle_scan(gradle_project)
+        findings, _ = scanner.scan_gradle(gradle_project)
         assert findings
         assert all(f.gradle_scopes == (":/project/runtimeClasspath",) for f in findings)
     else:
         with pytest.raises(GradleError):
-            scanner._run_gradle_scan(gradle_project)
+            scanner.scan_gradle(gradle_project)
+
+
+@pytest.mark.parametrize(
+    ("manager", "source", "secrets", "expected"),
+    [
+        ("bun", "uv-audit", False, ["uv-audit"]),
+        ("bun", "uv-audit", True, ["uv-audit", "secret"]),
+        ("uv", "trivy", False, ["trivy"]),
+        ("uv", "trivy", True, ["trivy"]),
+    ],
+)
+def test_scan_steps_follow_the_table_vulnerability_source(
+    mm_home, tmp_path, monkeypatch, manager, source, secrets, expected
+):
+    calls = []
+
+    def uv_audit(path):
+        calls.append("uv-audit")
+        return []
+
+    def trivy(path, scan_secrets, skip_dirs):
+        calls.append("trivy")
+        return [], []
+
+    def secret(path, skip_dirs):
+        calls.append("secret")
+        return []
+
+    monkeypatch.setattr(scanner, "_run_uv_audit", uv_audit)
+    monkeypatch.setattr(scanner, "_run_trivy_scan", trivy)
+    monkeypatch.setattr(scanner, "scan_secrets", secret)
+    monkeypatch.setattr(
+        scanner,
+        "package_manager_ops",
+        lambda name: dataclasses.replace(
+            PACKAGE_MANAGERS[name],
+            vulnerability_source=source,
+            outdated=lambda project: [],
+        ),
+    )
+    project = ProjectConfig(
+        path=tmp_path, package_manager=manager, scan_secrets=secrets
+    )
+    scanner.scan_project("demo", project)
+    assert calls == expected
+
+
+def test_scan_dates_bun_updates_with_bun_info_in_the_project(
+    mm_home, tmp_path, monkeypatch
+):
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs["cwd"]))
+        return subprocess.CompletedProcess(
+            cmd, 0, "zod | MIT\nPublished: 2024-01-01T00:00:00Z\n", ""
+        )
+
+    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args: ([], []))
+    monkeypatch.setattr(
+        scanner,
+        "package_manager_ops",
+        ops_with_outdated(lambda project: [make_update(pkg_name="zod")]),
+    )
+    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    project = ProjectConfig(path=tmp_path, package_manager="bun")
+    result = scanner.scan_project("demo", project, 7)
+    latest = make_update(pkg_name="zod").latest_version
+    assert calls == [(["bun", "info", f"zod@{latest}"], tmp_path)]
+    assert [u.published_date for u in result.updates] == [_OLD]
+
+
+@pytest.mark.parametrize(
+    "manager, source", [("uv", "pypi"), ("bun", "npm"), ("mvn", "central")]
+)
+def test_non_gradle_scan_filters_through_one_publication_context(
+    mm_home, tmp_path, monkeypatch, manager, source
+):
+    opened, filtered = [], []
+    real = scanner.PublicationLookupContext
+
+    def factory(path):
+        opened.append(path)
+        return real(path)
+
+    def fake_filter(
+        updates, publication_source, project_path, *, min_age_days, context
+    ):
+        filtered.append(
+            (publication_source, project_path, min_age_days, isinstance(context, real))
+        )
+        return updates
+
+    monkeypatch.setattr(scanner, "PublicationLookupContext", factory)
+    monkeypatch.setattr(scanner, "filter_registry_updates_by_age", fake_filter)
+    monkeypatch.setattr(
+        scanner,
+        "package_manager_ops",
+        ops_with_outdated(lambda project: [make_update()]),
+    )
+    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args: ([], []))
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda *args: [])
+    project = ProjectConfig(path=tmp_path, package_manager=manager, scan_secrets=False)
+    scanner.scan_project("demo", project, 9)
+    assert opened == [paths.publications_dir()]
+    assert filtered == [(source, tmp_path, 9, True)]

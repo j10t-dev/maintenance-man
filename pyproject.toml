@@ -12,8 +12,6 @@ dependencies = [
     "cyclopts==4.25.2",
     "packaging==26.3",
     "pydantic==2.13.5",
-    "pygments==2.21.0",
-    "pytest==9.1.1",
     "rich==15.0.0",
 ]
 
@@ -22,6 +20,7 @@ mm = "maintenance_man.cli:main"
 
 [dependency-groups]
 dev = [
+    "import-linter==2.15",
     "pytest==9.1.1",
     "ruff==0.15.20",
     "ty>=0.0.34",
@@ -29,9 +28,36 @@ dev = [
 
 [tool.ruff]
 line-length = 88
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = ["E", "F", "I", "W", "B", "SIM", "C4", "UP", "RUF", "PERF", "RET", "PIE", "PTH", "FURB", "RSE", "ERA", "PLE", "N", "TRY002", "TRY201", "TRY203", "TRY400", "TRY401", "TID251", "EM101", "EM102", "EM103", "C901", "PLR0911", "PLR0912", "PLR0915"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-returns = 6
+max-branches = 12
+max-statements = 50
+
+[tool.ruff.lint.per-file-ignores]
+"src/maintenance_man/process.py" = ["TID251"]
+"tests/**" = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"subprocess.run" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.Popen" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.call" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.check_call" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.check_output" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.getoutput" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.getstatusoutput" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.system" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.popen" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.posix_spawn" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"os.posix_spawnp" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"shutil.which" = { msg = "Use maintenance_man.process.require_tool instead." }
 
 [tool.ty.src]
 include = ["src/**/*.py", "tests/**/*.py"]
@@ -46,3 +72,72 @@ markers = [
     "component: tests that require Docker or full service stack",
 ]
 addopts = "-m 'not integration and not component'"
+
+[tool.importlinter]
+root_package = "maintenance_man"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+id = "models-pure"
+name = "Models are pure"
+type = "forbidden"
+source_modules = ["maintenance_man.models"]
+forbidden_modules = [
+    "maintenance_man.cli",
+    "maintenance_man.clock",
+    "maintenance_man.config",
+    "maintenance_man.dependency_age",
+    "maintenance_man.deployer",
+    "maintenance_man.env",
+    "maintenance_man.exit_codes",
+    "maintenance_man.gradle",
+    "maintenance_man.gradle_inventory",
+    "maintenance_man.gradle_resolution",
+    "maintenance_man.gradle_updates",
+    "maintenance_man.gradle_verification",
+    "maintenance_man.gradle_workflow",
+    "maintenance_man.github",
+    "maintenance_man.outdated",
+    "maintenance_man.package_managers",
+    "maintenance_man.paths",
+    "maintenance_man.process",
+    "maintenance_man.resources",
+    "maintenance_man.scanner",
+    "maintenance_man.services",
+    "maintenance_man.storage",
+    "maintenance_man.updater",
+    "maintenance_man.uv_dependencies",
+    "maintenance_man.vcs",
+    "maintenance_man.vcs_workflow",
+    "rich",
+    "cyclopts",
+]
+
+# Allowlist removed by design C (vcs) and design D (updater, gradle_workflow).
+[[tool.importlinter.contracts]]
+id = "rich-cli-only"
+name = "Only the CLI imports rich"
+type = "protected"
+protected_modules = ["rich"]
+allowed_importers = ["maintenance_man.cli"]
+
+[[tool.importlinter.contracts]]
+id = "vcs-no-gradle"
+name = "VCS does not import gradle"
+type = "forbidden"
+source_modules = ["maintenance_man.vcs"]
+forbidden_modules = ["maintenance_man.gradle"]
+
+[[tool.importlinter.contracts]]
+id = "cli-leaf"
+name = "The CLI is a leaf"
+type = "protected"
+protected_modules = ["maintenance_man.cli"]
+allowed_importers = []
+
+[[tool.importlinter.contracts]]
+id = "services-cli-only"
+name = "Only the CLI imports services"
+type = "protected"
+protected_modules = ["maintenance_man.services"]
+allowed_importers = ["maintenance_man.cli"]

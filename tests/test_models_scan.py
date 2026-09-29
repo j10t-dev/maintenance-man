@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     GradleMember,
     GradleUpdateTarget,
     ScanResult,
@@ -14,9 +15,70 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     VulnFinding,
     Workflow,
+    highest_fix_version,
     sort_vulns_by_severity,
 )
-from tests.conftest import make_scan_result, make_update
+from tests.conftest import make_scan_result, make_update, make_vuln
+
+
+def test_workflow_bookmarks_hold_the_managed_names():
+    assert dict(WORKFLOW_BOOKMARKS) == {
+        Workflow.UPDATE: "mm/update-dependencies",
+        Workflow.RESOLVE: "mm/resolve-dependencies",
+    }
+
+
+@pytest.mark.parametrize(
+    "severity, rank",
+    [
+        (Severity.UNKNOWN, 0),
+        (Severity.LOW, 1),
+        (Severity.MEDIUM, 2),
+        (Severity.HIGH, 3),
+        (Severity.CRITICAL, 4),
+    ],
+)
+def test_severity_rank(severity, rank):
+    assert severity.rank == rank
+
+
+def test_sort_keeps_critical_first_and_unknown_last():
+    vulns = [
+        make_vuln(pkg_name="a", severity=Severity.UNKNOWN),
+        make_vuln(pkg_name="b", severity=Severity.LOW),
+        make_vuln(pkg_name="c", severity=Severity.CRITICAL),
+        make_vuln(pkg_name="d", severity=Severity.HIGH),
+        make_vuln(pkg_name="e", severity=Severity.MEDIUM),
+    ]
+    assert [v.pkg_name for v in sort_vulns_by_severity(vulns)] == [
+        "c",
+        "d",
+        "e",
+        "b",
+        "a",
+    ]
+
+
+@pytest.mark.parametrize(
+    "versions, expected",
+    [
+        (["2.0.0", "10.0.0", "1.5"], "10.0.0"),
+        (["1.0", "bad", "2.0"], "2.0"),
+        (["bad-first", "bad-last"], "bad-first"),
+        ([None, "bad"], "bad"),
+        ([None], ""),
+    ],
+)
+def test_highest_fix_version(versions, expected):
+    vulns = [make_vuln(fixed_version=v) for v in versions]
+    assert highest_fix_version(vulns) == expected
+
+
+def test_findings_lists_vulnerabilities_then_updates():
+    vuln = make_vuln(pkg_name="v")
+    update = make_update(pkg_name="u")
+    result = make_scan_result(vulns=[vuln], updates=[update])
+    assert result.findings == (vuln, update)
 
 
 class TestVulnFinding:
@@ -31,7 +93,7 @@ class TestVulnFinding:
             description="Memory exhaustion from malformed RELATIVE-OID.",
             status="fixed",
             primary_url="https://avd.aquasec.com/nvd/cve-2026-23490",
-            published_date=datetime(2026, 1, 16, tzinfo=timezone.utc),
+            published_date=datetime(2026, 1, 16, tzinfo=UTC),
         )
         assert finding.vuln_id == "CVE-2026-23490"
         assert finding.fixed_version == "0.6.2"
@@ -76,11 +138,23 @@ class TestSecretFinding:
 
 
 class TestScanResult:
-    def test_scan_result_round_trips_ready_and_update_flow(self):
+    @pytest.mark.parametrize(
+        ("flow", "expected_flow"),
+        [
+            (Workflow.UPDATE, "update"),
+            (Workflow.RESOLVE, "resolve"),
+        ],
+        ids=["update", "resolve"],
+    )
+    def test_scan_result_round_trips_ready_flow(
+        self,
+        flow: Workflow,
+        expected_flow: str,
+    ):
         result = ScanResult(
-            project="project-ready-update",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
-            trivy_target="/tmp/project-ready-update",
+            project="project-ready",
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
+            trivy_target="/tmp/project-ready",
             vulnerabilities=[
                 VulnFinding(
                     vuln_id="CVE-2026-00001",
@@ -92,7 +166,7 @@ class TestScanResult:
                     description="d",
                     status="fixed",
                     update_status=UpdateStatus.READY,
-                    flow=Workflow.UPDATE,
+                    flow=flow,
                 )
             ],
             updates=[
@@ -102,55 +176,34 @@ class TestScanResult:
                     latest_version="19.0.0",
                     semver_tier=SemverTier.MAJOR,
                     update_status=UpdateStatus.READY,
-                    flow=Workflow.UPDATE,
+                    flow=flow,
                 )
             ],
         )
 
         reloaded = ScanResult.model_validate_json(result.model_dump_json())
 
-        assert reloaded.vulnerabilities[0].update_status == UpdateStatus.READY
-        assert reloaded.vulnerabilities[0].flow == "update"
-        assert reloaded.updates[0].update_status == UpdateStatus.READY
-        assert reloaded.updates[0].flow == "update"
-
-    def test_scan_result_round_trips_ready_and_resolve_flow(self):
-        result = ScanResult(
-            project="project-ready-resolve",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
-            trivy_target="/tmp/project-ready-resolve",
-            vulnerabilities=[
-                VulnFinding(
-                    vuln_id="CVE-2026-00002",
-                    pkg_name="urllib3",
-                    installed_version="2.0.0",
-                    fixed_version="2.0.7",
-                    severity=Severity.MEDIUM,
-                    title="t",
-                    description="d",
-                    status="fixed",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                )
-            ],
-            updates=[
-                UpdateFinding(
-                    pkg_name="vite",
-                    installed_version="5.0.0",
-                    latest_version="5.1.0",
-                    semver_tier=SemverTier.MINOR,
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                )
-            ],
-        )
-
-        reloaded = ScanResult.model_validate_json(result.model_dump_json())
-
-        assert reloaded.vulnerabilities[0].update_status == UpdateStatus.READY
-        assert reloaded.vulnerabilities[0].flow == "resolve"
-        assert reloaded.updates[0].update_status == UpdateStatus.READY
-        assert reloaded.updates[0].flow == "resolve"
+        assert reloaded.project == "project-ready"
+        assert reloaded.scanned_at == datetime(2026, 1, 30, tzinfo=UTC)
+        assert reloaded.trivy_target == "/tmp/project-ready"
+        vulnerability = reloaded.vulnerabilities[0]
+        assert vulnerability.vuln_id == "CVE-2026-00001"
+        assert vulnerability.pkg_name == "requests"
+        assert vulnerability.installed_version == "2.31.0"
+        assert vulnerability.fixed_version == "2.32.4"
+        assert vulnerability.severity == Severity.HIGH
+        assert vulnerability.title == "t"
+        assert vulnerability.description == "d"
+        assert vulnerability.status == "fixed"
+        assert vulnerability.update_status == UpdateStatus.READY
+        assert vulnerability.flow == expected_flow
+        update = reloaded.updates[0]
+        assert update.pkg_name == "react"
+        assert update.installed_version == "18.2.0"
+        assert update.latest_version == "19.0.0"
+        assert update.semver_tier == SemverTier.MAJOR
+        assert update.update_status == UpdateStatus.READY
+        assert update.flow == expected_flow
 
     def test_update_status_started_no_longer_exists(self):
         assert not hasattr(UpdateStatus, "STARTED")
@@ -158,7 +211,7 @@ class TestScanResult:
     def test_scan_result_empty(self):
         result = ScanResult(
             project="project-alpha",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-alpha",
             vulnerabilities=[],
             secrets=[],
@@ -178,7 +231,7 @@ class TestScanResult:
         )
         result = ScanResult(
             project="project-beta",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-beta",
             vulnerabilities=[vuln],
             secrets=[],
@@ -194,7 +247,7 @@ class TestScanResult:
         )
         result = ScanResult(
             project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-gamma",
             updates=[finding],
         )
@@ -204,7 +257,7 @@ class TestScanResult:
     def test_scan_result_empty_has_no_updates(self):
         result = ScanResult(
             project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-gamma",
         )
         assert result.has_updates is False
@@ -228,7 +281,7 @@ class TestUpdateFinding:
             installed_version="4.17.20",
             latest_version="4.17.21",
             semver_tier=SemverTier.PATCH,
-            published_date=datetime(2026, 1, 10, tzinfo=timezone.utc),
+            published_date=datetime(2026, 1, 10, tzinfo=UTC),
         )
         assert finding.published_date is not None
         assert finding.semver_tier == SemverTier.PATCH
@@ -239,11 +292,11 @@ class TestUpdateFinding:
             installed_version="18.2.0",
             latest_version="19.0.0",
             semver_tier=SemverTier.MAJOR,
-            published_date=datetime(2026, 1, 20, tzinfo=timezone.utc),
+            published_date=datetime(2026, 1, 20, tzinfo=UTC),
         )
         result = ScanResult(
             project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
             trivy_target="/tmp/project-gamma",
             updates=[finding],
         )
@@ -328,6 +381,36 @@ class TestSortVulnsBySeverity:
             "requests-med",
             "flask-high",
         ]
+
+
+# -- highest_fix_version --
+
+
+class TestHighestFixVersion:
+    def test_picks_highest_semver(self):
+        vulns = [
+            make_vuln(fixed_version="2.31.0"),
+            make_vuln(fixed_version="2.32.4"),
+            make_vuln(fixed_version="2.32.0"),
+        ]
+        assert highest_fix_version(vulns) == "2.32.4"
+
+    def test_single_vuln(self):
+        assert highest_fix_version([make_vuln(fixed_version="1.0.1")]) == "1.0.1"
+
+    def test_invalid_version_ignored(self):
+        vulns = [
+            make_vuln(fixed_version="not-a-version"),
+            make_vuln(fixed_version="2.0.0"),
+        ]
+        assert highest_fix_version(vulns) == "2.0.0"
+
+    def test_invalid_version_order_independent(self):
+        vulns = [
+            make_vuln(fixed_version="2.0.0"),
+            make_vuln(fixed_version="not-a-version"),
+        ]
+        assert highest_fix_version(vulns) == "2.0.0"
 
 
 class TestSemverTier:

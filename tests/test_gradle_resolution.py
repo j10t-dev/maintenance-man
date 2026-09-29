@@ -1,18 +1,28 @@
-import hashlib
 import json
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 
-from maintenance_man.gradle import GradleError, parse_catalogue
+from maintenance_man import gradle_resolution as candidates
+from maintenance_man.dependency_age import PublicationLookupContext
+from maintenance_man.gradle import (
+    GRADLE_INVENTORY_BOM_RELPATH,
+    GRADLE_INVENTORY_RELPATH,
+    GradleError,
+    parse_catalogue,
+)
 from maintenance_man.gradle_resolution import (
     attach_gradle_publications,
     collect_gradle_resolution,
     exact_fix_candidate,
     generate_gradle_report,
     parse_resolution_report,
+    prepare_gradle_candidates,
     resolve_gradle_owners,
     select_gradle_candidates,
     validate_gradle_candidates,
@@ -27,6 +37,8 @@ from maintenance_man.models.gradle import (
     IncompleteResolution,
     KnownOwner,
     ModuleId,
+    PublicationFact,
+    PublicationRequest,
     RepositoryDeclaration,
     ResolutionReport,
     ResolvedComponent,
@@ -39,12 +51,7 @@ from maintenance_man.models.scan import (
     Severity,
     VulnFinding,
 )
-
-FIXTURE = Path(__file__).parent / "fixtures/gradle/resolution/empty.json"
-
-
-def report_payload():
-    return json.loads(FIXTURE.read_text())
+from tests.conftest import FakeClock, fixture_runner, report_payload
 
 
 @pytest.mark.parametrize(
@@ -67,6 +74,18 @@ def test_selected_scope_completeness(change, expected):
     result = parse_resolution_report(json.dumps(value))
     assert isinstance(result, expected)
     assert len(result.report.selected_scopes) == 1
+
+
+def test_malformed_digest_precedes_incomplete_resolution():
+    raw = report_payload()
+    raw["catalogue_digest"] = "invalid"
+    raw["selection_errors"] = ["scope unavailable"]
+    with pytest.raises(GradleError) as caught:
+        parse_resolution_report(json.dumps(raw))
+    assert str(caught.value) == (
+        "Malformed Gradle resolution report: invalid catalogue digest"
+    )
+    assert type(caught.value.__cause__) is ValueError
 
 
 @pytest.mark.parametrize(
@@ -101,61 +120,50 @@ def make_project(tmp_path):
     return ProjectConfig(path=tmp_path, package_manager="gradle")
 
 
-def fixture_runner(root, args, *, label):
-    assert args[0] == "mmGradleReport"
-    assert "--rerun-tasks" in args and "--no-build-cache" in args
-    owned = root / ".mm-gradle-inventory"
-    assert (owned / ".mm-owned").is_file()
-    assert (owned / "gradle-report.gradle").read_text().startswith("import ")
-    (owned / "bom.json").write_text(
-        '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[{"group":"g","name":"a","version":"1.0","purl":"pkg:maven/g/a@1.0"}]}'
-    )
-    value = report_payload()
-    value["scopes"][0]["components"].append(
-        {
-            "id": "a",
-            "kind": "module",
-            "module": {"group": "g", "artifact": "a", "version": "1.0"},
-            "variants": ["runtime"],
-        }
-    )
-    value["scopes"][0]["edges"].append(
-        {"source": "root", "target": "a", "requested": "g:a:1.0", "constraint": False}
-    )
-    value["catalogue_digest"] = hashlib.sha256(
-        (root / "gradle/libs.versions.toml").read_bytes()
-    ).hexdigest()
-    (owned / "report.json").write_text(json.dumps(value))
-    return subprocess.CompletedProcess(args, 0, "", "")
-
-
 def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):
     project = make_project(tmp_path)
     with patch(
         "maintenance_man.gradle_resolution.run_gradle", side_effect=fixture_runner
     ):
-        with generate_gradle_report(project) as (bom, resolution):
-            assert bom.is_file()
-            assert isinstance(resolution, CompleteResolution)
+        with generate_gradle_report(project) as generated:
+            assert generated.bom_path.is_file()
+            assert isinstance(generated.resolution, CompleteResolution)
         assert not (tmp_path / ".mm-gradle-inventory").exists()
-        result = collect_gradle_resolution(
-            project, parse_catalogue(tmp_path / "gradle/libs.versions.toml")
-        )
+        result = collect_gradle_resolution(project)
     assert isinstance(result, CompleteResolution)
     assert result.report.scopes[0].components[0].kind == "root"
 
 
-def test_unmarked_output_is_never_reclaimed(tmp_path):
+def test_captured_inventory_bytes_and_models_survive_cleanup(tmp_path):
     project = make_project(tmp_path)
-    owned = tmp_path / ".mm-gradle-inventory"
-    owned.mkdir()
-    (owned / "caller.txt").write_text("keep")
-    with patch("maintenance_man.gradle_resolution.run_gradle") as runner:
-        with pytest.raises(GradleError):
-            with generate_gradle_report(project):
-                pass
-    runner.assert_not_called()
-    assert (owned / "caller.txt").read_text() == "keep"
+    with patch(
+        "maintenance_man.gradle_resolution.run_gradle", side_effect=fixture_runner
+    ):
+        with generate_gradle_report(project) as generated:
+            on_disk = generated.bom_path.read_bytes()
+        assert not generated.bom_path.exists()
+    assert generated.inventory_bytes == on_disk
+    assert [row["purl"] for row in generated.inventory.components] == [
+        "pkg:maven/g/a@1.0"
+    ]
+    assert isinstance(generated.resolution, CompleteResolution)
+
+
+def test_inventory_envelope_is_refused_before_the_report_is_parsed(tmp_path):
+    project = make_project(tmp_path)
+
+    def runner(root, args, *, label):
+        completed = fixture_runner(root, args, label=label)
+        (root / GRADLE_INVENTORY_BOM_RELPATH).write_text("[]")
+        (root / GRADLE_INVENTORY_RELPATH / "report.json").write_text("{not json")
+        return completed
+
+    with (
+        patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner),
+        pytest.raises(GradleError, match="malformed CycloneDX inventory"),
+        generate_gradle_report(project),
+    ):
+        pytest.fail("malformed inventory must not yield")
 
 
 @pytest.mark.parametrize(
@@ -182,6 +190,8 @@ def ownership_graph(
     domain="project",
     longer_path=False,
     overlapping=False,
+    cycle=False,
+    converging=False,
 ):
     (tmp_path / "libs.toml").write_text(
         """
@@ -226,6 +236,52 @@ b = { module = "g:other", version.ref = "b" }
             "constraint": constraint,
         },
     ]
+    if cycle:
+        scope["edges"].append(
+            {
+                "source": "child",
+                "target": "parent",
+                "requested": "g:parent:1.0.0",
+                "constraint": False,
+            }
+        )
+    if converging:
+        scope["components"] += [
+            {
+                "id": name,
+                "kind": "module",
+                "module": {"group": "g", "artifact": name, "version": "1.0.0"},
+                "variants": [],
+            }
+            for name in ("constrained-bridge", "unconstrained-bridge")
+        ]
+        scope["edges"] = [
+            scope["edges"][0],
+            {
+                "source": "parent",
+                "target": "constrained-bridge",
+                "requested": "g:constrained-bridge:1.0.0",
+                "constraint": True,
+            },
+            {
+                "source": "constrained-bridge",
+                "target": "child",
+                "requested": "g:child:2.0.0",
+                "constraint": False,
+            },
+            {
+                "source": "parent",
+                "target": "unconstrained-bridge",
+                "requested": "g:unconstrained-bridge:1.0.0",
+                "constraint": False,
+            },
+            {
+                "source": "unconstrained-bridge",
+                "target": "child",
+                "requested": "g:child:2.0.0",
+                "constraint": False,
+            },
+        ]
     if ambiguous:
         scope["components"].append(
             {
@@ -289,18 +345,29 @@ b = { module = "g:other", version.ref = "b" }
 
 
 @pytest.mark.parametrize(
-    "ambiguous,constraint,longer_path,overlapping,affected,expected",
+    "ambiguous,constraint,longer_path,overlapping,cycle,converging,affected,kind,group",
     [
-        (False, False, False, False, "child", "parent"),
-        (False, True, False, False, "child", "platform"),
-        (True, False, False, False, "child", "unknown"),
-        (True, False, True, False, "child", "unknown"),
-        (True, False, False, True, "child", "unknown"),
-        (True, False, False, True, "parent", "unknown"),
+        (False, False, False, False, False, False, "child", "parent", "ref:a"),
+        (False, True, False, False, False, False, "child", "platform", "ref:a"),
+        (False, False, False, False, True, False, "child", "parent", "ref:a"),
+        (False, False, False, False, False, True, "child", "parent", "ref:a"),
+        (True, False, False, False, False, False, "child", "unknown", None),
+        (True, False, True, False, False, False, "child", "unknown", None),
+        (True, False, False, True, False, False, "child", "unknown", None),
+        (True, False, False, True, False, False, "parent", "unknown", None),
     ],
 )
 def test_actual_edges_establish_unique_owner(
-    tmp_path, ambiguous, constraint, longer_path, overlapping, affected, expected
+    tmp_path,
+    ambiguous,
+    constraint,
+    longer_path,
+    overlapping,
+    cycle,
+    converging,
+    affected,
+    kind,
+    group,
 ):
     catalogue, result = ownership_graph(
         tmp_path,
@@ -308,6 +375,8 @@ def test_actual_edges_establish_unique_owner(
         constraint=constraint,
         longer_path=longer_path,
         overlapping=overlapping,
+        cycle=cycle,
+        converging=converging,
     )
     module = ModuleId(
         group="g",
@@ -316,9 +385,120 @@ def test_actual_edges_establish_unique_owner(
     )
     owners = resolve_gradle_owners(catalogue, result, module)
     assert len(owners) == 1
-    assert owners[0].kind == expected
+    assert owners[0].kind == kind
     if isinstance(owners[0], KnownOwner):
-        assert owners[0].group_key == "ref:a"
+        assert owners[0].group_key == group
+
+
+def plugin_marker_graph(tmp_path, *, domain="buildscript", failure=None):
+    (tmp_path / "plugins.toml").write_text(
+        """
+[versions]
+plugin = "1.0.0"
+[plugins]
+plugin = { id = "com.example.plugin", version.ref = "plugin" }
+"""
+    )
+    catalogue = parse_catalogue(tmp_path / "plugins.toml")
+    raw = report_payload()
+    raw["selected_scopes"][0]["domain"] = domain
+    scope = raw["scopes"][0]
+    scope["scope"]["domain"] = domain
+    scope["components"] += [
+        {
+            "id": "marker",
+            "kind": "module",
+            "module": {
+                "group": "com.example.plugin",
+                "artifact": "com.example.plugin.gradle.plugin",
+                "version": "1.0.0",
+            },
+            "variants": [],
+        },
+        {
+            "id": "implementation",
+            "kind": "module",
+            "module": {
+                "group": "com.example",
+                "artifact": "implementation",
+                "version": "2.0.0",
+            },
+            "variants": [],
+        },
+    ]
+    requested = (
+        "com.example:implementation:[1,3)"
+        if failure == "range"
+        else "com.example:implementation:2.1.0"
+        if failure == "mismatch"
+        else "com.example:implementation:2.0.0"
+    )
+    scope["edges"] = [
+        {
+            "source": "root",
+            "target": "marker",
+            "requested": "com.example.plugin:com.example.plugin.gradle.plugin:1.0.0",
+            "constraint": False,
+        },
+        {
+            "source": "marker",
+            "target": "implementation",
+            "requested": requested,
+            "constraint": False,
+        },
+    ]
+    if failure == "two_edges":
+        scope["components"].append(
+            {
+                "id": "other",
+                "kind": "module",
+                "module": {"group": "g", "artifact": "other", "version": "1.0"},
+                "variants": [],
+            }
+        )
+        scope["edges"].append(
+            {
+                "source": "marker",
+                "target": "other",
+                "requested": "g:other:1.0",
+                "constraint": False,
+            }
+        )
+    result = parse_resolution_report(json.dumps(raw))
+    assert isinstance(result, CompleteResolution)
+    return catalogue, result
+
+
+@pytest.mark.parametrize(
+    "domain,kind,group",
+    [
+        ("buildscript", "plugin", "ref:plugin"),
+        ("project", "unknown", None),
+    ],
+)
+def test_plugin_marker_owner_is_limited_to_buildscript(tmp_path, domain, kind, group):
+    catalogue, resolution = plugin_marker_graph(tmp_path, domain=domain)
+    owners = resolve_gradle_owners(
+        catalogue,
+        resolution,
+        ModuleId(group="com.example", artifact="implementation", version="2.0.0"),
+    )
+    assert len(owners) == 1
+    assert owners[0].kind == kind
+    if isinstance(owners[0], KnownOwner):
+        assert owners[0].group_key == group
+
+
+@pytest.mark.parametrize("failure", ["two_edges", "range", "mismatch"])
+def test_plugin_marker_requires_one_exact_implementation_edge(tmp_path, failure):
+    catalogue, resolution = plugin_marker_graph(tmp_path, failure=failure)
+    owners = resolve_gradle_owners(
+        catalogue,
+        resolution,
+        ModuleId(group="com.example", artifact="implementation", version="2.0.0"),
+    )
+    assert len(owners) == 1
+    assert owners[0].kind == "unknown"
 
 
 def candidate():
@@ -435,6 +615,33 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
     assert selected.publication_requests == ()
 
 
+def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
+    from maintenance_man.gradle import ReportProposal, build_update_findings
+
+    catalogue, resolution = ownership_graph(tmp_path)
+    discovered = [
+        build_update_findings(
+            catalogue,
+            [
+                ReportProposal(
+                    kind="library",
+                    alias="a",
+                    coordinate="g:parent",
+                    version=version,
+                )
+            ],
+        )[0]
+        for version in ("1.0.1", "1.0.2")
+    ]
+
+    result = select_gradle_candidates(catalogue, resolution, [], discovered)
+
+    assert result.candidates == ()
+    assert len(result.withheld) == 1
+    assert result.withheld[0].group_key == "ref:a"
+    assert result.withheld[0].reason == "conflicting or non-exact catalogue proposals"
+
+
 def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_root(
     tmp_path,
 ):
@@ -518,26 +725,6 @@ def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_r
     assert len(result.results) == 3
     assert (tmp_path / "gradle/libs.versions.toml").read_bytes() == before
     assert not (tmp_path / ".mm-gradle-inventory").exists()
-
-
-@pytest.mark.parametrize("declaration", [None, "standard-public"])
-def test_gradle_publication_requires_operator_declaration(tmp_path, declaration):
-    from maintenance_man.gradle_resolution import gradle_routing_prerequisite
-
-    project = ProjectConfig(
-        path=tmp_path, package_manager="gradle", gradle_repository_routing=declaration
-    )
-    block = gradle_routing_prerequisite(project)
-    if declaration is None:
-        assert block is not None
-        assert block.kind == "age"
-        assert block.reason == (
-            "Public repository routing has not been declared; automatic "
-            "publication eligibility requires "
-            "gradle_repository_routing = 'standard-public'"
-        )
-    else:
-        assert block is None
 
 
 def _resolution_with_repositories(repositories):
@@ -830,6 +1017,12 @@ def _validation_runner(build_response):
     return runner
 
 
+def _write_candidate_validation_response(directory, rows):
+    (directory / "candidate-validation.json").write_text(
+        json.dumps({"schema_version": 1, "results": rows})
+    )
+
+
 @pytest.mark.parametrize("security_only", [False, True])
 def test_shared_members_validate_only_in_projects_that_resolve_them(
     tmp_path, security_only
@@ -948,118 +1141,94 @@ def test_shared_members_validate_only_in_projects_that_resolve_them(
     ]
 
 
-def test_validate_gradle_candidates_refuses_duplicate_request_id(tmp_path):
-    """Both requests are covered by id, but a request_id repeats: the
-    duplicate collapses in the response dict, so its row count no longer
-    matches what Gradle actually returned."""
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [
-            _success_row(requests[0]),
-            _success_row(
-                requests[1],
-                implementation={"group": "g", "artifact": "impl", "version": "2.0"},
-            ),
-            _success_row(requests[0]),
-        ]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
-    ):
-        with pytest.raises(GradleError, match="coverage"):
-            validate_gradle_candidates(
-                project, [two_member_candidate()], _resolution_with_repositories(())
-            )
-
-
-def test_validate_gradle_candidates_refuses_extra_row(tmp_path):
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [
-            _success_row(requests[0]),
-            _success_row({**requests[0], "request_id": "99"}),
-        ]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
-    ):
-        with pytest.raises(GradleError, match="coverage"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
-
-
-@pytest.mark.parametrize("identity", [{"alias": "wrong-alias"}, {"kind": "plugin"}])
-def test_validate_gradle_candidates_refuses_identity_mismatch(tmp_path, identity):
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [_success_row(requests[0], **identity)]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
-    ):
-        with pytest.raises(GradleError, match="identity mismatch"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
-
-
-def test_validate_gradle_candidates_refuses_success_with_different_version(tmp_path):
-    project = make_project(tmp_path)
-
-    def build_response(root, directory, requests):
-        rows = [_success_row(requests[0], selected_version="9.9.9")]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
-
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
-    ):
-        with pytest.raises(GradleError, match="selected a different version"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
-
-
-def test_validate_gradle_candidates_refuses_plugin_success_without_implementation(
-    tmp_path,
+@pytest.mark.parametrize(
+    ("case", "candidate_factory", "rows_for", "reason"),
+    [
+        (
+            "duplicate request id",
+            two_member_candidate,
+            lambda requests: [
+                _success_row(requests[0]),
+                _success_row(
+                    requests[1],
+                    implementation={
+                        "group": "g",
+                        "artifact": "impl",
+                        "version": "2.0",
+                    },
+                ),
+                _success_row(requests[0]),
+            ],
+            "coverage",
+        ),
+        (
+            "extra row",
+            candidate,
+            lambda requests: [
+                _success_row(requests[0]),
+                _success_row({**requests[0], "request_id": "99"}),
+            ],
+            "coverage",
+        ),
+        (
+            "wrong alias",
+            candidate,
+            lambda requests: [_success_row(requests[0], alias="wrong-alias")],
+            "identity mismatch",
+        ),
+        (
+            "wrong kind",
+            candidate,
+            lambda requests: [_success_row(requests[0], kind="plugin")],
+            "identity mismatch",
+        ),
+        (
+            "wrong selected version",
+            candidate,
+            lambda requests: [_success_row(requests[0], selected_version="9.9.9")],
+            "selected a different version",
+        ),
+        (
+            "missing plugin implementation",
+            two_member_candidate,
+            lambda requests: [
+                _success_row(requests[0]),
+                _success_row(requests[1], implementation=None),
+            ],
+            "marker success lacks implementation",
+        ),
+    ],
+    ids=[
+        "duplicate-request-id",
+        "extra-row",
+        "wrong-alias",
+        "wrong-kind",
+        "wrong-selected-version",
+        "missing-plugin-implementation",
+    ],
+)
+def test_validate_gradle_candidates_refuses_invalid_native_response(
+    tmp_path, case, candidate_factory, rows_for, reason
 ):
     project = make_project(tmp_path)
+    catalogue = tmp_path / "gradle/libs.versions.toml"
+    before = catalogue.read_bytes()
 
     def build_response(root, directory, requests):
-        rows = [
-            _success_row(requests[0]),
-            _success_row(requests[1], implementation=None),
-        ]
-        (directory / "candidate-validation.json").write_text(
-            json.dumps({"schema_version": 1, "results": rows})
-        )
+        del root
+        _write_candidate_validation_response(directory, rows_for(requests))
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match=reason),
     ):
-        with pytest.raises(GradleError, match="marker success lacks implementation"):
-            validate_gradle_candidates(
-                project, [two_member_candidate()], _resolution_with_repositories(())
-            )
+        validate_gradle_candidates(
+            project, [candidate_factory()], _resolution_with_repositories(())
+        )
+    assert catalogue.read_bytes() == before, case
 
 
 def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
@@ -1077,11 +1246,13 @@ def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
         (directory / "candidate-validation.json").symlink_to(external)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    with patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner):
-        with pytest.raises(GradleError, match="symlink"):
-            validate_gradle_candidates(
-                project, [candidate()], _resolution_with_repositories(())
-            )
+    with (
+        patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner),
+        pytest.raises(GradleError, match="symlink"),
+    ):
+        validate_gradle_candidates(
+            project, [candidate()], _resolution_with_repositories(())
+        )
 
 
 def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
@@ -1094,14 +1265,63 @@ def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
         )
         (root / "gradle/libs.versions.toml").write_text("mutated = true\n")
 
-    with patch(
-        "maintenance_man.gradle_resolution.run_gradle",
-        side_effect=_validation_runner(build_response),
+    with (
+        patch(
+            "maintenance_man.gradle_resolution.run_gradle",
+            side_effect=_validation_runner(build_response),
+        ),
+        pytest.raises(GradleError, match="modified the catalogue"),
     ):
-        with pytest.raises(GradleError, match="modified the catalogue"):
+        validate_gradle_candidates(
+            project, [candidate()], _resolution_with_repositories(())
+        )
+
+
+@pytest.mark.parametrize("task", ["mmGradleReport", "mmGradleValidateCandidates"])
+def test_both_report_tasks_use_the_shared_init_script_command(tmp_path, task):
+    from maintenance_man.gradle_resolution import _report_command
+
+    project = make_project(tmp_path)
+    script = tmp_path / ".mm-gradle-inventory" / "gradle-report.gradle"
+    expected = [
+        task,
+        "--init-script",
+        str(script),
+        "--no-daemon",
+        "--console=plain",
+        "--rerun-tasks",
+        "--no-build-cache",
+    ]
+    assert _report_command(task, script) == expected
+    seen = []
+
+    def report(root, args, *, label):
+        seen.append((label, args))
+        return fixture_runner(root, args, label=label)
+
+    def respond(root, directory, requests):
+        (directory / "candidate-validation.json").write_text(
+            json.dumps({"schema_version": 1, "results": [_success_row(requests[0])]})
+        )
+
+    def validate(root, args, *, label):
+        seen.append((label, args))
+        return _validation_runner(respond)(root, args, label=label)
+
+    if task == "mmGradleReport":
+        with (
+            patch("maintenance_man.gradle_resolution.run_gradle", side_effect=report),
+            generate_gradle_report(project),
+        ):
+            pass
+    else:
+        with patch(
+            "maintenance_man.gradle_resolution.run_gradle", side_effect=validate
+        ):
             validate_gradle_candidates(
                 project, [candidate()], _resolution_with_repositories(())
             )
+    assert seen == [(task, expected)]
 
 
 def test_mixed_library_plugin_alias_keeps_member_validation_separate():
@@ -1158,3 +1378,98 @@ def test_mixed_library_plugin_alias_keeps_member_validation_separate():
         "org.jetbrains.kotlin.jvm:org.jetbrains.kotlin.jvm.gradle.plugin",
     ]
     assert result.publication_requests[1].marker_implementation == implementation
+
+
+_NOW = datetime(2030, 6, 15, 12, tzinfo=UTC)
+_MODULE = ModuleId(group="g", artifact="lib", version="2")
+
+
+def _age_candidate():
+    return GradleCandidate(
+        target=GradleUpdateTarget(
+            version_ref="lib",
+            members=[
+                GradleMember(
+                    kind="library",
+                    alias="lib",
+                    coordinate="g:lib",
+                    installed_version="1",
+                )
+            ],
+            target_version="2",
+        ),
+        origins=frozenset({"ordinary"}),
+        publication_requests=(
+            PublicationRequest(
+                module=_MODULE, repositories=("central",), routing_supported=True
+            ),
+        ),
+    )
+
+
+def _prepare_with_publication(published, minimum_age_days, clock, *, prefetch=None):
+    candidate = _age_candidate()
+    fact = PublicationFact(
+        repository="central",
+        module=_MODULE,
+        source_url="https://repo.maven.apache.org/maven2/g/lib/2/lib-2.pom",
+        method="last_modified",
+        artifact_digest="0" * 64,
+        timestamp=published,
+        checked_at=_NOW,
+    )
+    publication = SimpleNamespace(
+        prefetch=lambda requests: prefetch(list(requests)) if prefetch else None,
+        submit=lambda repository, module: SimpleNamespace(result=lambda: fact),
+        results={},
+    )
+    project = ProjectConfig(path=Path("/unused"), package_manager="gradle")
+    batch = CandidateValidationBatch(schema_version=1, results=())
+    with (
+        patch.object(candidates, "validate_gradle_candidates", lambda *args: batch),
+        patch.object(candidates, "attach_gradle_publications", lambda c, *args: c),
+    ):
+        (prepared,) = prepare_gradle_candidates(
+            project.model_copy(update={"gradle_repository_routing": "standard-public"}),
+            (candidate,),
+            CompleteResolution(report=report_stub()),
+            cast(PublicationLookupContext, publication),
+            minimum_age_days,
+            clock=clock,
+        )
+    return prepared
+
+
+def report_stub():
+    return parse_resolution_report(json.dumps(report_payload())).report
+
+
+@pytest.mark.parametrize(
+    "offset,minimum,withheld",
+    [
+        (timedelta(days=7), 7, True),
+        (timedelta(days=7) + timedelta(microseconds=1), 7, False),
+        (timedelta(days=7) - timedelta(microseconds=1), 7, True),
+        (timedelta(0), 0, False),
+    ],
+)
+def test_candidate_age_boundary_uses_the_injected_clock(offset, minimum, withheld):
+    prepared = _prepare_with_publication(_NOW - offset, minimum, FakeClock(_NOW))
+    assert (prepared.block is not None) is withheld
+    if withheld:
+        assert prepared.block.reason == "release younger than required 7 days"
+
+
+def test_candidate_age_reads_the_clock_after_prefetch():
+    clock = FakeClock(_NOW)
+    published = _NOW - timedelta(days=7)
+    # Exactly seven days old is withheld at the start...
+    assert _prepare_with_publication(published, 7, clock).block is not None
+    # ...but a fetch that advances time makes it old enough for the live decision.
+    advanced = _prepare_with_publication(
+        published,
+        7,
+        clock,
+        prefetch=lambda requests: clock.advance(timedelta(microseconds=1)),
+    )
+    assert advanced.block is None

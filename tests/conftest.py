@@ -1,10 +1,25 @@
-from datetime import datetime, timedelta, timezone
+import dataclasses
+import hashlib
+import json
+import subprocess
+from collections.abc import Callable
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.console import Console
 
-from maintenance_man.models.config import ProjectConfig
+from maintenance_man import cli
+from maintenance_man.cli import app
+from maintenance_man.config import load_config
+from maintenance_man.gradle import (
+    GRADLE_INVENTORY_BOM_RELPATH,
+    GRADLE_INVENTORY_MARKER_RELPATH,
+    GRADLE_INVENTORY_RELPATH,
+)
+from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
@@ -12,36 +27,176 @@ from maintenance_man.models.scan import (
     SemverTier,
     Severity,
     UpdateFinding,
+    UpdateStatus,
     VulnFinding,
+    Workflow,
 )
+from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
+from maintenance_man.storage import save_scan_results
+from tests.fake_vcs import FakeJjState
+from tests.fakes import FakeFindingProcessor
+
+
+@dataclasses.dataclass
+class FakeClock:
+    current: datetime
+
+    def __call__(self) -> datetime:
+        return self.current
+
+    def advance(self, delta: timedelta) -> None:
+        self.current += delta
+
+
+def completed(
+    argv: tuple[str, ...] = (),
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+
+def make_project(path: Path, **overrides: Any) -> ProjectConfig:
+    return ProjectConfig.model_validate(
+        {"path": path, "package_manager": "uv"} | overrides
+    )
+
+
+def make_config(**overrides: Any) -> MmConfig:
+    return MmConfig.model_validate({"projects": {}} | overrides)
+
+
+def write_config(home: Path, text: str) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def run_mm(*argv: str) -> int:
+    try:
+        result = app(list(argv), exit_on_error=False)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    assert result is None
+    return 0
+
+
+def configure_fake_vcs(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[FakeJjState, dict[str, Path]]:
+    config_path = home / "config.toml"
+    configured = load_config(config_path)
+    replacements: dict[Path, Path] = {}
+    state = FakeJjState()
+    for project in configured.projects.values():
+        if project.path in replacements:
+            continue
+        target = tmp_path / "repositories" / f"repo-{len(replacements)}"
+        replacements[project.path] = target
+        state.seed_repository(target, files={"dep.txt": "version=1\n"})
+    text = config_path.read_text(encoding="utf-8")
+    for source, target in replacements.items():
+        text = text.replace(str(source), str(target))
+    config_path.write_text(text, encoding="utf-8")
+    paths_by_name = {
+        name: replacements[project.path]
+        for name, project in configured.projects.items()
+    }
+    monkeypatch.setattr("maintenance_man.cli.make_vcs_services", state.services)
+    return state, paths_by_name
+
+
+_TERMINAL_OVERRIDES = ("FORCE_COLOR", "NO_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE")
+
+
+@pytest.fixture(autouse=True)
+def _plain_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Render CLI output as plain 80-column text whatever terminal runs the suite.
+
+    The CLI console is built at import, during collection, so it has already
+    read the invoking environment. Replace it with one that is never treated
+    as a terminal, and clear the overrides so child processes are plain too.
+    """
+    for name in _TERMINAL_OVERRIDES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(cli, "console", Console(force_terminal=False, width=80))
+
+
+@pytest.fixture(autouse=True)
+def _tools_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve CLI and scanner tool requirements without the host PATH."""
+
+    def found(name: str, hint: str) -> Path:
+        return Path("/usr/bin") / name
+
+    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", found)
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", found)
+
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 GRADLE_FIXTURES = FIXTURES_DIR / "gradle"
 
 _GRADLEW_STUB = "#!/bin/sh\nexit 0\n"
 
+FIXTURE = GRADLE_FIXTURES / "resolution" / "empty.json"
+
+
+def report_payload():
+    return json.loads(FIXTURE.read_text())
+
+
+def fixture_runner(root, args, *, label):
+    assert args[0] == "mmGradleReport"
+    assert "--rerun-tasks" in args and "--no-build-cache" in args
+    owned = root / GRADLE_INVENTORY_RELPATH
+    assert (root / GRADLE_INVENTORY_MARKER_RELPATH).is_file()
+    assert (owned / "gradle-report.gradle").read_text().startswith("import ")
+    (root / GRADLE_INVENTORY_BOM_RELPATH).write_text(
+        '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[{"group":"g","name":"a","version":"1.0","purl":"pkg:maven/g/a@1.0"}]}'
+    )
+    value = report_payload()
+    value["scopes"][0]["components"].append(
+        {
+            "id": "a",
+            "kind": "module",
+            "module": {"group": "g", "artifact": "a", "version": "1.0"},
+            "variants": ["runtime"],
+        }
+    )
+    value["scopes"][0]["edges"].append(
+        {"source": "root", "target": "a", "requested": "g:a:1.0", "constraint": False}
+    )
+    value["catalogue_digest"] = hashlib.sha256(
+        (root / "gradle/libs.versions.toml").read_bytes()
+    ).hexdigest()
+    (owned / "report.json").write_text(json.dumps(value))
+    return subprocess.CompletedProcess(args, 0, "", "")
+
 
 def make_vuln(**overrides: Any) -> VulnFinding:
-    defaults = dict(
-        vuln_id="CVE-2024-0001",
-        pkg_name="some-pkg",
-        installed_version="1.0.0",
-        fixed_version="1.0.1",
-        severity=Severity.HIGH,
-        title="Test vuln",
-        description="desc",
-        status="fixed",
-    )
+    defaults = {
+        "vuln_id": "CVE-2024-0001",
+        "pkg_name": "some-pkg",
+        "installed_version": "1.0.0",
+        "fixed_version": "1.0.1",
+        "severity": Severity.HIGH,
+        "title": "Test vuln",
+        "description": "desc",
+        "status": "fixed",
+    }
     return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
 def make_update(**overrides: Any) -> UpdateFinding:
-    defaults = dict(
-        pkg_name="pkg-a",
-        installed_version="1.0.0",
-        latest_version="1.0.1",
-        semver_tier=SemverTier.PATCH,
-    )
+    defaults = {
+        "pkg_name": "pkg-a",
+        "installed_version": "1.0.0",
+        "latest_version": "1.0.1",
+        "semver_tier": SemverTier.PATCH,
+    }
     return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
@@ -51,19 +206,25 @@ def make_scan_result(
 ) -> ScanResult:
     return ScanResult(
         project="vulnerable",
-        scanned_at=datetime.now(tz=timezone.utc),
+        scanned_at=datetime.now(tz=UTC),
         trivy_target="tests/fixtures/vulnerable-project",
         vulnerabilities=vulns if vulns is not None else [make_vuln()],
         updates=updates if updates is not None else [make_update()],
     )
 
 
-@pytest.fixture()
-def mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect MM_HOME to a temp directory (not yet created on disk)."""
+@pytest.fixture(autouse=True)
+def _isolated_mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every test gets its own mm home; nothing reaches the real ~/.mm."""
     home = tmp_path / ".mm"
-    monkeypatch.setattr("maintenance_man.config.MM_HOME", home)
+    monkeypatch.setattr("maintenance_man.paths.MM_HOME", home)
     return home
+
+
+@pytest.fixture()
+def mm_home(_isolated_mm_home: Path) -> Path:
+    """Return the per-test MM_HOME without creating it."""
+    return _isolated_mm_home
 
 
 @pytest.fixture()
@@ -131,70 +292,131 @@ def scan_results_dir(mm_home: Path) -> Path:
 
 
 @pytest.fixture()
-def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Patch all update-CLI boundaries so tests focus on orchestration.
-
-    Returns a dict holding the live scan_result object (key: ``scan_result``)
-    so individual tests can mutate lifecycle state before ``app(...)`` runs.
-    """
+def mock_update_cli_deps(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Provide real storage and one shared fake repository graph to update CLI."""
     scan_result = make_scan_result()
-    state: dict[str, object] = {"scan_result": scan_result}
+    vcs_state, project_paths = configure_fake_vcs(
+        mm_home_with_projects, tmp_path, monkeypatch
+    )
+    for project_path in set(project_paths.values()):
+        vcs_state.register_files(
+            project_path,
+            "mm-fixture-some-pkg.txt",
+            "mm-fixture-pkg-a.txt",
+            "mm-fixture-pkg-b.txt",
+            "mm-fixture-pkg-c.txt",
+        )
 
-    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.check_jj_available", lambda: None)
-    monkeypatch.setattr(
-        "maintenance_man.cli.load_scan_results",
-        lambda name, d: state["scan_result"],
+    def save_scan() -> None:
+        save_scan_results("vulnerable", scan_result)
+
+    save_scan()
+    for project_name in project_paths:
+        if project_name == "vulnerable":
+            continue
+        project_scan = deepcopy(scan_result)
+        project_scan.project = project_name
+        save_scan_results(project_name, project_scan)
+    processor = FakeFindingProcessor(
+        {
+            "some-pkg": (True, None),
+            "pkg-a": (True, None),
+            "pkg-b": (True, None),
+            "pkg-c": (True, None),
+        }
     )
-    monkeypatch.setattr(
-        "maintenance_man.cli.save_scan_results",
-        lambda name, d, sr: None,
+    monkeypatch.setattr("maintenance_man.services.update.process_findings", processor)
+    return {
+        "vcs_state": vcs_state,
+        "services": vcs_state.services(),
+        "scan_result": scan_result,
+        "save_scan": save_scan,
+        "project_paths": project_paths,
+    }
+
+
+@pytest.fixture()
+def mock_resolve_cli_deps(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Provide real storage and one shared fake repository graph to resolve CLI."""
+    scan_result = make_scan_result(
+        vulns=[
+            make_vuln(
+                update_status=UpdateStatus.FAILED,
+                flow=Workflow.RESOLVE,
+                failed_phase="unit",
+            ),
+        ],
+        updates=[
+            make_update(
+                update_status=UpdateStatus.FAILED,
+                flow=Workflow.RESOLVE,
+                failed_phase="unit",
+            ),
+        ],
     )
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda p: True)
-    monkeypatch.setattr("maintenance_man.cli.ensure_main_bookmark", lambda p: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.create_workspace",
-        lambda repo_path, project, revision: True,
+    vcs_state, project_paths = configure_fake_vcs(
+        mm_home_with_projects, tmp_path, monkeypatch
     )
-    monkeypatch.setattr(
-        "maintenance_man.cli.remove_workspace",
-        lambda repo_path, project: None,
+    for project_path in set(project_paths.values()):
+        vcs_state.register_files(
+            project_path,
+            "mm-fixture-some-pkg.txt",
+            "mm-fixture-pkg-a.txt",
+        )
+    vcs_state.repository(project_paths["vulnerable"]).set_bookmark(
+        bookmark="mm/resolve-dependencies", revision="@-"
     )
-    monkeypatch.setattr(
-        "maintenance_man.cli.workspace_path_for_project",
-        lambda project: Path("/tmp/mm-workspaces") / project,
+    fixture: dict[str, object] = {}
+
+    def save_scan() -> None:
+        save_scan_results(
+            "vulnerable",
+            fixture["scan_result"],  # ty:ignore[invalid-argument-type]
+        )
+
+    fixture.update(
+        {
+            "vcs_state": vcs_state,
+            "services": vcs_state.services(),
+            "scan_result": scan_result,
+            "save_scan": save_scan,
+            "project_paths": project_paths,
+        }
     )
-    monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: False)
-    monkeypatch.setattr(
-        "maintenance_man.cli.create_or_reset_bookmark",
-        lambda b, p, r: True,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.promote_bookmark_to_main",
-        lambda p, b: True,
-    )
-    monkeypatch.setattr("maintenance_man.cli.delete_bookmark", lambda b, p: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.refresh_working_copy_from_main", lambda p: True
-    )
-    monkeypatch.setattr("maintenance_man.cli.edit_new_change", lambda p, r: True)
-    return state
+    save_scan()
+    for project_name in project_paths:
+        if project_name == "vulnerable":
+            continue
+        project_scan = scan_result.model_copy(deep=True)
+        project_scan.project = project_name
+        save_scan_results(project_name, project_scan)
+    processor = FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)})
+    monkeypatch.setattr("maintenance_man.services.resolve.process_findings", processor)
+    return fixture
 
 
 def make_gradle_member(**overrides: Any) -> GradleMember:
-    defaults = dict(
-        kind="library",
-        alias="room-runtime",
-        coordinate="androidx.room:room-runtime",
-        installed_version="2.8.4",
-    )
+    defaults = {
+        "kind": "library",
+        "alias": "room-runtime",
+        "coordinate": "androidx.room:room-runtime",
+        "installed_version": "2.8.4",
+    }
     return GradleMember(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
 def make_gradle_target(**overrides: Any) -> GradleUpdateTarget:
-    defaults = dict(
-        version_ref="room",
-        members=[
+    defaults = {
+        "version_ref": "room",
+        "members": [
             make_gradle_member(
                 alias="room-runtime", coordinate="androidx.room:room-runtime"
             ),
@@ -205,8 +427,8 @@ def make_gradle_target(**overrides: Any) -> GradleUpdateTarget:
                 alias="room-testing", coordinate="androidx.room:room-testing"
             ),
         ],
-        target_version="2.8.5",
-    )
+        "target_version": "2.8.5",
+    }
     return GradleUpdateTarget(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
@@ -240,17 +462,12 @@ def mm_home_with_gradle(
     return mm_home_with_projects
 
 
-def set_maven_dates(
-    monkeypatch: pytest.MonkeyPatch, *, undated: set[str], days_old: int = 900
-) -> None:
-    """Substitute Maven Central lookups with controlled, relative publication dates.
+def ops_with_outdated(
+    outdated: Callable[[ProjectConfig], list[UpdateFinding]],
+) -> Callable[[str], PackageManagerOps]:
+    """Return a scanner table lookup whose entries use *outdated* instead."""
 
-    Coordinates in *undated* have no evidence at all; every other coordinate was
-    published *days_old* days ago.  The date is relative to now so an age
-    threshold in a test means what it says regardless of the current date.
-    """
-    published = datetime.now(timezone.utc) - timedelta(days=days_old)
-    monkeypatch.setattr(
-        "maintenance_man.dependency_age._get_maven_publish_date",
-        lambda pkg, version: None if pkg in undated else published,
-    )
+    def lookup(name: str) -> PackageManagerOps:
+        return dataclasses.replace(package_manager_ops(name), outdated=outdated)
+
+    return lookup

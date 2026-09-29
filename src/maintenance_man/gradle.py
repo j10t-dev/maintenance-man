@@ -1,16 +1,12 @@
 """Gradle adapter: wrapper invocation and version-catalogue target safety.
 
-Owns every Gradle-specific concern behind catalogue *targets*: the project's
-``./gradlew``, the supported catalogue declarations, grouping by shared version
-reference, plugin marker coordinates, plugin report validation and the two
-adapter-owned temporary outputs.  It performs subprocess and local-file I/O and
-owns no persistent cache.
+Runs the project's wrapper, parses catalogue declarations and update reports,
+groups shared versions, and manages adapter-owned temporary outputs.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -32,9 +28,9 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     SemverTier,
     UpdateFinding,
-    VulnFinding,
     classify_semver,
 )
+from maintenance_man.process import run_captured
 
 GRADLE_CATALOGUE_RELPATH = "gradle/libs.versions.toml"
 GRADLE_UPDATE_REPORT_RELPATH = "gradle/libs.versions.updates.toml"
@@ -52,15 +48,7 @@ _DISCOVER_ARGS = [
     "--no-daemon",
     "--console=plain",
 ]
-_BOM_ARGS = [
-    "cyclonedxBom",
-    "--no-daemon",
-    "--console=plain",
-    "--rerun-tasks",
-    "--no-build-cache",
-]
 _UNSAFE_TEXT_RE = re.compile(r"[\x00-\x1f\x7f]")
-_EXACT_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 
 class GradleError(Exception):
@@ -165,7 +153,8 @@ def apply_gradle_update(
             run_gradle(root, _APPLY_ARGS, label="versionCatalogApplyUpdates")
             _assert_only_target_changed(before, parse_catalogue(catalogue_path), target)
     except OSError as e:
-        raise GradleError(f"versionCatalogApplyUpdates failed: {e}") from e
+        msg = f"versionCatalogApplyUpdates failed: {e}"
+        raise GradleError(msg) from e
     return None
 
 
@@ -260,35 +249,51 @@ def discover_gradle_updates(project: ProjectConfig) -> list[UpdateFinding]:
             if not any(
                 line.strip() == GRADLE_NO_UPDATES_SIGNAL for line in output.splitlines()
             ):
-                raise GradleError(
+                msg = (
                     f"versionCatalogUpdate produced no report at "
                     f"{GRADLE_UPDATE_REPORT_RELPATH} — is version-catalog-update 1.1.1 "
                     f"applied to {root}?"
                 )
+                raise GradleError(msg)
             proposals = []
         else:
             proposals = parse_update_report(report_path)
 
-    if _digest(catalogue_path) != before:
-        raise GradleError(
+    require_catalogue_unchanged(
+        before,
+        _digest(catalogue_path),
+        message=(
             f"versionCatalogUpdate modified {GRADLE_CATALOGUE_RELPATH}; "
             "discovery must leave the source catalogue unchanged"
-        )
+        ),
+    )
 
     return build_update_findings(catalogue, proposals)
 
 
 def parse_catalogue(path: Path) -> Catalogue:
+    """Parse the supported subset of a Gradle version catalogue file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        msg = f"Version catalogue not found: {path}"
+        raise GradleError(msg) from e
+    except (UnicodeDecodeError, OSError) as e:
+        msg = f"Failed to parse version catalogue {path}: {e}"
+        raise GradleError(msg) from e
+    return parse_catalogue_text(text, source=str(path))
+
+
+def parse_catalogue_text(text: str, *, source: str = "<catalogue>") -> Catalogue:
     """Parse the supported subset of a Gradle version catalogue."""
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as e:
-        raise GradleError(f"Version catalogue not found: {path}") from e
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
-        raise GradleError(f"Failed to parse version catalogue {path}: {e}") from e
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        msg = f"Failed to parse version catalogue {source}: {e}"
+        raise GradleError(msg) from e
 
     versions: dict[str, CatalogueVersion] = {}
-    for name, value in _table(raw, "versions", path).items():
+    for name, value in _table(raw, "versions", source).items():
         if isinstance(value, str):
             versions[normalise_alias(name)] = CatalogueVersion(name=name, value=value)
         else:
@@ -302,10 +307,10 @@ def parse_catalogue(path: Path) -> Catalogue:
             )
 
     entries: dict[tuple[str, str], CatalogueEntry] = {}
-    for alias, value in _table(raw, "libraries", path).items():
+    for alias, value in _table(raw, "libraries", source).items():
         entry = _parse_library(alias, value)
         entries[entry.key] = entry
-    for alias, value in _table(raw, "plugins", path).items():
+    for alias, value in _table(raw, "plugins", source).items():
         entry = _parse_plugin(alias, value)
         entries[entry.key] = entry
 
@@ -317,34 +322,46 @@ def parse_catalogue(path: Path) -> Catalogue:
     preserved = {"sections": preserved}
     preserved["rich_versions"] = {
         normalise_alias(name): value
-        for name, value in _table(raw, "versions", path).items()
+        for name, value in _table(raw, "versions", source).items()
         if not isinstance(value, str)
     }
     preserved["rich_entries"] = {
         entry.key: value
         for heading, kind in (("libraries", "library"), ("plugins", "plugin"))
-        for alias, value in _table(raw, heading, path).items()
+        for alias, value in _table(raw, heading, source).items()
         if (entry := entries[(kind, normalise_alias(alias))]).unsupported is not None
     }
     return Catalogue(versions=versions, entries=entries, preserved_semantics=preserved)
 
 
 def parse_update_report(path: Path) -> list[ReportProposal]:
+    """Parse a plugin-generated update report file. Comments are not data."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        msg = f"malformed version catalogue update report {path}: {e}"
+        raise GradleError(msg) from e
+    return parse_update_report_text(text, source=str(path))
+
+
+def parse_update_report_text(
+    text: str, *, source: str = "<update report>"
+) -> list[ReportProposal]:
     """Parse a plugin-generated update report. Comments are not data."""
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
-        raise GradleError(
-            f"malformed version catalogue update report {path}: {e}"
-        ) from e
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        msg = f"malformed version catalogue update report {source}: {e}"
+        raise GradleError(msg) from e
 
     proposals: list[ReportProposal] = []
-    for alias, value in _table(raw, "libraries", path).items():
+    for alias, value in _table(raw, "libraries", source).items():
         if not isinstance(value, str) or value.count(":") != 2:
-            raise GradleError(
-                f"malformed library entry '{alias}' in {path}: expected "
+            msg = (
+                f"malformed library entry '{alias}' in {source}: expected "
                 f"'group:artifact:version', got {value!r}"
             )
+            raise GradleError(msg)
         group, name, version = value.split(":")
         proposals.append(
             ReportProposal(
@@ -354,12 +371,13 @@ def parse_update_report(path: Path) -> list[ReportProposal]:
                 version=assert_safe_text(version, "report version"),
             )
         )
-    for alias, value in _table(raw, "plugins", path).items():
+    for alias, value in _table(raw, "plugins", source).items():
         if not isinstance(value, str) or value.count(":") != 1:
-            raise GradleError(
-                f"malformed plugin entry '{alias}' in {path}: expected "
+            msg = (
+                f"malformed plugin entry '{alias}' in {source}: expected "
                 f"'plugin.id:version', got {value!r}"
             )
+            raise GradleError(msg)
         plugin_id, version = value.split(":")
         proposals.append(
             ReportProposal(
@@ -472,125 +490,23 @@ def owned_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
     try:
         inventory_dir.mkdir(parents=True)
     except OSError as exc:
-        raise GradleError(f"Could not create Gradle inventory: {exc}") from exc
+        msg = f"Could not create Gradle inventory: {exc}"
+        raise GradleError(msg) from exc
     try:
         (inventory_dir / ".mm-owned").write_bytes(b"")
     except OSError as exc:
         _remove_owned_tree(inventory_dir)
-        raise GradleError(f"Could not create Gradle inventory: {exc}") from exc
+        msg = f"Could not create Gradle inventory: {exc}"
+        raise GradleError(msg) from exc
     try:
         yield inventory_dir
     finally:
         _validate_owned_output_parents(root)
         marker = inventory_dir / ".mm-owned"
         if inventory_dir.is_symlink() or marker.is_symlink() or not marker.is_file():
-            raise GradleError("Gradle inventory ownership changed during operation")
+            msg = "Gradle inventory ownership changed during operation"
+            raise GradleError(msg)
         _remove_owned_tree(inventory_dir)
-
-
-@contextmanager
-def generate_gradle_inventory(project: ProjectConfig) -> Iterator[Path]:
-    """Yield a freshly generated, validated CycloneDX inventory."""
-    with owned_gradle_inventory(project) as directory:
-        try:
-            run_gradle(Path(project.path), _BOM_ARGS, label="cyclonedxBom")
-            bom = directory / "bom.json"
-            _validate_inventory(bom)
-        except OSError as exc:
-            raise GradleError(f"Could not generate Gradle inventory: {exc}") from exc
-        yield bom
-
-
-def resolve_gradle_vulnerability_target(
-    project: ProjectConfig, finding: VulnFinding
-) -> GradleUpdateTarget | GradleBlock:
-    """Map an advisory to an editable catalogue target, or explain the block.
-
-    Only catalogue **libraries** can own an advisory: mm never infers that
-    upgrading a parent, platform or plugin resolves a transitive finding.
-    """
-    fixed = (finding.fixed_version or "").strip()
-    if not fixed:
-        return GradleBlock(
-            kind="mapping", reason=f"{finding.vuln_id} names no fix version"
-        )
-    if not _EXACT_VERSION_RE.fullmatch(fixed):
-        return GradleBlock(
-            kind="conflict",
-            reason=(
-                f"{finding.vuln_id} does not name a single exact fix version "
-                f"({finding.fixed_version!r}); resolve manually"
-            ),
-        )
-
-    catalogue = parse_catalogue(Path(project.path) / GRADLE_CATALOGUE_RELPATH)
-    matches = [
-        entry
-        for entry in catalogue.entries.values()
-        if entry.kind == "library" and entry.coordinate == finding.pkg_name
-    ]
-    if not matches:
-        return GradleBlock(
-            kind="mapping",
-            reason=(
-                f"no catalogue library owns {finding.pkg_name}; it is transitive, "
-                f"platform-owned or a plugin implementation dependency — resolve "
-                f"manually"
-            ),
-        )
-    identities = {
-        ("ref", normalise_alias(entry.version_ref))
-        if entry.version_ref is not None
-        else (entry.kind, entry.alias)
-        for entry in matches
-    }
-    if len(identities) > 1:
-        return GradleBlock(
-            kind="conflict",
-            reason=(
-                f"{finding.pkg_name} is declared by more than one independently "
-                f"versioned catalogue alias; resolve manually"
-            ),
-        )
-
-    entry = matches[0]
-    if entry.unsupported is not None:
-        return GradleBlock(kind="mapping", reason=entry.unsupported)
-
-    version = catalogue.version_of(entry)
-    if version is None:
-        return GradleBlock(
-            kind="mapping",
-            reason=(
-                f"'{entry.alias}' has no catalogue version (platform/BOM managed); "
-                f"mm does not give it one"
-            ),
-        )
-    if version.value is None:
-        return GradleBlock(
-            kind="mapping",
-            reason=version.unsupported
-            or f"version '{version.name}' is not a simple literal",
-        )
-
-    entries = (
-        catalogue.members_of_ref(entry.version_ref)
-        if entry.version_ref is not None
-        else [entry]
-    )
-    return GradleUpdateTarget(
-        version_ref=version.name if entry.version_ref is not None else None,
-        members=[
-            GradleMember(
-                kind=member.kind,
-                alias=assert_safe_text(member.alias, "catalogue alias"),
-                coordinate=assert_safe_text(member.coordinate, "catalogue coordinate"),
-                installed_version=version.value,
-            )
-            for member in entries
-        ],
-        target_version=assert_safe_text(fixed, "fix version"),
-    )
 
 
 def run_gradle(
@@ -600,33 +516,16 @@ def run_gradle(
     _validate_owned_output_parents(root)
     wrapper = root / "gradlew"
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
-        raise GradleError(f"No executable Gradle wrapper at {wrapper}")
+        msg = f"No executable Gradle wrapper at {wrapper}"
+        raise GradleError(msg)
 
-    label = label or args[0]
-    try:
-        completed = subprocess.run(
-            [str(wrapper), *args],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=GRADLE_TIMEOUT_SECONDS,
-            stdin=subprocess.DEVNULL,
-            env=project_env(),
-        )
-    except subprocess.TimeoutExpired as e:
-        raise GradleError(
-            f"./gradlew {label} timed out after {GRADLE_TIMEOUT_SECONDS}s in {root}"
-        ) from e
-
-    except (OSError, UnicodeDecodeError) as e:
-        raise GradleError(f"Could not run ./gradlew {label} in {root}: {e}") from e
-
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()[-2000:]
-        raise GradleError(
-            f"./gradlew {label} failed (exit {completed.returncode}): {detail}"
-        )
-    return completed
+    return run_captured(
+        [str(wrapper), *args],
+        root,
+        timeout=GRADLE_TIMEOUT_SECONDS,
+        label=f"./gradlew {label or args[0]}",
+        error=GradleError,
+    )
 
 
 def claim_owned_file(path: Path, marker: Path, label: str) -> None:
@@ -647,7 +546,8 @@ def claim_owned_file(path: Path, marker: Path, label: str) -> None:
             raise _collision(path, label)
         path.unlink()
     except OSError as e:
-        raise GradleError(f"Could not claim {label} at {path}: {e}") from e
+        msg = f"Could not claim {label} at {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def claim_owned_dir(path: Path, label: str) -> None:
@@ -662,7 +562,8 @@ def claim_owned_dir(path: Path, label: str) -> None:
             raise _collision(path, label)
         shutil.rmtree(path)
     except OSError as e:
-        raise GradleError(f"Could not claim {label} at {path}: {e}") from e
+        msg = f"Could not claim {label} at {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def _validate_owned_output_parents(root: Path) -> None:
@@ -676,9 +577,8 @@ def _validate_owned_output_parents(root: Path) -> None:
         ):
             raise _collision(report_parent, "Gradle report directory")
     except OSError as e:
-        raise GradleError(
-            f"Could not inspect Gradle output parents in {root}: {e}"
-        ) from e
+        msg = f"Could not inspect Gradle output parents in {root}: {e}"
+        raise GradleError(msg) from e
 
 
 def reclaim_gradle_outputs(root: Path) -> None:
@@ -692,14 +592,11 @@ def reclaim_gradle_outputs(root: Path) -> None:
         marker.unlink(missing_ok=True)
         claim_owned_dir(inventory, "Gradle inventory directory")
     except (OSError, GradleError) as e:
-        raise GradleError(
-            f"Could not reclaim interrupted Gradle outputs in {root}: {e}"
-        ) from e
+        msg = f"Could not reclaim interrupted Gradle outputs in {root}: {e}"
+        raise GradleError(msg) from e
 
 
-def workspace_environment_reason(
-    source_root: Path, workspace_root: Path, *, tracked_local_properties: bool = False
-) -> str | None:
+def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str | None:
     """Explain why a workspace build could not resolve the Android SDK.
 
     ``mm update`` applies inside a jj workspace, which checks out tracked files
@@ -715,8 +612,6 @@ def workspace_environment_reason(
         return None
     source = source_root / GRADLE_LOCAL_PROPERTIES_RELPATH
     if not source.is_file():
-        return None
-    if tracked_local_properties:
         return None
     return (
         f"{source} is not a tracked regular file in the selected revision, so it is "
@@ -735,7 +630,8 @@ def normalise_alias(name: str) -> str:
 def assert_safe_text(value: str, label: str) -> str:
     """Reject report data that cannot be safely written to a TOML document."""
     if not value or _UNSAFE_TEXT_RE.search(value):
-        raise GradleError(f"unsafe {label}: {value!r}")
+        msg = f"unsafe {label}: {value!r}"
+        raise GradleError(msg)
     return value
 
 
@@ -762,7 +658,8 @@ def _owned_update_report(root: Path) -> Iterator[Path]:
         try:
             marker.write_bytes(b"")
         except OSError as e:
-            raise GradleError(f"Could not mark Gradle update report {path}: {e}") from e
+            msg = f"Could not mark Gradle update report {path}: {e}"
+            raise GradleError(msg) from e
         yield path
     finally:
         try:
@@ -770,9 +667,8 @@ def _owned_update_report(root: Path) -> Iterator[Path]:
             path.unlink(missing_ok=True)
             marker.unlink(missing_ok=True)
         except OSError as e:
-            raise GradleError(
-                f"Could not remove owned Gradle update report {path}: {e}"
-            ) from e
+            msg = f"Could not remove owned Gradle update report {path}: {e}"
+            raise GradleError(msg) from e
 
 
 def _group_finding(
@@ -960,74 +856,33 @@ def _unsupported_entry(kind: GradleKind, alias: str, reason: str) -> CatalogueEn
     return CatalogueEntry(kind, alias, alias, None, None, reason)
 
 
-def _table(raw: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
+def _table(raw: dict[str, Any], name: str, source: str) -> dict[str, Any]:
     table = raw.get(name, {})
     if not isinstance(table, dict):
-        raise GradleError(f"malformed [{name}] table in {path}")
+        msg = f"malformed [{name}] table in {source}"
+        raise GradleError(msg)
     return table
+
+
+def file_digest(path: Path) -> str:
+    """SHA-256 of *path*'s bytes; the original OSError escapes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def require_catalogue_unchanged(
+    before: str, after: str, *, message: str, reported_digest: str | None = None
+) -> None:
+    """Refuse with *message* when the catalogue digest moved or disagrees."""
+    if before != after or (reported_digest is not None and reported_digest != before):
+        raise GradleError(message)
 
 
 def _digest(path: Path) -> str:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return file_digest(path)
     except OSError as e:
-        raise GradleError(f"Could not read Gradle catalogue {path}: {e}") from e
-
-
-def _validate_inventory(path: Path) -> None:
-    """A missing, empty, non-Maven or malformed inventory is never a clean scan."""
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as e:
-        raise GradleError(
-            f"cyclonedxBom produced no inventory at {path}; is org.cyclonedx.bom "
-            f"3.4.1 applied with the documented fixed output paths?"
-        ) from e
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
-        raise GradleError(f"malformed CycloneDX inventory {path}: {e}") from e
-
-    if not isinstance(document, dict):
-        raise GradleError(f"malformed CycloneDX inventory {path}: expected an object")
-    if document.get("bomFormat") != "CycloneDX":
-        raise GradleError(f"{path} is not a CycloneDX document")
-    if _spec_version(document.get("specVersion")) < (1, 5):
-        raise GradleError(
-            f"unsupported CycloneDX spec version "
-            f"{document.get('specVersion')!r} in {path}; mm requires 1.5 or later"
-        )
-    components = document.get("components", [])
-    if not isinstance(components, list) or any(
-        not isinstance(component, dict) for component in components
-    ):
-        raise GradleError(
-            f"malformed CycloneDX inventory {path}: "
-            "components must be an array of objects"
-        )
-    if not components:
-        raise GradleError(
-            f"CycloneDX inventory {path} has no components; an empty inventory is "
-            f"an unsupported scan, not a clean result"
-        )
-    if not any(
-        str(component.get("purl", "")).startswith("pkg:maven/")
-        for component in components
-    ):
-        raise GradleError(
-            f"CycloneDX inventory {path} has no Maven components; the scan scope is "
-            f"unsupported, not clean"
-        )
-
-
-def _spec_version(raw: object) -> tuple[int, ...]:
-    """Parse a CycloneDX specVersion as a numeric tuple. Unparsable sorts lowest.
-
-    A floor rather than an equality: a plugin patch bump that emits a newer
-    schema must not turn every Gradle scan into a hard error.
-    """
-    try:
-        return tuple(int(part) for part in str(raw).split("."))
-    except ValueError:
-        return (0,)
+        msg = f"Could not read Gradle catalogue {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def _remove_owned_tree(path: Path) -> None:
@@ -1039,7 +894,8 @@ def _remove_owned_tree(path: Path) -> None:
     except FileNotFoundError:
         pass
     except OSError as e:
-        raise GradleError(f"failed to remove owned Gradle inventory {path}: {e}") from e
+        msg = f"failed to remove owned Gradle inventory {path}: {e}"
+        raise GradleError(msg) from e
 
 
 def _validate_catalogue_state(
@@ -1055,55 +911,11 @@ def _validate_catalogue_state(
 
     expected_version = target.target_version if expect_applied else None
     for member in target.members:
-        entry = catalogue.entry(member.kind, member.alias)
-        if entry is None:
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"the catalogue no longer declares {member.kind} "
-                    f"'{member.alias}'; rescan required"
-                ),
-            )
-        if entry.coordinate != member.coordinate:
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"'{member.alias}' now resolves to {entry.coordinate}, not "
-                    f"{member.coordinate}; rescan required"
-                ),
-            )
-        if entry.unsupported is not None:
-            return GradleBlock(kind="mapping", reason=entry.unsupported)
-        if _ref_key(entry) != (
-            normalise_alias(target.version_ref) if target.version_ref else None
-        ):
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"'{member.alias}' no longer shares version reference "
-                    f"'{target.version_ref}'; rescan required"
-                ),
-            )
-        version = catalogue.version_of(entry)
-        if version is None or version.value is None:
-            return GradleBlock(
-                kind="mapping",
-                reason=(
-                    f"'{member.alias}' no longer has a simple catalogue version; "
-                    f"resolve manually"
-                ),
-            )
-        expected = expected_version or member.installed_version
-        if version.value != expected:
-            return GradleBlock(
-                kind="stale",
-                reason=(
-                    f"'{member.alias}' is at {version.value}, expected {expected}; "
-                    f"the catalogue no longer matches the scan; note that an "
-                    f"uncommitted catalogue edit is not visible in the update "
-                    f"workspace. Rescan required"
-                ),
-            )
+        block = _validate_catalogue_member(
+            catalogue, target, member, expected_version=expected_version
+        )
+        if block is not None:
+            return block
 
     if target.version_ref is not None:
         current = {entry.key for entry in catalogue.members_of_ref(target.version_ref)}
@@ -1121,6 +933,78 @@ def _validate_catalogue_state(
     return None
 
 
+def _validate_catalogue_member(
+    catalogue: Catalogue,
+    target: GradleUpdateTarget,
+    member: GradleMember,
+    *,
+    expected_version: str | None,
+) -> GradleBlock | None:
+    entry = catalogue.entry(member.kind, member.alias)
+    if entry is None:
+        return GradleBlock(
+            kind="stale",
+            reason=(
+                f"the catalogue no longer declares {member.kind} "
+                f"'{member.alias}'; rescan required"
+            ),
+        )
+    if entry.coordinate != member.coordinate:
+        return GradleBlock(
+            kind="stale",
+            reason=(
+                f"'{member.alias}' now resolves to {entry.coordinate}, not "
+                f"{member.coordinate}; rescan required"
+            ),
+        )
+    if entry.unsupported is not None:
+        return GradleBlock(kind="mapping", reason=entry.unsupported)
+    expected_ref = normalise_alias(target.version_ref) if target.version_ref else None
+    if _ref_key(entry) != expected_ref:
+        return GradleBlock(
+            kind="stale",
+            reason=(
+                f"'{member.alias}' no longer shares version reference "
+                f"'{target.version_ref}'; rescan required"
+            ),
+        )
+    return _validate_catalogue_member_version(
+        catalogue,
+        entry,
+        expected_version or member.installed_version,
+        recorded_alias=member.alias,
+    )
+
+
+def _validate_catalogue_member_version(
+    catalogue: Catalogue,
+    entry: CatalogueEntry,
+    expected: str,
+    *,
+    recorded_alias: str,
+) -> GradleBlock | None:
+    version = catalogue.version_of(entry)
+    if version is None or version.value is None:
+        return GradleBlock(
+            kind="mapping",
+            reason=(
+                f"'{recorded_alias}' no longer has a simple catalogue version; "
+                f"resolve manually"
+            ),
+        )
+    if version.value == expected:
+        return None
+    return GradleBlock(
+        kind="stale",
+        reason=(
+            f"'{recorded_alias}' is at {version.value}, expected {expected}; "
+            f"the catalogue no longer matches the scan; note that an "
+            f"uncommitted catalogue edit is not visible in the update "
+            f"workspace. Rescan required"
+        ),
+    )
+
+
 def _assert_only_target_changed(
     before: Catalogue, after: Catalogue, target: GradleUpdateTarget
 ) -> None:
@@ -1130,60 +1014,90 @@ def _assert_only_target_changed(
     because both sides are compared as parsed models, not as text.
     """
     if before.preserved_semantics != after.preserved_semantics:
-        raise GradleError(
+        msg = (
             "versionCatalogApplyUpdates changed bundles or unsupported "
             "catalogue declarations"
         )
+        raise GradleError(msg)
     changed = {
         (member.kind, normalise_alias(member.alias)) for member in target.members
     }
     if set(before.entries) != set(after.entries):
-        raise GradleError(
+        msg = (
             "versionCatalogApplyUpdates added or removed catalogue aliases; "
             "the catalogue change was not the selected group"
         )
+        raise GradleError(msg)
 
     for key, old in before.entries.items():
-        new = after.entries[key]
-        if old.coordinate != new.coordinate or _ref_key(old) != _ref_key(new):
-            raise GradleError(
-                f"alias '{old.alias}' changed identity during apply: "
-                f"{old.coordinate}/{_ref_key(old)} -> {new.coordinate}/{_ref_key(new)}"
-            )
-        old_value = _version_value(before, old)
-        new_value = _version_value(after, new)
-        if key in changed:
-            if new.unsupported is not None or new_value is None:
-                raise GradleError(
-                    f"selected alias {new.alias!r} no longer has a simple version"
-                )
-            if new_value != target.target_version:
-                raise GradleError(
-                    f"'{old.alias}' is {new_value!r} after apply, "
-                    f"expected {target.target_version!r}"
-                )
-        elif old_value != new_value:
-            raise GradleError(
-                f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
-            )
+        _assert_alias_change(
+            before,
+            after,
+            old,
+            selected=key in changed,
+            target_version=target.target_version,
+        )
 
     if set(before.versions) != set(after.versions):
-        raise GradleError("versionCatalogApplyUpdates added or removed version entries")
+        msg = "versionCatalogApplyUpdates added or removed version entries"
+        raise GradleError(msg)
 
     changed_ref = normalise_alias(target.version_ref) if target.version_ref else None
     for name, old_version in before.versions.items():
-        new_version = after.versions[name]
-        if name == changed_ref:
-            if new_version.value != target.target_version:
-                raise GradleError(
-                    f"version '{old_version.name}' is {new_version.value!r} after "
-                    f"apply, expected {target.target_version!r}"
-                )
-        elif new_version.value != old_version.value:
-            raise GradleError(
-                f"unexpected change to version '{old_version.name}': "
-                f"{old_version.value!r} -> {new_version.value!r}"
-            )
+        _assert_named_version_change(
+            old_version,
+            after.versions[name],
+            selected=name == changed_ref,
+            target_version=target.target_version,
+        )
+
+
+def _assert_alias_change(
+    before: Catalogue,
+    after: Catalogue,
+    old: CatalogueEntry,
+    *,
+    selected: bool,
+    target_version: str,
+) -> None:
+    new = after.entries[old.key]
+    if old.coordinate != new.coordinate or _ref_key(old) != _ref_key(new):
+        msg = (
+            f"alias '{old.alias}' changed identity during apply: "
+            f"{old.coordinate}/{_ref_key(old)} -> {new.coordinate}/{_ref_key(new)}"
+        )
+        raise GradleError(msg)
+    old_value = _version_value(before, old)
+    new_value = _version_value(after, new)
+    if selected and (new.unsupported is not None or new_value is None):
+        msg = f"selected alias {new.alias!r} no longer has a simple version"
+        raise GradleError(msg)
+    if selected and new_value != target_version:
+        msg = f"'{old.alias}' is {new_value!r} after apply, expected {target_version!r}"
+        raise GradleError(msg)
+    if not selected and old_value != new_value:
+        msg = f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
+        raise GradleError(msg)
+
+
+def _assert_named_version_change(
+    old: CatalogueVersion,
+    new: CatalogueVersion,
+    *,
+    selected: bool,
+    target_version: str,
+) -> None:
+    if selected and new.value != target_version:
+        msg = (
+            f"version '{old.name}' is {new.value!r} after apply, "
+            f"expected {target_version!r}"
+        )
+        raise GradleError(msg)
+    if not selected and new.value != old.value:
+        msg = (
+            f"unexpected change to version '{old.name}': {old.value!r} -> {new.value!r}"
+        )
+        raise GradleError(msg)
 
 
 def _version_value(catalogue: Catalogue, entry: CatalogueEntry) -> str | None:

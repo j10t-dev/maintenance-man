@@ -1,11 +1,10 @@
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from maintenance_man.cli import _relative_time, app
-from maintenance_man.models.activity import record_activity
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -14,8 +13,9 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
+from maintenance_man.storage import record_activity
 
-_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
 
 def _write_scan_result(mm_home: Path, name: str, result: ScanResult) -> None:
@@ -24,6 +24,17 @@ def _write_scan_result(mm_home: Path, name: str, result: ScanResult) -> None:
         result.model_dump_json(indent=2),
         encoding="utf-8",
     )
+
+
+def _table_row(output: str, name: str) -> tuple[str, ...]:
+    for line in output.splitlines():
+        if "│" not in line:
+            continue
+        cells = tuple(cell.strip() for cell in line.split("│")[1:-1])
+        if cells and cells[0] == name:
+            return cells
+    message = f"No table row found for {name!r}"
+    raise AssertionError(message)
 
 
 @pytest.fixture()
@@ -108,6 +119,23 @@ class TestListCommand:
         assert "myapp" in output
         assert "uv" in output
 
+    def test_list_prints_bracketed_project_name_literally(
+        self, mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        mm_home.mkdir(parents=True)
+        (mm_home / "config.toml").write_text(
+            f'[projects."a[b]"]\npath = "{project}"\npackage_manager = "uv"\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            app(["list"])
+
+        assert exc_info.value.code == 0
+        assert "a[b]" in capsys.readouterr().out
+
 
 class TestListFindings:
     def test_shows_never_for_unscanned_projects(
@@ -144,8 +172,8 @@ class TestListFindings:
             app(["list"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
-        assert "2" in output  # 2 actionable vulns
-        assert "3" in output  # 3 updates
+        row = _table_row(output, "myapp")
+        assert row[2:5] == ("2", "3", "1")
 
     def test_corrupt_scan_results_skipped(
         self,
@@ -242,29 +270,44 @@ class TestListFindings:
         low_pos = output.index("CVE-LOW")
         assert crit_pos < high_pos < low_pos
 
+    @pytest.mark.parametrize(
+        ("severities", "vuln_ids", "expected_order"),
+        [
+            ((Severity.HIGH, Severity.HIGH), ("CVE-0001", "CVE-0002"), None),
+            (
+                (Severity.CRITICAL, Severity.HIGH),
+                ("CVE-CRIT", "CVE-HIGH"),
+                ("CVE-CRIT", "CVE-HIGH"),
+            ),
+        ],
+        ids=["equal-severity", "mixed-severity"],
+    )
     def test_detail_fix_marker_on_highest_version(
         self,
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
+        severities: tuple[Severity, Severity],
+        vuln_ids: tuple[str, str],
+        expected_order: tuple[str, str] | None,
     ):
         """'← fix' marks the highest fix version for duplicate-package vulns."""
         vulns = [
             VulnFinding(
-                vuln_id="CVE-0001",
+                vuln_id=vuln_ids[0],
                 pkg_name="requests",
                 installed_version="2.25.0",
                 fixed_version="2.31.0",
-                severity=Severity.HIGH,
+                severity=severities[0],
                 title="t",
                 description="d",
                 status="fixed",
             ),
             VulnFinding(
-                vuln_id="CVE-0002",
+                vuln_id=vuln_ids[1],
                 pkg_name="requests",
                 installed_version="2.25.0",
                 fixed_version="2.32.4",
-                severity=Severity.HIGH,
+                severity=severities[1],
                 title="t",
                 description="d",
                 status="fixed",
@@ -281,62 +324,14 @@ class TestListFindings:
             app(["list", "--detail"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
-        # The marker should appear on the row with 2.32.4
         assert "2.32.4" in output
-        # Find lines containing the marker
         lines_with_marker = [
             line for line in output.splitlines() if "\u2190 fix" in line
         ]
         assert len(lines_with_marker) == 1
         assert "2.32.4" in lines_with_marker[0]
-
-    def test_detail_fix_marker_mixed_severity_same_package(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Mixed severities for same package still show marker on highest fix."""
-        vulns = [
-            VulnFinding(
-                vuln_id="CVE-CRIT",
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.31.0",
-                severity=Severity.CRITICAL,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-            VulnFinding(
-                vuln_id="CVE-HIGH",
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.32.4",
-                severity=Severity.HIGH,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-        ]
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            trivy_target=".",
-            vulnerabilities=vulns,
-        )
-        _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        # CRITICAL should appear before HIGH
-        assert output.index("CVE-CRIT") < output.index("CVE-HIGH")
-        # Marker on the row with 2.32.4 (the HIGH one)
-        lines_with_marker = [
-            line for line in output.splitlines() if "\u2190 fix" in line
-        ]
-        assert len(lines_with_marker) == 1
-        assert "2.32.4" in lines_with_marker[0]
+        if expected_order is not None:
+            assert output.index(expected_order[0]) < output.index(expected_order[1])
 
     def test_detail_no_fix_marker_for_single_vuln_package(
         self,
@@ -371,6 +366,8 @@ class TestListActivity:
         output = capsys.readouterr().out
         assert "Built" in output
         assert "Deployed" in output
+        row = _table_row(output, "myapp")
+        assert row[6:8] == ("—", "—")
 
     def test_shows_relative_time_for_build(
         self,
