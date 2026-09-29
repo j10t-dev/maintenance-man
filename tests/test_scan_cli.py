@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
 from maintenance_man import cli, scanner, vcs_workflow
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
@@ -14,9 +15,14 @@ from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Event,
+    GradleFlowFailed,
+    GradleRunArchived,
+    GradleWithheld,
+    NoEligibleGradleChanges,
     Operation,
     OperationFailed,
     ProjectSkipped,
+    PullRequestOutput,
     SkipReason,
     SyncCompleted,
 )
@@ -37,6 +43,7 @@ from maintenance_man.models.scan import (
     Severity,
     UpdateFinding,
     VulnFinding,
+    Workflow,
 )
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
@@ -152,6 +159,28 @@ from tests.fake_vcs import FakeJjState
             "  a[b] — already [up] to date",
             "  a[b] — already [up] to date",
         ),
+        (
+            GradleWithheld("g:[lib]", "too [new]"),
+            "Withheld g:[lib]: too [new]",
+            "Withheld g:[lib]: too [new]",
+        ),
+        (
+            NoEligibleGradleChanges(),
+            "No eligible Gradle changes",
+            "No eligible Gradle changes",
+        ),
+        (
+            GradleRunArchived(Path("/tmp/[history]/run.json")),
+            "Archived failed Gradle run to /tmp/[history]/run.json; "
+            "rebuilding candidates from main",
+            "Archived failed Gradle run to /tmp/[history]/run.json; "
+            "rebuilding candidates from main",
+        ),
+        (
+            GradleFlowFailed(Workflow.UPDATE, "bad [projects.x]"),
+            "Cannot complete Gradle update: bad [projects.x]",
+            "Cannot complete Gradle update: bad [projects.x]",
+        ),
     ],
 )
 def test_event_renderer_preserves_text(
@@ -169,6 +198,30 @@ def test_event_renderer_preserves_text(
     cli._Renderer(batch=batch)(event)
 
     assert output.getvalue().rstrip("\n") == (batch_text if batch else single)
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_pull_request_output_is_indented_and_dim(
+    monkeypatch: pytest.MonkeyPatch, batch: bool
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        cli,
+        "console",
+        Console(
+            file=output,
+            width=220,
+            force_terminal=True,
+            color_system="standard",
+        ),
+    )
+
+    cli._Renderer(batch=batch)(PullRequestOutput("https://x/pull/1"))
+
+    rendered = Text.from_ansi(output.getvalue())
+    assert rendered.plain == "  https://x/pull/1\n"
+    assert rendered.spans
+    assert all("dim" in str(span.style) for span in rendered.spans)
 
 
 def test_every_event_has_a_renderer() -> None:

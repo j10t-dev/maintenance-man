@@ -92,9 +92,6 @@ name = "Only the CLI imports rich"
 type = "protected"
 protected_modules = ["rich"]
 allowed_importers = ["maintenance_man.cli"]
-ignore_imports = [
-    "maintenance_man.gradle_workflow -> rich",
-]
 
 [[tool.importlinter.contracts]]
 id = "vcs-no-gradle"

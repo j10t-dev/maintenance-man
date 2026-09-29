@@ -1522,7 +1522,8 @@ def test_gradle_ready_only_missing_bookmark_preserves_state(
 def test_gradle_workspace_revision_reports_uninspectable_local_properties(
     gradle_project, monkeypatch
 ):
-    from maintenance_man.cli import _gradle_workspace_revision, _UpdateSetupError
+    from maintenance_man.gradle import GradleError
+    from maintenance_man.gradle_workflow import pin_workspace_revision
     from maintenance_man.vcs import RevisionError
 
     monkeypatch.delenv("ANDROID_HOME", raising=False)
@@ -1539,13 +1540,13 @@ def test_gradle_workspace_revision_reports_uninspectable_local_properties(
     )
 
     with pytest.raises(
-        _UpdateSetupError,
+        GradleError,
         match=(
             r"Cannot inspect local.properties in mm/update-dependencies: "
             r"inspection failed"
         ),
     ):
-        _gradle_workspace_revision(
+        pin_workspace_revision(
             "android",
             gradle_project,
             "mm/update-dependencies",

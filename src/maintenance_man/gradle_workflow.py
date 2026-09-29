@@ -1,12 +1,10 @@
 """Gradle workflow preparation, workspace coordination, and finalization."""
 
+import contextlib
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-
-from rich import print as rprint
 
 from maintenance_man import gradle_updates as gradle_updater
 from maintenance_man import paths
@@ -14,14 +12,13 @@ from maintenance_man.dependency_age import (
     PublicationLookupContext,
     filter_gradle_updates_by_age,
 )
-from maintenance_man.exit_codes import ExitCode
-from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
 from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GradleError,
     discover_gradle_updates,
     parse_catalogue,
+    workspace_environment_reason,
 )
 from maintenance_man.gradle_resolution import (
     prepare_gradle_candidates,
@@ -34,7 +31,17 @@ from maintenance_man.gradle_verification import (
     snapshot_vulnerabilities,
 )
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.events import Emit
+from maintenance_man.models.events import (
+    Emit,
+    GradleFlowFailed,
+    GradleRunArchived,
+    GradleRunReported,
+    GradleWithheld,
+    NoEligibleGradleChanges,
+    Outcome,
+    PullRequestOutput,
+    ScanReported,
+)
 from maintenance_man.models.gradle import (
     ApplyingAttempt,
     CompletedAttempt,
@@ -80,15 +87,9 @@ from maintenance_man.vcs_workflow import (
     remove_workspace,
 )
 
-
-@dataclass(frozen=True)
-class GradleInteraction:
-    """Presentation and environment checks supplied by the CLI."""
-
-    choose: Callable[[tuple[GradleCandidate, ...]], tuple[GradleCandidate, ...]]
-    report: Callable[[GradleRun, ProjectConfig], None]
-    report_scan: Callable[[ScanResult], None]
-    workspace_revision: Callable[[str, ProjectConfig, str], str]
+type GradleChooser = Callable[
+    [tuple[GradleCandidate, ...]], tuple[GradleCandidate, ...]
+]
 
 
 def _prepare_gradle_run(
@@ -98,13 +99,12 @@ def _prepare_gradle_run(
     base: str,
     publication: PublicationLookupContext,
     minimum_age_days: int,
-    interactive: bool,
     discovered: list[UpdateFinding] | None = None,
     *,
-    interaction: GradleInteraction,
+    choose: GradleChooser | None,
     vcs: VcsServices,
     emit: Emit,
-) -> GradleRun | ExitCode:
+) -> GradleRun | Outcome:
     # Resolve current security findings even when discovery produces no proposals.
     vulnerabilities, resolution = _run_gradle_scan(project)
     catalogue = parse_catalogue(project.path / GRADLE_CATALOGUE_RELPATH)
@@ -113,8 +113,8 @@ def _prepare_gradle_run(
     )
     plan = select_gradle_candidates(catalogue, resolution, vulnerabilities, proposals)
     candidates = (
-        interaction.choose(plan.candidates)
-        if interactive and plan.candidates
+        choose(plan.candidates)
+        if choose is not None and plan.candidates
         else plan.candidates
     )
     prepared = prepare_gradle_candidates(
@@ -127,28 +127,31 @@ def _prepare_gradle_run(
         for item in prepared
     )
     if not any(isinstance(item, PlannedAttempt) for item in attempts):
-        interaction.report_scan(
-            ScanResult(
-                project=project_name,
-                scanned_at=datetime.now(UTC),
-                trivy_target=str(project.path),
-                vulnerabilities=vulnerabilities,
-                gradle_resolution=resolution.report.model_dump(mode="json"),
+        emit(
+            ScanReported(
+                ScanResult(
+                    project=project_name,
+                    scanned_at=datetime.now(UTC),
+                    trivy_target=str(project.path),
+                    vulnerabilities=vulnerabilities,
+                    gradle_resolution=resolution.report.model_dump(mode="json"),
+                )
             )
         )
         for withheld in plan.withheld:
-            rprint(f"Withheld {withheld.coordinate}: {withheld.reason}")
+            emit(GradleWithheld(withheld.coordinate, withheld.reason))
         for item in prepared:
             if item.block:
-                rprint(
-                    f"Withheld {item.candidate.target.display_name}: "
-                    f"{item.block.reason}"
+                emit(
+                    GradleWithheld(
+                        item.candidate.target.display_name, item.block.reason
+                    )
                 )
-        rprint("No eligible Gradle changes")
+        emit(NoEligibleGradleChanges())
         return (
-            ExitCode.UPDATE_FAILED
+            Outcome.FAILED
             if attempts or plan.withheld or vulnerabilities
-            else ExitCode.OK
+            else Outcome.SUCCEEDED
         )
     gradle_updater.gradle_check_commands(project)
     context = initialize_comparison_context(
@@ -295,7 +298,7 @@ def _finish_verified_gradle_run(
                 ),
             )
             if output:
-                rprint(output)
+                emit(PullRequestOutput(output))
             run = _complete_gradle_attempts(run.model_copy(update={"submitted": True}))
             gradle_updater.save_gradle_run(path, run)
         return run
@@ -337,7 +340,7 @@ def _finish_verified_gradle_run(
 
 
 def _archive_rolled_back_gradle_run(
-    run: GradleRun, project: ProjectConfig, *, vcs: VcsServices
+    run: GradleRun, project: ProjectConfig, *, vcs: VcsServices, emit: Emit
 ) -> None:
     if (
         run.flow != Workflow.UPDATE
@@ -390,14 +393,39 @@ def _archive_rolled_back_gradle_run(
     path.unlink()
     fsync_dir(path.parent)
     gradle_updater.retire_gradle_context(run.context)
-    rprint(f"Archived failed Gradle run to {archive}; rebuilding candidates from main")
+    emit(GradleRunArchived(archive))
+
+
+def pin_workspace_revision(
+    project_name: str,
+    project: ProjectConfig,
+    revision: str,
+    *,
+    vcs: VcsServices,
+) -> str:
+    """Verify SDK file availability and pin the revision inspected."""
+    reason = workspace_environment_reason(
+        project.path, workspace_path_for_project(project_name)
+    )
+    if reason is None:
+        return revision
+    try:
+        inspection = vcs.repository(project.path).revision_file(
+            revision=revision, filename="local.properties"
+        )
+    except RevisionError as exc:
+        raise GradleError(
+            f"Cannot inspect local.properties in {revision}: {exc}"
+        ) from exc
+    if not inspection.is_regular:
+        raise GradleError(reason)
+    return inspection.commit_id
 
 
 def _new_gradle_workspace(
     project_name: str,
     project: ProjectConfig,
     flow: Workflow,
-    interaction: GradleInteraction,
     *,
     vcs: VcsServices,
 ) -> tuple[ProjectConfig, str]:
@@ -420,14 +448,14 @@ def _new_gradle_workspace(
             "manual review required"
         )
     if flow == Workflow.UPDATE:
-        interaction.workspace_revision(project_name, project, "main")
+        pin_workspace_revision(project_name, project, "main", vcs=vcs)
     source_repo = vcs.repository(Path(project.path))
     prune_stale_bookmarks(repo=source_repo, host=vcs.code_host(Path(project.path)))
     ensure_main_bookmark(repo=source_repo)
     base = source_repo.resolve_revision(revision="main")
     bookmark = WORKFLOW_BOOKMARKS[flow]
     if flow == Workflow.UPDATE:
-        interaction.workspace_revision(project_name, project, base)
+        pin_workspace_revision(project_name, project, base, vcs=vcs)
         remove_workspace(repo=source_repo, project=project_name)
         workspace = create_workspace(
             repo=source_repo, project=project_name, revision=base
@@ -495,18 +523,36 @@ def _gradle_run_needs_replanning(run: GradleRun) -> bool:
     )
 
 
+def _gradle_display_result(run: GradleRun, project: ProjectConfig) -> ScanResult:
+    result = None
+    if run.refreshed:
+        # A removed results file must not hide durable residual evidence.
+        with contextlib.suppress(NoScanResultsError):
+            result = load_scan_results(run.project)
+    if result is not None:
+        return result
+    return ScanResult(
+        project=run.project,
+        scanned_at=run.context.created_at,
+        trivy_target=str(project.path),
+        vulnerabilities=snapshot_vulnerabilities(run.accepted_snapshot),
+        gradle_resolution=run.accepted_snapshot.resolution.report.model_dump(
+            mode="json"
+        ),
+    )
+
+
 def run_gradle_flow(
     project_name: str,
     project: ProjectConfig,
     flow: Workflow,
     *,
-    interactive: bool,
     minimum_age_days: int,
     continue_: bool = False,
-    interaction: GradleInteraction,
+    choose: GradleChooser | None,
     emit: Emit,
     vcs: VcsServices | None = None,
-) -> int:
+) -> Outcome:
     services = vcs or make_vcs_services()
     try:
         path = gradle_updater.gradle_run_path(project_name)
@@ -514,7 +560,7 @@ def run_gradle_flow(
         if run is not None and (run.refreshed or run.submitted):
             gradle_updater.retire_gradle_context(run.context)
             if continue_:
-                return ExitCode.OK
+                return Outcome.SUCCEEDED
             run = None
         if (
             run is not None
@@ -522,7 +568,7 @@ def run_gradle_flow(
             and not continue_
             and run.has(FailedAttempt)
         ):
-            _archive_rolled_back_gradle_run(run, project, vcs=services)
+            _archive_rolled_back_gradle_run(run, project, vcs=services, emit=emit)
             run = None
         if run is not None and (run.project != project_name or run.flow != flow):
             raise GradleError("Another Gradle workflow owns the unfinished ledger")
@@ -533,7 +579,6 @@ def run_gradle_flow(
                 project_name,
                 project,
                 flow,
-                interaction,
                 vcs=services,
             )
         else:
@@ -552,12 +597,11 @@ def run_gradle_flow(
                     base,
                     publication,
                     minimum_age_days,
-                    interactive,
-                    interaction=interaction,
+                    choose=choose,
                     vcs=services,
                     emit=emit,
                 )
-                if isinstance(prepared, ExitCode):
+                if isinstance(prepared, Outcome):
                     if previous is not None:
                         path.unlink()
                         gradle_updater.retire_gradle_context(previous.context)
@@ -618,11 +662,11 @@ def run_gradle_flow(
                 emit=emit,
             )
             if run.has(ApplyingAttempt, FailedAttempt, PlannedAttempt):
-                interaction.report(run, project)
-                return ExitCode.UPDATE_FAILED
+                emit(GradleRunReported(_gradle_display_result(run, project), run))
+                return Outcome.FAILED
             if not run.has(ReadyAttempt, CompletedAttempt):
-                interaction.report(run, project)
-                rprint("No eligible Gradle changes")
+                emit(GradleRunReported(_gradle_display_result(run, project), run))
+                emit(NoEligibleGradleChanges())
                 # A clean/withheld-only run has no effects requiring recovery.
                 path.unlink(missing_ok=True)
                 release_comparison_context(run.context)
@@ -632,11 +676,11 @@ def run_gradle_flow(
                         project=project_name,
                     )
                 return (
-                    ExitCode.UPDATE_FAILED
+                    Outcome.FAILED
                     if run.attempts
                     or run.selection_blocks
                     or run.initial_snapshot.findings
-                    else ExitCode.OK
+                    else Outcome.SUCCEEDED
                 )
             run = _finish_verified_gradle_run(
                 run,
@@ -647,20 +691,19 @@ def run_gradle_flow(
                 emit=emit,
             )
             gradle_updater.retire_gradle_context(run.context)
-            interaction.report(run, project)
+            emit(GradleRunReported(_gradle_display_result(run, project), run))
         if flow == Workflow.UPDATE and run.refreshed:
             remove_workspace(
                 repo=services.repository(Path(project.path)), project=project_name
             )
-        return ExitCode.OK
+        return Outcome.SUCCEEDED
     except (
         GradleError,
         ScanError,
-        _UpdateSetupError,
         RevisionError,
         CodeHostError,
         ToolNotFoundError,
         OSError,
     ) as exc:
-        rprint(f"Cannot complete Gradle {flow}: {exc}")
-        return ExitCode.UPDATE_FAILED
+        emit(GradleFlowFailed(flow, str(exc)))
+        return Outcome.FAILED

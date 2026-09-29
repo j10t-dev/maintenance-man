@@ -443,6 +443,13 @@ def test_models_contract_covers_all_modules() -> None:
     assert {"rich", "cyclopts"} <= forbidden
 
 
+def test_rich_contract_has_no_exceptions() -> None:
+    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    contracts = config["tool"]["importlinter"]["contracts"]
+    (rich_cli_only,) = [c for c in contracts if c.get("id") == "rich-cli-only"]
+    assert "ignore_imports" not in rich_cli_only
+
+
 def test_package_directories_are_regular_packages() -> None:
     # grimp leaves namespace packages out of the graph, so no contract sees them.
     namespace = sorted(

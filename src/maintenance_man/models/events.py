@@ -1,8 +1,10 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
-from maintenance_man.models.scan import ScanResult, UpdateKind
+from maintenance_man.models.gradle import GradleRun
+from maintenance_man.models.scan import ScanResult, UpdateKind, Workflow
 
 
 class Outcome(StrEnum):
@@ -143,6 +145,39 @@ class FindingFailed:
     phase: str
 
 
+@dataclass(frozen=True, slots=True)
+class PullRequestOutput:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class GradleWithheld:
+    label: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class NoEligibleGradleChanges:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class GradleRunArchived:
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class GradleFlowFailed:
+    flow: Workflow
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class GradleRunReported:
+    scan: ScanResult
+    run: GradleRun
+
+
 type Event = (
     ProjectStarted
     | ProjectSkipped
@@ -159,5 +194,11 @@ type Event = (
     | FindingStepFailed
     | FindingPassed
     | FindingFailed
+    | PullRequestOutput
+    | GradleWithheld
+    | NoEligibleGradleChanges
+    | GradleRunArchived
+    | GradleFlowFailed
+    | GradleRunReported
 )
 type Emit = Callable[[Event], None]

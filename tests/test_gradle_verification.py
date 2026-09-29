@@ -18,15 +18,20 @@ from maintenance_man import gradle_resolution as candidates
 from maintenance_man import gradle_updates as updater
 from maintenance_man import gradle_verification as verification
 from maintenance_man import gradle_workflow as workflow_service
-from maintenance_man.cli import (
-    _gradle_workspace_revision as real_gradle_workspace_revision,
-)
 from maintenance_man.github import CodeHostError
+from maintenance_man.gradle import GradleError
 from maintenance_man.gradle_updates import run_gradle_checks as real_run_gradle_checks
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     FindingStepFailed,
     FindingStepKind,
+    GradleFlowFailed,
+    GradleRunArchived,
+    GradleRunReported,
+    GradleWithheld,
+    NoEligibleGradleChanges,
+    Outcome,
+    PullRequestOutput,
 )
 from maintenance_man.models.events import (
     TestCommandStarted as CommandStartedEvent,
@@ -872,6 +877,7 @@ def test_gradle_continue_revision_failure_after_checked_intent_is_preserved(
 @pytest.mark.parametrize(
     "error",
     [
+        GradleError("workflow failed"),
         RevisionError("jj unavailable"),
         CodeHostError("host unavailable"),
         ToolNotFoundError("trivy is not installed or not on PATH. hint"),
@@ -883,18 +889,21 @@ def test_gradle_flow_reports_revision_failures(workflow, monkeypatch, capsys, er
         "load_gradle_run",
         MagicMock(side_effect=error),
     )
+    emitted = RecordingEmit()
     assert (
-        cli._run_gradle_flow(
+        workflow_service.run_gradle_flow(
             "sample",
             workflow.project,
             Workflow.UPDATE,
-            interactive=False,
             minimum_age_days=7,
+            choose=None,
+            emit=emitted,
             vcs=_workflow_vcs(workflow.project.path),
         )
-        == cli.ExitCode.UPDATE_FAILED
+        is Outcome.FAILED
     )
-    assert f"Cannot complete Gradle update: {error}" in capsys.readouterr().out
+    assert emitted.events == [GradleFlowFailed(Workflow.UPDATE, str(error))]
+    assert capsys.readouterr().out == ""
 
 
 def test_gradle_run_has_reports_attempt_kinds(workflow):
@@ -1044,7 +1053,6 @@ def test_missing_routing_declaration_allows_checked_update(workflow, minimum_age
 
 
 def test_gradle_no_updates_does_not_require_build_hooks(workflow, monkeypatch):
-    from maintenance_man import cli
     from maintenance_man.models.scan import ScanResult
 
     project = workflow.project.model_copy(
@@ -1073,15 +1081,16 @@ def test_gradle_no_updates_does_not_require_build_hooks(workflow, monkeypatch):
         lambda *args: pytest.fail("No update needs acceptance hooks"),
     )
     assert (
-        cli._run_gradle_flow(
+        workflow_service.run_gradle_flow(
             "sample",
             project,
             Workflow.UPDATE,
-            interactive=False,
             minimum_age_days=7,
+            choose=None,
+            emit=RecordingEmit(),
             vcs=workflow.vcs,
         )
-        == cli.ExitCode.OK
+        is Outcome.SUCCEEDED
     )
     assert not {"apply", "commit"} & set(workflow.effects)
     assert updater.load_gradle_run(updater.gradle_run_path("sample")) is None
@@ -1230,14 +1239,12 @@ def driver(workflow, resolution, monkeypatch):
 
 
 def invoke_driver(driver, *, interactive=False, minimum_age_days=7, vcs=None):
-    from maintenance_man import cli
-
-    return cli._run_gradle_flow(
+    return workflow_service.run_gradle_flow(
         "sample",
         driver.project,
         Workflow.UPDATE,
-        interactive=interactive,
         minimum_age_days=minimum_age_days,
+        choose=cli._choose_gradle_candidates if interactive else None,
         vcs=vcs or driver.workflow.vcs,
         emit=driver.emit,
     )
@@ -1246,7 +1253,7 @@ def invoke_driver(driver, *, interactive=False, minimum_age_days=7, vcs=None):
 def test_gradle_driver_promotes_verified_update_with_residual_advisory(driver):
     from maintenance_man.models.scan import ScanResult
 
-    assert invoke_driver(driver) == 0
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
     run = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert run is not None
     assert run.refreshed and run.promoted_commit_id == run.managed_tip_id
@@ -1265,6 +1272,10 @@ def test_gradle_driver_promotes_verified_update_with_residual_advisory(driver):
     assert fresh.vulnerabilities[0].installed_version == "2"
     assert fresh.vulnerabilities[0].update_status is None
     assert fresh.vulnerabilities[0].flow is None
+    (reported,) = driver.emit.of_type(GradleRunReported)
+    assert reported.run == run
+    assert len(reported.scan.vulnerabilities) == 1
+    assert reported.scan.vulnerabilities[0].vuln_id == "CVE-1"
 
 
 def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
@@ -1280,7 +1291,7 @@ def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
 
     monkeypatch.setattr("maintenance_man.updater.run_live", run_test)
 
-    assert invoke_driver(driver) == cli.ExitCode.UPDATE_FAILED
+    assert invoke_driver(driver) is Outcome.FAILED
     assert driver.emit.of_type(CommandStartedEvent) == [
         CommandStartedEvent(driver.project.test_unit),
         CommandStartedEvent(driver.project.test_unit),
@@ -1299,7 +1310,7 @@ def test_gradle_driver_selection_applies_whole_group_once(
     driver.selection = selection
     code = invoke_driver(driver, interactive=True)
     # Existing residual findings still remain visible when no candidate is selected.
-    assert code == (0 if expected_applies else 4)
+    assert code is (Outcome.SUCCEEDED if expected_applies else Outcome.FAILED)
     assert driver.effects.count("apply") == expected_applies
     assert driver.effects.count("commit") == expected_applies
     if expected_applies:
@@ -1322,7 +1333,17 @@ def test_gradle_driver_uses_current_age_policy_before_apply(
         return AgeBlock(reason="exact publication withheld")
 
     monkeypatch.setattr(candidates, "evaluate_gradle_candidate_age", age)
-    assert invoke_driver(driver, minimum_age_days=minimum_age_days) == 4
+    assert invoke_driver(driver, minimum_age_days=minimum_age_days) is Outcome.FAILED
+    progress = [
+        event
+        for event in driver.emit.events
+        if isinstance(event, (GradleWithheld, NoEligibleGradleChanges))
+    ]
+    assert progress == [
+        GradleWithheld("g:lib", "cannot identify an unambiguous catalogue entry"),
+        GradleWithheld("lib", "exact publication withheld"),
+        NoEligibleGradleChanges(),
+    ]
     assert driver.effects in ([], ["bookmark"])
     assert updater.load_gradle_run(updater.gradle_run_path("sample")) is None
 
@@ -1363,7 +1384,7 @@ def test_gradle_driver_withheld_group_does_not_prevent_verified_promotion(
             else None
         ),
     )
-    assert invoke_driver(driver) == 0
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
     run = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert run is not None
     assert {item.candidate.target.group_key: item.state for item in run.attempts} == {
@@ -1382,11 +1403,6 @@ def test_gradle_driver_withheld_group_does_not_prevent_verified_promotion(
 def test_gradle_driver_refuses_sdk_before_sync_or_workspace_effects(
     driver, monkeypatch
 ):
-    from maintenance_man import cli
-
-    monkeypatch.setattr(
-        cli, "_gradle_workspace_revision", real_gradle_workspace_revision
-    )
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     (driver.project.path / "local.properties").write_text("sdk.dir=/unavailable\n")
@@ -1400,7 +1416,7 @@ def test_gradle_driver_refuses_sdk_before_sync_or_workspace_effects(
         "remove_workspace",
         lambda *args: driver.effects.append("remove"),
     )
-    assert invoke_driver(driver) == 4
+    assert invoke_driver(driver) is Outcome.FAILED
     assert driver.effects in ([], ["bookmark"])
 
 
@@ -1410,11 +1426,6 @@ def test_gradle_driver_rechecks_sdk_at_pinned_base_before_workspace_effects(
     monkeypatch,
     post_sync_tracked,
 ):
-    from maintenance_man import cli
-
-    monkeypatch.setattr(
-        cli, "_gradle_workspace_revision", real_gradle_workspace_revision
-    )
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     (driver.project.path / "local.properties").write_text("sdk.dir=/android\n")
@@ -1472,8 +1483,8 @@ def test_gradle_driver_rechecks_sdk_at_pinned_base_before_workspace_effects(
         tree=driver.workflow.initial.tree_id,
         after=driver.workflow.after,
     )
-    assert invoke_driver(driver, vcs=vcs_state.services()) == (
-        0 if post_sync_tracked else 4
+    assert invoke_driver(driver, vcs=vcs_state.services()) is (
+        Outcome.SUCCEEDED if post_sync_tracked else Outcome.FAILED
     )
     inspections = [
         dict(call.arguments)
@@ -1499,11 +1510,6 @@ def test_gradle_driver_rechecks_sdk_at_pinned_base_before_workspace_effects(
 def test_gradle_driver_skips_unneeded_sdk_revision_inspection(
     driver, monkeypatch, sdk_env, properties
 ):
-    from maintenance_man import cli
-
-    monkeypatch.setattr(
-        cli, "_gradle_workspace_revision", real_gradle_workspace_revision
-    )
     monkeypatch.delenv("ANDROID_HOME", raising=False)
     monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
     if sdk_env:
@@ -1521,7 +1527,7 @@ def test_gradle_driver_skips_unneeded_sdk_revision_inspection(
     )
     revision = repo.resolve_revision(revision="main")
     assert (
-        real_gradle_workspace_revision(
+        workflow_service.pin_workspace_revision(
             "sample", driver.project, revision, vcs=vcs_state.services()
         )
         == revision
@@ -1538,7 +1544,7 @@ def test_gradle_driver_retains_verified_ledger_when_final_effect_fails(
         error=RevisionError(f"{failure} failed"),
         path=driver.project.path,
     )
-    assert invoke_driver(driver) == 4
+    assert invoke_driver(driver) is Outcome.FAILED
     run = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert run is not None
     assert run.attempts[0].state == "ready"
@@ -2071,15 +2077,17 @@ def test_gradle_resolve_host_failure_retries_completed_push_without_reapply(
     assert workflow.vcs_state.remote_bookmark_targets(
         workflow.project.path, bookmark=run.managed_bookmark
     ) == (run.managed_tip_id,)
+    emitted = RecordingEmit()
     finished = workflow_service._finish_verified_gradle_run(
         stored,
         workflow.project,
         workflow.publication,
         7,
         vcs=workflow.vcs,
-        emit=RecordingEmit(),
+        emit=emitted,
     )
     assert finished.submitted
+    assert emitted.of_type(PullRequestOutput) == [PullRequestOutput("PR #1")]
     assert isinstance(finished.attempts[0], CompletedAttempt)
     assert workflow.effects.count("apply") == apply_count
     assert workflow.effects.count("commit") == commit_count
@@ -2222,15 +2230,16 @@ def test_gradle_cli_uses_ledger_even_without_scan_results(workflow, monkeypatch)
     monkeypatch.setattr(workflow_service, "load_scan_results", read_published)
     monkeypatch.setattr(workflow_service, "_finish_verified_gradle_run", finish)
     assert (
-        cli._run_gradle_flow(
+        workflow_service.run_gradle_flow(
             "sample",
             workflow.project,
             Workflow.UPDATE,
-            interactive=False,
             minimum_age_days=7,
+            choose=None,
+            emit=RecordingEmit(),
             vcs=workflow.vcs,
         )
-        == cli.ExitCode.OK
+        is Outcome.SUCCEEDED
     )
     assert workflow.effects.count("apply") == 1
 
@@ -2254,15 +2263,16 @@ def test_gradle_legacy_ready_without_ledger_refuses_before_workspace(
     monkeypatch.setattr(workflow_service, "load_scan_results", lambda *args: legacy)
     workflow.vcs_state.clear_calls()
     assert (
-        cli._run_gradle_flow(
+        workflow_service.run_gradle_flow(
             "sample",
             workflow.project,
             Workflow.UPDATE,
-            interactive=False,
             minimum_age_days=7,
+            choose=None,
+            emit=RecordingEmit(),
             vcs=workflow.vcs,
         )
-        == cli.ExitCode.UPDATE_FAILED
+        is Outcome.FAILED
     )
     assert not any(
         call.method == "add_workspace" for call in workflow.vcs_state.effects
@@ -2333,19 +2343,22 @@ def test_gradle_failed_update_restart_retains_evidence(
         path=workflow.project.path,
         action=reset,
     )
+    emitted = RecordingEmit()
     if unsafe or not workspace_exists:
         with pytest.raises(updater.GradleError):
             workflow_service._archive_rolled_back_gradle_run(
-                failed, workflow.project, vcs=workflow.vcs
+                failed, workflow.project, vcs=workflow.vcs, emit=emitted
             )
         assert updater.load_gradle_run(updater.gradle_run_path("sample")) == failed
         assert effects == []
     else:
         workflow_service._archive_rolled_back_gradle_run(
-            failed, workflow.project, vcs=workflow.vcs
+            failed, workflow.project, vcs=workflow.vcs, emit=emitted
         )
         assert not updater.gradle_run_path("sample").exists()
         assert effects == ["reset"]
+        (archived,) = emitted.of_type(GradleRunArchived)
+        assert archived.path.parent == paths.gradle_runs_dir() / "history"
     assert user_file.read_text().startswith("preserve these")
 
 
@@ -2387,7 +2400,7 @@ def test_gradle_failed_update_restart_refuses_uncertain_dirty_state(
 
     with pytest.raises(updater.GradleError, match="inspect") as caught:
         workflow_service._archive_rolled_back_gradle_run(
-            failed, workflow.project, vcs=workflow.vcs
+            failed, workflow.project, vcs=workflow.vcs, emit=RecordingEmit()
         )
 
     assert isinstance(caught.value.__cause__, RevisionError)
@@ -2466,17 +2479,16 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
         path=workflow.project.path,
         action=lambda: effects.append("remove"),
     )
-    result = cli._run_gradle_flow(
+    result = workflow_service.run_gradle_flow(
         "sample",
         workflow.project,
         Workflow.UPDATE,
-        interactive=False,
         minimum_age_days=7,
+        choose=None,
+        emit=RecordingEmit(),
         vcs=workflow.vcs,
     )
-    assert result == (
-        cli.ExitCode.OK if mutation == "none" else cli.ExitCode.UPDATE_FAILED
-    )
+    assert result is (Outcome.SUCCEEDED if mutation == "none" else Outcome.FAILED)
     assert effects == (["process", "finalize", "remove"] if mutation == "none" else [])
     assert updater.gradle_run_path("sample").read_bytes() == before
     assert workflow.effects.count("apply") == 1
@@ -2526,16 +2538,17 @@ def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
         lambda value, *args, **kwargs: value,
     )
     assert (
-        cli._run_gradle_flow(
+        workflow_service.run_gradle_flow(
             "sample",
             workflow.project,
             Workflow.RESOLVE,
-            interactive=False,
             minimum_age_days=7,
             continue_=True,
+            choose=None,
+            emit=RecordingEmit(),
             vcs=workflow.vcs,
         )
-        == cli.ExitCode.OK
+        is Outcome.SUCCEEDED
     )
     assert effects == ["verify-committed-repair", "accepted-workspace-guard", "process"]
 
@@ -2665,21 +2678,9 @@ def test_gradle_result_render_uses_durable_or_published_evidence(
             return published
         raise cli.NoScanResultsError("no saved results")
 
-    rendered = []
-    monkeypatch.setattr(cli, "load_scan_results", load)
-    monkeypatch.setattr(
-        cli,
-        "_print_scan_result",
-        lambda value, **kwargs: rendered.append((value, kwargs)),
-    )
-    summaries = []
-    monkeypatch.setattr(cli, "_print_gradle_run_summary", summaries.append)
+    monkeypatch.setattr(workflow_service, "load_scan_results", load)
     before = run.model_dump_json()
-    cli._print_gradle_run_result(run, workflow.project)
-    assert len(rendered) == 1
-    result, options = rendered[0]
-    assert options == {}
-    assert summaries == [run]
+    result = workflow_service._gradle_display_result(run, workflow.project)
     assert reads == (["load"] if refreshed else [])
     if refreshed and published_exists:
         assert result is published
@@ -2692,6 +2693,22 @@ def test_gradle_result_render_uses_durable_or_published_evidence(
             f"{scope.project_path}/{scope.domain}/{scope.configuration}",
         )
     assert run.model_dump_json() == before
+
+
+def test_gradle_run_reported_renders_scan_before_summary(workflow, monkeypatch):
+    run = ready_workflow(workflow)
+    scan = workflow_service._gradle_display_result(run, workflow.project)
+    rendered = []
+    monkeypatch.setattr(
+        cli, "_print_scan_result", lambda value: rendered.append(("scan", value))
+    )
+    monkeypatch.setattr(
+        cli, "_print_gradle_run_summary", lambda value: rendered.append(("run", value))
+    )
+
+    cli._Renderer(batch=False)(GradleRunReported(scan, run))
+
+    assert rendered == [("scan", scan), ("run", run)]
 
 
 @pytest.mark.parametrize(
@@ -3030,7 +3047,7 @@ def test_snapshot_refuses_inventory_missing_a_resolved_module(
 def test_completed_run_releases_private_databases(driver):
     cache = driver.workflow.context.private_cache_path
     assert cache.is_dir()
-    assert invoke_driver(driver) == 0
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
     saved = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert saved is not None and saved.refreshed
     assert not cache.exists()
@@ -3150,11 +3167,11 @@ def test_gradle_retry_replans_after_native_preparation_failure(driver, monkeypat
         raise updater.GradleError("Temporary native metadata failure")
 
     monkeypatch.setattr(candidates, "validate_gradle_candidates", fail)
-    assert invoke_driver(driver) == cli.ExitCode.UPDATE_FAILED
+    assert invoke_driver(driver) is Outcome.FAILED
     assert driver.effects == ["bookmark"]
     driver.effects.clear()
     monkeypatch.setattr(candidates, "validate_gradle_candidates", native)
-    assert invoke_driver(driver) == cli.ExitCode.OK
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
     assert driver.effects.count("apply") == 1
     assert driver.effects.count("commit") == 1
     assert driver.effects.count("promote") == 1
@@ -3180,7 +3197,7 @@ def test_gradle_empty_discovery_checks_fresh_security_findings(
 
     monkeypatch.setattr(workflow_service, "load_scan_results", previous)
     # The current graph contains an advisory even though the cached scan does not.
-    assert invoke_driver(driver) == cli.ExitCode.UPDATE_FAILED
+    assert invoke_driver(driver) is Outcome.FAILED
     assert not {"apply", "commit", "promote", "refresh"} & set(driver.effects)
 
 
@@ -3302,10 +3319,7 @@ def test_gradle_ineligible_run_does_not_build_or_freeze_scanner_inputs(
 
     monkeypatch.setattr(updater, "run_gradle_checks", unnecessary)
     monkeypatch.setattr(workflow_service, "initialize_comparison_context", unnecessary)
-    assert (
-        invoke_driver(driver, interactive=block == "selection")
-        == cli.ExitCode.UPDATE_FAILED
-    )
+    assert invoke_driver(driver, interactive=block == "selection") is Outcome.FAILED
     assert driver.effects in ([], ["bookmark"])
 
 
@@ -3325,7 +3339,7 @@ def test_gradle_retries_an_empty_preparation_ledger_from_older_versions(driver):
         bookmark=run.managed_bookmark,
         targets=(driver.workflow.base,),
     )
-    assert invoke_driver(driver) == cli.ExitCode.OK
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
     assert driver.effects == ["apply", "commit", "bookmark", "promote", "refresh"]
 
 
@@ -3359,7 +3373,7 @@ def test_gradle_reconsiders_old_withheld_run_on_the_next_invocation(driver):
     )
     updater.save_gradle_run(updater.gradle_run_path("sample"), run)
 
-    assert invoke_driver(driver) == cli.ExitCode.OK
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
     assert driver.effects == ["apply", "commit", "bookmark", "promote", "refresh"]
 
 
@@ -3367,7 +3381,7 @@ def test_gradle_updates_without_declared_public_routing(driver):
     driver.project = driver.project.model_copy(
         update={"gradle_repository_routing": None}
     )
-    assert invoke_driver(driver) == cli.ExitCode.OK
+    assert invoke_driver(driver) is Outcome.SUCCEEDED
     assert driver.effects[-5:] == [
         "apply",
         "commit",

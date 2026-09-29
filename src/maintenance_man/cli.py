@@ -1,4 +1,3 @@
-import contextlib
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,8 +26,6 @@ from maintenance_man.deployer import BuildError
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
 from maintenance_man.github import CodeHostError
-from maintenance_man.gradle import workspace_environment_reason
-from maintenance_man.gradle_verification import snapshot_vulnerabilities
 from maintenance_man.models.activity import ActivityEvent
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
@@ -43,13 +40,19 @@ from maintenance_man.models.events import (
     FindingStarted,
     FindingStepFailed,
     FindingStepKind,
+    GradleFlowFailed,
+    GradleRunArchived,
+    GradleRunReported,
+    GradleWithheld,
     HealthChecked,
     HealthcheckUnconfigured,
+    NoEligibleGradleChanges,
     Operation,
     OperationFailed,
     Outcome,
     ProjectSkipped,
     ProjectStarted,
+    PullRequestOutput,
     ScanReported,
     SkipReason,
     SyncCompleted,
@@ -92,10 +95,7 @@ from maintenance_man.updater import (
     run_test_phases,
     sort_updates_by_risk,
 )
-from maintenance_man.vcs import (
-    RevisionError,
-    workspace_path_for_project,
-)
+from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import (
     VcsServices,
     create_workspace,
@@ -355,6 +355,50 @@ def _render_healthcheck_unconfigured(
     console.print("[dim]--check: no healthcheck_url configured in \\[defaults][/]")
 
 
+@_renders(PullRequestOutput)
+def _render_pull_request_output(event: PullRequestOutput, batch: bool) -> None:
+    del batch
+    console.print(f"[dim]  {escape(event.text)}[/]")
+
+
+@_renders(GradleWithheld)
+def _render_gradle_withheld(event: GradleWithheld, batch: bool) -> None:
+    del batch
+    console.print(f"Withheld {escape(event.label)}: {escape(event.reason)}")
+
+
+@_renders(NoEligibleGradleChanges)
+def _render_no_eligible_gradle_changes(
+    event: NoEligibleGradleChanges, batch: bool
+) -> None:
+    del event, batch
+    console.print("No eligible Gradle changes")
+
+
+@_renders(GradleRunArchived)
+def _render_gradle_run_archived(event: GradleRunArchived, batch: bool) -> None:
+    del batch
+    console.print(
+        f"Archived failed Gradle run to {escape(str(event.path))}; "
+        "rebuilding candidates from main"
+    )
+
+
+@_renders(GradleFlowFailed)
+def _render_gradle_flow_failed(event: GradleFlowFailed, batch: bool) -> None:
+    del batch
+    console.print(
+        f"Cannot complete Gradle {escape(event.flow.value)}: {escape(event.error)}"
+    )
+
+
+@_renders(GradleRunReported)
+def _render_gradle_run_reported(event: GradleRunReported, batch: bool) -> None:
+    del batch
+    _print_scan_result(event.scan)
+    _print_gradle_run_summary(event.run)
+
+
 app = cyclopts.App(
     name="mm",
     help="Config-driven CLI for routine software project maintenance.",
@@ -571,32 +615,6 @@ def _update_batch_targets(
         not r.passed for _, results in all_project_results for r in results
     )
     sys.exit(ExitCode.UPDATE_FAILED if any_failed else ExitCode.OK)
-
-
-def _gradle_workspace_revision(
-    project: str,
-    proj_config: ProjectConfig,
-    revision: str,
-    *,
-    vcs: VcsServices,
-) -> str:
-    """Verify SDK file availability and pin the revision inspected."""
-    reason = workspace_environment_reason(
-        proj_config.path, workspace_path_for_project(project)
-    )
-    if reason is None:
-        return revision
-    try:
-        inspection = vcs.repository(proj_config.path).revision_file(
-            revision=revision, filename="local.properties"
-        )
-    except RevisionError as exc:
-        raise _UpdateSetupError(
-            f"Cannot inspect local.properties in {revision}: {exc}"
-        ) from exc
-    if not inspection.is_regular:
-        raise _UpdateSetupError(reason)
-    return inspection.commit_id
 
 
 def _enter_update_workspace(
@@ -2068,26 +2086,6 @@ def _print_blocked_findings(scan_result: ScanResult) -> None:
         )
 
 
-def _print_gradle_run_result(run: GradleRun, project: ProjectConfig) -> None:
-    result = None
-    if run.refreshed:
-        # A removed results file must not hide durable residual evidence.
-        with contextlib.suppress(NoScanResultsError):
-            result = load_scan_results(run.project)
-    if result is None:
-        result = ScanResult(
-            project=run.project,
-            scanned_at=run.context.created_at,
-            trivy_target=str(project.path),
-            vulnerabilities=snapshot_vulnerabilities(run.accepted_snapshot),
-            gradle_resolution=run.accepted_snapshot.resolution.report.model_dump(
-                mode="json"
-            ),
-        )
-    _print_scan_result(result)
-    _print_gradle_run_summary(run)
-
-
 def _run_gradle_flow(
     project_name: str,
     project: ProjectConfig,
@@ -2099,21 +2097,14 @@ def _run_gradle_flow(
     vcs: VcsServices,
     emit: Emit | None = None,
 ) -> int:
-    return gradle_workflow.run_gradle_flow(
+    outcome = gradle_workflow.run_gradle_flow(
         project_name,
         project,
         flow,
-        interactive=interactive,
         minimum_age_days=minimum_age_days,
         continue_=continue_,
+        choose=_choose_gradle_candidates if interactive else None,
         emit=emit or _Renderer(batch=False),
         vcs=vcs,
-        interaction=gradle_workflow.GradleInteraction(
-            choose=_choose_gradle_candidates,
-            report=_print_gradle_run_result,
-            report_scan=_print_scan_result,
-            workspace_revision=lambda name, config, revision: (
-                _gradle_workspace_revision(name, config, revision, vcs=vcs)
-            ),
-        ),
     )
+    return ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED
