@@ -1,14 +1,27 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.console import Console
 
 from maintenance_man import cli, paths
-from maintenance_man.cli import ExitCode, GateDecision, app, should_deploy
+from maintenance_man.cli import ExitCode, app
 from maintenance_man.deployer import BuildError, DeployError, HealthCheckResult
 from maintenance_man.models.activity import ActivityEvent, ProjectActivity
+from maintenance_man.models.events import (
+    DeployStep,
+    DeployStepFailed,
+    DeployStepStarted,
+    DeployStepSucceeded,
+    Event,
+    HealthChecked,
+    HealthcheckUnconfigured,
+    ProjectStarted,
+)
+from maintenance_man.services import deploy as deploy_service
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
 from tests.conftest import configure_fake_vcs, run_mm, write_config
@@ -17,10 +30,93 @@ from tests.fake_vcs import FakeJjState
 
 def test_deploy_summary_prints_bracketed_project_literal(capsys) -> None:
     cli._print_deploy_summary(
-        [cli.DeployResult("a[b]", build_status="pass", deploy_status="pass")]
+        [deploy_service.DeployResult("a[b]", build_status="pass", deploy_status="pass")]
     )
 
     assert "a[b]" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize(
+    ("event", "single", "batch_text"),
+    [
+        (
+            ProjectStarted("a[b]"),
+            "",
+            f"\n{'═' * 40}\na[b]\n{'═' * 40}\n",
+        ),
+        (
+            DeployStepStarted("a[b]", DeployStep.BUILD),
+            "Building a[b]\n\n",
+            "  Building...\n",
+        ),
+        (
+            DeployStepStarted("a[b]", DeployStep.DEPLOY),
+            "Deploying a[b]\n\n",
+            "  Deploying...\n",
+        ),
+        (
+            DeployStepStarted("a[b]", DeployStep.HEALTH),
+            "\nChecking health of a[b]...\n",
+            "",
+        ),
+        (
+            DeployStepSucceeded("a[b]", DeployStep.BUILD),
+            "\nBuild succeeded.\n\n",
+            "",
+        ),
+        (
+            DeployStepSucceeded("a[b]", DeployStep.DEPLOY),
+            "\nDeploy succeeded.\n",
+            "",
+        ),
+        (
+            DeployStepFailed("a[b]", DeployStep.BUILD, "bad [state]"),
+            "Error: bad [state]\n",
+            "  Build failed: bad [state]\n",
+        ),
+        (
+            DeployStepFailed("a[b]", DeployStep.DEPLOY, "bad [state]"),
+            "Error: bad [state]\n",
+            "  Deploy failed: bad [state]\n",
+        ),
+        (
+            HealthChecked("a[b]", True, None),
+            "Healthy: a[b] is up\n",
+            "  Healthy: a[b] is up\n",
+        ),
+        (
+            HealthChecked("a[b]", False, "bad [state]"),
+            "Warning: bad [state]\n",
+            "  Warning: bad [state]\n",
+        ),
+        (
+            HealthChecked("a[b]", False, None),
+            "Warning: a[b] is not healthy\n",
+            "  Warning: a[b] is not healthy\n",
+        ),
+        (
+            HealthcheckUnconfigured(),
+            "--check: no healthcheck_url configured in [defaults]\n",
+            "--check: no healthcheck_url configured in [defaults]\n",
+        ),
+    ],
+)
+def test_deploy_event_renderer_preserves_text(
+    monkeypatch: pytest.MonkeyPatch,
+    event: Event,
+    single: str,
+    batch_text: str,
+    batch: bool,
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=220, color_system=None)
+    )
+
+    cli._Renderer(batch=batch)(event)
+
+    assert output.getvalue() == (batch_text if batch else single)
 
 
 @dataclass(frozen=True)
@@ -78,7 +174,9 @@ def test_unresolved_main_deploy_gate_persists_no_invented_identity(
     )
     monkeypatch.setattr(cli, "make_vcs_services", state.services)
     deployed: list[str] = []
-    monkeypatch.setattr(cli, "run_deploy", lambda name, *args: deployed.append(name))
+    monkeypatch.setattr(
+        deploy_service, "run_deploy", lambda name, *args: deployed.append(name)
+    )
 
     argv = ["deploy", "demo"] + (["--force"] if force else [])
     assert run_mm(*argv) == expected_code
@@ -116,7 +214,7 @@ def test_deploy_saves_the_exact_main_identity_used_by_the_gate(
         )
         state.seed_bookmark(project_path, bookmark="main", targets=(advanced,))
 
-    monkeypatch.setattr(cli, "run_deploy", deploy)
+    monkeypatch.setattr(deploy_service, "run_deploy", deploy)
 
     assert run_mm("deploy", "demo") == ExitCode.OK
 
@@ -148,8 +246,8 @@ def _activity(*, success: bool, commit_id: str | None) -> dict[str, ProjectActiv
         (["deploy", "deploy-only", "--force"], ExitCode.OK, True),
     ],
 )
-@patch("maintenance_man.cli.record_activity")
-@patch("maintenance_man.cli.run_deploy")
+@patch("maintenance_man.services.deploy.record_activity")
+@patch("maintenance_man.services.deploy.run_deploy")
 def test_unresolved_repository_uses_the_existing_deploy_gate(
     mock_deploy,
     mock_record,
@@ -174,66 +272,6 @@ def test_unresolved_repository_uses_the_existing_deploy_gate(
         assert mock_record.call_args.kwargs["commit_id"] is None
 
 
-class TestShouldDeploy:
-    @pytest.mark.parametrize(
-        "resolved, prior, force, expected",
-        [
-            (True, "same-success", False, "SKIP_UNCHANGED"),
-            (True, "old-success", False, "DEPLOY"),
-            (True, "same-failure", False, "DEPLOY"),
-            (True, "missing-id", False, "DEPLOY"),
-            (True, "none", False, "DEPLOY"),
-            (False, "none", False, "SKIP_BLOCKED"),
-            (True, "same-success", True, "DEPLOY"),
-            (False, "none", True, "DEPLOY"),
-        ],
-    )
-    def test_gate_decision(self, tmp_path, resolved, prior, force, expected):
-        project_path = tmp_path / "project"
-        state = FakeJjState()
-        repo = state.seed_repository(project_path, files={})
-        expected_id = repo.resolve_revision(revision="main") if resolved else None
-        if not resolved:
-            state.fail(
-                "resolve_revision",
-                error=RevisionError("no main"),
-                path=project_path,
-            )
-        activity = {
-            "same-success": _activity(success=True, commit_id=expected_id),
-            "old-success": _activity(success=True, commit_id="OLD"),
-            "same-failure": _activity(success=False, commit_id=expected_id),
-            "missing-id": _activity(success=True, commit_id=None),
-            "none": {},
-        }[prior]
-        decision, current_id = should_deploy(
-            "app", project_path, activity, force=force, vcs=state.services()
-        )
-        assert decision == getattr(GateDecision, expected)
-        assert current_id == expected_id
-
-    def test_last_build_only_does_not_gate(self, tmp_path):
-        project_path = tmp_path / "project"
-        state = FakeJjState()
-        repo = state.seed_repository(project_path, files={})
-        main_id = repo.resolve_revision(revision="main")
-        activity = {
-            "app": ProjectActivity(
-                last_build=ActivityEvent(
-                    timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                    success=True,
-                    branch="main",
-                    commit_id=main_id,
-                )
-            )
-        }
-        decision, current_id = should_deploy(
-            "app", project_path, activity, force=False, vcs=state.services()
-        )
-        assert decision == GateDecision.DEPLOY
-        assert current_id == main_id
-
-
 class TestDeployCommand:
     @pytest.fixture(autouse=True)
     def _gate(self, _deploy_vcs: _DeployVcs) -> None:
@@ -245,7 +283,7 @@ class TestDeployCommand:
             app(["deploy", "no-deploy"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_successful_deploy(
         self, mock_deploy: MagicMock, mm_home_with_projects: Path
     ) -> None:
@@ -256,7 +294,7 @@ class TestDeployCommand:
         mock_deploy.assert_called_once()
 
     @patch(
-        "maintenance_man.cli.run_deploy",
+        "maintenance_man.services.deploy.run_deploy",
         side_effect=DeployError("deploy failed"),
     )
     def test_failed_deploy(
@@ -267,8 +305,8 @@ class TestDeployCommand:
             app(["deploy", "deployable"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.DEPLOY_FAILED
 
-    @patch("maintenance_man.cli.run_deploy")
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_build_flag_runs_build_then_deploy(
         self,
         mock_build: MagicMock,
@@ -282,7 +320,7 @@ class TestDeployCommand:
         mock_build.assert_called_once()
         mock_deploy.assert_called_once()
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_build_flag_skips_when_no_build_command(
         self, mock_deploy: MagicMock, mm_home_with_projects: Path
     ) -> None:
@@ -292,9 +330,9 @@ class TestDeployCommand:
         assert exc_info.value.code == ExitCode.OK
         mock_deploy.assert_called_once()
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     @patch(
-        "maintenance_man.cli.run_build",
+        "maintenance_man.services.deploy.run_build",
         side_effect=BuildError("build failed"),
     )
     def test_build_failure_aborts_deploy(
@@ -315,8 +353,8 @@ class TestDeployCommand:
             app(["deploy", "nonexistent"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
 
-    @patch("maintenance_man.cli.record_activity")
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.record_activity")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_successful_deploy_records_activity(
         self,
         mock_deploy: MagicMock,
@@ -330,8 +368,11 @@ class TestDeployCommand:
         _, kwargs = mock_record.call_args
         assert kwargs["success"] is True
 
-    @patch("maintenance_man.cli.record_activity")
-    @patch("maintenance_man.cli.run_deploy", side_effect=DeployError("deploy failed"))
+    @patch("maintenance_man.services.deploy.record_activity")
+    @patch(
+        "maintenance_man.services.deploy.run_deploy",
+        side_effect=DeployError("deploy failed"),
+    )
     def test_failed_deploy_records_activity(
         self,
         mock_deploy: MagicMock,
@@ -345,9 +386,9 @@ class TestDeployCommand:
         _, kwargs = mock_record.call_args
         assert kwargs["success"] is False
 
-    @patch("maintenance_man.cli.record_activity")
-    @patch("maintenance_man.cli.run_deploy")
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.record_activity")
+    @patch("maintenance_man.services.deploy.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_deploy_with_build_records_both(
         self,
         mock_build: MagicMock,
@@ -371,10 +412,10 @@ class TestDeployCheck:
         pass
 
     @patch(
-        "maintenance_man.cli.check_health",
+        "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=True),
     )
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_check_calls_healthchecker(
         self,
         mock_deploy: MagicMock,
@@ -396,10 +437,10 @@ class TestDeployCheck:
         mock_check.assert_called_once_with("http://pihost:8080", "deployable")
 
     @patch(
-        "maintenance_man.cli.check_health",
+        "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=False, error="connection refused"),
     )
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_check_unhealthy_still_exits_ok(
         self,
         mock_deploy: MagicMock,
@@ -418,18 +459,61 @@ class TestDeployCheck:
             app(["deploy", "deployable", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
 
-    @patch("maintenance_man.cli.run_deploy")
+    @pytest.mark.parametrize("healthcheck_line", [None, 'healthcheck_url = ""'])
+    @patch("maintenance_man.services.deploy.check_health")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_check_without_healthcheck_url_warns(
         self,
         mock_deploy: MagicMock,
+        mock_check: MagicMock,
+        healthcheck_line: str | None,
         mm_home_with_projects: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """--check without healthcheck_url configured prints warning."""
+        if healthcheck_line is not None:
+            config_path = mm_home_with_projects / "config.toml"
+            config_path.write_text(
+                config_path.read_text().replace(
+                    "min_version_age_days = 7",
+                    f"min_version_age_days = 7\n{healthcheck_line}",
+                )
+            )
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "deployable", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
-        assert "--check: no healthcheck_url configured" in capsys.readouterr().out
+        output = capsys.readouterr().out
+        assert output.count("--check: no healthcheck_url configured") == 1
+        mock_check.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("failure", "error", "expected_code"),
+        [
+            ("run_build", BuildError("build failed"), ExitCode.BUILD_FAILED),
+            ("run_deploy", DeployError("deploy failed"), ExitCode.DEPLOY_FAILED),
+        ],
+    )
+    def test_failed_deploy_with_check_has_no_health_hint(
+        self,
+        failure: str,
+        error: BuildError | DeployError,
+        expected_code: ExitCode,
+        mm_home_with_projects: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(deploy_service, "run_build", lambda *args: None)
+        monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
+
+        def fail(*args) -> None:
+            raise error
+
+        monkeypatch.setattr(deploy_service, failure, fail)
+
+        assert run_mm("deploy", "deployable", "--build", "--check") == expected_code
+        output = capsys.readouterr().out
+        assert str(error) in output
+        assert "no healthcheck_url" not in output
 
 
 class TestMassDeployCommand:
@@ -437,8 +521,8 @@ class TestMassDeployCommand:
     def _gate(self, _deploy_vcs: _DeployVcs) -> None:
         pass
 
-    @patch("maintenance_man.cli.run_deploy")
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_deploys_all_projects_with_deploy_command(
         self,
         mock_build: MagicMock,
@@ -454,8 +538,8 @@ class TestMassDeployCommand:
         # Only "deployable" has build_command
         assert mock_build.call_count == 1
 
-    @patch("maintenance_man.cli.run_deploy")
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_skips_projects_without_deploy_command(
         self,
         mock_build: MagicMock,
@@ -473,10 +557,10 @@ class TestMassDeployCommand:
         assert "vulnerable" not in deployed_projects
 
     @patch(
-        "maintenance_man.cli.run_deploy",
+        "maintenance_man.services.deploy.run_deploy",
         side_effect=DeployError("deploy failed"),
     )
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_continues_after_deploy_failure(
         self,
         mock_build: MagicMock,
@@ -489,9 +573,9 @@ class TestMassDeployCommand:
         assert exc_info.value.code == ExitCode.DEPLOY_FAILED
         assert mock_deploy.call_count == 2
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     @patch(
-        "maintenance_man.cli.run_build",
+        "maintenance_man.services.deploy.run_build",
         side_effect=BuildError("build failed"),
     )
     def test_build_failure_skips_deploy_for_that_project(
@@ -507,8 +591,8 @@ class TestMassDeployCommand:
         # "deployable" build fails => deploy skipped; "deploy-only" has no build => runs
         assert mock_deploy.call_count == 1
 
-    @patch("maintenance_man.cli.run_deploy")
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_prints_summary_table(
         self,
         mock_build: MagicMock,
@@ -523,11 +607,11 @@ class TestMassDeployCommand:
         assert "Deploy Summary" in output
 
     @patch(
-        "maintenance_man.cli.check_health",
+        "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=True),
     )
-    @patch("maintenance_man.cli.run_deploy")
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_check_flag_works_in_mass_mode(
         self,
         mock_build: MagicMock,
@@ -552,20 +636,34 @@ class TestMassDeployCommand:
         assert "Healthy: deploy-only is up" in output
         assert "Healthy: deployable is up" in output
 
-    @patch("maintenance_man.cli.run_deploy")
-    @patch("maintenance_man.cli.run_build")
+    @pytest.mark.parametrize("healthcheck_line", [None, 'healthcheck_url = ""'])
+    @patch("maintenance_man.services.deploy.check_health")
+    @patch("maintenance_man.services.deploy.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_check_without_healthcheck_url_warns_in_mass_mode(
         self,
         mock_build: MagicMock,
         mock_deploy: MagicMock,
+        mock_check: MagicMock,
+        healthcheck_line: str | None,
         mm_home_with_projects: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """Mass deploy warns when --check is requested without healthcheck_url."""
+        if healthcheck_line is not None:
+            config_path = mm_home_with_projects / "config.toml"
+            config_path.write_text(
+                config_path.read_text().replace(
+                    "min_version_age_days = 7",
+                    f"min_version_age_days = 7\n{healthcheck_line}",
+                )
+            )
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
-        assert "--check: no healthcheck_url configured" in capsys.readouterr().out
+        output = capsys.readouterr().out
+        assert output.count("--check: no healthcheck_url configured") == 1
+        mock_check.assert_not_called()
 
     def test_no_projects_configured(
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]
@@ -586,7 +684,7 @@ class TestDeployGateWiring:
     def _vcs(self, _deploy_vcs: _DeployVcs) -> None:
         pass
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_explicit_unchanged_skips_with_warning(
         self,
         mock_deploy: MagicMock,
@@ -597,7 +695,7 @@ class TestDeployGateWiring:
     ) -> None:
         main_id = _deploy_vcs.main_ids["deploy-only"]
         monkeypatch.setattr(
-            "maintenance_man.cli.load_activity",
+            "maintenance_man.services.deploy.load_activity",
             lambda path: (
                 _activity(success=True, commit_id="C")
                 | {
@@ -618,8 +716,8 @@ class TestDeployGateWiring:
         mock_deploy.assert_not_called()
         assert "force" in capsys.readouterr().out.lower()
 
-    @patch("maintenance_man.cli.record_activity")
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.record_activity")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_explicit_unchanged_records_nothing(
         self,
         mock_deploy: MagicMock,
@@ -630,7 +728,7 @@ class TestDeployGateWiring:
     ) -> None:
         main_id = _deploy_vcs.main_ids["deploy-only"]
         monkeypatch.setattr(
-            "maintenance_man.cli.load_activity",
+            "maintenance_man.services.deploy.load_activity",
             lambda path: {
                 "deploy-only": ProjectActivity(
                     last_deploy=ActivityEvent(
@@ -646,8 +744,8 @@ class TestDeployGateWiring:
             app(["deploy", "deploy-only"], exit_on_error=False)
         mock_record.assert_not_called()
 
-    @patch("maintenance_man.cli.record_activity")
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.record_activity")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_force_redeploys_unchanged_and_records_commit_id(
         self,
         mock_deploy: MagicMock,
@@ -658,7 +756,7 @@ class TestDeployGateWiring:
     ) -> None:
         main_id = _deploy_vcs.main_ids["deploy-only"]
         monkeypatch.setattr(
-            "maintenance_man.cli.load_activity",
+            "maintenance_man.services.deploy.load_activity",
             lambda path: {
                 "deploy-only": ProjectActivity(
                     last_deploy=ActivityEvent(
@@ -676,7 +774,7 @@ class TestDeployGateWiring:
         mock_deploy.assert_called_once()
         assert mock_record.call_args.kwargs["commit_id"] == main_id
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_explicit_blocked_exits_error(
         self,
         mock_deploy: MagicMock,
@@ -689,13 +787,15 @@ class TestDeployGateWiring:
             error=RevisionError("no main"),
             path=_deploy_vcs.paths["deploy-only"],
         )
-        monkeypatch.setattr("maintenance_man.cli.load_activity", lambda path: {})
+        monkeypatch.setattr(
+            "maintenance_man.services.deploy.load_activity", lambda path: {}
+        )
         with pytest.raises(SystemExit) as exc:
             app(["deploy", "deploy-only"], exit_on_error=False)
         assert exc.value.code == ExitCode.ERROR
         mock_deploy.assert_not_called()
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_batch_blocked_exits_ok(
         self,
         mock_deploy: MagicMock,
@@ -710,14 +810,16 @@ class TestDeployGateWiring:
         _deploy_vcs.state.fail(
             "resolve_revision", ordinal=2, error=RevisionError("no main"), path=path
         )
-        monkeypatch.setattr("maintenance_man.cli.load_activity", lambda path: {})
+        monkeypatch.setattr(
+            "maintenance_man.services.deploy.load_activity", lambda path: {}
+        )
         with pytest.raises(SystemExit) as exc:
             app(["deploy"], exit_on_error=False)
         assert exc.value.code == ExitCode.OK
         mock_deploy.assert_not_called()
 
-    @patch("maintenance_man.cli.run_build")
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_batch_skips_unchanged_deploys_changed(
         self,
         mock_deploy: MagicMock,
@@ -728,7 +830,7 @@ class TestDeployGateWiring:
     ) -> None:
         main_id = _deploy_vcs.main_ids["deployable"]
         monkeypatch.setattr(
-            "maintenance_man.cli.load_activity",
+            "maintenance_man.services.deploy.load_activity",
             lambda path: {
                 "deployable": ProjectActivity(
                     last_deploy=ActivityEvent(
@@ -749,11 +851,11 @@ class TestDeployGateWiring:
         mock_build.assert_not_called()
 
     @patch(
-        "maintenance_man.cli.check_health",
+        "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=True),
     )
-    @patch("maintenance_man.cli.run_build")
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_build")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_check_not_run_for_skipped(
         self,
         mock_deploy: MagicMock,
@@ -772,7 +874,7 @@ class TestDeployGateWiring:
         )
         main_id = _deploy_vcs.main_ids["deployable"]
         monkeypatch.setattr(
-            "maintenance_man.cli.load_activity",
+            "maintenance_man.services.deploy.load_activity",
             lambda path: {
                 "deployable": ProjectActivity(
                     last_deploy=ActivityEvent(
@@ -796,7 +898,7 @@ class TestDeployGateWiring:
             app(["deploy", "--check"], exit_on_error=False)
         mock_check.assert_not_called()
 
-    @patch("maintenance_man.cli.run_deploy")
+    @patch("maintenance_man.services.deploy.run_deploy")
     def test_loop_closes_real_activity(
         self,
         mock_deploy: MagicMock,

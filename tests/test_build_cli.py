@@ -6,7 +6,6 @@ import pytest
 from maintenance_man import cli, paths
 from maintenance_man.cli import ExitCode, app
 from maintenance_man.deployer import BuildError
-from maintenance_man.models.config import ProjectConfig
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
 from tests.conftest import configure_fake_vcs, run_mm, write_config
@@ -40,7 +39,7 @@ def test_label_failure_does_not_block_persisted_build_activity(
         'build_command = "build"\n',
     )
     monkeypatch.setattr(cli, "make_vcs_services", state.services)
-    monkeypatch.setattr(cli, "run_build", lambda *args: None)
+    monkeypatch.setattr("maintenance_man.services.deploy.run_build", lambda *args: None)
 
     assert run_mm("build", "demo") == ExitCode.OK
 
@@ -52,21 +51,6 @@ def test_label_failure_does_not_block_persisted_build_activity(
 
 
 class TestBuildCommand:
-    def test_build_launch_failure_records_a_failed_build(
-        self, mm_home: Path, tmp_path: Path
-    ) -> None:
-        mm_home.mkdir(parents=True)
-        missing = tmp_path / "missing"
-        state = FakeJjState()
-        state.seed_repository(missing, files={})
-        missing.rmdir()
-        config = ProjectConfig(path=missing, package_manager="uv", build_command="true")
-        with pytest.raises(BuildError):
-            cli._run_build_step("demo", config, vcs=state.services())
-        recorded = load_activity(paths.activity_path())["demo"].last_build
-        assert recorded is not None
-        assert recorded.success is False
-
     def test_no_build_config(
         self, mm_home_with_projects: Path, _build_vcs: FakeJjState
     ) -> None:
@@ -83,7 +67,7 @@ class TestBuildCommand:
             app(["build", "deploy-only"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
 
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_successful_build(
         self,
         mock_build: MagicMock,
@@ -97,7 +81,10 @@ class TestBuildCommand:
         mock_build.assert_called_once()
         assert any(call.method == "revision_bookmarks" for call in _build_vcs.attempts)
 
-    @patch("maintenance_man.cli.run_build", side_effect=BuildError("build failed"))
+    @patch(
+        "maintenance_man.services.deploy.run_build",
+        side_effect=BuildError("build failed"),
+    )
     def test_failed_build(
         self,
         mock_build: MagicMock,
@@ -117,8 +104,8 @@ class TestBuildCommand:
             app(["build", "nonexistent"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
 
-    @patch("maintenance_man.cli.record_activity")
-    @patch("maintenance_man.cli.run_build")
+    @patch("maintenance_man.services.deploy.record_activity")
+    @patch("maintenance_man.services.deploy.run_build")
     def test_successful_build_records_activity(
         self,
         mock_build: MagicMock,
@@ -133,8 +120,11 @@ class TestBuildCommand:
         _, kwargs = mock_record.call_args
         assert kwargs["success"] is True
 
-    @patch("maintenance_man.cli.record_activity")
-    @patch("maintenance_man.cli.run_build", side_effect=BuildError("build failed"))
+    @patch("maintenance_man.services.deploy.record_activity")
+    @patch(
+        "maintenance_man.services.deploy.run_build",
+        side_effect=BuildError("build failed"),
+    )
     def test_failed_build_records_activity(
         self,
         mock_build: MagicMock,

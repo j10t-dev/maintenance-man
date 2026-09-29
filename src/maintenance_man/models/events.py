@@ -33,6 +33,17 @@ class Operation(StrEnum):
     SYNC = "sync"
 
 
+class DeployStep(StrEnum):
+    BUILD = "build"
+    DEPLOY = "deploy"
+    HEALTH = "health"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectStarted:
+    project: str
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectSkipped:
     project: str
@@ -59,5 +70,47 @@ class SyncCompleted:
     action: str
 
 
-type Event = ProjectSkipped | OperationFailed | ScanReported | SyncCompleted
+@dataclass(frozen=True, slots=True)
+class DeployStepStarted:
+    project: str
+    step: DeployStep
+
+
+@dataclass(frozen=True, slots=True)
+class DeployStepSucceeded:
+    project: str
+    step: DeployStep
+
+
+@dataclass(frozen=True, slots=True)
+class DeployStepFailed:
+    project: str
+    step: DeployStep
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class HealthChecked:
+    project: str
+    is_up: bool
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class HealthcheckUnconfigured:
+    pass
+
+
+type Event = (
+    ProjectStarted
+    | ProjectSkipped
+    | OperationFailed
+    | ScanReported
+    | SyncCompleted
+    | DeployStepStarted
+    | DeployStepSucceeded
+    | DeployStepFailed
+    | HealthChecked
+    | HealthcheckUnconfigured
+)
 type Emit = Callable[[Event], None]

@@ -3,7 +3,6 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
@@ -24,29 +23,27 @@ from maintenance_man.config import (
     load_config,
     resolve_project,
 )
-from maintenance_man.deployer import (
-    BuildError,
-    DeployError,
-    check_health,
-    run_build,
-    run_deploy,
-)
+from maintenance_man.deployer import BuildError
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
 from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import workspace_environment_reason
 from maintenance_man.gradle_verification import snapshot_vulnerabilities
-from maintenance_man.models.activity import (
-    ActivityEvent,
-    ProjectActivity,
-)
+from maintenance_man.models.activity import ActivityEvent
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
+    DeployStep,
+    DeployStepFailed,
+    DeployStepStarted,
+    DeployStepSucceeded,
     Event,
+    HealthChecked,
+    HealthcheckUnconfigured,
     Operation,
     OperationFailed,
     Outcome,
     ProjectSkipped,
+    ProjectStarted,
     ScanReported,
     SkipReason,
     SyncCompleted,
@@ -69,13 +66,14 @@ from maintenance_man.models.scan import (
     sort_vulns_by_severity,
 )
 from maintenance_man.process import ToolNotFoundError
+from maintenance_man.services import WorkflowError
+from maintenance_man.services import deploy as deploy_service
 from maintenance_man.services import scan as scan_service
 from maintenance_man.services.scan import ScanSummary
 from maintenance_man.storage import (
     NoScanResultsError,
     load_activity,
     load_scan_results,
-    record_activity,
     save_scan_results,
 )
 from maintenance_man.updater import (
@@ -103,56 +101,8 @@ from maintenance_man.vcs_workflow import (
     remove_workspace,
 )
 from maintenance_man.vcs_workflow import (
-    current_label as repository_current_label,
-)
-from maintenance_man.vcs_workflow import (
     prune_stale_bookmarks as prune_repository_bookmarks,
 )
-
-
-class GateDecision(StrEnum):
-    DEPLOY = "deploy"
-    SKIP_UNCHANGED = "unchanged"
-    SKIP_BLOCKED = "blocked"
-
-
-@dataclass
-class DeployResult:
-    project: str
-    build_status: Literal["pass", "fail", "skip"]
-    deploy_status: Literal["pass", "fail", "skip", "unchanged", "blocked"]
-
-
-def should_deploy(
-    name: str,
-    project_path: Path,
-    activity: dict[str, ProjectActivity],
-    *,
-    force: bool,
-    vcs: VcsServices,
-) -> tuple[GateDecision, str | None]:
-    """Decide whether a project needs deploying.
-
-    Returns the decision and the main commit_id it gated on (None when
-    unresolvable). The caller records this id rather than re-resolving, so the
-    recorded identity matches what was gated even if main moves concurrently.
-    """
-    try:
-        current_id = vcs.repository(project_path).resolve_revision(revision="main")
-    except RevisionError:
-        current_id = None
-
-    if force:
-        return GateDecision.DEPLOY, current_id
-    if current_id is None:
-        return GateDecision.SKIP_BLOCKED, None
-
-    proj = activity.get(name)
-    last = proj.last_deploy if proj else None
-    if last is not None and last.success and last.commit_id == current_id:
-        return GateDecision.SKIP_UNCHANGED, current_id
-    return GateDecision.DEPLOY, current_id
-
 
 console = Console()
 
@@ -289,6 +239,74 @@ def _render_scan_reported(event: ScanReported, batch: bool) -> None:
 def _render_sync_completed(event: SyncCompleted, batch: bool) -> None:
     del batch
     console.print(f"  {escape(event.project)} — {escape(event.action)}")
+
+
+@_renders(ProjectStarted)
+def _render_project_started(event: ProjectStarted, batch: bool) -> None:
+    if not batch:
+        return
+    console.print(f"\n{'═' * 40}")
+    console.print(f"[bold]{escape(event.project)}[/]")
+    console.print("═" * 40)
+
+
+@_renders(DeployStepStarted)
+def _render_deploy_step_started(event: DeployStepStarted, batch: bool) -> None:
+    if batch:
+        if event.step is DeployStep.BUILD:
+            console.print("  [bold]Building...[/]")
+        elif event.step is DeployStep.DEPLOY:
+            console.print("  [bold]Deploying...[/]")
+        return
+
+    if event.step is DeployStep.BUILD:
+        console.print(f"[bold]Building {escape(event.project)}[/]\n")
+    elif event.step is DeployStep.DEPLOY:
+        console.print(f"[bold]Deploying {escape(event.project)}[/]\n")
+    else:
+        console.print(f"\n[bold]Checking health of {escape(event.project)}...[/]")
+
+
+@_renders(DeployStepSucceeded)
+def _render_deploy_step_succeeded(event: DeployStepSucceeded, batch: bool) -> None:
+    if batch:
+        return
+    if event.step is DeployStep.BUILD:
+        console.print("\n[bold green]Build succeeded.[/]\n")
+    elif event.step is DeployStep.DEPLOY:
+        console.print("\n[bold green]Deploy succeeded.[/]")
+
+
+@_renders(DeployStepFailed)
+def _render_deploy_step_failed(event: DeployStepFailed, batch: bool) -> None:
+    error = escape(event.error)
+    if not batch:
+        console.print(f"[bold red]Error:[/] {error}")
+    elif event.step is DeployStep.BUILD:
+        console.print(f"  [bold red]Build failed:[/] {error}")
+    elif event.step is DeployStep.DEPLOY:
+        console.print(f"  [bold red]Deploy failed:[/] {error}")
+
+
+@_renders(HealthChecked)
+def _render_health_checked(event: HealthChecked, batch: bool) -> None:
+    indent = "  " if batch else ""
+    if event.is_up:
+        console.print(f"{indent}[bold green]Healthy:[/] {escape(event.project)} is up")
+    elif event.error:
+        console.print(f"{indent}[bold yellow]Warning:[/] {escape(event.error)}")
+    else:
+        console.print(
+            f"{indent}[bold yellow]Warning:[/] {escape(event.project)} is not healthy"
+        )
+
+
+@_renders(HealthcheckUnconfigured)
+def _render_healthcheck_unconfigured(
+    event: HealthcheckUnconfigured, batch: bool
+) -> None:
+    del event, batch
+    console.print("[dim]--check: no healthcheck_url configured in \\[defaults][/]")
 
 
 app = cyclopts.App(
@@ -1074,128 +1092,7 @@ def _print_mass_update_summary(
     console.print(table)
 
 
-def _deploy_one(
-    name: str,
-    proj_config: ProjectConfig,
-    cfg: MmConfig,
-    commit_id: str | None,
-    *,
-    check: bool = False,
-    vcs: VcsServices,
-) -> DeployResult:
-    """Build and deploy a single project. Returns result, never raises."""
-    build_status = "skip"
-    deploy_status = "skip"
-
-    if proj_config.build_command:
-        console.print("  [bold]Building...[/]")
-        try:
-            _run_build_step(name, proj_config, vcs=vcs)
-        except BuildError as e:
-            console.print(f"  [bold red]Build failed:[/] {escape(str(e))}")
-            build_status = "fail"
-            return DeployResult(
-                project=name,
-                build_status=build_status,
-                deploy_status=deploy_status,
-            )
-        build_status = "pass"
-
-    console.print("  [bold]Deploying...[/]")
-    try:
-        _run_deploy_step(name, proj_config, commit_id, vcs=vcs)
-    except DeployError as e:
-        console.print(f"  [bold red]Deploy failed:[/] {escape(str(e))}")
-        deploy_status = "fail"
-        return DeployResult(
-            project=name,
-            build_status=build_status,
-            deploy_status=deploy_status,
-        )
-    deploy_status = "pass"
-
-    if check and cfg.defaults.healthcheck_url:
-        _run_health_check_step(cfg.defaults.healthcheck_url, name, indent="  ")
-
-    return DeployResult(
-        project=name,
-        build_status=build_status,
-        deploy_status=deploy_status,
-    )
-
-
-def _deploy_all(
-    cfg: MmConfig,
-    *,
-    check: bool = False,
-    force: bool = False,
-    vcs: VcsServices,
-) -> NoReturn:
-    """Deploy all configured projects that have a deploy_command."""
-    if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
-        sys.exit(ExitCode.OK)
-
-    activity = load_activity(paths.activity_path())
-    results: list[DeployResult] = []
-
-    for name, proj_config in sorted(cfg.projects.items()):
-        if not proj_config.deployable:
-            console.print(f"[dim]{escape(name)} — skipped (not deployable)[/]")
-            continue
-
-        if not proj_config.deploy_command:
-            continue
-
-        if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {escape(name)} — "
-                f"path does not exist: {escape(str(proj_config.path))}"
-            )
-            results.append(
-                DeployResult(project=name, build_status="skip", deploy_status="fail")
-            )
-            continue
-
-        decision, current_id = should_deploy(
-            name, proj_config.path, activity, force=force, vcs=vcs
-        )
-        if decision is GateDecision.SKIP_UNCHANGED:
-            console.print(f"[dim]{escape(name)} — unchanged since last deploy[/]")
-            results.append(
-                DeployResult(
-                    project=name, build_status="skip", deploy_status="unchanged"
-                )
-            )
-            continue
-        if decision is GateDecision.SKIP_BLOCKED:
-            console.print(
-                f"[bold yellow]Warning:[/] {escape(name)} — could not resolve main "
-                f"revision; skipping (use --force to deploy anyway)"
-            )
-            results.append(
-                DeployResult(project=name, build_status="skip", deploy_status="blocked")
-            )
-            continue
-
-        console.print(f"\n{'═' * 40}")
-        console.print(f"[bold]{escape(name)}[/]")
-        console.print("═" * 40)
-
-        results.append(
-            _deploy_one(name, proj_config, cfg, current_id, check=check, vcs=vcs)
-        )
-
-    _print_deploy_summary(results)
-
-    # Only "fail" counts; "unchanged"/"blocked" are deliberate skips, not failures.
-    any_failed = any(
-        r.deploy_status == "fail" or r.build_status == "fail" for r in results
-    )
-    sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
-
-
-def _print_deploy_summary(results: list[DeployResult]) -> None:
+def _print_deploy_summary(results: list[deploy_service.DeployResult]) -> None:
     """Print a cross-project deploy summary table."""
     if not results:
         console.print("\n[dim]No projects have deploy_command configured.[/]")
@@ -1223,107 +1120,6 @@ def _print_deploy_summary(results: list[DeployResult]) -> None:
 
     console.print()
     console.print(table)
-
-
-def _warn_missing_healthcheck_url() -> None:
-    """Warn when --check was requested but no healthcheck_url is configured."""
-    console.print("[dim]--check: no healthcheck_url configured in \\[defaults][/]")
-
-
-def _record_deploy_activity(
-    project: str,
-    event_type: Literal["build", "deploy"],
-    *,
-    success: bool,
-    project_path: Path,
-    commit_id: str | None = None,
-    vcs: VcsServices,
-) -> None:
-    """Record build/deploy activity for a project."""
-    activity_path = paths.activity_path()
-    branch = repository_current_label(repo=vcs.repository(project_path))
-    record_activity(
-        activity_path,
-        project,
-        event_type,
-        success=success,
-        branch=branch,
-        commit_id=commit_id,
-    )
-
-
-def _run_build_step(
-    project: str, proj_config: ProjectConfig, *, vcs: VcsServices
-) -> None:
-    """Run build and record activity, raising BuildError on failure."""
-    assert proj_config.build_command is not None
-    try:
-        run_build(project, proj_config.build_command, proj_config.path)
-    except BuildError:
-        _record_deploy_activity(
-            project,
-            "build",
-            success=False,
-            project_path=proj_config.path,
-            vcs=vcs,
-        )
-        raise
-    _record_deploy_activity(
-        project,
-        "build",
-        success=True,
-        project_path=proj_config.path,
-        vcs=vcs,
-    )
-
-
-def _run_deploy_step(
-    project: str,
-    proj_config: ProjectConfig,
-    commit_id: str | None,
-    *,
-    vcs: VcsServices,
-) -> None:
-    """Run deploy and record activity, raising DeployError on failure."""
-    assert proj_config.deploy_command is not None
-    try:
-        run_deploy(project, proj_config.deploy_command, proj_config.path)
-    except DeployError:
-        _record_deploy_activity(
-            project,
-            "deploy",
-            success=False,
-            project_path=proj_config.path,
-            commit_id=None,
-            vcs=vcs,
-        )
-        raise
-    _record_deploy_activity(
-        project,
-        "deploy",
-        success=True,
-        project_path=proj_config.path,
-        commit_id=commit_id,
-        vcs=vcs,
-    )
-
-
-def _run_health_check_step(
-    healthcheck_url: str,
-    project: str,
-    *,
-    indent: str = "",
-) -> None:
-    """Run a health check and print a consistent status message."""
-    result = check_health(healthcheck_url, project)
-    if result.is_up:
-        console.print(f"{indent}[bold green]Healthy:[/] {escape(project)} is up")
-    elif result.error:
-        console.print(f"{indent}[bold yellow]Warning:[/] {escape(result.error)}")
-    else:
-        console.print(
-            f"{indent}[bold yellow]Warning:[/] {escape(project)} is not healthy"
-        )
 
 
 @app.command
@@ -1354,66 +1150,48 @@ def deploy(
     """
     cfg = _load_cfg(config)
     vcs = make_vcs_services()
+    renderer = _Renderer(batch=project is None)
 
     if not project:
         if check and not cfg.defaults.healthcheck_url:
-            _warn_missing_healthcheck_url()
-        _deploy_all(cfg, check=check, force=force, vcs=vcs)
-        return  # _deploy_all calls sys.exit(); guard against refactors
+            renderer(HealthcheckUnconfigured())
+        if not cfg.projects:
+            console.print(
+                "No projects configured. Edit ~/.mm/config.toml to add projects."
+            )
+            sys.exit(ExitCode.OK)
+        results = deploy_service.deploy_all(
+            cfg,
+            check=check,
+            force=force,
+            vcs=vcs,
+            emit=renderer,
+        )
+        _print_deploy_summary(list(results))
+        any_failed = any(
+            result.deploy_status == "fail" or result.build_status == "fail"
+            for result in results
+        )
+        sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
 
     proj_config = _resolve_proj(cfg, project)
-
-    if not proj_config.deployable:
-        console.print(f"[dim]{escape(project)} — skipped (not deployable)[/]")
-        sys.exit(ExitCode.OK)
-
-    if not proj_config.deploy_command:
-        _fatal(
-            f"No deploy_command configured for {project}. "
-            f"Add deploy_command to [projects.{project}] in ~/.mm/config.toml."
-        )
-
-    activity = load_activity(paths.activity_path())
-    decision, current_id = should_deploy(
-        project, proj_config.path, activity, force=force, vcs=vcs
-    )
-    if decision is GateDecision.SKIP_UNCHANGED:
-        console.print(
-            f"[bold yellow]{escape(project)}[/] unchanged since last deploy "
-            f"(use --force to redeploy)."
-        )
-        sys.exit(ExitCode.OK)
-    if decision is GateDecision.SKIP_BLOCKED:
-        _fatal(
-            f"Could not resolve main revision for {project}; refusing "
-            f"to deploy unverified state (use --force to override).",
-            code=ExitCode.ERROR,
-        )
-
-    if build and proj_config.build_command:
-        console.print(f"[bold]Building {escape(project)}[/]\n")
-        try:
-            _run_build_step(project, proj_config, vcs=vcs)
-        except BuildError as e:
-            _fatal(str(e), code=ExitCode.BUILD_FAILED)
-        console.print("\n[bold green]Build succeeded.[/]\n")
-
-    console.print(f"[bold]Deploying {escape(project)}[/]\n")
-
     try:
-        _run_deploy_step(project, proj_config, current_id, vcs=vcs)
-    except DeployError as e:
-        _fatal(str(e), code=ExitCode.DEPLOY_FAILED)
-
-    console.print("\n[bold green]Deploy succeeded.[/]")
-
-    if check:
-        if not cfg.defaults.healthcheck_url:
-            _warn_missing_healthcheck_url()
-        else:
-            console.print(f"\n[bold]Checking health of {escape(project)}...[/]")
-            _run_health_check_step(cfg.defaults.healthcheck_url, project)
-
+        result = deploy_service.deploy_project(
+            project,
+            proj_config,
+            healthcheck_url=cfg.defaults.healthcheck_url,
+            build=build,
+            check=check,
+            force=force,
+            vcs=vcs,
+            emit=renderer,
+        )
+    except WorkflowError as exc:
+        _fatal(str(exc))
+    if result.build_status == "fail":
+        sys.exit(ExitCode.BUILD_FAILED)
+    if result.deploy_status == "fail":
+        sys.exit(ExitCode.DEPLOY_FAILED)
     sys.exit(ExitCode.OK)
 
 
@@ -1479,7 +1257,7 @@ def build(
     console.print(f"[bold]Building {escape(project)}[/]\n")
 
     try:
-        _run_build_step(project, proj_config, vcs=vcs)
+        deploy_service.build_project(project, proj_config, vcs=vcs)
     except BuildError as e:
         _fatal(str(e), code=ExitCode.BUILD_FAILED)
 
