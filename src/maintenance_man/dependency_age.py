@@ -12,11 +12,12 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+from packaging.version import Version
 from pydantic import ValidationError
 
 from maintenance_man.clock import Clock, utc_now
@@ -28,12 +29,15 @@ from maintenance_man.models.gradle import (
     PublicationEvidence,
     PublicationFact,
     PublicationRequest,
+    RepositoryId,
 )
+from maintenance_man.models.publication import Registry, RegistryFact
 from maintenance_man.models.scan import (
     UpdateFinding,
 )
 from maintenance_man.process import ProcessError, run_captured
 from maintenance_man.storage import atomic_write_text
+from maintenance_man.uv_dependencies import normalise_pkg_name
 
 
 def filter_by_age(
@@ -201,6 +205,7 @@ _ALIASES = {
 _REDIRECT_HOSTS = {
     "central": {"repo.maven.apache.org", "repo1.maven.org"},
     "google": {"dl.google.com"},
+    "pypi": {"pypi.org"},
     "portal": {
         "plugins.gradle.org",
         "plugins-artifacts.gradle.org",
@@ -246,6 +251,20 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class PublicationError(Exception):
     """Publication evidence could not be trusted or obtained."""
+
+
+_LOOKUP_ERRORS = (
+    http.client.HTTPException,
+    OSError,
+    ValueError,
+    OverflowError,
+    KeyError,
+    TypeError,
+    ET.ParseError,
+    urllib.error.URLError,
+    PublicationError,
+    ProcessError,
+)
 
 
 def _public_url(url, repository, suffix=None):
@@ -296,7 +315,12 @@ def _publication_http(url, repository, suffix, count):
             if error.code in (301, 302, 303, 307, 308):
                 location = error.headers.get("Location")
                 error.close()
-                if suffix is None or redirects == 5 or not location:
+                if (
+                    suffix is None
+                    or repository == "pypi"
+                    or redirects == 5
+                    or not location
+                ):
                     msg = "publication redirect limit or invalid redirect"
                     raise PublicationError(msg) from error
                 url = urllib.parse.urljoin(url, location)
@@ -416,6 +440,67 @@ def _parse_central_timestamp(body, module):
     return max(dates)
 
 
+def _registry_timestamp(value):
+    if not isinstance(value, str):
+        msg = "invalid registry timestamp"
+        raise PublicationError(msg)
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _pypi_release(data):
+    """Return (name, version, urls) from a PyPI release document."""
+    info = data.get("info") if isinstance(data, dict) else None
+    urls = data.get("urls") if isinstance(data, dict) else None
+    if (
+        not isinstance(info, dict)
+        or not isinstance(info.get("name"), str)
+        or not isinstance(info.get("version"), str)
+        or not isinstance(urls, list)
+        or not all(isinstance(entry, dict) for entry in urls)
+    ):
+        msg = "unexpected PyPI response shape"
+        raise PublicationError(msg)
+    return info["name"], info["version"], urls
+
+
+def _pypi_timestamp(body, package, version):
+    name, released, urls = _pypi_release(json.loads(body))
+    if normalise_pkg_name(name) != normalise_pkg_name(package) or Version(
+        released
+    ) != Version(version):
+        msg = "PyPI identity mismatch"
+        raise PublicationError(msg)
+    uploads = [
+        _registry_timestamp(entry["upload_time_iso_8601"])
+        for entry in urls
+        if entry.get("upload_time_iso_8601") is not None
+    ]
+    if not uploads:
+        msg = "PyPI upload time missing"
+        raise PublicationError(msg)
+    return min(uploads)
+
+
+def _npm_timestamp(package, version, project_path):
+    completed = run_captured(
+        ["bun", "info", f"{package}@{version}"],
+        project_path,
+        timeout=30,
+        label="bun info",
+        ok_codes=None,
+    )
+    value = next(
+        (
+            line.removeprefix("Published:").strip()
+            for line in completed.stdout.splitlines()
+            if line.startswith("Published:")
+        ),
+        None,
+    )
+    return _registry_timestamp(value) if value else None
+
+
 class PublicationLookupContext:
     """Command-scoped cache, shared pool and disk cache for publication facts."""
 
@@ -484,21 +569,32 @@ class PublicationLookupContext:
                 continue
         return None
 
-    def submit(self, repository, module):
-        key = self._key(repository, module)
+    def _submit(self, key, fetch, *args):
         with self.lock:
             prior = self.inflight.get(key)
             if prior is not None:
                 if not prior.done():
                     return prior
                 value = prior.result()
-                if not isinstance(value, PublicationFact) or self._fresh(
-                    value.checked_at
-                ):
+                if not isinstance(
+                    value, (PublicationFact, RegistryFact)
+                ) or self._fresh(value.checked_at):
                     return prior
-            future = self.pool.submit(self._fetch, key, module)
+            future = self.pool.submit(fetch, *args)
             self.inflight[key] = future
             return future
+
+    def submit(
+        self, repository: RepositoryId, module: ModuleId
+    ) -> Future[PublicationFact | AgeBlock | None]:
+        key = self._key(repository, module)
+        return self._submit(key, self._fetch, key, module)
+
+    def submit_registry(
+        self, registry: Registry, package: str, version: str, project_path: Path
+    ) -> Future[RegistryFact | AgeBlock | None]:
+        key = ("registry", registry, package, version)
+        return self._submit(key, self._fetch_registry, key, project_path)
 
     def prefetch(self, requests):
         for request in requests:
@@ -540,6 +636,25 @@ class PublicationLookupContext:
             raise PublicationError(msg)
         return "central_timestamp", _parse_central_timestamp(result[0], module)
 
+    def _store(self, path, fact):
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(path, fact.model_dump_json())
+        except OSError:
+            # Evidence was verified live; disk errors cannot supply evidence.
+            pass
+
+    def _lookup_failed(self, label, error):
+        logging.getLogger(__name__).debug(
+            "Publication lookup failed for %s", label, exc_info=True
+        )
+        reason = (
+            str(error)
+            if isinstance(error, PublicationError)
+            else "publication lookup failed"
+        )
+        return AgeBlock(reason=f"{label}: {reason}")
+
     def _fetch(self, key, module):
         started = time.monotonic()
         try:
@@ -573,37 +688,83 @@ class PublicationLookupContext:
                 checked_at=self.clock(),
                 implementation=implementation,
             )
-            try:
-                self.cache_dir.mkdir(parents=True, exist_ok=True)
-                path = self._path(key, method)
-                atomic_write_text(path, fact.model_dump_json())
-            except OSError:
-                # Evidence was verified live; disk errors cannot supply evidence.
-                pass
+            self._store(self._path(key, method), fact)
             return fact
-        except (
-            http.client.HTTPException,
-            OSError,
-            ValueError,
-            OverflowError,
-            KeyError,
-            TypeError,
-            ET.ParseError,
-            urllib.error.URLError,
-            PublicationError,
-        ) as error:
-            logging.getLogger(__name__).debug(
-                "Publication lookup failed for %s:%s",
-                module.coordinate,
-                module.version,
-                exc_info=True,
+        except _LOOKUP_ERRORS as error:
+            return self._lookup_failed(f"{module.coordinate}:{module.version}", error)
+        finally:
+            with self.lock:
+                self.seconds += time.monotonic() - started
+
+    def _registry_path(self, key):
+        digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+        return self.cache_dir / (digest + ".json")
+
+    def _cached_registry(self, key):
+        _, registry, package, version = key
+        try:
+            fact = RegistryFact.model_validate_json(
+                self._registry_path(key).read_bytes()
             )
-            reason = (
-                str(error)
-                if isinstance(error, PublicationError)
-                else "publication lookup failed"
+        except OSError, ValueError:
+            return None
+        if (
+            (fact.registry, fact.package, fact.version) != (registry, package, version)
+            or fact.timestamp > self.clock()
+            or not self._fresh(fact.checked_at)
+        ):
+            return None
+        with self.lock:
+            self.cache_hits += 1
+        return fact
+
+    def _pypi_lookup(self, package, version):
+        quote = functools.partial(urllib.parse.quote, safe="")
+        suffix = f"pypi/{quote(package)}/{quote(version)}/json"
+        url = "https://pypi.org/" + suffix
+        response = self.transport(url, "pypi", suffix, self._count)
+        if response is None:
+            return None
+        body, _headers, final_url = response
+        if final_url != url:
+            msg = "PyPI response URL changed"
+            raise PublicationError(msg)
+        if len(body) > _MAX_BYTES:
+            msg = "PyPI response exceeds size limit"
+            raise PublicationError(msg)
+        return _pypi_timestamp(body, package, version)
+
+    def _registry_lookup(self, registry, package, version, project_path):
+        if registry == "pypi":
+            return self._pypi_lookup(package, version)
+        self._count()
+        return _npm_timestamp(package, version, project_path)
+
+    def _fetch_registry(self, key, project_path):
+        started = time.monotonic()
+        _, registry, package, version = key
+        try:
+            if registry == "pypi" and (cached := self._cached_registry(key)):
+                return cached
+            timestamp = self._registry_lookup(registry, package, version, project_path)
+            if timestamp is None:
+                return None
+            timestamp = timestamp.astimezone(UTC)
+            if timestamp > self.clock():
+                msg = "future publication timestamp"
+                raise PublicationError(msg)
+            fact = RegistryFact(
+                registry=registry,
+                package=package,
+                version=version,
+                timestamp=timestamp,
+                checked_at=self.clock(),
             )
-            return AgeBlock(reason=f"{module.coordinate}:{module.version}: {reason}")
+            if registry == "pypi":
+                self._store(self._registry_path(key), fact)
+            return fact
+        except _LOOKUP_ERRORS as error:
+            return self._lookup_failed(f"{package}:{version}", error)
         finally:
             with self.lock:
                 self.seconds += time.monotonic() - started

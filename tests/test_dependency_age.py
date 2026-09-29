@@ -1,4 +1,6 @@
+import hashlib
 import io
+import json
 import subprocess
 import threading
 import urllib.error
@@ -13,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from maintenance_man.dependency_age import (
+    _MAX_BYTES,
     PublicationError,
     PublicationLookupContext,
     _public_url,
@@ -32,6 +35,7 @@ from maintenance_man.models.gradle import (
     PublicationRequest,
     RepositoryDeclaration,
 )
+from maintenance_man.models.publication import RegistryFact
 from maintenance_man.models.scan import (
     SemverTier,
     UpdateFinding,
@@ -1485,4 +1489,396 @@ def test_gradle_scan_submits_every_update_before_waiting(tmp_path, monkeypatch):
     assert [update.gradle_target for update in result] == [
         first.gradle_target,
         second.gradle_target,
+    ]
+
+
+def _pypi_body(name="pkg", version="1.0", uploads=("2025-12-31T00:00:00Z",)):
+    return json.dumps(
+        {
+            "info": {"name": name, "version": version},
+            "urls": [{"upload_time_iso_8601": value} for value in uploads],
+        }
+    ).encode()
+
+
+def _pypi_context(cache, response, clock=lambda: _PUB_NOW):
+    calls = []
+
+    def transport(url, root, suffix, count):
+        count()
+        calls.append((url, root, suffix))
+        if isinstance(response, Exception):
+            raise response
+        if response is None:
+            return None
+        body, final_url = response if isinstance(response, tuple) else (response, url)
+        return body, {}, final_url
+
+    return PublicationLookupContext(cache, transport, clock), calls
+
+
+def _registry_path(cache, registry, package, version):
+    key = json.dumps(["registry", registry, package, version]).encode()
+    return cache / (hashlib.sha256(key).hexdigest() + ".json")
+
+
+def test_pypi_lookup_uses_exact_url_and_earliest_upload(tmp_path):
+    body = _pypi_body(
+        name="requests",
+        version="2.31.0",
+        uploads=("2025-12-31T10:00:00Z", "2025-12-30T08:00:00Z"),
+    )
+    context, calls = _pypi_context(tmp_path, body)
+    with context:
+        fact = context.submit_registry("pypi", "requests", "2.31.0", tmp_path).result()
+    assert calls == [
+        (
+            "https://pypi.org/pypi/requests/2.31.0/json",
+            "pypi",
+            "pypi/requests/2.31.0/json",
+        )
+    ]
+    assert fact == RegistryFact(
+        registry="pypi",
+        package="requests",
+        version="2.31.0",
+        timestamp=datetime(2025, 12, 30, 8, tzinfo=UTC),
+        checked_at=_PUB_NOW,
+    )
+    assert _registry_path(tmp_path, "pypi", "requests", "2.31.0").is_file()
+
+
+@pytest.mark.parametrize(
+    "package, version, body, expected",
+    [
+        (
+            "Typing_Extensions",
+            "4.12.2",
+            _pypi_body("typing-extensions", "4.12.2", ("2024-06-07T18:52:13Z",)),
+            datetime(2024, 6, 7, 18, 52, 13, tzinfo=UTC),
+        ),
+        (
+            "pkg",
+            "1.0.0",
+            _pypi_body("pkg", "1.0", ("2025-12-31T00:00:00",)),
+            datetime(2025, 12, 31, tzinfo=UTC),
+        ),
+        (
+            "pkg",
+            "6.0.2.0",
+            _pypi_body("pkg", "6.0.2", ("2025-12-31T00:00:00Z", None)),
+            datetime(2025, 12, 31, tzinfo=UTC),
+        ),
+    ],
+    ids=["normalised-name", "equivalent-version-naive-utc", "null-upload-skipped"],
+)
+def test_pypi_identity_accepts_equivalent_names_and_versions(
+    tmp_path, package, version, body, expected
+):
+    context, _ = _pypi_context(tmp_path, body)
+    with context:
+        fact = context.submit_registry("pypi", package, version, tmp_path).result()
+    assert fact.timestamp == expected
+
+
+def test_pypi_absent_release_is_unknown(tmp_path):
+    context, _ = _pypi_context(tmp_path, None)
+    with context:
+        assert context.submit_registry("pypi", "pkg", "1.0", tmp_path).result() is None
+
+
+@pytest.mark.parametrize(
+    "response, reason",
+    [
+        (_pypi_body("other"), "PyPI identity mismatch"),
+        (_pypi_body(version="2.0"), "PyPI identity mismatch"),
+        (_pypi_body(version="not a version"), "publication lookup failed"),
+        (_pypi_body(uploads=()), "PyPI upload time missing"),
+        (_pypi_body(uploads=("2026-09-19T00:00:00Z",)), "future publication timestamp"),
+        (_pypi_body(uploads=(1,)), "invalid registry timestamp"),
+        (_pypi_body(uploads=("soon",)), "publication lookup failed"),
+        (b"<html>", "publication lookup failed"),
+        (b"[]", "unexpected PyPI response shape"),
+        (b'{"info": null, "urls": []}', "unexpected PyPI response shape"),
+        (b'{"info": [], "urls": []}', "unexpected PyPI response shape"),
+        (
+            b'{"info": {"name": "pkg", "version": "1.0"}, "urls": {}}',
+            "unexpected PyPI response shape",
+        ),
+        (
+            b'{"info": {"name": "pkg", "version": "1.0"}, "urls": ["x"]}',
+            "unexpected PyPI response shape",
+        ),
+        (
+            b'{"info": {"name": 1, "version": "1.0"}, "urls": []}',
+            "unexpected PyPI response shape",
+        ),
+        ("oversized", "PyPI response exceeds size limit"),
+        (
+            (_pypi_body(), "https://pypi.org/pypi/other/1.0/json"),
+            "PyPI response URL changed",
+        ),
+        (PublicationError("publication HTTP 429"), "publication HTTP 429"),
+    ],
+)
+def test_pypi_failures_are_contained(tmp_path, response, reason):
+    if response == "oversized":
+        response = b" " * (_MAX_BYTES + 1)
+    context, _ = _pypi_context(tmp_path, response)
+    with context:
+        result = context.submit_registry("pypi", "pkg", "1.0", tmp_path).result()
+    assert result == AgeBlock(reason=f"pkg:1.0: {reason}")
+    assert not list(tmp_path.glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["https://pypi.org/pypi/pkg/1.0/json", "https://pypi.org/pypi/other/1.0/json"],
+)
+def test_pypi_transport_refuses_any_redirect(monkeypatch, location):
+    from maintenance_man import dependency_age as age
+
+    calls = []
+
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request.full_url)
+            headers = Message()
+            headers["Location"] = location
+            raise urllib.error.HTTPError(
+                request.full_url, 302, "redirect", headers, None
+            )
+
+    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
+    with pytest.raises(PublicationError, match="invalid redirect"):
+        _publication_http(
+            "https://pypi.org/pypi/pkg/1.0/json",
+            "pypi",
+            "pypi/pkg/1.0/json",
+            lambda: None,
+        )
+    assert calls == ["https://pypi.org/pypi/pkg/1.0/json"]
+
+
+def test_pypi_transport_refuses_other_hosts_before_opening(monkeypatch):
+    from maintenance_man import dependency_age as age
+
+    def refuse(*args, **kwargs):
+        pytest.fail("no request expected")
+
+    monkeypatch.setattr(
+        age.urllib.request,
+        "build_opener",
+        lambda *_: SimpleNamespace(open=refuse),
+    )
+    with pytest.raises(PublicationError, match="untrusted publication redirect"):
+        _publication_http(
+            "https://evil.test/pypi/pkg/1.0/json",
+            "pypi",
+            "pypi/pkg/1.0/json",
+            lambda: None,
+        )
+
+
+def _seed(cache, **changes):
+    fact = RegistryFact(
+        registry="pypi",
+        package="pkg",
+        version="1.0",
+        timestamp=datetime(2025, 12, 31, tzinfo=UTC),
+        checked_at=_PUB_NOW,
+    ).model_copy(update=changes)
+    path = _registry_path(cache, "pypi", "pkg", "1.0")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(fact.model_dump_json())
+    return path
+
+
+@pytest.mark.parametrize(
+    "changes, clock, expected_calls",
+    [
+        ({}, _PUB_NOW + timedelta(hours=23, minutes=59), 0),
+        ({}, _PUB_NOW + timedelta(hours=24), 1),
+        ({}, _PUB_NOW - timedelta(seconds=1), 1),
+        ({"timestamp": _PUB_NOW + timedelta(hours=1)}, _PUB_NOW, 1),
+        ({"package": "other"}, _PUB_NOW, 1),
+        ({"registry": "npm"}, _PUB_NOW, 1),
+    ],
+    ids=[
+        "fresh",
+        "expired",
+        "future-check",
+        "future-date",
+        "other-package",
+        "other-registry",
+    ],
+)
+def test_pypi_cache_freshness_and_identity(tmp_path, changes, clock, expected_calls):
+    _seed(tmp_path, **changes)
+    context, calls = _pypi_context(tmp_path, _pypi_body(), clock=lambda: clock)
+    with context:
+        result = context.submit_registry("pypi", "pkg", "1.0", tmp_path).result()
+    assert len(calls) == expected_calls
+    assert context.cache_hits == 1 - expected_calls
+    assert isinstance(result, RegistryFact)
+
+
+def test_pypi_corrupt_cache_goes_live(tmp_path):
+    _seed(tmp_path).write_text("{broken")
+    context, calls = _pypi_context(tmp_path, _pypi_body())
+    with context:
+        assert isinstance(
+            context.submit_registry("pypi", "pkg", "1.0", tmp_path).result(),
+            RegistryFact,
+        )
+    assert len(calls) == 1
+
+
+def test_pypi_fact_is_shared_across_projects(tmp_path):
+    cache = tmp_path / "cache"
+    first, _ = _pypi_context(cache, _pypi_body())
+    with first:
+        first.submit_registry("pypi", "pkg", "1.0", tmp_path / "a").result()
+    second, calls = _pypi_context(cache, _pypi_body())
+    with second:
+        fact = second.submit_registry("pypi", "pkg", "1.0", tmp_path / "b").result()
+    assert calls == []
+    assert fact.timestamp == datetime(2025, 12, 31, tzinfo=UTC)
+
+
+def test_pypi_cache_write_failure_returns_live_fact(tmp_path):
+    cache = tmp_path / "not-a-directory"
+    cache.write_text("")
+    context, _ = _pypi_context(cache, _pypi_body())
+    with context:
+        result = context.submit_registry("pypi", "pkg", "1.0", tmp_path).result()
+    assert isinstance(result, RegistryFact)
+
+
+def test_registry_and_maven_facts_share_a_directory(tmp_path):
+    _, request, _, maven = _publication_fixture(tmp_path)
+    pypi, _ = _pypi_context(tmp_path, _pypi_body())
+    with maven:
+        lookup_gradle_publication(request, maven)
+    with pypi:
+        pypi.submit_registry("pypi", "pkg", "1.0", tmp_path).result()
+    assert len(list(tmp_path.glob("*.json"))) == 2
+    _, _, maven_calls, maven_again = _publication_fixture(tmp_path)
+    pypi_again, pypi_calls = _pypi_context(tmp_path, _pypi_body())
+    with maven_again:
+        lookup_gradle_publication(request, maven_again)
+    with pypi_again:
+        pypi_again.submit_registry("pypi", "pkg", "1.0", tmp_path).result()
+    assert maven_calls == [] and pypi_calls == []
+
+
+def test_duplicate_registry_lookups_share_one_request(tmp_path):
+    context, calls = _pypi_context(tmp_path, _pypi_body())
+    with context:
+        first = context.submit_registry("pypi", "pkg", "1.0", tmp_path)
+        second = context.submit_registry("pypi", "pkg", "1.0", tmp_path)
+        assert first is second
+        assert isinstance(first.result(), RegistryFact)
+    assert len(calls) == 1
+
+
+def _fake_bun(monkeypatch, *outputs):
+    calls = []
+    queue = list(outputs)
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        output = queue.pop(0)
+        if isinstance(output, BaseException):
+            raise output
+        return subprocess.CompletedProcess(cmd, 1, output, "warning")
+
+    monkeypatch.setattr(_PATCH_SUBRUN, run)
+    return calls
+
+
+def test_npm_lookup_runs_bun_info_in_the_project_without_disk_cache(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    project, cache = tmp_path / "project", tmp_path / "cache"
+    calls = _fake_bun(monkeypatch, "pkg@1.0.0 | MIT\nPublished: 2024-01-02T03:04:05Z\n")
+    with PublicationLookupContext(cache, clock=lambda: _PUB_NOW) as context:
+        fact = context.submit_registry("npm", "pkg", "1.0.0", project).result()
+        assert context.requests == 1
+    assert fact.timestamp == datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+    ((cmd, kwargs),) = calls
+    assert cmd == ["bun", "info", "pkg@1.0.0"]
+    assert kwargs["cwd"] == project
+    assert kwargs["timeout"] == 30
+    assert "VIRTUAL_ENV" not in kwargs["env"]
+    assert not cache.exists() or not list(cache.iterdir())
+
+
+@pytest.mark.parametrize(
+    "output, expected",
+    [
+        (
+            "Published: 2024-01-02T03:04:05\n",
+            datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC),
+        ),
+        ("pkg@1.0.0 | MIT\n", None),
+        ("Published:\n", None),
+        (
+            subprocess.TimeoutExpired(["bun", "info"], 30),
+            AgeBlock(reason="pkg:1.0.0: publication lookup failed"),
+        ),
+        (
+            FileNotFoundError(2, "No such file or directory", "bun"),
+            AgeBlock(reason="pkg:1.0.0: publication lookup failed"),
+        ),
+        (
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+            AgeBlock(reason="pkg:1.0.0: publication lookup failed"),
+        ),
+        (
+            "Published: soon\n",
+            AgeBlock(reason="pkg:1.0.0: publication lookup failed"),
+        ),
+    ],
+)
+def test_npm_dates_and_failures(tmp_path, monkeypatch, output, expected):
+    _fake_bun(monkeypatch, output)
+    with PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW) as context:
+        result = context.submit_registry("npm", "pkg", "1.0.0", tmp_path).result()
+    if isinstance(expected, datetime):
+        assert result.timestamp == expected
+    else:
+        assert result == expected
+
+
+def test_npm_ignores_a_planted_cache_file_and_reruns_each_context(
+    tmp_path, monkeypatch
+):
+    planted = _registry_path(tmp_path, "npm", "pkg", "1.0.0")
+    planted.write_text(
+        RegistryFact(
+            registry="npm",
+            package="pkg",
+            version="1.0.0",
+            timestamp=datetime(2020, 1, 1, tzinfo=UTC),
+            checked_at=_PUB_NOW,
+        ).model_dump_json()
+    )
+    calls = _fake_bun(
+        monkeypatch,
+        "Published: 2024-01-01T00:00:00Z\n",
+        "Published: 2026-09-17T00:00:00Z\n",
+    )
+    dates = []
+    for _ in range(2):
+        with PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW) as context:
+            first = context.submit_registry("npm", "pkg", "1.0.0", tmp_path)
+            again = context.submit_registry("npm", "pkg", "1.0.0", tmp_path)
+            dates.append(first.result().timestamp)
+            assert again is first
+    assert len(calls) == 2
+    assert dates == [
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2026, 9, 17, tzinfo=UTC),
     ]
