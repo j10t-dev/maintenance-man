@@ -179,6 +179,11 @@ def test_publication_request_reports_trusted_repository_ids():
         RepositoryDeclaration(
             project_path=":app", domain="library", url="https://maven.google.com"
         ),
+        RepositoryDeclaration(
+            project_path=":lib",
+            domain="library",
+            url="https://repo.maven.apache.org/maven2",
+        ),
     )
 
     request = publication_request(module, declarations)
@@ -1026,24 +1031,18 @@ def test_gradle_scan_age_filter_keeps_unknown_and_filters_known_young(
     tmp_path, kind, date, kept
 ):
     from maintenance_man import dependency_age as age
-    from maintenance_man.models.scan import GradleMember, GradleUpdateTarget
 
     coordinate = "org.example:lib" if kind == "library" else "org.example.plugin"
-    target = GradleUpdateTarget(
-        version_ref="lib",
-        target_version="2.0",
-        members=[
-            GradleMember(
-                kind=kind, alias="lib", coordinate=coordinate, installed_version="1.0"
-            )
-        ],
+    row, project, resolution = _scan_age_inputs(
+        tmp_path,
+        member_specs=((kind, "lib", coordinate),),
+        repository_specs=((kind, "https://repo.maven.apache.org/maven2"),),
     )
-    row = _make_update("lib", "2.0").model_copy(update={"gradle_target": target})
     module = (
-        ModuleId(group="org.example", artifact="lib", version="2.0")
+        ModuleId(group="org.example", artifact="lib", version="2")
         if kind == "library"
         else ModuleId(
-            group=coordinate, artifact=coordinate + ".gradle.plugin", version="2.0"
+            group=coordinate, artifact=coordinate + ".gradle.plugin", version="2"
         )
     )
 
@@ -1059,35 +1058,6 @@ def test_gradle_scan_age_filter_keeps_unknown_and_filters_known_young(
             )
         return body, {"Last-Modified": date}, url
 
-    from maintenance_man.models.config import ProjectConfig
-    from maintenance_man.models.gradle import (
-        CompleteResolution,
-        RepositoryDeclaration,
-        ResolutionReport,
-    )
-
-    project = ProjectConfig(
-        path=tmp_path,
-        package_manager="gradle",
-        gradle_repository_routing="standard-public",
-    )
-    resolution = CompleteResolution(
-        report=ResolutionReport(
-            schema_version=1,
-            root_project=":",
-            producer_versions={"gradle": "9", "cyclonedx": "3", "report": "1"},
-            catalogue_digest="catalogue",
-            repositories=(
-                RepositoryDeclaration(
-                    domain=kind,
-                    project_path=":",
-                    url="https://repo.maven.apache.org/maven2",
-                ),
-            ),
-            selected_scopes=(),
-            scopes=(),
-        )
-    )
     with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
         result = age.filter_gradle_updates_by_age(
             [row], project, resolution, 7, context

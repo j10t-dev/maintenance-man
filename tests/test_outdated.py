@@ -371,18 +371,7 @@ class TestBunOutdated:
         assert updates[0].pkg_name == "typescript"
         assert updates[1].pkg_name == "eslint"
 
-    def test_empty_output(self):
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        project = _make_project("bun")
-
-        with patch("maintenance_man.process.subprocess.run", return_value=completed):
-            updates = bun_outdated(project)
-
-        assert updates == []
-
-    def test_disables_progress_output_to_avoid_bun_resolving_hangs(self):
+    def test_empty_output_disables_progress(self):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr=""
         )
@@ -391,8 +380,9 @@ class TestBunOutdated:
         with patch(
             "maintenance_man.process.subprocess.run", return_value=completed
         ) as run:
-            bun_outdated(project)
+            updates = bun_outdated(project)
 
+        assert updates == []
         assert run.call_args.args[0] == ["bun", "outdated", "--no-progress"]
 
     def test_command_failure_raises(self):

@@ -19,6 +19,7 @@ class TestRunBuild:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
         run_build("myproject", "scripts/build.sh", tmp_path)
         mock_run.assert_called_once()
+        assert mock_run.call_args.args == ("scripts/build.sh",)
         call_kwargs = mock_run.call_args.kwargs
         assert call_kwargs["cwd"] == tmp_path
         assert call_kwargs["shell"] is True
@@ -75,9 +76,12 @@ class TestRunDeploy:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
         run_deploy("myproject", "scripts/deploy.sh", tmp_path)
         mock_run.assert_called_once()
+        assert mock_run.call_args.args == ("scripts/deploy.sh",)
         call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["cwd"] == tmp_path
         assert call_kwargs["shell"] is True
         assert call_kwargs["executable"] == "/bin/bash"
+        assert call_kwargs["timeout"] == 600
 
     @patch("maintenance_man.process.subprocess.run")
     def test_failed_deploy_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
@@ -115,7 +119,9 @@ class TestCheckHealth:
 
         assert result.is_up is True
         assert result.error is None
-        mock_urlopen.assert_called_once()
+        mock_urlopen.assert_called_once_with(
+            "http://pihost:8080/api/status/lifts", timeout=10
+        )
 
     @patch("maintenance_man.deployer.urllib.request.urlopen")
     def test_unhealthy_service(self, mock_urlopen: MagicMock) -> None:

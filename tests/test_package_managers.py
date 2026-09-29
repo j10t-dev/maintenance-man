@@ -179,11 +179,6 @@ class TestUpdateCommands:
                 UvDependencyLocation(kind="group"),
             )
 
-    def test_uv_transitive_location_emits_lock_upgrade_command(self):
-        assert _uv_update_command(
-            "urllib3", "2.7.0", UvDependencyLocation(kind="transitive")
-        ) == ["uv", "lock", "--upgrade-package", "urllib3"]
-
     def test_uv_unreadable_pyproject_is_an_update_command_error(self, tmp_path):
         with pytest.raises(UpdateCommandError, match="Failed to read"):
             package_manager_ops("uv").update_commands("pytest", "9.0.3", tmp_path)

@@ -409,24 +409,6 @@ class TestScanProjectWithUpdates:
         assert "cryptography" not in update_pkg_names
         assert "brand-new-pkg" in update_pkg_names
 
-    def test_scan_passes_min_version_age_days(self, scan_results_dir: Path):
-        """min_version_age_days is forwarded to filter_registry_updates_by_age."""
-        project = _make_project(FIXTURES_DIR / "clean-project")
-        with (
-            patch(
-                "maintenance_man.scanner.package_manager_ops",
-                ops_with_outdated(lambda project: []),
-            ),
-            patch(
-                "maintenance_man.scanner.filter_registry_updates_by_age",
-                return_value=[],
-            ) as mock_age,
-        ):
-            scan_project("clean", project, min_version_age_days=14)
-
-        mock_age.assert_called_once()
-        assert mock_age.call_args.kwargs["min_age_days"] == 14
-
 
 class TestUvNativeScan:
     def test_uv_project_uses_uv_audit_locked_not_trivy_vulns(

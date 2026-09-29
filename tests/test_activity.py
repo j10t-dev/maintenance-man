@@ -58,6 +58,7 @@ class TestRecordActivity:
         assert result["myapp"].last_build is not None
         assert result["myapp"].last_build.success is True
         assert result["myapp"].last_build.branch == "main"
+        assert result["myapp"].last_build.commit_id is None
         assert result["myapp"].last_deploy is None
 
     def test_records_deploy_event(self, tmp_path: Path):
@@ -109,13 +110,6 @@ class TestCommitId:
         result = load_activity(path)
         assert result["myapp"].last_deploy is not None
         assert result["myapp"].last_deploy.commit_id == "abc123"
-
-    def test_commit_id_defaults_to_none(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        record_activity(path, "myapp", "build", success=True, branch="main")
-        result = load_activity(path)
-        assert result["myapp"].last_build is not None
-        assert result["myapp"].last_build.commit_id is None
 
     def test_legacy_record_without_commit_id_loads_as_none(self, tmp_path: Path):
         path = tmp_path / "activity.json"

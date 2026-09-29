@@ -138,11 +138,23 @@ class TestSecretFinding:
 
 
 class TestScanResult:
-    def test_scan_result_round_trips_ready_and_update_flow(self):
+    @pytest.mark.parametrize(
+        ("flow", "expected_flow"),
+        [
+            (Workflow.UPDATE, "update"),
+            (Workflow.RESOLVE, "resolve"),
+        ],
+        ids=["update", "resolve"],
+    )
+    def test_scan_result_round_trips_ready_flow(
+        self,
+        flow: Workflow,
+        expected_flow: str,
+    ):
         result = ScanResult(
-            project="project-ready-update",
+            project="project-ready",
             scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-ready-update",
+            trivy_target="/tmp/project-ready",
             vulnerabilities=[
                 VulnFinding(
                     vuln_id="CVE-2026-00001",
@@ -154,7 +166,7 @@ class TestScanResult:
                     description="d",
                     status="fixed",
                     update_status=UpdateStatus.READY,
-                    flow=Workflow.UPDATE,
+                    flow=flow,
                 )
             ],
             updates=[
@@ -164,55 +176,34 @@ class TestScanResult:
                     latest_version="19.0.0",
                     semver_tier=SemverTier.MAJOR,
                     update_status=UpdateStatus.READY,
-                    flow=Workflow.UPDATE,
+                    flow=flow,
                 )
             ],
         )
 
         reloaded = ScanResult.model_validate_json(result.model_dump_json())
 
-        assert reloaded.vulnerabilities[0].update_status == UpdateStatus.READY
-        assert reloaded.vulnerabilities[0].flow == "update"
-        assert reloaded.updates[0].update_status == UpdateStatus.READY
-        assert reloaded.updates[0].flow == "update"
-
-    def test_scan_result_round_trips_ready_and_resolve_flow(self):
-        result = ScanResult(
-            project="project-ready-resolve",
-            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-ready-resolve",
-            vulnerabilities=[
-                VulnFinding(
-                    vuln_id="CVE-2026-00002",
-                    pkg_name="urllib3",
-                    installed_version="2.0.0",
-                    fixed_version="2.0.7",
-                    severity=Severity.MEDIUM,
-                    title="t",
-                    description="d",
-                    status="fixed",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                )
-            ],
-            updates=[
-                UpdateFinding(
-                    pkg_name="vite",
-                    installed_version="5.0.0",
-                    latest_version="5.1.0",
-                    semver_tier=SemverTier.MINOR,
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                )
-            ],
-        )
-
-        reloaded = ScanResult.model_validate_json(result.model_dump_json())
-
-        assert reloaded.vulnerabilities[0].update_status == UpdateStatus.READY
-        assert reloaded.vulnerabilities[0].flow == "resolve"
-        assert reloaded.updates[0].update_status == UpdateStatus.READY
-        assert reloaded.updates[0].flow == "resolve"
+        assert reloaded.project == "project-ready"
+        assert reloaded.scanned_at == datetime(2026, 1, 30, tzinfo=UTC)
+        assert reloaded.trivy_target == "/tmp/project-ready"
+        vulnerability = reloaded.vulnerabilities[0]
+        assert vulnerability.vuln_id == "CVE-2026-00001"
+        assert vulnerability.pkg_name == "requests"
+        assert vulnerability.installed_version == "2.31.0"
+        assert vulnerability.fixed_version == "2.32.4"
+        assert vulnerability.severity == Severity.HIGH
+        assert vulnerability.title == "t"
+        assert vulnerability.description == "d"
+        assert vulnerability.status == "fixed"
+        assert vulnerability.update_status == UpdateStatus.READY
+        assert vulnerability.flow == expected_flow
+        update = reloaded.updates[0]
+        assert update.pkg_name == "react"
+        assert update.installed_version == "18.2.0"
+        assert update.latest_version == "19.0.0"
+        assert update.semver_tier == SemverTier.MAJOR
+        assert update.update_status == UpdateStatus.READY
+        assert update.flow == expected_flow
 
     def test_update_status_started_no_longer_exists(self):
         assert not hasattr(UpdateStatus, "STARTED")

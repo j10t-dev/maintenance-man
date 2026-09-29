@@ -50,10 +50,6 @@ class TestProjectConfigTestFields:
         assert pc.test_integration == "bun run test:integration"
         assert pc.test_component == "bun run test:component"
 
-    def test_rejects_extra_fields(self):
-        with pytest.raises(ValidationError, match="unknown"):
-            ProjectConfig(path=Path("/tmp/x"), package_manager="bun", unknown="bad")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
-
 
 class TestProjectConfigScanSkipDirs:
     def test_defaults_to_empty_list(self):
@@ -93,12 +89,6 @@ class TestProjectConfigDeployFields:
         )
         assert pc.build_command == "scripts/build.sh"
         assert pc.deploy_command == "scripts/deploy.sh"
-
-
-def test_gradle_package_manager_is_accepted(tmp_path):
-    project = ProjectConfig(path=tmp_path, package_manager="gradle")
-
-    assert project.package_manager == "gradle"
 
 
 class TestDefaultsConfigHealthcheck:

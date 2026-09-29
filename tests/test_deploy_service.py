@@ -145,8 +145,12 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         error=RevisionError("no main"),
         path=projects["c"].path,
     )
-    monkeypatch.setattr(deploy_service, "run_build", lambda *args: None)
-    monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
+    built: list[tuple[str, str, object]] = []
+    deployed: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(deploy_service, "run_build", lambda *args: built.append(args))
+    monkeypatch.setattr(
+        deploy_service, "run_deploy", lambda *args: deployed.append(args)
+    )
     monkeypatch.setattr(
         deploy_service,
         "load_activity",
@@ -177,6 +181,8 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         deploy_service.DeployResult("c", "skip", "blocked"),
         deploy_service.DeployResult("d", "skip", "fail"),
     )
+    assert built == [("a", "build", projects["a"].path)]
+    assert deployed == [("a", "deploy", projects["a"].path)]
     assert emit.events == [
         ProjectStarted("a"),
         DeployStepStarted("a", DeployStep.BUILD),
@@ -288,7 +294,10 @@ def test_deploy_project_refuses_unresolvable_main_without_force(
     project = make_project(tmp_path / "api", deploy_command="deploy")
     state.seed_repository(project.path, files={})
     state.fail("resolve_revision", error=RevisionError("no main"), path=project.path)
-    monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
+    deployed: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        deploy_service, "run_deploy", lambda *args: deployed.append(args)
+    )
 
     with pytest.raises(
         WorkflowError,
@@ -305,6 +314,7 @@ def test_deploy_project_refuses_unresolvable_main_without_force(
             vcs=state.services(),
             emit=RecordingEmit(),
         )
+    assert deployed == []
 
 
 def test_deploy_project_force_allows_unresolvable_main(tmp_path, monkeypatch) -> None:

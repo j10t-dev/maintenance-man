@@ -1104,10 +1104,28 @@ def test_sync_refuses_divergent_main_without_refresh(
     c.origin_peer.commit_file("dep.txt", "remote\n", "remote advance")
     c.origin_peer.push_main()
     change_before = c.repo.change_id()
+    tree_before = c.repo.tree_id()
+    file_before = (c.repo.path / "dep.txt").read_text(encoding="utf-8")
+    attempt_index = len(c.attempts) if c.attempts is not None else None
+    command_index = len(c.commands) if c.commands is not None else None
 
     with pytest.raises(RevisionError):
         sync_main(repo=c.repo)
     assert c.repo.change_id() == change_before
+    assert c.repo.tree_id() == tree_before
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == file_before
+    if c.attempts is not None:
+        assert attempt_index is not None
+        assert not any(
+            call.method in {"rebase_working_copy", "new_change"}
+            for call in c.attempts[attempt_index:]
+        )
+    if c.commands is not None:
+        assert command_index is not None
+        assert not any(
+            command[:2] in {("jj", "rebase"), ("jj", "new")}
+            for command in c.commands[command_index:]
+        )
 
 
 def test_sync_refuses_preexisting_conflicted_main_without_refresh(
