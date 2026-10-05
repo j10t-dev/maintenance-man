@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from maintenance_man import __version__, gradle_workflow
+from maintenance_man import __version__
 from maintenance_man import config as _config
 from maintenance_man.config import (
     MM_HOME,
@@ -37,9 +37,9 @@ from maintenance_man.exit_codes import ExitCode
 from maintenance_man.exit_codes import UpdateSetupError as _UpdateSetupError
 from maintenance_man.gradle import (
     GradleError,
+    validate_gradle_recovery,
     workspace_environment_reason,
 )
-from maintenance_man.gradle_verification import snapshot_vulnerabilities
 from maintenance_man.models.activity import (
     ActivityEvent,
     ProjectActivity,
@@ -47,12 +47,6 @@ from maintenance_man.models.activity import (
     record_activity,
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
-from maintenance_man.models.gradle import (
-    FailedAttempt,
-    GradleCandidate,
-    GradleRun,
-    WithheldAttempt,
-)
 from maintenance_man.models.scan import (
     ScanResult,
     UpdateFinding,
@@ -71,7 +65,7 @@ from maintenance_man.updater import (
     Finding,
     NoScanResultsError,
     UpdateResult,
-    consolidate_vulns,
+    group_findings,
     has_test_config,
     highest_fix_version,
     load_scan_results,
@@ -81,14 +75,12 @@ from maintenance_man.updater import (
     remove_completed_findings,
     run_test_phases,
     save_scan_results,
-    sort_updates_by_risk,
 )
 from maintenance_man.vcs import (
     BookmarkLookupError,
     GitHubCLINotFoundError,
     JJCLINotFoundError,
     bookmark_exists,
-    check_gh_available,
     check_jj_available,
     create_or_reset_bookmark,
     create_workspace,
@@ -97,14 +89,15 @@ from maintenance_man.vcs import (
     delete_bookmark,
     edit_new_change,
     ensure_main_bookmark,
+    exact_commit_id,
     main_commit_id,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
-    push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
     resolve_bookmark_contains_current_change,
     revision_file,
+    same_revision,
     sync_main,
     workspace_path_for_project,
 )
@@ -334,7 +327,6 @@ def update(
     _exit_if_no_update_targets(cfg, targets)
 
     try:
-        check_gh_available()
         check_jj_available()
     except (GitHubCLINotFoundError, JJCLINotFoundError) as e:
         _fatal(str(e))
@@ -400,7 +392,6 @@ def _update_batch_targets(
     results_dir = _config.MM_HOME / "scan-results"
     all_project_results: list[tuple[str, list[UpdateResult]]] = []
     had_errors = False
-    gradle_reported = False
 
     for name in target_names:
         proj_config = cfg.projects[name]
@@ -416,25 +407,22 @@ def _update_batch_targets(
         console.print(f"[bold]{name}[/]")
         console.print("═" * 40)
 
-        outcome = _update_batch(
-            name, proj_config, results_dir, cfg.defaults.min_version_age_days
-        )
+        outcome = _update_batch(name, proj_config, results_dir)
         if outcome is None:
             had_errors = True
             continue
         results, promotion_failed = outcome
-        if proj_config.package_manager == "gradle":
-            gradle_reported = True
         if promotion_failed:
             had_errors = True
         if results:
             all_project_results.append((name, results))
 
-    if all_project_results or not gradle_reported:
-        _print_mass_update_summary(all_project_results)
+    _print_mass_update_summary(all_project_results)
 
     any_failed = had_errors or any(
-        not r.passed for _, results in all_project_results for r in results
+        not r.passed and not r.blocked_reason
+        for _, results in all_project_results
+        for r in results
     )
     sys.exit(ExitCode.UPDATE_FAILED if any_failed else ExitCode.OK)
 
@@ -483,8 +471,6 @@ def _enter_update_workspace(
             raise _UpdateSetupError("could not create clean change on update bookmark")
         return workspace_path
 
-    if not prune_stale_bookmarks(proj_config.path):
-        raise _UpdateSetupError("failed to sync trunk")
     if not ensure_main_bookmark(proj_config.path):
         raise _UpdateSetupError("main bookmark not found")
     revision = "main"
@@ -510,8 +496,15 @@ def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
     return [
         vuln
         for vuln in vulns
-        if vuln.update_status is None
-        or (vuln.update_status == UpdateStatus.FAILED and vuln.flow == Workflow.UPDATE)
+        if (vuln.actionable or vuln.gradle_target is not None)
+        and not vuln.blocked_reason
+        and (
+            vuln.update_status is None
+            or (
+                vuln.update_status == UpdateStatus.FAILED
+                and vuln.flow == Workflow.UPDATE
+            )
+        )
     ]
 
 
@@ -519,8 +512,11 @@ def _selectable_updates(updates: list[UpdateFinding]) -> list[UpdateFinding]:
     return [
         u
         for u in updates
-        if u.update_status is None
-        or (u.update_status == UpdateStatus.FAILED and u.flow == Workflow.UPDATE)
+        if not u.blocked_reason
+        and (
+            u.update_status is None
+            or (u.update_status == UpdateStatus.FAILED and u.flow == Workflow.UPDATE)
+        )
     ]
 
 
@@ -622,7 +618,9 @@ def _has_update_progress(scan_result: ScanResult) -> bool:
 
 def _has_update_failures(scan_result: ScanResult) -> bool:
     return any(
-        f.update_status == UpdateStatus.FAILED and f.flow == Workflow.UPDATE
+        f.update_status == UpdateStatus.FAILED
+        and f.flow == Workflow.UPDATE
+        and not f.blocked_reason
         for f in (*scan_result.vulnerabilities, *scan_result.updates)
     )
 
@@ -640,15 +638,11 @@ def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -
             )
 
 
-_RESOLVE_CLAIMABLE_TEST_PHASES = {"unit", "integration", "component"}
-
-
 def _is_resolve_claimable_failure(f: Finding, active_flow: Workflow) -> bool:
     return (
         active_flow == Workflow.RESOLVE
         and f.flow == Workflow.UPDATE
         and f.update_status == UpdateStatus.FAILED
-        and f.failed_phase in _RESOLVE_CLAIMABLE_TEST_PHASES
     )
 
 
@@ -663,7 +657,7 @@ def _assert_no_conflicting_flow(
         if f.update_status is not None
         and f.flow is not None
         and f.flow != active_flow
-        and not _is_resolve_claimable_failure(f, active_flow)
+        and not (active_flow == Workflow.RESOLVE and f.flow == Workflow.UPDATE)
     ]
     if conflicts:
         assert conflicts[0].flow is not None
@@ -675,50 +669,36 @@ def _assert_no_conflicting_flow(
         )
 
 
-def _finalise_local_update(
+def _finalise_local_changes(
     orig_path: Path,
     scan_result: ScanResult,
     project_name: str,
     results_dir: Path,
+    flow: Workflow,
 ) -> bool:
-    """Promote `_UPDATE_BOOKMARK` to main and promote READY findings.
-
-    Dirty-tree checks are unnecessary here because update work runs in an
-    isolated jj workspace, then only the managed bookmark is promoted.
-    """
-    if not promote_bookmark_to_main(orig_path, _UPDATE_BOOKMARK):
-        console.print(
-            f"[bold red]Promotion failed:[/] {_UPDATE_BOOKMARK} could not be "
-            f"promoted to main"
-        )
+    bookmark = _UPDATE_BOOKMARK if flow == Workflow.UPDATE else _RESOLVE_BOOKMARK
+    if not promote_bookmark_to_main(orig_path, bookmark):
+        console.print(f"[bold red]Promotion failed:[/] {project_name} remains pending")
         return False
-
     if not refresh_working_copy_from_main(orig_path):
         console.print(
-            f"[bold red]Workspace refresh failed:[/] {project_name} could not be "
-            "updated to the promoted main bookmark"
+            f"[bold red]Workspace refresh failed:[/] {project_name}: main was promoted"
         )
         return False
-
-    for v in scan_result.vulnerabilities:
-        if v.update_status == UpdateStatus.READY and v.flow == Workflow.UPDATE:
-            v.update_status = UpdateStatus.COMPLETED
-    for u in scan_result.updates:
-        if u.update_status == UpdateStatus.READY and u.flow == Workflow.UPDATE:
-            u.update_status = UpdateStatus.COMPLETED
-
+    for finding in (*scan_result.vulnerabilities, *scan_result.updates):
+        if finding.update_status == UpdateStatus.READY and finding.flow == flow:
+            finding.update_status = UpdateStatus.COMPLETED
+            finding.failed_phase = None
+            finding.flow = None
     remove_completed_findings(scan_result)
     save_scan_results(project_name, results_dir, scan_result)
-    console.print(f"[bold green]Promoted {_UPDATE_BOOKMARK} to main.[/]")
+    console.print(f"[bold green]Promoted {project_name} to local main.[/]")
     return True
 
 
-def _warn_missing_test_config(project: str, proj_config: ProjectConfig) -> None:
+def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
     if not has_test_config(proj_config):
-        console.print(
-            f"  [bold yellow]Warning:[/] {project} — no test configuration "
-            f"(test phases will be skipped)"
-        )
+        _fatal(f"{project} — no test configuration; automatic updates require tests")
 
 
 def _load_validated_scan(
@@ -730,19 +710,23 @@ def _load_validated_scan(
     try:
         scan_result = load_scan_results(project, results_dir)
     except NoScanResultsError:
-        console.print(f"[bold green]{project}[/] — no scan results; nothing to do.")
-        sys.exit(ExitCode.OK)
+        _fatal(f"No scan results for {project}; run mm scan {project} first")
     try:
         _assert_supported_in_progress_state(scan_result, project)
         _assert_no_conflicting_flow(scan_result, workflow, project)
     except _FlowConflictError as e:
         _fatal(str(e))
-    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
+    actionable_vulns = [
+        v
+        for v in scan_result.vulnerabilities
+        if v.actionable or v.gradle_target is not None
+    ]
     updates = scan_result.updates
     if not actionable_vulns and not updates:
         console.print(f"[bold green]{project}[/] — nothing to {workflow}.")
         sys.exit(ExitCode.OK)
-    _warn_missing_test_config(project, proj_config)
+    if group_findings(proj_config, [*actionable_vulns, *updates]):
+        _require_test_config(project, proj_config)
     return scan_result, actionable_vulns, updates
 
 
@@ -752,13 +736,12 @@ def _load_validated_scan(
 def _ordered_resolve_candidates(
     scan_result: ScanResult,
     proj_config: ProjectConfig,
-    minimum_age_days: int,
 ) -> list[Finding]:
     """Return fresh + resolve-owned failed findings, ordered for processing."""
     candidate_vulns = [
         v
         for v in scan_result.vulnerabilities
-        if v.actionable
+        if (v.actionable or v.gradle_target is not None)
         and (
             (v.flow is None and v.update_status is None)
             or (v.flow == Workflow.RESOLVE and v.update_status == UpdateStatus.FAILED)
@@ -772,16 +755,12 @@ def _ordered_resolve_candidates(
         or (u.flow == Workflow.RESOLVE and u.update_status == UpdateStatus.FAILED)
         or _is_resolve_claimable_failure(u, Workflow.RESOLVE)
     ]
-    return [
-        *consolidate_vulns(candidate_vulns),
-        *sort_updates_by_risk(candidate_updates),
-    ]
+    return group_findings(proj_config, [*candidate_vulns, *candidate_updates])
 
 
 def _ordered_failed_findings(
     scan_result: ScanResult,
     proj_config: ProjectConfig,
-    minimum_age_days: int,
 ) -> list[Finding]:
     """Return resolve-owned FAILED findings in processing order."""
     failed_vulns = [
@@ -794,10 +773,7 @@ def _ordered_failed_findings(
         for u in scan_result.updates
         if u.update_status == UpdateStatus.FAILED and u.flow == Workflow.RESOLVE
     ]
-    return [
-        *consolidate_vulns(failed_vulns),
-        *sort_updates_by_risk(failed_updates),
-    ]
+    return group_findings(proj_config, [*failed_vulns, *failed_updates])
 
 
 def _ordered_ready_findings(
@@ -817,10 +793,7 @@ def _ordered_ready_findings(
         for u in scan_result.updates
         if u.update_status == UpdateStatus.READY and u.flow == flow
     ]
-    return [
-        *consolidate_vulns(ready_vulns),
-        *sort_updates_by_risk(ready_updates),
-    ]
+    return group_findings(proj_config, [*ready_vulns, *ready_updates])
 
 
 def _has_ready_resolve_progress(scan_result: ScanResult) -> bool:
@@ -859,9 +832,8 @@ def _run_resolve_findings(
     scan_result: ScanResult,
     results_dir: Path,
     findings: list[Finding],
-    minimum_age_days: int,
 ) -> int:
-    """Process resolve candidates; stop on first failure, submit when all READY."""
+    """Process resolve candidates; stop on first failure, promote when all READY."""
     results = process_findings(
         findings,
         proj_config,
@@ -870,11 +842,10 @@ def _run_resolve_findings(
         project_name=project,
         results_dir=results_dir,
         on_failure="stop",
-        minimum_age_days=minimum_age_days,
     )
-    if any(not r.passed for r in results) or _ordered_failed_findings(
-        scan_result, proj_config, minimum_age_days
-    ):
+    if any(
+        not r.passed and not r.blocked_reason for r in results
+    ) or _ordered_failed_findings(scan_result, proj_config):
         console.print(
             f"  [bold yellow]Resolve paused.[/] Continue with "
             f"[bold]mm resolve {project} --continue[/]."
@@ -884,54 +855,40 @@ def _run_resolve_findings(
     ready_findings = _ordered_ready_findings(
         scan_result, flow=Workflow.RESOLVE, proj_config=proj_config
     )
-    if scan_result.blocked_findings:
-        _print_blocked_findings(scan_result)
-        save_scan_results(project, results_dir, scan_result)
-        return ExitCode.UPDATE_FAILED
+    _print_blocked_findings(scan_result)
     if not ready_findings:
         return ExitCode.OK
-    return _submit_resolve_bookmark(
-        project, proj_config.path, results_dir, scan_result, ready_findings
-    )
-
-
-def _submit_resolve_bookmark(
-    project: str,
-    project_path: Path,
-    results_dir: Path,
-    scan_result: ScanResult,
-    ready_findings: list[Finding],
-) -> int:
-    """Push the resolve bookmark, open a PR, and promote READY findings on success."""
-    if scan_result.blocked_findings:
-        _print_blocked_findings(scan_result)
-        console.print(
-            "  [bold yellow]Not submitting:[/] blocked findings remain. "
-            "Rescan or resolve them manually."
-        )
-        save_scan_results(project, results_dir, scan_result)
+    if not _finalise_local_changes(
+        proj_config.path, scan_result, project, results_dir, Workflow.RESOLVE
+    ):
         return ExitCode.UPDATE_FAILED
-    for f in ready_findings:
-        f.failed_phase = None
-
-    ok, output = push_bookmark_and_create_pr(project_path, _RESOLVE_BOOKMARK)
-    if output:
-        console.print(f"  [dim]{output}[/]")
-    if not ok:
-        save_scan_results(project, results_dir, scan_result)
-        console.print(
-            f"  [bold yellow]Submit failed.[/] Keeping {_RESOLVE_BOOKMARK} "
-            f"for manual recovery."
-        )
-        return ExitCode.UPDATE_FAILED
-
-    for f in ready_findings:
-        f.update_status = UpdateStatus.COMPLETED
-        f.failed_phase = None
-        f.flow = None
-    remove_completed_findings(scan_result)
-    save_scan_results(project, results_dir, scan_result)
+    delete_bookmark(_RESOLVE_BOOKMARK, proj_config.path)
     return ExitCode.OK
+
+
+def _take_over_update_progress(project_path: Path, scan_result: ScanResult) -> None:
+    if not _has_update_progress(scan_result):
+        return
+    if current_change_has_changes(project_path):
+        _fatal("Commit or discard manual changes before taking over pending updates")
+    if not bookmark_exists(_UPDATE_BOOKMARK, project_path):
+        _fatal("Pending update bookmark is missing; rescan or restore it")
+    if not create_or_reset_bookmark(_RESOLVE_BOOKMARK, project_path, _UPDATE_BOOKMARK):
+        _fatal("Could not transfer pending updates to resolve")
+    if not edit_new_change(project_path, _RESOLVE_BOOKMARK):
+        _fatal("Could not open pending resolve work")
+    for finding in (*scan_result.vulnerabilities, *scan_result.updates):
+        if finding.flow == Workflow.UPDATE:
+            finding.flow = Workflow.RESOLVE
+
+
+def _cleanup_update_workspace(project: str, config: ProjectConfig) -> bool:
+    try:
+        remove_workspace(config.path, project)
+        return True
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        console.print(f"[bold red]Cleanup failed:[/] {project} — {exc}")
+        return False
 
 
 def _print_mass_update_summary(
@@ -1644,44 +1601,92 @@ def _parse_selection(
     return selected_vulns, selected_updates
 
 
-def _choose_gradle_candidates(
-    candidates: tuple[GradleCandidate, ...],
-) -> tuple[GradleCandidate, ...]:
-    for index, candidate in enumerate(candidates, 1):
-        console.print(
-            f"{index}. {candidate.target.display_name} -> "
-            f"{candidate.target.target_version}"
+def _execute_update(
+    project: str,
+    proj_config: ProjectConfig,
+    scan_result: ScanResult,
+    results_dir: Path,
+    *,
+    interactive: bool,
+) -> tuple[list[UpdateResult], bool]:
+    _print_scan_result(scan_result)
+    vulns = _selectable_vulns(scan_result.vulnerabilities)
+    updates = _selectable_updates(scan_result.updates)
+    if interactive and (vulns or updates):
+        vulns, updates = _prompt_selection(vulns, updates)
+    # Include all saved rows associated with selected Gradle targets so a
+    # security/ordinary duplicate shares the result even when selected once.
+    selected = [*vulns, *updates]
+    targets = [f.gradle_target for f in selected if f.gradle_target is not None]
+    selected = [
+        f
+        for f in (*scan_result.vulnerabilities, *scan_result.updates)
+        if f in selected or (f.gradle_target is not None and f.gradle_target in targets)
+    ]
+    groups = group_findings(proj_config, selected)
+    ready = _ordered_ready_findings(
+        scan_result, flow=Workflow.UPDATE, proj_config=proj_config
+    )
+    _print_blocked_findings(scan_result)
+    if not groups and not ready:
+        console.print(f"{project} — nothing eligible to update")
+        return [], _has_update_failures(scan_result)
+    if not has_test_config(proj_config):
+        console.print(f"[bold red]{project} — no test configuration[/]")
+        return [UpdateResult(project, "update", False, "configuration")], True
+    results: list[UpdateResult] = []
+    failed = False
+    try:
+        path = _enter_update_workspace(project, proj_config, scan_result)
+        work_config = proj_config.model_copy(update={"path": path})
+        selected_vulns = [
+            f for f in selected if isinstance(f, VulnFinding) and not f.blocked_reason
+        ]
+        security_targets = [
+            f.gradle_target for f in selected_vulns if f.gradle_target is not None
+        ]
+        selected_updates = [
+            f
+            for f in selected
+            if isinstance(f, UpdateFinding)
+            and not f.blocked_reason
+            and (f.gradle_target is None or f.gradle_target not in security_targets)
+        ]
+        results = _process_selected_vulns(
+            selected_vulns, work_config, scan_result, project, results_dir
         )
-        for member in candidate.target.members:
-            console.print(
-                f"   {member.alias}: {member.coordinate} "
-                f"{member.installed_version} -> {candidate.target.target_version}"
+        if not any(r.failed_phase in {"rollback", "bookmark"} for r in results):
+            results += _process_selected_updates(
+                selected_updates, work_config, scan_result, project, results_dir
             )
-    while True:
-        selection = (
-            console.input(
-                "Select all, none, vulns, updates, or comma-separated numbers: "
+        failed = any(
+            not r.passed and not r.blocked_reason for r in results
+        ) or _has_update_failures(scan_result)
+        if failed:
+            console.print(f"[yellow]{project}: pending because updates failed[/]")
+        elif _ordered_ready_findings(
+            scan_result, flow=Workflow.UPDATE, proj_config=proj_config
+        ):
+            failed = not _finalise_local_changes(
+                proj_config.path, scan_result, project, results_dir, Workflow.UPDATE
             )
-            .strip()
-            .lower()
-        )
-        if selection == "all":
-            return candidates
-        if selection == "none":
-            return ()
-        if selection in {"vulns", "updates"}:
-            origin = "security" if selection == "vulns" else "ordinary"
-            return tuple(item for item in candidates if origin in item.origins)
-        try:
-            indices = {int(value.strip()) for value in selection.split(",")}
-        except ValueError:
-            console.print("Invalid selection")
-            continue
-        if indices and min(indices) >= 1 and max(indices) <= len(candidates):
-            return tuple(
-                item for index, item in enumerate(candidates, 1) if index in indices
-            )
-        console.print("Invalid selection")
+
+    except (
+        _UpdateSetupError,
+        BookmarkLookupError,
+        GradleError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
+        console.print(f"[bold red]Error:[/] {project} — {exc}")
+        results.append(UpdateResult(project, "update", False, "setup"))
+        failed = True
+    finally:
+        if not _cleanup_update_workspace(project, proj_config):
+            failed = True
+    if not failed and results and not _has_update_progress(scan_result):
+        delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
+    return results, failed
 
 
 def _run_update_flow(
@@ -1689,132 +1694,32 @@ def _run_update_flow(
     proj_config: ProjectConfig,
     scan_result: ScanResult,
     results_dir: Path,
-    actionable_vulns: list[VulnFinding],
-    updates: list[UpdateFinding],
     *,
     interactive: bool,
-    minimum_age_days: int,
 ) -> int:
-    """Set up the workspace, process findings, finalise. Returns exit code."""
-    if proj_config.package_manager == "gradle":
-        return _run_gradle_flow(
-            project,
-            proj_config,
-            results_dir,
-            Workflow.UPDATE,
-            interactive=interactive,
-            minimum_age_days=minimum_age_days,
-        )
-    try:
-        wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except (_UpdateSetupError, BookmarkLookupError) as e:
-        _fatal(str(e))
-    work_config = proj_config.model_copy(update={"path": wt_path})
-    finalised = False
-    try:
-        _print_scan_result(scan_result)
-        selectable_vulns = _selectable_vulns(actionable_vulns)
-        selectable_updates = _selectable_updates(updates)
-        if interactive and (selectable_vulns or selectable_updates):
-            selected_vulns, selected_updates = _prompt_selection(
-                selectable_vulns, selectable_updates
-            )
-        else:
-            selected_vulns, selected_updates = (selectable_vulns, selectable_updates)
-        all_results = _process_selected_vulns(
-            selected_vulns, work_config, scan_result, project, results_dir
-        ) + _process_selected_updates(
-            selected_updates, work_config, scan_result, project, results_dir
-        )
-        _print_update_summary(all_results)
-        if (
-            any((not r.passed for r in all_results))
-            or _has_update_failures(scan_result)
-            or scan_result.blocked_findings
-        ):
-            return ExitCode.UPDATE_FAILED
-        finalised = _finalise_local_update(
-            proj_config.path, scan_result, project, results_dir
-        )
-    finally:
-        remove_workspace(proj_config.path, project)
-    if not finalised:
-        return ExitCode.UPDATE_FAILED
-    delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
-    return ExitCode.OK
+    results, failed = _execute_update(
+        project, proj_config, scan_result, results_dir, interactive=interactive
+    )
+    _print_update_summary(results)
+    return ExitCode.UPDATE_FAILED if failed else ExitCode.OK
 
 
 def _update_batch(
-    project: str, proj_config: ProjectConfig, results_dir: Path, minimum_age_days: int
+    project: str, proj_config: ProjectConfig, results_dir: Path
 ) -> tuple[list[UpdateResult], bool] | None:
-    """Process all actionable findings for a single project (batch mode).
-
-    Returns ``(results, promotion_failed)``. ``promotion_failed`` is ``True``
-    when outstanding blocks remain or bookmark promotion was attempted and
-    failed. Per-finding failures are reported in ``results``. Returns ``None``
-    if the project was skipped due to an error.
-    """
-    if proj_config.package_manager == "gradle":
-        code = _run_gradle_flow(
-            project,
-            proj_config,
-            results_dir,
-            Workflow.UPDATE,
-            interactive=False,
-            minimum_age_days=minimum_age_days,
-        )
-        return ([], code != ExitCode.OK)
     try:
         scan_result = load_scan_results(project, results_dir)
     except NoScanResultsError:
-        return ([], False)
+        console.print(f"{project}: no saved scan; run mm scan {project} first")
+        return [], False
     try:
         _assert_supported_in_progress_state(scan_result, project)
         _assert_no_conflicting_flow(scan_result, Workflow.UPDATE, project)
-    except _FlowConflictError as e:
-        console.print(f"  [bold yellow]Skipped:[/] {project} — {e}")
+    except _FlowConflictError as exc:
+        console.print(f"[yellow]Skipped:[/] {project} — {exc}")
         return None
-    actionable_vulns = [v for v in scan_result.vulnerabilities if v.actionable]
-    updates = scan_result.updates
-    if not actionable_vulns and (not updates):
-        console.print(f"  [dim]{project} — nothing to update[/]")
-        return ([], False)
-    _warn_missing_test_config(project, proj_config)
-    try:
-        wt_path = _enter_update_workspace(project, proj_config, scan_result)
-    except (_UpdateSetupError, BookmarkLookupError) as e:
-        console.print(f"  [bold red]Error:[/] {project} — {e}")
-        return None
-    work_config = proj_config.model_copy(update={"path": wt_path})
-    finalised = False
-    promotion_attempted = False
-    try:
-        _print_scan_result(scan_result)
-        all_results = _process_selected_vulns(
-            _selectable_vulns(actionable_vulns),
-            work_config,
-            scan_result,
-            project,
-            results_dir,
-        ) + _process_selected_updates(
-            _selectable_updates(updates), work_config, scan_result, project, results_dir
-        )
-        any_failed_result = any((not r.passed for r in all_results))
-        any_failed_finding = _has_update_failures(scan_result)
-        if not (
-            any_failed_result or any_failed_finding or scan_result.blocked_findings
-        ):
-            promotion_attempted = True
-            finalised = _finalise_local_update(
-                proj_config.path, scan_result, project, results_dir
-            )
-    finally:
-        remove_workspace(proj_config.path, project)
-    if finalised:
-        delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
-    return (
-        all_results,
-        bool(scan_result.blocked_findings) or (promotion_attempted and (not finalised)),
+    return _execute_update(
+        project, proj_config, scan_result, results_dir, interactive=False
     )
 
 
@@ -1822,29 +1727,11 @@ def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
     """Update a single project with interactive selection."""
     proj_config = _resolve_proj(cfg, project)
     results_dir = _config.MM_HOME / "scan-results"
-    if proj_config.package_manager == "gradle":
-        sys.exit(
-            _run_gradle_flow(
-                project,
-                proj_config,
-                results_dir,
-                Workflow.UPDATE,
-                interactive=True,
-                minimum_age_days=cfg.defaults.min_version_age_days,
-            )
-        )
     scan_result, actionable_vulns, updates = _load_validated_scan(
         project, results_dir, proj_config, Workflow.UPDATE
     )
     exit_code = _run_update_flow(
-        project,
-        proj_config,
-        scan_result,
-        results_dir,
-        actionable_vulns,
-        updates,
-        interactive=True,
-        minimum_age_days=cfg.defaults.min_version_age_days,
+        project, proj_config, scan_result, results_dir, interactive=True
     )
     sys.exit(exit_code)
 
@@ -1859,8 +1746,8 @@ def resolve(
 
     Applies each failed finding on ``mm/resolve-dependencies``, runs tests, and
     stops on the first failure so the operator can debug manually. Rerun with
-    ``--continue`` after committing a manual fix to re-test and advance. Submits
-    a PR once all candidates reach READY.
+    ``--continue`` after committing a manual fix to re-test and advance. Promotes
+    to local main once all candidates reach READY.
 
     Parameters
     ----------
@@ -1874,50 +1761,45 @@ def resolve(
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     results_dir = _config.MM_HOME / "scan-results"
-    minimum_age_days = cfg.defaults.min_version_age_days
     try:
-        check_gh_available()
         check_jj_available()
     except (GitHubCLINotFoundError, JJCLINotFoundError) as e:
         _fatal(str(e))
-    if proj_config.package_manager == "gradle":
-        sys.exit(
-            _run_gradle_flow(
-                project,
-                proj_config,
-                results_dir,
-                Workflow.RESOLVE,
-                interactive=False,
-                minimum_age_days=minimum_age_days,
-                continue_=continue_,
-            )
-        )
     scan_result, actionable_vulns, updates = _load_validated_scan(
         project, results_dir, proj_config, Workflow.RESOLVE
     )
     if continue_:
         sys.exit(
-            _handle_resolve_continue(
-                project, proj_config, scan_result, results_dir, minimum_age_days
-            )
+            _handle_resolve_continue(project, proj_config, scan_result, results_dir)
         )
-    candidates = _ordered_resolve_candidates(scan_result, proj_config, minimum_age_days)
-    if not prune_stale_bookmarks(proj_config.path):
-        _fatal("failed to sync trunk")
+    if _ordered_failed_findings(scan_result, proj_config):
+        _fatal(f"resolve already paused for {project} — rerun with --continue")
+    candidates = _ordered_resolve_candidates(scan_result, proj_config)
+    if (
+        not candidates
+        and not _has_update_progress(scan_result)
+        and not _has_ready_resolve_progress(scan_result)
+    ):
+        _print_blocked_findings(scan_result)
+        sys.exit(ExitCode.OK)
     try:
+        if current_change_has_changes(proj_config.path):
+            _fatal("Commit or discard manual changes before starting resolve")
         if not ensure_main_bookmark(proj_config.path):
             _fatal("main bookmark not found")
-        if _ordered_failed_findings(scan_result, proj_config, minimum_age_days):
-            _fatal(
-                f"resolve already paused for [bold]{project}[/] — rerun with --continue"
-            )
-        if not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
-            _fatal(f"aborted resolve for [bold]{project}[/]")
+        takeover = _has_update_progress(scan_result)
+        if takeover:
+            _take_over_update_progress(proj_config.path, scan_result)
+            save_scan_results(project, results_dir, scan_result)
+            delete_bookmark(_UPDATE_BOOKMARK, proj_config.path)
+        elif not _prepare_resolve_bookmark(proj_config.path, scan_result, candidates):
+            _fatal(f"aborted resolve for {project}")
+        candidates = _ordered_resolve_candidates(scan_result, proj_config)
     except BookmarkLookupError as exc:
         _fatal(str(exc))
     sys.exit(
         _run_resolve_findings(
-            project, proj_config, scan_result, results_dir, candidates, minimum_age_days
+            project, proj_config, scan_result, results_dir, candidates
         )
     )
 
@@ -1927,19 +1809,12 @@ def _handle_resolve_continue(
     proj_config: ProjectConfig,
     scan_result: ScanResult,
     results_dir: Path,
-    minimum_age_days: int,
 ) -> int:
     """Retest the paused blocker on the resolve bookmark."""
-    if proj_config.package_manager == "gradle":
-        return _run_gradle_flow(
-            project,
-            proj_config,
-            results_dir,
-            Workflow.RESOLVE,
-            interactive=False,
-            minimum_age_days=minimum_age_days,
-            continue_=True,
-        )
+    failed = _ordered_failed_findings(scan_result, proj_config)[:1]
+    if not failed:
+        _fatal("No paused failure in the current saved scan to continue")
+    _require_test_config(project, proj_config)
     if not resolve_bookmark_contains_current_change(
         proj_config.path, _RESOLVE_BOOKMARK
     ):
@@ -1951,8 +1826,23 @@ def _handle_resolve_continue(
             "--continue requires an empty current jj change — commit or discard "
             "manual changes first"
         )
-    failed = _ordered_failed_findings(scan_result, proj_config, minimum_age_days)
+    repair_base = scan_result.resolve_repair_base
+    if repair_base is None:
+        repair_base = exact_commit_id(proj_config.path, _RESOLVE_BOOKMARK)
+    repair = same_revision(proj_config.path, "@-", repair_base)
+    if not repair.ok or repair.value:
+        _fatal("--continue requires a committed manual repair after the pending tip")
+    failed = _ordered_failed_findings(scan_result, proj_config)[:1]
     if failed:
+        for blocker in failed:
+            if blocker.gradle_target is not None:
+                block = validate_gradle_recovery(proj_config, blocker.gradle_target)
+                if block is not None:
+                    console.print(
+                        f"[red]Repair does not apply the saved target:[/] "
+                        f"{block.reason}"
+                    )
+                    return ExitCode.UPDATE_FAILED
         passed, failed_phase = run_test_phases(proj_config, proj_config.path)
         for blocker in failed:
             blocker.flow = Workflow.RESOLVE
@@ -1966,12 +1856,17 @@ def _handle_resolve_continue(
                 f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
             )
             return ExitCode.UPDATE_FAILED
+        # Keep the original base before moving the bookmark. If the later
+        # READY save is interrupted, --continue can verify this same repair.
+        scan_result.resolve_repair_base = repair_base
+        save_scan_results(project, results_dir, scan_result)
         if not create_or_reset_bookmark(_RESOLVE_BOOKMARK, proj_config.path, "@-"):
             save_scan_results(project, results_dir, scan_result)
             _fatal(f"could not move {_RESOLVE_BOOKMARK} to the committed manual fix")
         for blocker in failed:
             blocker.update_status = UpdateStatus.READY
             blocker.failed_phase = None
+        scan_result.resolve_repair_base = None
         save_scan_results(project, results_dir, scan_result)
         for blocker in failed:
             console.print(f"  [bold green]PASS[/] {blocker.pkg_name}")
@@ -1980,47 +1875,8 @@ def _handle_resolve_continue(
         proj_config,
         scan_result,
         results_dir,
-        _ordered_resolve_candidates(scan_result, proj_config, minimum_age_days),
-        minimum_age_days,
+        _ordered_resolve_candidates(scan_result, proj_config),
     )
-
-
-def _print_gradle_run_summary(run: GradleRun) -> None:
-    counts = {
-        state: sum(attempt.state == state for attempt in run.attempts)
-        for state in ("ready", "completed", "failed", "applying")
-    }
-    withheld: dict[tuple[str, str, str, str], str] = {}
-    for block in run.selection_blocks:
-        if block.group_key is not None:
-            key = ("target", block.group_key, "", block.reason)
-            label = block.group_key
-        else:
-            key = ("package", block.coordinate, block.installed_version, block.reason)
-            label = f"{block.coordinate}@{block.installed_version}"
-        withheld[key] = label
-    for attempt in run.attempts:
-        if isinstance(attempt, WithheldAttempt):
-            target = attempt.candidate.target
-            key = ("target", target.group_key, "", attempt.reason)
-            withheld[key] = f"{target.display_name} -> {target.target_version}"
-    console.print(
-        f"Verified: {counts['ready'] + counts['completed']}; "
-        f"withheld: {len(withheld)}; "
-        f"failed: {counts['failed'] + counts['applying']}; "
-        f"residual advisories: {len(run.accepted_snapshot.findings)}"
-    )
-    for (kind, identity, version, reason), label in sorted(withheld.items()):
-        prefix = "WITHHELD TARGET" if kind == "target" else "RESIDUAL PACKAGE"
-        console.print(f"  {prefix} {escape(label)} — {escape(reason)}")
-    for attempt in run.attempts:
-        if isinstance(attempt, FailedAttempt):
-            target = attempt.candidate.target
-            console.print(
-                f"  FAILED {escape(target.display_name)} -> "
-                f"{escape(target.target_version)} "
-                f"— {escape(attempt.reason)}"
-            )
 
 
 def _print_scan_result(
@@ -2143,54 +1999,3 @@ def _print_blocked_findings(scan_result: ScanResult) -> None:
             f"  [yellow]BLOCKED[/] {escape(finding.pkg_name)} — "
             f"{escape(finding.blocked_reason or '')}"
         )
-
-
-def _print_gradle_run_result(
-    run: GradleRun, project: ProjectConfig, results_dir: Path
-) -> None:
-    result = None
-    if run.refreshed:
-        try:
-            result = load_scan_results(run.project, results_dir)
-        except NoScanResultsError:
-            # A removed results file must not hide durable residual evidence.
-            pass
-    if result is None:
-        result = ScanResult(
-            project=run.project,
-            scanned_at=run.context.created_at,
-            trivy_target=str(project.path),
-            vulnerabilities=snapshot_vulnerabilities(run.accepted_snapshot),
-            gradle_resolution=run.accepted_snapshot.resolution.report.model_dump(
-                mode="json"
-            ),
-        )
-    _print_scan_result(result)
-    _print_gradle_run_summary(run)
-
-
-def _run_gradle_flow(
-    project_name: str,
-    project: ProjectConfig,
-    results_dir: Path,
-    flow: Workflow,
-    *,
-    interactive: bool,
-    minimum_age_days: int,
-    continue_: bool = False,
-) -> int:
-    return gradle_workflow.run_gradle_flow(
-        project_name,
-        project,
-        results_dir,
-        flow,
-        interactive=interactive,
-        minimum_age_days=minimum_age_days,
-        continue_=continue_,
-        interaction=gradle_workflow.GradleInteraction(
-            choose=_choose_gradle_candidates,
-            report=_print_gradle_run_result,
-            report_scan=_print_scan_result,
-            workspace_revision=_gradle_workspace_revision,
-        ),
-    )

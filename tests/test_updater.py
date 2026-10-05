@@ -117,7 +117,7 @@ def mock_local_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         mock = MagicMock(return_value=default)
         monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
         mocks[name] = mock
-    mock_discard = MagicMock()
+    mock_discard = MagicMock(return_value=True)
     monkeypatch.setattr("maintenance_man.updater.discard_current_change", mock_discard)
     mocks["discard_current_change"] = mock_discard
     return mocks
@@ -133,7 +133,7 @@ def mock_resolve_vcs(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         ("create_or_reset_bookmark", True),
         ("_apply_update", True),
         ("run_test_phases", (True, None)),
-        ("discard_current_change", None),
+        ("discard_current_change", True),
     ]:
         mock = MagicMock(return_value=default)
         monkeypatch.setattr(f"maintenance_man.updater.{name}", mock)
@@ -823,7 +823,7 @@ class TestProcessFindingsLocal:
         assert results[0].failed_phase == "apply"
         assert results[1].passed is True
 
-    def test_no_test_config_treats_update_as_pass(
+    def test_no_test_config_rejects_update_before_effects(
         self, mock_local_vcs: dict[str, MagicMock], tmp_path: Path
     ):
         project_config = ProjectConfig(path=tmp_path, package_manager="bun")
@@ -835,9 +835,9 @@ class TestProcessFindingsLocal:
         )
 
         assert len(results) == 1
-        assert results[0].passed is True
+        assert results[0].passed is False
         mock_local_vcs["run_test_phases"].assert_not_called()
-        mock_local_vcs["commit_current_change"].assert_called_once()
+        mock_local_vcs["commit_current_change"].assert_not_called()
 
     def test_commit_failure_marks_finding_failed_and_continues(
         self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
@@ -868,7 +868,7 @@ class TestProcessFindingsLocal:
 
         assert len(results) == 1
         assert results[0].passed is False
-        assert results[0].failed_phase == "commit"
+        assert results[0].failed_phase == "bookmark"
         mock_local_vcs["commit_current_change"].assert_called_once()
         mock_local_vcs["_apply_update"].assert_called_once()
         mock_local_vcs["discard_current_change"].assert_not_called()
@@ -1046,7 +1046,7 @@ class TestProcessFindingsResolve:
         assert mock_resolve_vcs["commit_current_change"].call_count == 1
         mock_resolve_vcs["discard_current_change"].assert_not_called()
 
-    def test_no_test_config_treats_update_as_pass(
+    def test_no_test_config_rejects_update_before_effects(
         self, mock_resolve_vcs: dict[str, MagicMock], tmp_path: Path
     ):
         project_config = ProjectConfig(path=tmp_path, package_manager="bun")
@@ -1059,7 +1059,7 @@ class TestProcessFindingsResolve:
         )
 
         assert len(results) == 1
-        assert results[0].passed is True
+        assert results[0].passed is False
         mock_resolve_vcs["run_test_phases"].assert_not_called()
 
     def test_status_tracking(
@@ -1193,3 +1193,110 @@ def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(
 
     assert block is not None and block.kind == "stale"
     assert "update workspace" in block.reason
+
+
+def test_shared_processor_applies_saved_gradle_target_and_persists_ready(
+    tmp_path, monkeypatch, mock_local_vcs
+):
+    from maintenance_man import gradle
+
+    target = make_gradle_target()
+    finding = make_update(pkg_name="room", gradle_target=target)
+    scan = ScanResult(
+        project="android",
+        scanned_at=datetime.now(timezone.utc),
+        trivy_target=str(tmp_path),
+        updates=[finding],
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="gradle", test_unit="test")
+    applied = []
+    monkeypatch.setattr(gradle, "apply_gradle_update", lambda p, t: applied.append(t))
+    # Generic command construction cannot apply a catalogue target.
+    mock_local_vcs["_apply_update"].return_value = False
+    results = process_updates(
+        [finding],
+        project,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        project_name="android",
+        results_dir=tmp_path,
+    )
+    assert [r.passed for r in results] == [True]
+    assert applied == [target]
+    saved = load_scan_results("android", tmp_path)
+    assert saved.updates[0].update_status == UpdateStatus.READY
+    assert saved.updates[0].flow == Workflow.UPDATE
+
+
+def test_shared_processor_requires_tests_before_applying(tmp_path, mock_local_vcs):
+    finding = make_update()
+    project = ProjectConfig(path=tmp_path, package_manager="bun")
+    results = process_updates([finding], project, flow=Workflow.UPDATE)
+    assert [r.passed for r in results] == [False]
+    assert results[0].failed_phase == "configuration"
+    mock_local_vcs["_apply_update"].assert_not_called()
+
+
+def test_gradle_mixed_rows_apply_once_and_retry_only_failed_group(
+    tmp_path, monkeypatch, mock_local_vcs
+):
+    from maintenance_man import gradle
+    from maintenance_man.updater import group_findings, process_findings
+
+    a = make_gradle_target()
+    b = make_gradle_target(version_ref="other")
+    rows = [
+        make_vuln(gradle_target=a),
+        make_update(gradle_target=a),
+        make_update(pkg_name="other", gradle_target=b),
+    ]
+    project = ProjectConfig(path=tmp_path, package_manager="gradle", test_unit="test")
+    applied = []
+    monkeypatch.setattr(gradle, "apply_gradle_update", lambda p, t: applied.append(t))
+    mock_local_vcs["run_test_phases"].side_effect = [(True, None), (False, "unit")]
+    results = process_findings(
+        group_findings(project, rows), project, flow=Workflow.UPDATE
+    )
+    assert [r.passed for r in results] == [True, False]
+    assert [r.update_status for r in rows] == [
+        UpdateStatus.READY,
+        UpdateStatus.READY,
+        UpdateStatus.FAILED,
+    ]
+    mock_local_vcs["run_test_phases"].side_effect = [(True, None)]
+    results = process_findings(
+        group_findings(project, rows), project, flow=Workflow.UPDATE
+    )
+    assert [r.passed for r in results] == [True]
+    assert applied == [a, b, b]
+
+
+def test_malformed_saved_gradle_target_is_blocked_before_effects(
+    tmp_path, mock_local_vcs
+):
+    from maintenance_man.updater import group_findings
+
+    finding = make_update(gradle_target=make_gradle_target(members=[]))
+    project = ProjectConfig(path=tmp_path, package_manager="gradle", test_unit="test")
+    assert group_findings(project, [finding]) == []
+    assert finding.blocked_reason is not None
+    assert "empty Gradle target" in finding.blocked_reason
+    mock_local_vcs["commit_current_change"].assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["apply", "unit", "commit"])
+def test_failed_rollback_stops_before_next_candidate(
+    phase, project_config, mock_local_vcs
+):
+    mock_local_vcs["discard_current_change"].return_value = False
+    if phase == "apply":
+        mock_local_vcs["_apply_update"].side_effect = [False, True]
+    elif phase == "unit":
+        mock_local_vcs["run_test_phases"].side_effect = [(False, "unit"), (True, None)]
+    else:
+        mock_local_vcs["commit_current_change"].side_effect = [False, True]
+    rows = [make_update(pkg_name="B"), make_update(pkg_name="C")]
+    results = process_findings(rows, project_config, flow=Workflow.UPDATE)
+    assert [r.pkg_name for r in results] == ["B"]
+    assert results[0].failed_phase == "rollback"
+    assert rows[1].update_status is None

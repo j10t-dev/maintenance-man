@@ -103,6 +103,7 @@ def make_project(tmp_path):
 
 def fixture_runner(root, args, *, label):
     assert args[0] == "mmGradleReport"
+    assert "--daemon" in args and "--no-daemon" not in args
     assert "--rerun-tasks" in args and "--no-build-cache" in args
     owned = root / ".mm-gradle-inventory"
     assert (owned / ".mm-owned").is_file()
@@ -1138,3 +1139,89 @@ def test_mixed_library_plugin_alias_keeps_member_validation_separate():
         "org.jetbrains.kotlin.jvm:org.jetbrains.kotlin.jvm.gradle.plugin",
     ]
     assert result.publication_requests[1].marker_implementation == implementation
+
+
+def test_selection_preserves_exact_source_rows(tmp_path):
+    catalogue, resolution = ownership_graph(tmp_path)
+    rows = [
+        VulnFinding(
+            vuln_id=advisory,
+            pkg_name=coordinate,
+            installed_version=version,
+            fixed_version=fix,
+            severity=Severity.HIGH,
+            title="example",
+            description="example",
+            status="affected",
+        )
+        for advisory, coordinate, version, fix in [
+            ("CVE-1", "g:parent", "1.0.0", "1.0.1"),
+            ("CVE-2", "g:child", "2.0.0", "2.0.1"),
+        ]
+    ]
+    from maintenance_man.models.scan import SemverTier, UpdateFinding
+
+    proposal = UpdateFinding(
+        pkg_name="a",
+        installed_version="1.0.0",
+        latest_version="1.0.1",
+        semver_tier=SemverTier.PATCH,
+        gradle_target=candidate().target,
+    )
+    plan = select_gradle_candidates(catalogue, resolution, rows, [proposal])
+    assert plan.candidates[0].model_dump().get("source_indices") == (0, 1)
+
+
+def test_one_vulnerability_with_two_known_scope_owners_keeps_both_targets(tmp_path):
+    from copy import deepcopy
+
+    from maintenance_man.models.scan import SemverTier, UpdateFinding
+
+    catalogue, resolution = ownership_graph(tmp_path)
+    raw = resolution.report.model_dump(mode="json")
+    second = deepcopy(raw["scopes"][0])
+    second["scope"]["configuration"] = "otherClasspath"
+    for component in second["components"]:
+        if component["id"] == "parent":
+            component["module"]["artifact"] = "other"
+    second["edges"][0]["requested"] = "g:other:1.0.0"
+    raw["scopes"].append(second)
+    raw["selected_scopes"].append(second["scope"])
+    resolution = CompleteResolution(report=ResolutionReport.model_validate(raw))
+    proposals = [
+        UpdateFinding(
+            pkg_name=ref,
+            installed_version="1.0.0",
+            latest_version="1.0.1",
+            semver_tier=SemverTier.PATCH,
+            gradle_target=GradleUpdateTarget(
+                version_ref=ref,
+                members=[
+                    GradleMember(
+                        kind="library",
+                        alias=ref,
+                        coordinate=coordinate,
+                        installed_version="1.0.0",
+                    )
+                ],
+                target_version="1.0.1",
+            ),
+        )
+        for ref, coordinate in [("a", "g:parent"), ("b", "g:other")]
+    ]
+    row = VulnFinding(
+        vuln_id="CVE-child",
+        pkg_name="g:child",
+        installed_version="2.0.0",
+        fixed_version="2.0.1",
+        severity=Severity.HIGH,
+        title="child",
+        description="child",
+        status="affected",
+    )
+    plan = select_gradle_candidates(catalogue, resolution, [row], proposals)
+    assert [(c.target.version_ref, c.source_indices) for c in plan.candidates] == [
+        ("a", (0,)),
+        ("b", (0,)),
+    ]
+    assert not plan.withheld

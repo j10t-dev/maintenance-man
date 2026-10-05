@@ -11,10 +11,11 @@ from typing import Literal, Protocol
 from packaging.version import InvalidVersion, Version
 from rich import print as rprint
 
-from maintenance_man import sanitise_project_name
+from maintenance_man import gradle, sanitise_project_name
 from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    GradleUpdateTarget,
     ScanResult,
     SemverTier,
     UpdateFinding,
@@ -63,6 +64,7 @@ class Finding(Protocol):
     update_status: UpdateStatus | None
     failed_phase: str | None
     flow: Workflow | None
+    gradle_target: GradleUpdateTarget | None
 
     @property
     def target_version(self) -> str: ...
@@ -176,7 +178,7 @@ def _consolidated_lifecycle_state(
 
 @dataclass
 class _ConsolidatedVuln:
-    """Proxy that groups several vulns for the same package into one finding.
+    """Proxy for saved rows applied and tested as one dependency target.
 
     Satisfies the :class:`Finding` protocol so it can be used in the update
     processing flows.  Writes to :attr:`update_status`, :attr:`failed_phase`
@@ -188,7 +190,9 @@ class _ConsolidatedVuln:
     installed_version: str
     _target_version: str
     _detail: str
-    _originals: list[VulnFinding] = field(repr=False)
+    _originals: Sequence[VulnFinding | UpdateFinding] = field(repr=False)
+    gradle_target: GradleUpdateTarget | None = None
+    kind: UpdateKind = "vuln"
     _update_status: UpdateStatus | None = None
     _failed_phase: str | None = None
     _flow: Workflow | None = None
@@ -265,25 +269,133 @@ def consolidate_vulns(
     return consolidated
 
 
+def group_findings(
+    project: ProjectConfig, findings: Sequence[VulnFinding | UpdateFinding]
+) -> list[Finding]:
+    """Group saved rows into one application/test unit per dependency target."""
+    eligible = [
+        f
+        for f in findings
+        if not f.blocked_reason
+        and (
+            not isinstance(f, VulnFinding)
+            or f.actionable
+            or f.gradle_target is not None
+        )
+    ]
+    if project.package_manager != "gradle":
+        return [
+            *consolidate_vulns([f for f in eligible if isinstance(f, VulnFinding)]),
+            *sort_updates_by_risk(
+                [f for f in eligible if isinstance(f, UpdateFinding)]
+            ),
+        ]
+    groups: dict[str, list[VulnFinding | UpdateFinding]] = {}
+    for f in eligible:
+        if f.gradle_target is None:
+            f.blocked_reason = "Saved scan has no catalogue target; run mm scan first"
+            f.gradle_block_kind = "mapping"
+            continue
+        target = f.gradle_target
+        shape = gradle.validate_gradle_target_shape(target)
+        if shape is not None:
+            f.blocked_reason = shape.reason
+            f.gradle_block_kind = shape.kind
+            continue
+        key = json.dumps(target.model_dump(mode="json"), sort_keys=True)
+        groups.setdefault(key, []).append(f)
+    result: list[Finding] = []
+    for originals in groups.values():
+        target = originals[0].gradle_target
+        assert target is not None
+        status, phase, flow = _consolidated_lifecycle_state(originals)
+        result.append(
+            _ConsolidatedVuln(
+                pkg_name=target.display_name,
+                installed_version=target.members[0].installed_version,
+                _target_version=target.target_version,
+                _detail=", ".join(dict.fromkeys(f.detail for f in originals)),
+                _originals=originals,
+                gradle_target=target,
+                kind="vuln"
+                if any(isinstance(f, VulnFinding) for f in originals)
+                else "update",
+                _update_status=status,
+                _failed_phase=phase,
+                _flow=flow,
+            )
+        )
+    return result
+
+
+@dataclass(frozen=True)
+class Applied:
+    pass
+
+
+@dataclass(frozen=True)
+class Blocked:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ApplyFailed:
+    reason: str
+
+
+type ApplyOutcome = Applied | Blocked | ApplyFailed
+
+
+def apply_finding(project: ProjectConfig, finding: Finding) -> ApplyOutcome:
+    try:
+        if project.package_manager == "gradle":
+            target = finding.gradle_target
+            if target is None:
+                return Blocked("Saved scan has no catalogue target; run mm scan first")
+            # Retry after a status-write interruption may encounter the saved
+            # target already applied. Validate it, then run the common tests.
+            if gradle.validate_gradle_recovery(project, target) is None:
+                return Applied()
+            block = gradle.apply_gradle_update(project, target)
+            return Blocked(block.reason) if block else Applied()
+        if _apply_update(
+            project.package_manager,
+            finding.pkg_name,
+            finding.target_version,
+            Path(project.path),
+        ):
+            return Applied()
+        return ApplyFailed("package manager failed")
+    except (gradle.GradleError, OSError, subprocess.TimeoutExpired) as exc:
+        return ApplyFailed(str(exc))
+
+
 def process_vulns(
     vulns: list[VulnFinding],
     project_config: ProjectConfig,
     *,
     flow: Workflow,
-    minimum_age_days: int = 7,
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
     """Process vuln fixes in the single-bookmark update flow."""
-    actionable = [v for v in vulns if v.actionable]
-    consolidated = consolidate_vulns(actionable)
+    actionable: list[VulnFinding | UpdateFinding] = [
+        v for v in vulns if v.actionable or v.gradle_target is not None
+    ]
+    if scan_result is not None:
+        targets = [f.gradle_target for f in actionable if f.gradle_target is not None]
+        actionable.extend(
+            u
+            for u in scan_result.updates
+            if u.gradle_target is not None and u.gradle_target in targets
+        )
+    consolidated = group_findings(project_config, actionable)
     return process_findings(
         consolidated,
         project_config,
         _VULN_STACK,
         flow=flow,
-        minimum_age_days=minimum_age_days,
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
@@ -295,19 +407,17 @@ def process_updates(
     project_config: ProjectConfig,
     *,
     flow: Workflow,
-    minimum_age_days: int = 7,
     scan_result: ScanResult | None = None,
     project_name: str = "",
     results_dir: Path | None = None,
 ) -> list[UpdateResult]:
     """Process updates in the single-bookmark update flow, risk-ascending."""
-    sorted_updates = sort_updates_by_risk(updates)
+    sorted_updates = group_findings(project_config, updates)
     return process_findings(
         sorted_updates,
         project_config,
         _UPDATE_STACK,
         flow=flow,
-        minimum_age_days=minimum_age_days,
         scan_result=scan_result,
         project_name=project_name,
         results_dir=results_dir,
@@ -332,7 +442,9 @@ def save_scan_results(
 ) -> None:
     """Write scan results (with update statuses) back to disk."""
     results_file = _results_path(project_name, results_dir)
-    results_file.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
+    temporary = results_file.with_suffix(".json.tmp")
+    temporary.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
+    temporary.replace(results_file)
 
 
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
@@ -443,7 +555,6 @@ def process_findings(
     cfg: _WorkflowConfig | None = None,
     *,
     flow: Workflow,
-    minimum_age_days: int = 7,
     on_failure: FailureStrategy = "continue",
     scan_result: ScanResult | None = None,
     project_name: str = "",
@@ -463,20 +574,38 @@ def process_findings(
     has_tests = has_test_config(project_config)
 
     for f in findings:
+        if f.update_status in (UpdateStatus.READY, UpdateStatus.COMPLETED):
+            continue
         flow_cfg = _workflow_config(f, cfg)
         rprint(
             f"\n  {flow_cfg.label} {f.pkg_name} {f.installed_version} "
             f"-> {f.target_version} ({f.detail})"
         )
 
-        applied = _apply_update(
-            project_config.package_manager,
-            f.pkg_name,
-            f.target_version,
-            project_path,
-        )
-
-        if not applied:
+        if not has_tests:
+            results.append(
+                UpdateResult(f.pkg_name, flow_cfg.kind, False, "configuration")
+            )
+            continue
+        outcome = apply_finding(project_config, f)
+        if isinstance(outcome, Blocked):
+            originals = f._originals if isinstance(f, _ConsolidatedVuln) else [f]
+            for original in originals:
+                if isinstance(original, (VulnFinding, UpdateFinding)):
+                    original.blocked_reason = outcome.reason
+                    original.gradle_block_kind = "stale"
+                    original.update_status = None
+                    original.failed_phase = None
+                    original.flow = None
+            _persist_status(scan_result, project_name, results_dir)
+            results.append(
+                UpdateResult(
+                    f.pkg_name, flow_cfg.kind, False, blocked_reason=outcome.reason
+                )
+            )
+            continue
+        if isinstance(outcome, ApplyFailed):
+            rprint(f"  [bold red]FAIL[/] {outcome.reason}")
             results.append(
                 _record_failure(
                     f,
@@ -490,7 +619,7 @@ def process_findings(
                     discard=on_failure == "continue",
                 )
             )
-            if on_failure == "stop":
+            if on_failure == "stop" or results[-1].failed_phase == "rollback":
                 break
             continue
 
@@ -525,7 +654,7 @@ def process_findings(
                             discard=on_failure == "continue",
                         )
                     )
-                    if on_failure == "stop":
+                    if on_failure == "stop" or results[-1].failed_phase == "rollback":
                         break
                     continue
                 if not create_or_reset_bookmark(
@@ -535,7 +664,7 @@ def process_findings(
                         _record_failure(
                             f,
                             flow_cfg.kind,
-                            "commit",
+                            "bookmark",
                             project_path,
                             scan_result,
                             flow,
@@ -551,8 +680,8 @@ def process_findings(
                 f.flow = flow
         else:
             rprint(f"  [bold red]FAIL[/] {f.pkg_name} — {failed_phase} failed")
-            if on_failure == "continue":
-                discard_current_change(project_path)
+            if on_failure == "continue" and not discard_current_change(project_path):
+                failed_phase = "rollback"
             f.update_status = UpdateStatus.FAILED
             f.failed_phase = failed_phase
             f.flow = flow
@@ -567,7 +696,7 @@ def process_findings(
             )
         )
 
-        if not passed and on_failure == "stop":
+        if not passed and (on_failure == "stop" or failed_phase == "rollback"):
             break
 
     return results
@@ -580,7 +709,9 @@ def _workflow_config(
     """Return flow config for a finding, inferring it when omitted."""
     if cfg is not None:
         return cfg
-    vuln_types = (VulnFinding, _ConsolidatedVuln)
+    if isinstance(finding, _ConsolidatedVuln):
+        return _VULN_STACK if finding.kind == "vuln" else _UPDATE_STACK
+    vuln_types = (VulnFinding,)
     return _VULN_STACK if isinstance(finding, vuln_types) else _UPDATE_STACK
 
 
@@ -597,8 +728,8 @@ def _record_failure(
     discard: bool = True,
 ) -> UpdateResult:
     """Mark finding as failed, optionally discard changes, persist and return."""
-    if discard:
-        discard_current_change(project_path)
+    if discard and not discard_current_change(project_path):
+        phase = "rollback"
     finding.update_status = UpdateStatus.FAILED
     finding.failed_phase = phase
     finding.flow = flow

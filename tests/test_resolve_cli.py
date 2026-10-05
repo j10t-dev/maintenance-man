@@ -20,7 +20,6 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.updater import NoScanResultsError, UpdateResult
 from tests.conftest import (
-    make_gradle_target,
     make_scan_result,
     make_update,
     make_vuln,
@@ -63,8 +62,15 @@ def mock_resolve_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         ],
     )
     state: dict[str, object] = {"scan_result": scan_result}
+    monkeypatch.setattr("maintenance_man.cli.exact_commit_id", lambda *args: "a" * 40)
+    from maintenance_man.vcs import RevisionCheck
 
-    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
+    monkeypatch.setattr(
+        "maintenance_man.cli.same_revision",
+        lambda *args: RevisionCheck(ok=True, value=False),
+    )
+
+    monkeypatch.setattr("maintenance_man.vcs.check_gh_available", lambda: None)
     monkeypatch.setattr("maintenance_man.cli.check_jj_available", lambda: None)
     monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda p: True)
     monkeypatch.setattr("maintenance_man.cli.ensure_main_bookmark", lambda p: True)
@@ -90,14 +96,17 @@ def mock_resolve_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         "maintenance_man.cli.current_change_has_changes", lambda p: False
     )
     monkeypatch.setattr(
-        "maintenance_man.cli.push_bookmark_and_create_pr",
-        lambda p, b: (True, "PR #1"),
+        "maintenance_man.cli.promote_bookmark_to_main",
+        lambda p, b: True,
+    )
+    monkeypatch.setattr(
+        "maintenance_man.cli.refresh_working_copy_from_main", lambda p: True
     )
     return state
 
 
 class TestResolveCandidates:
-    def test_ordered_resolve_candidates_excludes_other_flows(self):
+    def test_resolve_candidates_include_all_update_failures(self):
         scan_result = make_scan_result(
             vulns=[
                 make_vuln(pkg_name="pkg-a", vuln_id="CVE-1"),
@@ -124,9 +133,9 @@ class TestResolveCandidates:
             ],
         )
 
-        candidates = _ordered_resolve_candidates(scan_result, _uv_project(), 7)
+        candidates = _ordered_resolve_candidates(scan_result, _uv_project())
 
-        assert {f.pkg_name for f in candidates} == {"pkg-a", "pkg-b", "pkg-e"}
+        assert {f.pkg_name for f in candidates} == {"pkg-a", "pkg-b", "pkg-c", "pkg-e"}
 
     def test_ordered_resolve_candidates_include_update_owned_test_failures(self):
         scan_result = make_scan_result(
@@ -141,7 +150,7 @@ class TestResolveCandidates:
             vulns=[],
         )
 
-        candidates = _ordered_resolve_candidates(scan_result, _uv_project(), 7)
+        candidates = _ordered_resolve_candidates(scan_result, _uv_project())
 
         assert [f.pkg_name for f in candidates] == ["pkg-a"]
 
@@ -167,7 +176,7 @@ class TestResolveCandidates:
             ],
         )
 
-        failed = _ordered_failed_findings(scan_result, _uv_project(), 7)
+        failed = _ordered_failed_findings(scan_result, _uv_project())
 
         assert [f.pkg_name for f in failed] == ["keep"]
 
@@ -209,7 +218,7 @@ class TestResolvePreChecks:
         from maintenance_man.vcs import GitHubCLINotFoundError
 
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
+            "maintenance_man.vcs.check_gh_available",
             MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -232,7 +241,7 @@ class TestResolvePreChecks:
             app(["resolve", "vulnerable"])
         assert exc_info.value.code == 1
 
-    def test_conflicting_update_flow_aborts(
+    def test_existing_resolve_pause_precedes_takeover(
         self,
         mm_home_with_projects: Path,
         mock_resolve_cli_deps: dict,
@@ -250,7 +259,7 @@ class TestResolvePreChecks:
 
         out = capsys.readouterr().out.lower()
         assert exc_info.value.code == 1
-        assert "update" in out
+        assert "--continue" in out
         assert "resolve" in out
         assert "vulnerable" in out
         mock_process.assert_not_called()
@@ -272,6 +281,7 @@ class TestResolvePreChecks:
             ],
         )
         mock_resolve_cli_deps["scan_result"] = scan_result
+        monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda *args: True)
         mock_process = MagicMock(
             return_value=[
                 UpdateResult(
@@ -309,7 +319,7 @@ class TestResolvePreChecks:
         assert "rescan" in capsys.readouterr().out.lower()
         mock_process.assert_not_called()
 
-    def test_missing_test_config_warns_and_proceeds(
+    def test_missing_tests_prevent_resolve_promotion(
         self,
         mm_home_with_projects: Path,
         mock_resolve_cli_deps: dict,
@@ -346,12 +356,12 @@ class TestResolvePreChecks:
             app(["resolve", "vulnerable"])
 
         out = capsys.readouterr().out.lower()
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 1
         assert "no test configuration" in out
 
 
 class TestResolveNoOp:
-    def test_no_scan_results_is_noop(
+    def test_missing_scan_requires_explicit_scan(
         self,
         mm_home_with_projects: Path,
         mock_resolve_cli_deps: dict,
@@ -367,7 +377,7 @@ class TestResolveNoOp:
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
 
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 1
         mock_create.assert_not_called()
 
     def test_no_actionable_findings_is_noop(
@@ -426,7 +436,7 @@ class TestResolveFlow:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        mock_push = MagicMock(return_value=(True, "PR #1"))
+        mock_push = MagicMock(return_value=True)
         monkeypatch.setattr(
             "maintenance_man.cli.process_findings",
             MagicMock(
@@ -440,9 +450,7 @@ class TestResolveFlow:
                 ]
             ),
         )
-        monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr", mock_push
-        )
+        monkeypatch.setattr("maintenance_man.cli.promote_bookmark_to_main", mock_push)
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
@@ -451,7 +459,7 @@ class TestResolveFlow:
         mock_push.assert_not_called()
         assert "mm resolve vulnerable --continue" in capsys.readouterr().out
 
-    def test_all_pass_submits_pr(
+    def test_all_pass_promotes_locally(
         self,
         mm_home_with_projects: Path,
         mock_resolve_fresh: dict,
@@ -466,13 +474,11 @@ class TestResolveFlow:
                 for f in findings
             ]
 
-        mock_push = MagicMock(return_value=(True, "PR #1"))
+        mock_push = MagicMock(return_value=True)
         monkeypatch.setattr(
             "maintenance_man.cli.process_findings", MagicMock(side_effect=_mark_ready)
         )
-        monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr", mock_push
-        )
+        monkeypatch.setattr("maintenance_man.cli.promote_bookmark_to_main", mock_push)
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
@@ -480,7 +486,7 @@ class TestResolveFlow:
         assert exc_info.value.code == 0
         mock_push.assert_called_once()
 
-    def test_existing_ready_resolve_progress_preserves_bookmark_and_submits(
+    def test_existing_ready_resolve_progress_promotes_without_reapplying(
         self,
         mm_home_with_projects: Path,
         mock_resolve_cli_deps: dict,
@@ -497,20 +503,18 @@ class TestResolveFlow:
         mock_delete = MagicMock(return_value=True)
         mock_set = MagicMock(return_value=True)
         mock_new = MagicMock(return_value=True)
-        mock_push = MagicMock(return_value=(True, "PR #1"))
+        mock_push = MagicMock(return_value=True)
         monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: True)
         monkeypatch.setattr("maintenance_man.cli.delete_bookmark", mock_delete)
         monkeypatch.setattr("maintenance_man.cli.create_or_reset_bookmark", mock_set)
         monkeypatch.setattr("maintenance_man.cli.edit_new_change", mock_new)
-        monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr", mock_push
-        )
+        monkeypatch.setattr("maintenance_man.cli.promote_bookmark_to_main", mock_push)
 
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
 
         assert exc_info.value.code == 0
-        mock_delete.assert_not_called()
+        mock_delete.assert_called_once()
         mock_set.assert_not_called()
         mock_new.assert_not_called()
         mock_push.assert_called_once()
@@ -582,18 +586,17 @@ class TestResolveFlow:
             app(["resolve", "vulnerable"])
 
         assert exc_info.value.code == 0
-        assert [name for name, _ in calls[:5]] == [
-            "prune",
+        assert [name for name, _ in calls[:4]] == [
             "ensure-main",
             "delete",
             "set",
             "new",
         ]
-        assert calls[3][1][0] == _RESOLVE_BOOKMARK
-        assert calls[3][1][1].name == "vulnerable-project"
-        assert calls[3][1][2] == "main"
-        assert calls[4][1][0].name == "vulnerable-project"
-        assert calls[4][1][1] == _RESOLVE_BOOKMARK
+        assert calls[2][1][0] == _RESOLVE_BOOKMARK
+        assert calls[2][1][1].name == "vulnerable-project"
+        assert calls[2][1][2] == "main"
+        assert calls[3][1][0].name == "vulnerable-project"
+        assert calls[3][1][1] == _RESOLVE_BOOKMARK
 
 
 class TestResolveSubmit:
@@ -618,8 +621,8 @@ class TestResolveSubmit:
             "maintenance_man.cli.process_findings", MagicMock(side_effect=_mark_ready)
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr",
-            MagicMock(return_value=(True, "PR #1")),
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -650,8 +653,8 @@ class TestResolveSubmit:
             "maintenance_man.cli.process_findings", MagicMock(side_effect=_mark_ready)
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr",
-            MagicMock(return_value=(False, "push rejected")),
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=False),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -720,8 +723,8 @@ class TestResolveContinue:
             MagicMock(return_value=[]),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr",
-            MagicMock(return_value=(True, "PR #1")),
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -757,8 +760,8 @@ class TestResolveContinue:
             MagicMock(return_value=[]),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr",
-            MagicMock(return_value=(True, "PR #1")),
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -795,8 +798,8 @@ class TestResolveContinue:
         monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
         monkeypatch.setattr("maintenance_man.cli.create_or_reset_bookmark", mock_move)
         monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr",
-            MagicMock(return_value=(True, "PR #1")),
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -856,8 +859,8 @@ class TestResolveContinue:
         mock_process = MagicMock(return_value=[])
         monkeypatch.setattr("maintenance_man.cli.process_findings", mock_process)
         monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr",
-            MagicMock(return_value=(True, "PR #1")),
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
         )
 
         with pytest.raises(SystemExit):
@@ -914,8 +917,8 @@ class TestResolveContinue:
             "maintenance_man.cli.process_findings", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr",
-            MagicMock(return_value=(True, "PR #1")),
+            "maintenance_man.cli.promote_bookmark_to_main",
+            MagicMock(return_value=True),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -924,7 +927,7 @@ class TestResolveContinue:
         assert exc_info.value.code == 0
         assert blocker.update_status == UpdateStatus.COMPLETED
 
-    def test_continue_with_no_failed_blockers_exits_noop(
+    def test_continue_requires_a_current_saved_failure(
         self,
         mm_home_with_projects: Path,
         mock_resolve_cli_deps: dict,
@@ -937,10 +940,8 @@ class TestResolveContinue:
 
         mock_tests = MagicMock()
         monkeypatch.setattr("maintenance_man.cli.run_test_phases", mock_tests)
-        mock_push = MagicMock(return_value=(True, "PR #1"))
-        monkeypatch.setattr(
-            "maintenance_man.cli.push_bookmark_and_create_pr", mock_push
-        )
+        mock_push = MagicMock(return_value=True)
+        monkeypatch.setattr("maintenance_man.cli.promote_bookmark_to_main", mock_push)
         monkeypatch.setattr(
             "maintenance_man.cli.process_findings", MagicMock(return_value=[])
         )
@@ -948,9 +949,9 @@ class TestResolveContinue:
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable", "--continue"])
 
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 1
         mock_tests.assert_not_called()
-        mock_push.assert_called_once()
+        mock_push.assert_not_called()
 
 
 class TestResolveCliSurface:
@@ -975,99 +976,79 @@ class TestResolveCliSurface:
         assert exc_info.value.code == 1
 
 
-@pytest.mark.parametrize("continue_", [False, True])
-@pytest.mark.parametrize("status", [UpdateStatus.FAILED, UpdateStatus.READY])
-@pytest.mark.parametrize(
-    "target_shape", ["valid", "missing", "empty", "mixed-history", "cross-kind"]
-)
-def test_gradle_legacy_resolve_history_never_authorizes_effects(
-    mm_home_with_gradle,
-    monkeypatch,
-    continue_,
-    status,
-    target_shape,
-):
-    """Even a manually repaired catalogue cannot replace a revision-bound ledger."""
-    import subprocess
-
-    target = make_gradle_target()
-    if target_shape == "missing":
-        target = None
-    elif target_shape == "empty":
-        target.members = []
-    elif target_shape == "mixed-history":
-        target.members[1].installed_version = "9.9.9"
-    updates = [
-        make_update(
-            pkg_name="room",
-            installed_version="2.8.4",
-            latest_version="2.8.5",
-            gradle_target=target,
-            update_status=status,
-            failed_phase="unit",
-            flow=Workflow.RESOLVE,
-        )
-    ]
-    vulns = (
-        [
-            make_vuln(
-                pkg_name="androidx.room:room-runtime",
-                installed_version="2.8.4",
-                fixed_version=None,
-                gradle_target=make_gradle_target(),
-                update_status=status,
-                failed_phase="unit",
-                flow=Workflow.RESOLVE,
-            )
-        ]
-        if target_shape == "cross-kind"
-        else []
-    )
-    scan = make_scan_result(vulns=vulns, updates=updates)
-    results = mm_home_with_gradle / "scan-results" / "android.json"
-    results.parent.mkdir(exist_ok=True)
-    results.write_text(scan.model_dump_json())
-    before = results.read_bytes()
-    for name in ("check_gh_available", "check_jj_available"):
-        monkeypatch.setattr(f"maintenance_man.cli.{name}", lambda: None)
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("legacy history must not run commands or alter bookmarks")
-
-    monkeypatch.setattr(subprocess, "run", forbidden)
-    args = ["resolve", "android"] + (["--continue"] if continue_ else [])
-    with pytest.raises(SystemExit) as exc:
-        app(args)
-    assert exc.value.code == 4
-    assert results.read_bytes() == before
-    assert not (mm_home_with_gradle / "gradle-runs" / "android.json").exists()
-
-
-@pytest.mark.parametrize("owned", [False, True])
-def test_gradle_continuation_without_ledger_preserves_interrupted_outputs(
-    mm_home_with_gradle,
-    gradle_project,
-    monkeypatch,
-    owned,
-):
-    import subprocess
-
-    report = gradle_project.path / "gradle/libs.versions.updates.toml"
-    report.write_bytes(b"preserved output")
-    marker = gradle_project.path / "gradle/.mm-owned-report"
-    if owned:
-        marker.write_bytes(b"")
-    for name in ("check_gh_available", "check_jj_available"):
-        monkeypatch.setattr(f"maintenance_man.cli.{name}", lambda: None)
-    monkeypatch.setattr(
-        subprocess, "run", lambda *args, **kwargs: pytest.fail("no ledger")
-    )
-    with pytest.raises(SystemExit) as exc:
-        app(["resolve", "android", "--continue"])
-    assert exc.value.code == 4
-    assert report.read_bytes() == b"preserved output"
-    assert marker.exists() is owned
-
-
 def _uv_project() -> ProjectConfig:
     return ProjectConfig(path=Path("/tmp/fake"), package_manager="uv")
+
+
+def test_resolve_accepts_the_complete_update_owned_stack():
+    from maintenance_man.cli import _assert_no_conflicting_flow
+
+    scan = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(
+                pkg_name="A", update_status=UpdateStatus.READY, flow=Workflow.UPDATE
+            ),
+            make_update(
+                pkg_name="B",
+                update_status=UpdateStatus.FAILED,
+                flow=Workflow.UPDATE,
+                failed_phase="apply",
+            ),
+            make_update(
+                pkg_name="C", update_status=UpdateStatus.READY, flow=Workflow.UPDATE
+            ),
+        ],
+    )
+    _assert_no_conflicting_flow(scan, Workflow.RESOLVE, "example")
+
+
+def test_continue_only_accepts_paused_candidate_then_applies_other_failures(
+    tmp_path, monkeypatch, mock_resolve_cli_deps
+):
+    from maintenance_man import cli
+
+    scan = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(
+                pkg_name=name,
+                update_status=UpdateStatus.FAILED,
+                flow=Workflow.RESOLVE,
+                failed_phase="unit",
+            )
+            for name in ("B", "D")
+        ],
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="test")
+    monkeypatch.setattr(cli, "run_test_phases", lambda *args: (True, None))
+    attempted = []
+
+    def process(findings, *args, **kwargs):
+        attempted.extend(f.pkg_name for f in findings)
+        return [UpdateResult(f.pkg_name, "update", False, "unit") for f in findings]
+
+    monkeypatch.setattr(cli, "process_findings", process)
+    assert cli._handle_resolve_continue("example", project, scan, tmp_path) == 4
+    assert attempted == ["D"]
+    assert [r.update_status for r in scan.updates] == [
+        UpdateStatus.READY,
+        UpdateStatus.FAILED,
+    ]
+
+
+def test_takeover_failure_preserves_update_ownership(
+    tmp_path, monkeypatch, mock_resolve_cli_deps
+):
+    from maintenance_man import cli
+
+    scan = make_scan_result(
+        vulns=[],
+        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)],
+    )
+    before = scan.model_dump_json()
+    monkeypatch.setattr(cli, "bookmark_exists", lambda *args: True)
+    monkeypatch.setattr(cli, "edit_new_change", lambda *args: False)
+    with pytest.raises(SystemExit):
+        cli._take_over_update_progress(tmp_path, scan)
+    assert scan.model_dump_json() == before

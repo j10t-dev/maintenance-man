@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import pytest
 
-from maintenance_man import gradle_resolution as candidates
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GRADLE_INVENTORY_BOM_RELPATH,
@@ -498,6 +497,37 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         scanner, "_run_gradle_scan", lambda project: (state.vulns, resolution)
     )
     monkeypatch.setattr(scanner, "get_outdated", lambda project: state.findings)
+
+    def native_candidates(root, args, *, label):
+        directory = root / ".mm-gradle-inventory"
+        requests = json.loads((directory / "candidate-requests.json").read_text())[
+            "requests"
+        ]
+        rows = [
+            {
+                **{
+                    key: request[key]
+                    for key in (
+                        "request_id",
+                        "project_path",
+                        "group_key",
+                        "alias",
+                        "kind",
+                    )
+                },
+                "selected_version": request["candidate_version"],
+                "implementation": None,
+                "reason": None,
+            }
+            for request in requests
+        ]
+        (directory / "candidate-validation.json").write_text(
+            json.dumps({"schema_version": 1, "results": rows})
+        )
+
+    monkeypatch.setattr(
+        "maintenance_man.gradle_resolution.run_gradle", native_candidates
+    )
     state.project = gradle_project.model_copy(
         update={"scan_secrets": False, "gradle_repository_routing": "standard-public"}
     )
@@ -546,37 +576,34 @@ def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
         "org.example:lib0",
         "org.example:lib1",
     ]
-    assert result.vulnerabilities[0].gradle_target is None
+    assert result.vulnerabilities[0].gradle_target == state.findings[0].gradle_target
     assert all(row.blocked_reason is None for row in result.updates)
 
 
-def test_gradle_scan_reports_unmapped_update_without_planning_diagnostics(
+def test_gradle_scan_reports_unmapped_update_as_blocked(
     scoped_publication_scan,
 ):
     state = scoped_publication_scan
     state.findings.append(make_update(pkg_name="unmapped", gradle_target=None))
     result = scan_project("android", state.project, 7)
-    assert result.updates[-1].blocked_reason is None
-    assert result.updates[-1].gradle_block_kind is None
+    assert result.updates[-1].blocked_reason
+    assert result.updates[-1].gradle_block_kind == "mapping"
 
 
-def test_gradle_scan_does_not_run_update_planning(scoped_publication_scan, monkeypatch):
+def test_gradle_scan_prepares_targets_and_retains_unmapped_vulnerability(
+    scoped_publication_scan, monkeypatch
+):
     state = scoped_publication_scan
     state.vulns = [
         make_vuln(pkg_name="unmapped", installed_version="1.0", fixed_version="2.0")
     ]
-    monkeypatch.setattr(
-        candidates,
-        "validate_gradle_candidates",
-        lambda *args: pytest.fail("scan must not run native update validation"),
-    )
 
     result = scan_project("android", state.project, 7)
 
     assert len(result.updates) == 2
     assert len(result.vulnerabilities) == 1
     assert result.vulnerabilities[0].pkg_name == "unmapped"
-    assert result.vulnerabilities[0].blocked_reason is None
+    assert result.vulnerabilities[0].blocked_reason
 
 
 def test_gradle_scan_filters_young_updates_without_hiding_vulnerabilities(
@@ -588,9 +615,13 @@ def test_gradle_scan_filters_young_updates_without_hiding_vulnerabilities(
 
     result = scan_project("android", state.project, 7)
 
-    assert [row.pkg_name for row in result.updates] == ["org.example:lib1"]
+    assert [row.pkg_name for row in result.updates] == [
+        "org.example:lib0",
+        "org.example:lib1",
+    ]
+    assert result.updates[0].gradle_block_kind == "age"
     assert [row.pkg_name for row in result.vulnerabilities] == ["org.example:lib0"]
-    assert not result.blocked_findings
+    assert result.blocked_findings
 
 
 def test_gradle_scan_disabled_age_policy_skips_publication_lookups(
@@ -1181,3 +1212,79 @@ def test_gradle_scan_checks_local_project_provenance(
     else:
         with pytest.raises(GradleError):
             scanner._run_gradle_scan(gradle_project)
+
+
+def test_successful_scan_replaces_pending_progress_and_preserves_source_files(
+    scoped_publication_scan, mm_home
+):
+    from maintenance_man.models.scan import UpdateStatus, Workflow
+    from maintenance_man.updater import load_scan_results, save_scan_results
+    from tests.conftest import make_scan_result
+
+    project = scoped_publication_scan.project
+    results_dir = mm_home / "scan-results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    prior = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(
+                pkg_name="old-pending",
+                update_status=UpdateStatus.READY,
+                flow=Workflow.UPDATE,
+            )
+        ],
+    )
+    prior.resolve_repair_base = "a" * 40
+    save_scan_results("android", results_dir, prior)
+    manual = project.path / "manual-repair.txt"
+    manual.write_text("keep this repair\n")
+    scan_project("android", project, 0)
+    current = load_scan_results("android", results_dir)
+    assert [r.pkg_name for r in current.updates] == [
+        "org.example:lib0",
+        "org.example:lib1",
+    ]
+    assert all(r.update_status is None and r.flow is None for r in current.updates)
+    assert current.resolve_repair_base is None
+    assert manual.read_text() == "keep this repair\n"
+
+
+def test_scan_projects_exact_security_rows_and_security_only_targets(
+    scoped_publication_scan, mm_home
+):
+    from maintenance_man.updater import load_scan_results
+
+    state = scoped_publication_scan
+    state.findings = []
+    state.vulns = [
+        make_vuln(
+            vuln_id=advisory,
+            pkg_name=package,
+            installed_version="1.0",
+            fixed_version="1.0.1",
+        )
+        for advisory, package in [
+            ("CVE-A", "org.example:lib0"),
+            ("CVE-B", "org.example:lib1"),
+        ]
+    ]
+    scan_project("android", state.project, 0)
+    current = load_scan_results("android", mm_home / "scan-results")
+    actual = []
+    for row in current.vulnerabilities:
+        target = row.gradle_target
+        assert target is not None
+        actual.append(
+            (row.vuln_id, row.pkg_name, target.version_ref, target.target_version)
+        )
+    assert (
+        actual
+        == [
+            ("CVE-A", "org.example:lib0", "lib0", "1.0.1"),
+            ("CVE-B", "org.example:lib1", "lib1", "1.0.1"),
+        ]
+        == [
+            ("CVE-A", "org.example:lib0", "lib0", "1.0.1"),
+            ("CVE-B", "org.example:lib1", "lib1", "1.0.1"),
+        ]
+    )

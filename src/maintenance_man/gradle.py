@@ -45,12 +45,12 @@ GRADLE_NO_UPDATES_SIGNAL = "There are no updates available"
 _DISCOVER_ARGS = [
     "versionCatalogUpdate",
     "--interactive",
-    "--no-daemon",
+    "--daemon",
     "--console=plain",
 ]
 _BOM_ARGS = [
     "cyclonedxBom",
-    "--no-daemon",
+    "--daemon",
     "--console=plain",
     "--rerun-tasks",
     "--no-build-cache",
@@ -126,7 +126,7 @@ class ReportProposal:
     version: str
 
 
-_APPLY_ARGS = ["versionCatalogApplyUpdates", "--no-daemon", "--console=plain"]
+_APPLY_ARGS = ["versionCatalogApplyUpdates", "--daemon", "--console=plain"]
 
 
 def apply_gradle_update(

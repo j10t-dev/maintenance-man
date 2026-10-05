@@ -19,10 +19,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     AgeBlock,
-    CompleteResolution,
     ModuleId,
     PublicationEvidence,
     PublicationFact,
@@ -687,78 +685,3 @@ def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
                 reason=f"release younger than required {minimum_age_days} days"
             )
     return None
-
-
-def filter_gradle_updates_by_age(
-    updates: list[UpdateFinding],
-    project: ProjectConfig,
-    resolution: CompleteResolution,
-    min_age_days: int,
-    context: PublicationLookupContext,
-) -> list[UpdateFinding]:
-    """Filter known young catalogue proposals; unknown dates remain eligible.
-
-    Scan-time lookups use catalogue coordinates and declared repositories only.
-    Native candidate validation remains part of the update workflow.
-    """
-    if (
-        not updates
-        or min_age_days == 0
-        or project.gradle_repository_routing != "standard-public"
-    ):
-        return list(updates)
-    cutoff = context.now() - timedelta(days=min_age_days)
-    pending = []
-    for update in updates:
-        requests = []
-        if update.gradle_target is not None:
-            for member in update.gradle_target.members:
-                if member.kind == "plugin":
-                    module = ModuleId(
-                        group=member.coordinate,
-                        artifact=member.coordinate + ".gradle.plugin",
-                        version=update.latest_version,
-                    )
-                else:
-                    parts = member.coordinate.split(":")
-                    if len(parts) != 2:
-                        continue
-                    module = ModuleId(
-                        group=parts[0], artifact=parts[1], version=update.latest_version
-                    )
-                repositories = tuple(
-                    repository
-                    for repository in resolution.report.repositories
-                    if repository.domain == member.kind
-                )
-                request = publication_request(module, repositories)
-                if request.routing_supported:
-                    requests.append(
-                        tuple(
-                            context.submit(repository, module)
-                            for repository in request.repositories
-                        )
-                    )
-        pending.append((update, requests))
-    result = []
-    for update, requests in pending:
-        dates = []
-        complete = (
-            bool(requests)
-            and update.gradle_target is not None
-            and len(requests) == len(update.gradle_target.members)
-        )
-        for futures in requests:
-            facts = [future.result() for future in futures]
-            known = [fact for fact in facts if isinstance(fact, PublicationFact)]
-            dates.extend(fact.timestamp for fact in known)
-            if (
-                any(isinstance(fact, AgeBlock) for fact in facts)
-                or len({fact.artifact_digest for fact in known}) != 1
-            ):
-                complete = False
-        if dates and max(dates) >= cutoff:
-            continue
-        published = max(dates) if complete else None
-        result.append(update.model_copy(update={"published_date": published}))
-    return result

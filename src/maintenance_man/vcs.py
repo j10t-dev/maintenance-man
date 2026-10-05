@@ -1,4 +1,3 @@
-import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -8,7 +7,6 @@ from rich import print as rprint
 
 from maintenance_man import config as _config
 from maintenance_man import sanitise_project_name
-from maintenance_man.gradle import GradleError
 
 
 class GitHubCLINotFoundError(Exception):
@@ -627,132 +625,13 @@ def _run(
     )
 
 
-def revision_tree_id(path: Path, revision: str = "@") -> str:
-    resolved = _single_commit_id(path, revision)
-    if not resolved.ok:
-        raise GradleError(resolved.error)
-    result = _run(
-        ["jj", "debug", "object", "commit", resolved.commit_id],
-        path,
-    )
-    # jj exposes the stored tree through its object inspector, not a template
-    # keyword. Refuse conflicted trees and unfamiliar inspector output.
-    trees = re.findall(
-        r'^    root_tree: Resolved\(\s*TreeId\(\s*"([0-9a-f]{40,64})",?\s*\),?\s*\),$',
-        result.stdout,
-        re.MULTILINE,
-    )
-    if result.returncode != 0 or len(trees) != 1:
-        raise GradleError("Cannot identify the verified jj tree")
-    return trees[0]
-
-
 def exact_commit_id(path: Path, revision: str) -> str:
     result = _single_commit_id(path, revision)
     if not result.ok:
-        raise GradleError(result.error)
+        raise BookmarkLookupError(result.error)
     return result.commit_id
 
 
-def _guarded_tip(source_bookmark: str, expected_base: str, expected_tip: str) -> str:
-    if source_bookmark not in _MANAGED_BOOKMARK_PREFIXES:
-        raise GradleError("Unexpected managed Gradle bookmark")
-    if not all(
-        re.fullmatch(r"[0-9a-f]{40,64}", value)
-        for value in (expected_base, expected_tip)
-    ):
-        raise GradleError("Invalid expected revision identity")
-    # Cardinality is tested before intersection so conflicted bookmarks cannot
-    # be reduced to the one expected arm and accidentally accepted.
-    base = f"exactly(exactly(main, 1) & {expected_base}, 1)"
-    tip = f"exactly(exactly({source_bookmark}, 1) & {expected_tip}, 1)"
-    return f"exactly(({base})::({tip}) & ({tip}), 1)"
-
-
-def promote_bookmark_to_main(
-    path: Path,
-    source_bookmark: str,
-    *,
-    expected_base: str | None = None,
-    expected_tip: str | None = None,
-) -> bool:
-    if expected_base is None and expected_tip is None:
-        return create_or_reset_bookmark("main", path, source_bookmark)
-    if expected_base is None or expected_tip is None:
-        return False
-    try:
-        guarded = _guarded_tip(source_bookmark, expected_base, expected_tip)
-        result = _run(["jj", "bookmark", "set", "main", "-r", guarded], path)
-        if result.returncode != 0:
-            return False
-        # Concurrent jj operations may merge into a conflicted bookmark. Never
-        # report finalization success unless the single result remains exact.
-        return (
-            exact_commit_id(path, "main") == expected_tip
-            and exact_commit_id(path, source_bookmark) == expected_tip
-        )
-    except GradleError, OSError, subprocess.TimeoutExpired:
-        return False
-
-
-def push_bookmark_and_create_pr(
-    project_path: Path,
-    bookmark: str,
-    *,
-    expected_base: str | None = None,
-    expected_tip: str | None = None,
-) -> tuple[bool, str]:
-    if expected_base is None and expected_tip is None:
-        selector = ["--bookmark", bookmark]
-    elif expected_base is None or expected_tip is None:
-        return False, "Both expected revision identities are required"
-    else:
-        try:
-            selector = [
-                "--named",
-                f"{bookmark}={_guarded_tip(bookmark, expected_base, expected_tip)}",
-            ]
-        except GradleError as exc:
-            return False, str(exc)
-    push = _run(
-        ["jj", "git", "push", *selector, "--remote", "origin"],
-        project_path,
-        timeout=120,
-    )
-    if push.returncode != 0:
-        return False, push.stderr.strip()
-    if expected_tip is not None:
-        try:
-            if (
-                exact_commit_id(project_path, bookmark) != expected_tip
-                or exact_commit_id(project_path, "main") != expected_base
-            ):
-                return False, "Local revisions changed during submission"
-        except GradleError as exc:
-            return False, str(exc)
-    pr = _run(
-        ["gh", "pr", "create", "--fill", "--head", bookmark, "--base", "main"],
-        project_path,
-        timeout=60,
-    )
-    if pr.returncode != 0:
-        if "already exists" in pr.stderr.lower():
-            return True, f"PR already exists for {bookmark}"
-        return False, pr.stderr.strip()
-    return True, pr.stdout.strip()
-
-
-def reset_verified_gradle_bookmark(
-    path: Path, bookmark: str, *, expected_base: str, expected_tip: str
-) -> bool:
-    try:
-        guarded = _guarded_tip(bookmark, expected_base, expected_tip)
-        base = f"exactly({expected_base} & ::({guarded}), 1)"
-        result = _run(
-            ["jj", "bookmark", "set", bookmark, "--allow-backwards", "-r", base], path
-        )
-        return (
-            result.returncode == 0 and exact_commit_id(path, bookmark) == expected_base
-        )
-    except GradleError, OSError, subprocess.TimeoutExpired:
-        return False
+def promote_bookmark_to_main(path: Path, source_bookmark: str) -> bool:
+    """Promote through jj's normal forward-only bookmark operation."""
+    return create_or_reset_bookmark("main", path, source_bookmark)

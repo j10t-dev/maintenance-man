@@ -37,7 +37,10 @@ def test_batch_reports_bookmark_access_error_without_requesting_rescan(
         lambda *args: subprocess.CompletedProcess([], 1, "", "permission denied"),
     )
     project = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
-    assert cli._update_batch("example", project, tmp_path, 7) is None
+    outcome = cli._update_batch("example", project, tmp_path)
+    assert outcome is not None
+    results, failed = outcome
+    assert failed and results[0].failed_phase == "setup"
     output = " ".join(capsys.readouterr().out.split())
     assert "permission denied" in output
     assert "rescan required" not in output
@@ -55,7 +58,7 @@ class TestUpdatePreChecks:
         from maintenance_man.vcs import GitHubCLINotFoundError
 
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
+            "maintenance_man.vcs.check_gh_available",
             MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
 
@@ -64,7 +67,7 @@ class TestUpdatePreChecks:
 
         assert exc_info.value.code == 0
 
-    def test_missing_gh_errors(
+    def test_update_does_not_require_gh(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -73,12 +76,13 @@ class TestUpdatePreChecks:
         from maintenance_man.vcs import GitHubCLINotFoundError
 
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
+            "maintenance_man.vcs.check_gh_available",
             MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
+        monkeypatch.setattr("maintenance_man.cli.Prompt.ask", lambda *a, **k: "none")
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
-        assert exc_info.value.code == 1
+        assert exc_info.value.code == 0
 
     def test_missing_jj_errors(
         self,
@@ -97,7 +101,7 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 1
 
-    def test_missing_test_config_warns_and_proceeds(
+    def test_missing_test_config_rejects_before_effects(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -128,7 +132,9 @@ class TestUpdatePreChecks:
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
 
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 1
+        mock_vulns.assert_not_called()
+        mock_updates.assert_not_called()
         assert "no test configuration" in capsys.readouterr().out.lower()
 
     def test_conflicting_resolve_flow_aborts(
@@ -192,7 +198,7 @@ class TestUpdatePreChecks:
 class TestUpdateNoOp:
     """No-op-first ordering: nothing to do => exit 0 without side effects."""
 
-    def test_no_scan_results_is_noop(
+    def test_missing_scan_requires_explicit_scan(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -208,7 +214,7 @@ class TestUpdateNoOp:
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 1
         mock_prune.assert_not_called()
         mock_workspace.assert_not_called()
 
@@ -885,18 +891,18 @@ class TestUpdateFinalise:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
+            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
         )
 
         with pytest.raises(SystemExit):
             app(["update", "vulnerable"])
 
         names = [name for name, _ in calls]
-        assert names[:5] == ["prune", "ensure-main", "set", "workspace", "new"]
-        assert calls[2][1][0] == "mm/update-dependencies"
+        assert names[:4] == ["ensure-main", "set", "workspace", "new"]
+        assert calls[1][1][0] == "mm/update-dependencies"
+        assert calls[1][1][2] == "main"
         assert calls[2][1][2] == "main"
-        assert calls[3][1][2] == "main"
-        assert calls[4][1][1] == "mm/update-dependencies"
+        assert calls[3][1][1] == "mm/update-dependencies"
 
 
 class TestUpdateAll:
@@ -934,11 +940,10 @@ class TestUpdateAll:
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update"])
-        assert exc_info.value.code == 0
-        # All 7 projects have findings in the stub — missing test config is
-        # now a warning, not a skip.
-        assert mock_vulns.call_count == 7
-        assert mock_updates.call_count == 7
+        assert exc_info.value.code == 4
+        # The no-tests project fails before application; the other six run.
+        assert mock_vulns.call_count == 6
+        assert mock_updates.call_count == 6
 
     def test_any_failure_exits_4(
         self,
@@ -990,8 +995,8 @@ class TestUpdateAll:
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "no-tests"])
-        assert exc_info.value.code == 0
-        mock_vulns.assert_called_once()
+        assert exc_info.value.code == 1
+        mock_vulns.assert_not_called()
 
 
 class TestUpdateTargetSelection:
@@ -1003,7 +1008,7 @@ class TestUpdateTargetSelection:
         from maintenance_man.vcs import GitHubCLINotFoundError
 
         monkeypatch.setattr(
-            "maintenance_man.cli.check_gh_available",
+            "maintenance_man.vcs.check_gh_available",
             MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
 
@@ -1288,10 +1293,6 @@ def gradle_update_cli(
     mock_update_cli_deps, mm_home_with_gradle, gradle_project, monkeypatch
 ):
     """Update-CLI boundaries plus Gradle spies. Returns a mutable spy record."""
-    monkeypatch.setattr(
-        "maintenance_man.gradle_workflow.load_scan_results",
-        lambda *args: mock_update_cli_deps["scan_result"],
-    )
     from maintenance_man.vcs import RevisionFileCheck
 
     monkeypatch.setattr(
@@ -1299,7 +1300,7 @@ def gradle_update_cli(
         lambda *args: RevisionFileCheck(ok=True, value=False, commit_id="a" * 40),
     )
     monkeypatch.setattr(
-        "maintenance_man.updater.discard_current_change", lambda path: None
+        "maintenance_man.updater.discard_current_change", lambda path: True
     )
     spies: dict[str, list] = {
         "workspaces": [],
@@ -1317,11 +1318,11 @@ def gradle_update_cli(
         lambda cfg, path: (spies["tests"].append(1), (True, None))[1],
     )
     monkeypatch.setattr(
-        "maintenance_man.gradle_updates.apply_gradle_update",
+        "maintenance_man.gradle.apply_gradle_update",
         lambda project, target: spies["applies"].append(target) or None,
     )
     monkeypatch.setattr(
-        "maintenance_man.gradle_updates.validate_gradle_target",
+        "maintenance_man.gradle.validate_gradle_target",
         lambda project, target: None,
     )
     monkeypatch.setattr(
@@ -1403,7 +1404,7 @@ def test_batch_summary_classifies_block_before_failed(capsys):
 
 
 @pytest.mark.parametrize("batch", [False, True])
-def test_gradle_ready_with_unresolved_block_never_finalizes(
+def test_gradle_ready_promotes_despite_unresolved_findings(
     gradle_update_cli,
     mock_update_cli_deps,
     monkeypatch,
@@ -1433,14 +1434,17 @@ def test_gradle_ready_with_unresolved_block_never_finalizes(
     )
     (mm_home_with_gradle / "config.toml").write_text(
         f'[projects.android]\npath = "{gradle_project.path}"\n'
-        'package_manager = "gradle"\n'
+        'package_manager = "gradle"\ntest_unit = "./gradlew test"\n'
     )
+    monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda *args: True)
     args = ["update"] if batch else ["update", "android"]
     with pytest.raises(SystemExit) as exc:
         app(args)
-    assert exc.value.code == 4
-    assert all(f.update_status == UpdateStatus.READY for f in state.updates)
-    assert all(not values for values in gradle_update_cli.values())
+    assert exc.value.code == 0
+    assert state.updates == []
+    assert len(state.vulnerabilities) == 1
+    assert gradle_update_cli["promotions"] == ["mm/update-dependencies"]
+    assert gradle_update_cli["applies"] == []
 
 
 def test_gradle_ready_only_missing_bookmark_preserves_state(
@@ -1542,30 +1546,60 @@ def test_resumed_sdk_refusal_precedes_workspace_removal(
     assert gradle_update_cli["workspaces"] == []
 
 
-@pytest.mark.parametrize("batch", [False, True])
-@pytest.mark.parametrize("status", [UpdateStatus.FAILED, UpdateStatus.READY])
-def test_gradle_legacy_update_history_is_preserved_without_effects(
-    gradle_update_cli,
-    mock_update_cli_deps,
-    monkeypatch,
-    batch,
-    status,
+def test_blocked_application_is_successful_batch_noop(
+    mm_home_with_projects, mock_update_cli_deps, monkeypatch
 ):
-    import subprocess
+    from maintenance_man import cli
 
-    scan = _gradle_scan_state(mock_update_cli_deps)
-    for row in scan.updates:
-        row.update_status = status
-        row.flow = Workflow.UPDATE
-        row.failed_phase = "unit"
-    before = scan.model_dump_json()
     monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *args, **kwargs: pytest.fail("legacy history cannot authorize commands"),
+        cli,
+        "_update_batch",
+        lambda *args: (
+            [UpdateResult("stale", "update", False, blocked_reason="target changed")],
+            False,
+        ),
     )
-    with pytest.raises(SystemExit) as exc:
-        app(["update"] if batch else ["update", "android"])
-    assert exc.value.code == ExitCode.UPDATE_FAILED
-    assert scan.model_dump_json() == before
-    assert all(not effects for effects in gradle_update_cli.values())
+    with pytest.raises(SystemExit) as result:
+        app(["update"])
+    assert result.value.code == 0
+
+
+def test_cleanup_failure_keeps_pass_rows_and_batch_continues(
+    mm_home_with_projects, mock_update_cli_deps, monkeypatch, capsys
+):
+    from maintenance_man import cli
+
+    entered = []
+
+    def enter(name, project, scan):
+        entered.append(name)
+        return project.path
+
+    monkeypatch.setattr(cli, "_enter_update_workspace", enter)
+
+    def cleanup(*args):
+        raise OSError("cleanup broken")
+
+    monkeypatch.setattr(cli, "remove_workspace", cleanup)
+
+    def passed(items, *args, **kwargs):
+        for row in items:
+            row.update_status = UpdateStatus.READY
+            row.flow = Workflow.UPDATE
+        return [UpdateResult(row.pkg_name, "update", True) for row in items]
+
+    monkeypatch.setattr(cli, "process_vulns", passed)
+    monkeypatch.setattr(cli, "process_updates", passed)
+    monkeypatch.setattr(
+        cli,
+        "load_scan_results",
+        lambda *args: make_scan_result(vulns=[], updates=[make_update()]),
+    )
+    with pytest.raises(SystemExit) as result:
+        app(["update", "vulnerable", "clean"])
+    assert result.value.code == 4
+    assert entered == ["vulnerable", "clean"]
+    output = capsys.readouterr().out
+    assert (
+        "cleanup broken" in output and "PASS" in output and "Update Summary" in output
+    )

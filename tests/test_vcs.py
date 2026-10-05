@@ -28,7 +28,6 @@ from maintenance_man.vcs import (
     main_commit_id,
     promote_bookmark_to_main,
     prune_stale_bookmarks,
-    push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
     resolve_bookmark_contains_current_change,
@@ -550,65 +549,6 @@ class TestPruneStaleBookmarks:
     def test_fetch_failure_returns_false(self, mock_run: MagicMock, tmp_path: Path):
         mock_run.return_value = _completed(returncode=1, stderr="network error")
         assert prune_stale_bookmarks(tmp_path) is False
-
-
-class TestPushBookmarkAndCreatePr:
-    @patch("maintenance_man.vcs._run")
-    def test_success_returns_pr_url(self, mock_run: MagicMock, tmp_path: Path):
-        mock_run.side_effect = [
-            _completed(),
-            _completed(stdout="https://github.com/owner/repo/pull/42"),
-        ]
-        ok, output = push_bookmark_and_create_pr(tmp_path, "mm/resolve-dependencies")
-        assert ok is True
-        assert output == "https://github.com/owner/repo/pull/42"
-        mock_run.assert_any_call(
-            [
-                "jj",
-                "git",
-                "push",
-                "--bookmark",
-                "mm/resolve-dependencies",
-                "--remote",
-                "origin",
-            ],
-            tmp_path,
-            timeout=120,
-        )
-        mock_run.assert_any_call(
-            [
-                "gh",
-                "pr",
-                "create",
-                "--fill",
-                "--head",
-                "mm/resolve-dependencies",
-                "--base",
-                "main",
-            ],
-            tmp_path,
-            timeout=60,
-        )
-
-    @patch("maintenance_man.vcs._run")
-    def test_pr_already_exists_is_success(self, mock_run: MagicMock, tmp_path: Path):
-        mock_run.side_effect = [
-            _completed(),
-            _completed(returncode=1, stderr="a pull request already exists"),
-        ]
-        ok, output = push_bookmark_and_create_pr(tmp_path, "mm/resolve-dependencies")
-        assert ok is True
-        assert "already exists" in output.lower()
-
-    @patch("maintenance_man.vcs._run")
-    def test_push_failure_returns_stderr_and_does_not_create_pr(
-        self, mock_run: MagicMock, tmp_path: Path
-    ):
-        mock_run.return_value = _completed(returncode=1, stderr="push rejected")
-        ok, output = push_bookmark_and_create_pr(tmp_path, "mm/resolve-dependencies")
-        assert ok is False
-        assert output == "push rejected"
-        assert mock_run.call_count == 1
 
 
 class TestEnsureMainBookmark:
@@ -1194,29 +1134,3 @@ def test_revision_file_malformed_listing_fails_closed(tmp_path, monkeypatch, lis
     assert not result.ok
     assert not result.value
     assert result.error
-
-
-def test_gradle_submission_binds_revision_in_push_operation(monkeypatch, tmp_path):
-    commands = []
-    base, tip = "a" * 40, "b" * 40
-
-    def execute(command, path, **kwargs):
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, "created", "")
-
-    monkeypatch.setattr(vcs, "_run", execute)
-    monkeypatch.setattr(
-        vcs,
-        "exact_commit_id",
-        lambda path, revision: base if revision == "main" else tip,
-    )
-    assert vcs.push_bookmark_and_create_pr(
-        tmp_path, "mm/resolve-dependencies", expected_base=base, expected_tip=tip
-    )[0]
-    assert "--named" in commands[0]
-    selector = commands[0][commands[0].index("--named") + 1]
-    assert selector.startswith("mm/resolve-dependencies=exactly(")
-    assert base in selector and tip in selector
-    assert "exactly(main, 1)" in selector
-    assert "exactly(mm/resolve-dependencies, 1)" in selector
-    assert commands[1][:3] == ["gh", "pr", "create"]

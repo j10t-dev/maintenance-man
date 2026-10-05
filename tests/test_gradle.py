@@ -502,7 +502,7 @@ class TestDiscoverGradleUpdates:
             str(Path(gradle_project.path) / "gradlew"),
             "versionCatalogUpdate",
             "--interactive",
-            "--no-daemon",
+            "--daemon",
             "--console=plain",
         ]
         assert Path(kwargs["cwd"]) == Path(gradle_project.path)
@@ -546,7 +546,7 @@ class TestGenerateGradleInventory:
         assert not (root / GRADLE_INVENTORY_RELPATH).exists()
         assert calls[0][1:] == [
             "cyclonedxBom",
-            "--no-daemon",
+            "--daemon",
             "--console=plain",
             "--rerun-tasks",
             "--no-build-cache",
@@ -927,7 +927,7 @@ class TestApplyGradleUpdate:
 
         assert calls[0][1:] == [
             "versionCatalogApplyUpdates",
-            "--no-daemon",
+            "--daemon",
             "--console=plain",
         ]
 

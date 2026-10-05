@@ -1,10 +1,8 @@
-import hashlib
 import json
 import logging
 import re
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,22 +16,20 @@ from maintenance_man import sanitise_project_name
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     filter_by_age,
-    filter_gradle_updates_by_age,
 )
 from maintenance_man.gradle import (
+    GRADLE_CATALOGUE_RELPATH,
     GradleError,
+    parse_catalogue,
 )
 from maintenance_man.gradle_resolution import (
     generate_gradle_report,
+    prepare_gradle_candidates,
+    select_gradle_candidates,
 )
-from maintenance_man.gradle_verification import context_inputs_valid
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
-    ComparisonContext,
     CompleteResolution,
-    FindingEvidence,
-    FindingKey,
-    GradleSnapshot,
     IncompleteResolution,
     ModuleId,
     ResolutionReport,
@@ -47,7 +43,6 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.outdated import get_outdated
-from maintenance_man.vcs import revision_tree_id
 
 
 class TrivyNotFoundError(Exception):
@@ -84,12 +79,9 @@ def scan_project(
     elif project.package_manager == "gradle":
         vulns, resolution = _run_gradle_scan(project)
         updates = get_outdated(project)
-        with PublicationLookupContext(
-            _config.MM_HOME / "gradle-publications"
-        ) as context:
-            updates = filter_gradle_updates_by_age(
-                updates, project, resolution, min_version_age_days, context
-            )
+        vulns, updates = _prepare_gradle_scan_findings(
+            project, vulns, resolution, updates, min_version_age_days
+        )
         secrets = (
             _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
             if project.scan_secrets
@@ -124,6 +116,93 @@ def scan_project(
     temporary.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
     temporary.replace(results_file)
     return scan_result
+
+
+def _prepare_gradle_scan_findings(
+    project: ProjectConfig,
+    vulnerabilities: list[VulnFinding],
+    resolution: CompleteResolution,
+    proposals: list[UpdateFinding],
+    minimum_age_days: int,
+) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+    catalogue = parse_catalogue(Path(project.path) / GRADLE_CATALOGUE_RELPATH)
+    plan = select_gradle_candidates(catalogue, resolution, vulnerabilities, proposals)
+    published: dict[str, datetime] = {}
+    with PublicationLookupContext(_config.MM_HOME / "gradle-publications") as context:
+        prepared = (
+            prepare_gradle_candidates(
+                project, plan.candidates, resolution, context, minimum_age_days
+            )
+            if plan.candidates
+            else ()
+        )
+        for item in prepared:
+            facts = [
+                context.results.get(request.model_dump_json())
+                for request in item.candidate.publication_requests
+            ]
+            dates = [fact.timestamp for fact in facts if fact is not None]
+            if dates:
+                published[item.candidate.target.group_key] = max(dates)
+    rows: list[VulnFinding] = []
+    associated: set[int] = set()
+    by_group = {item.candidate.target.group_key: item for item in prepared}
+    for item in prepared:
+        for index in item.candidate.source_indices:
+            associated.add(index)
+            rows.append(
+                vulnerabilities[index].model_copy(
+                    update={
+                        "gradle_target": item.candidate.target,
+                        "blocked_reason": item.block.reason if item.block else None,
+                        "gradle_block_kind": item.block.kind if item.block else None,
+                    }
+                )
+            )
+    for block in plan.withheld:
+        for index in block.source_indices:
+            associated.add(index)
+            rows.append(
+                vulnerabilities[index].model_copy(
+                    update={
+                        "gradle_target": None,
+                        "blocked_reason": block.reason,
+                        "gradle_block_kind": "mapping",
+                    }
+                )
+            )
+    for index, finding in enumerate(vulnerabilities):
+        if index not in associated:
+            rows.append(
+                finding.model_copy(
+                    update={
+                        "blocked_reason": "No supported catalogue target",
+                        "gradle_block_kind": "mapping",
+                    }
+                )
+            )
+    for proposal in proposals:
+        target = proposal.gradle_target
+        item = by_group.get(target.group_key) if target else None
+        if item is not None:
+            proposal.published_date = published.get(item.candidate.target.group_key)
+            proposal.gradle_target = item.candidate.target
+            proposal.blocked_reason = item.block.reason if item.block else None
+            proposal.gradle_block_kind = item.block.kind if item.block else None
+        elif not proposal.blocked_reason:
+            block = next(
+                (
+                    b
+                    for b in plan.withheld
+                    if target and b.group_key == target.group_key
+                ),
+                None,
+            )
+            proposal.blocked_reason = (
+                block.reason if block else "No supported catalogue target"
+            )
+            proposal.gradle_block_kind = "mapping"
+    return rows, proposals
 
 
 def check_trivy_available() -> None:
@@ -572,111 +651,4 @@ def _inventory_coverage_errors(
         f"resolved module missing from inventory: {module}"
         for module in scopes
         if module not in inventory
-    )
-
-
-def capture_gradle_snapshot(
-    project: ProjectConfig, context: ComparisonContext
-) -> GradleSnapshot | IncompleteResolution:
-    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
-        raise TrivyScanError(
-            "Comparison context expired or inputs changed; rebuild baseline and tip"
-        )
-    with generate_gradle_report(project) as (bom, resolution):
-        if isinstance(resolution, IncompleteResolution):
-            return resolution
-        report = resolution.report
-        if (
-            set(report.selected_scopes) != set(context.selected_scopes)
-            or report.producer_versions != context.producer_versions
-        ):
-            return IncompleteResolution(
-                report=report, reasons=("selected scopes or producer versions changed",)
-            )
-        inventory = bom.read_bytes()
-        modules = _inventory_modules(inventory, report)
-        scopes = _resolution_module_scopes(report)
-        coverage_errors = _inventory_coverage_errors(modules, scopes)
-        if coverage_errors:
-            return IncompleteResolution(
-                report=report,
-                reasons=coverage_errors,
-            )
-        binary = next(
-            key.removeprefix("binary:")
-            for key in context.loaded_input_digests
-            if key.startswith("binary:")
-        )
-        trivy_started = time.monotonic()
-        try:
-            completed = subprocess.run(
-                [binary, *context.scanner_flags, str(bom)],
-                cwd=project.path,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
-            raise TrivyScanError(f"Trivy snapshot failed: {exc}") from exc
-        if completed.returncode != 0:
-            raise TrivyScanError(f"Trivy snapshot failed: {completed.stderr.strip()}")
-        logging.getLogger(__name__).info(
-            "Gradle Trivy snapshot %.3fs", time.monotonic() - trivy_started
-        )
-        rows = _parse_gradle_trivy_output(completed.stdout)
-        grouped: dict[FindingKey, list[VulnFinding]] = {}
-        for row in rows:
-            group, separator, artifact = row.pkg_name.partition(":")
-            module = ModuleId(
-                group=group, artifact=artifact, version=row.installed_version
-            )
-            if not separator or module not in scopes or module not in modules:
-                return IncompleteResolution(
-                    report=report,
-                    reasons=(
-                        f"finding has no exact inventory/graph scope: "
-                        f"{row.pkg_name} {row.installed_version}",
-                    ),
-                )
-            for scope in scopes[module]:
-                key = FindingKey(
-                    advisory_id=row.vuln_id, coordinate=row.pkg_name, scope=scope
-                )
-                grouped.setdefault(key, []).append(row)
-        rank = {
-            Severity.UNKNOWN: 0,
-            Severity.LOW: 1,
-            Severity.MEDIUM: 2,
-            Severity.HIGH: 3,
-            Severity.CRITICAL: 4,
-        }
-        findings = tuple(
-            FindingEvidence(
-                key=key,
-                affected_versions=frozenset(row.installed_version for row in evidence),
-                severity=max((row.severity for row in evidence), key=rank.__getitem__),
-                has_unknown=any(row.severity == Severity.UNKNOWN for row in evidence),
-                rows=tuple(evidence),
-            )
-            for key, evidence in sorted(
-                grouped.items(),
-                key=lambda item: (
-                    item[0].advisory_id,
-                    item[0].coordinate,
-                    item[0].scope.project_path,
-                    item[0].scope.domain,
-                    item[0].scope.configuration,
-                ),
-            )
-        )
-    # Generated report/BOM cleanup must precede the jj source-tree snapshot.
-    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
-        raise TrivyScanError("Comparison inputs changed during capture")
-    return GradleSnapshot(
-        tree_id=revision_tree_id(Path(project.path)),
-        resolution=resolution,
-        context_identity=context.identity,
-        findings=findings,
-        inventory_digest=hashlib.sha256(inventory).hexdigest(),
-        inventory_modules=modules,
     )

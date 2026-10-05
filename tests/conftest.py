@@ -140,7 +140,7 @@ def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     scan_result = make_scan_result()
     state: dict[str, object] = {"scan_result": scan_result}
 
-    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
+    monkeypatch.setattr("maintenance_man.vcs.check_gh_available", lambda: None)
     monkeypatch.setattr("maintenance_man.cli.check_jj_available", lambda: None)
     monkeypatch.setattr(
         "maintenance_man.cli.load_scan_results",

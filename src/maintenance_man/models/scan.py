@@ -163,6 +163,8 @@ class ScanResult(BaseModel):
     secrets: list[SecretFinding] = []
     updates: list[UpdateFinding] = []
     gradle_resolution: dict[str, Any] | None = None
+    # Stable repair base until its READY status is atomically saved.
+    resolve_repair_base: str | None = None
 
     @property
     def has_actionable_vulns(self) -> bool:

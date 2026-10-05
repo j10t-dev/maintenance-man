@@ -11,10 +11,9 @@ from collections import deque
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError
@@ -134,7 +133,7 @@ def generate_gradle_report(
                     "mmGradleReport",
                     "--init-script",
                     str(script),
-                    "--no-daemon",
+                    "--daemon",
                     "--console=plain",
                     "--rerun-tasks",
                     "--no-build-cache",
@@ -223,7 +222,7 @@ def _scope_owners(
         parents.setdefault(edge.target, []).append(edge)
     queue = deque((component_id, 0, False) for component_id in affected)
     visited = set()
-    owners = set()
+    owners: set[tuple[str, Literal["direct", "parent", "platform", "plugin"]]] = set()
     owner_distances = {}
     while queue:
         component_id, distance, constrained = queue.popleft()
@@ -231,7 +230,7 @@ def _scope_owners(
             continue
         visited.add((component_id, constrained))
         if component_id in editable:
-            kind = (
+            kind: Literal["direct", "parent", "platform", "plugin"] = (
                 "direct" if distance == 0 else ("platform" if constrained else "parent")
             )
             for group in editable[component_id]:
@@ -392,6 +391,7 @@ def select_gradle_candidates(
             scopes=_candidate_scopes(catalogue, resolution, target),
         )
     linked = {}
+    indices = {id(row): index for index, row in enumerate(vulnerabilities)}
     for finding in vulnerabilities:
         parts = finding.pkg_name.split(":")
         if len(parts) != 2:
@@ -402,6 +402,7 @@ def select_gradle_candidates(
                     installed_version=finding.installed_version,
                     reason="finding lacks Maven coordinate",
                     advisory_ids=frozenset({finding.vuln_id}),
+                    source_indices=(indices[id(finding)],),
                 )
             )
             continue
@@ -411,7 +412,7 @@ def select_gradle_candidates(
         owners = resolve_gradle_owners(catalogue, resolution, module)
         known = [owner for owner in owners if isinstance(owner, KnownOwner)]
         groups = {owner.group_key for owner in known}
-        if any(isinstance(owner, UnknownOwner) for owner in owners) or len(groups) != 1:
+        if any(isinstance(owner, UnknownOwner) for owner in owners) or not groups:
             withheld.append(
                 CandidateWithheld(
                     group_key=None,
@@ -419,12 +420,16 @@ def select_gradle_candidates(
                     installed_version=finding.installed_version,
                     reason="cannot identify an unambiguous catalogue entry",
                     advisory_ids=frozenset({finding.vuln_id}),
+                    source_indices=(indices[id(finding)],),
                 )
             )
             continue
-        key = next(iter(groups))
-        linked.setdefault(key, []).append((finding, known))
+        for key in sorted(groups):
+            linked.setdefault(key, []).append(
+                (finding, [owner for owner in known if owner.group_key == key])
+            )
     for key, links in linked.items():
+        source_indices = tuple(indices[id(finding)] for finding, _ in links)
         advisory_ids = frozenset(finding.vuln_id for finding, _ in links)
         coordinates = frozenset(finding.pkg_name for finding, _ in links)
         scopes = tuple(
@@ -436,6 +441,7 @@ def select_gradle_candidates(
                 update={
                     "origins": frozenset({"ordinary", "security"}),
                     "requested_advisories": advisory_ids,
+                    "source_indices": source_indices,
                     "requested_coordinates": coordinates,
                     "scopes": tuple(dict.fromkeys((*existing.scopes, *scopes))),
                 }
@@ -460,6 +466,7 @@ def select_gradle_candidates(
                     installed_version=links[0][0].installed_version,
                     reason="owner requires one independent exact catalogue proposal",
                     advisory_ids=advisory_ids,
+                    source_indices=source_indices,
                 )
             )
             continue
@@ -482,6 +489,7 @@ def select_gradle_candidates(
                     installed_version=links[0][0].installed_version,
                     reason="incompatible shared catalogue group",
                     advisory_ids=advisory_ids,
+                    source_indices=source_indices,
                 )
             )
             continue
@@ -489,6 +497,7 @@ def select_gradle_candidates(
             target=built[0].gradle_target,
             origins=frozenset({"security"}),
             requested_advisories=advisory_ids,
+            source_indices=source_indices,
             requested_coordinates=coordinates,
             owner_keys=(key,),
             scopes=scopes,
@@ -501,6 +510,7 @@ def select_gradle_candidates(
                 coordinate=candidate.target.display_name,
                 installed_version=candidate.target.members[0].installed_version,
                 reason="conflicting or non-exact catalogue proposals",
+                source_indices=candidate.source_indices,
             )
         )
     return GradleFixPlan(
@@ -581,7 +591,7 @@ def validate_gradle_candidates(
                     "mmGradleValidateCandidates",
                     "--init-script",
                     str(script),
-                    "--no-daemon",
+                    "--daemon",
                     "--console=plain",
                     "--rerun-tasks",
                     "--no-build-cache",
@@ -740,7 +750,7 @@ def prepare_gradle_candidates(
             result.append(item)
             continue
         age = evaluate_gradle_candidate_age(
-            item.candidate, minimum_age_days, publication, datetime.now(timezone.utc)
+            item.candidate, minimum_age_days, publication, publication.now()
         )
         result.append(
             PreparedCandidate(
