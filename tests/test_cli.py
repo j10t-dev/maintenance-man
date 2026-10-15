@@ -90,9 +90,9 @@ class TestTodoCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["todo"])
         assert exc_info.value.code == 0
-        output = capsys.readouterr().out
+        output = capsys.readouterr().err
         assert "beta" in output
-        assert "no TODO.md" in output
+        assert "no todo items" in output.lower()
 
     def test_todo_all_shows_empty_message(
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
@@ -103,9 +103,9 @@ class TestTodoCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["todo"])
         assert exc_info.value.code == 0
-        output = capsys.readouterr().out
+        output = capsys.readouterr().err
         assert "alpha" in output
-        assert "empty" in output
+        assert "2 projects have no TODO items: alpha, beta" in output
 
     def test_todo_single_project_shows_content(
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
@@ -126,8 +126,8 @@ class TestTodoCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["todo", "beta"])
         assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "no TODO.md" in output
+        output = capsys.readouterr().err
+        assert "no todo items" in output.lower()
 
     def test_todo_unknown_project_exits_error(self, mm_home_with_todos: Path):
         """mm todo <unknown> exits with error (config error, not missing file)."""
@@ -146,4 +146,4 @@ class TestTodoCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["todo"])
         assert exc_info.value.code == 0
-        assert "no projects" in capsys.readouterr().out.lower()
+        assert "no projects" in capsys.readouterr().err.lower()

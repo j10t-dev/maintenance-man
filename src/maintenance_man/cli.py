@@ -1,22 +1,18 @@
 import subprocess
 import sys
 import time
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn
+from typing import Annotated, Literal, NoReturn
 
 import cyclopts
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.markup import escape
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.table import Table
+from rich.text import Text
 
-from maintenance_man import __version__
+from maintenance_man import __version__, output
 from maintenance_man import config as _config
 from maintenance_man.config import (
     MM_HOME,
@@ -41,7 +37,6 @@ from maintenance_man.gradle import (
     workspace_environment_reason,
 )
 from maintenance_man.models.activity import (
-    ActivityEvent,
     ProjectActivity,
     load_activity,
     record_activity,
@@ -109,11 +104,15 @@ class GateDecision(StrEnum):
     SKIP_BLOCKED = "blocked"
 
 
+type BuildPhaseStatus = Literal["pass", "fail", "skip"]
+type DeployPhaseStatus = BuildPhaseStatus | Literal["unchanged", "blocked"]
+
+
 @dataclass
 class DeployResult:
     project: str
-    build_status: Literal["pass", "fail", "skip"]
-    deploy_status: Literal["pass", "fail", "skip", "unchanged", "blocked"]
+    build_status: BuildPhaseStatus
+    deploy_status: DeployPhaseStatus
 
 
 def should_deploy(
@@ -144,10 +143,6 @@ def should_deploy(
     return GateDecision.DEPLOY, current_id
 
 
-console = Console()
-
-_TABLE_STYLE: dict[str, Any] = dict(show_edge=False, pad_edge=False, box=None)
-
 _UPDATE_BOOKMARK = "mm/update-dependencies"
 _RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
@@ -156,6 +151,8 @@ app = cyclopts.App(
     help="Config-driven CLI for routine software project maintenance.",
     version=__version__,
     version_flags=["--version", "-v"],
+    help_formatter=output.HelpFormatter(),
+    error_formatter=lambda error: output.literal(f"error: {error}"),
 )
 
 
@@ -170,9 +167,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 @app.command
 def init() -> None:
     """Initialise the ~/.mm directory and skeleton config."""
+    output.set_verbose(False)
     ensure_mm_home()
-    console.print(f"Initialised {MM_HOME}")
-    console.print(f"Edit {MM_HOME / 'config.toml'} to add projects.")
+    output.notice(f"Initialised {MM_HOME}")
+    output.notice(f"Add projects to {MM_HOME / 'config.toml'}")
 
 
 @app.command
@@ -190,6 +188,7 @@ def scan(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
 
     try:
@@ -198,13 +197,18 @@ def scan(
         _fatal(str(e))
 
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        output.notice("No projects configured · add projects to ~/.mm/config.toml")
         return
 
     if project:
         proj_config = _resolve_proj(cfg, project)
         try:
-            result = _scan_one(project, proj_config, cfg.defaults.min_version_age_days)
+            result = _scan_one(
+                project,
+                proj_config,
+                cfg.defaults.min_version_age_days,
+                report_clean=True,
+            )
         except (TrivyScanError, GradleError) as e:
             _fatal(str(e))
 
@@ -213,26 +217,34 @@ def scan(
         )
 
     # Scan all projects
+    started = time.monotonic()
     has_vulns = False
     has_updates = False
     had_gradle_error = False
+    clean: list[str] = []
     for name, proj_config in cfg.projects.items():
         if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
+            output.diagnostic(
+                "warning", f"{name} · path does not exist: {proj_config.path}"
             )
             continue
         try:
             result = _scan_one(name, proj_config, cfg.defaults.min_version_age_days)
         except (TrivyScanError, GradleError) as e:
-            console.print(f"[bold red]Error:[/] {name} — {e}")
+            output.diagnostic("error", f"{name} · {e}")
             had_gradle_error |= proj_config.package_manager == "gradle"
             continue
 
+        if not result.has_findings:
+            clean.append(name)
         has_vulns |= _scan_has_vulns(result, proj_config)
         has_updates |= result.has_updates
 
+    if clean:
+        output.notice(
+            f"{len(clean)} projects have no findings: {', '.join(clean)}"
+            f" · scanned in {time.monotonic() - started:.1f}s"
+        )
     if had_gradle_error:
         sys.exit(ExitCode.ERROR)
     sys.exit(_scan_exit_code(has_vulns, has_updates))
@@ -271,11 +283,11 @@ def _sorted_project_names(cfg: MmConfig) -> list[str]:
 
 def _exit_if_no_update_targets(cfg: MmConfig, target_names: list[str]) -> None:
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        output.notice("No projects configured · add projects to ~/.mm/config.toml")
         sys.exit(ExitCode.OK)
 
     if not target_names:
-        console.print("No target projects.")
+        output.notice("No target projects")
         sys.exit(ExitCode.OK)
 
 
@@ -306,12 +318,15 @@ def _resolve_update_targets(
 def update(
     *projects: str,
     negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
+    verbose: bool = False,
     config: Path | None = None,
 ) -> None:
     """Apply updates from scan results to one, many, or all projects.
 
     Parameters
     ----------
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     projects: str
         Project names to update. No names batch-updates all configured projects.
         With -n/--negate, names are exclusions. One name keeps the interactive
@@ -321,6 +336,7 @@ def update(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     mode, targets = _resolve_update_targets(cfg, list(projects), negate=negate)
 
@@ -351,10 +367,11 @@ def sync(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
 
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        output.notice("No projects configured · add projects to ~/.mm/config.toml")
         sys.exit(ExitCode.OK)
 
     ordered = _dedupe_preserve_order(list(projects))
@@ -362,22 +379,33 @@ def sync(
     targets = ordered if ordered else _sorted_project_names(cfg)
 
     had_errors = False
+    failures: dict[str, list[str]] = {}
     for name in targets:
         proj_config = cfg.projects[name]
         if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
+            output.diagnostic(
+                "warning", f"{name} · path does not exist: {proj_config.path}"
             )
             had_errors = True
             continue
         ok, msg = sync_main(proj_config.path)
-        if ok:
-            console.print(f"  {name} — {msg}")
-        else:
-            console.print(f"  [bold red]{name} — {msg}[/]")
-            had_errors = True
+        output.heading(name)
+        output.outcome(
+            name,
+            "sync",
+            "passed" if ok else "failed",
+            "main",
+            reason=msg if ok or not output.terminal() else "",
+        )
+        if not ok:
+            failures.setdefault(msg, []).append(name)
+        had_errors |= not ok
 
+    for reason, names in failures.items():
+        output.diagnostic(
+            "error",
+            f"{len(names)} projects failed to sync: {', '.join(names)} · {reason}",
+        )
     sys.exit(ExitCode.SYNC_FAILED if had_errors else ExitCode.OK)
 
 
@@ -396,16 +424,13 @@ def _update_batch_targets(
     for name in target_names:
         proj_config = cfg.projects[name]
         if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
+            output.diagnostic(
+                "warning", f"{name} · path does not exist: {proj_config.path}"
             )
             had_errors = True
             continue
 
-        console.print(f"\n{'═' * 40}")
-        console.print(f"[bold]{name}[/]")
-        console.print("═" * 40)
+        output.heading(name)
 
         outcome = _update_batch(name, proj_config, results_dir)
         if outcome is None:
@@ -534,13 +559,13 @@ def _prompt_selection(
     choices = "/".join(parts)
 
     while True:
-        selection = Prompt.ask(f"\n  Select updates [{choices}]", default="all")
+        selection = output.prompt(f"Select updates [{choices}]", default="all")
         result = _parse_selection(
             selection, numbered, selectable_vulns, selectable_updates
         )
         if result is not None:
             return result
-        console.print(f"[bold red]Invalid selection:[/] '{selection}'. Try again.")
+        output.diagnostic("error", f"Invalid selection: {selection}")
 
 
 def _process_selected_vulns(
@@ -552,7 +577,6 @@ def _process_selected_vulns(
 ) -> list[UpdateResult]:
     if not selected:
         return []
-    console.print(f"\n[bold]Processing {len(selected)} vuln fix(es)...[/]")
     return process_vulns(
         selected,
         work_config,
@@ -572,7 +596,6 @@ def _process_selected_updates(
 ) -> list[UpdateResult]:
     if not selected:
         return []
-    console.print(f"\n[bold]Processing {len(selected)} update(s)...[/]")
     return process_updates(
         selected,
         work_config,
@@ -584,28 +607,19 @@ def _process_selected_updates(
 
 
 def _print_update_summary(all_results: list[UpdateResult]) -> None:
-    blocked = [r for r in all_results if r.blocked_reason]
-    passed = [r for r in all_results if r.passed and not r.blocked_reason]
-    failed = [r for r in all_results if not r.passed and not r.blocked_reason]
-    console.print("\n" + "─" * 40)
-    console.print("[bold]Summary:[/]")
-    if passed:
-        console.print(f"  [green]{len(passed)} passed[/]")
-    if blocked:
-        console.print(f"  [yellow]{len(blocked)} blocked[/]")
-        for r in blocked:
-            console.print(f"  [yellow]BLOCKED[/] {r.pkg_name} — {r.blocked_reason}")
-    if failed:
-        phase_labels = {
-            "apply": "install failed",
-            "branch": "bookmark creation failed",
-            "commit": "commit failed",
+    if not all_results:
+        return
+    counts = Counter(
+        "blocked" if result.blocked_reason else "passed" if result.passed else "failed"
+        for result in all_results
+    )
+    output.summary(
+        {
+            state: counts[state]
+            for state in ("passed", "failed", "blocked")
+            if counts[state]
         }
-        for r in failed:
-            phase = r.failed_phase or "unknown"
-            label = phase_labels.get(phase, phase)
-            console.print(f"  [red]FAIL[/] {r.pkg_name} — {label}")
-    console.print("─" * 40)
+    )
 
 
 def _has_update_progress(scan_result: ScanResult) -> bool:
@@ -678,11 +692,17 @@ def _finalise_local_changes(
 ) -> bool:
     bookmark = _UPDATE_BOOKMARK if flow == Workflow.UPDATE else _RESOLVE_BOOKMARK
     if not promote_bookmark_to_main(orig_path, bookmark):
-        console.print(f"[bold red]Promotion failed:[/] {project_name} remains pending")
+        output.outcome(
+            project_name, "promotion", "failed", "local main", reason="remains pending"
+        )
         return False
     if not refresh_working_copy_from_main(orig_path):
-        console.print(
-            f"[bold red]Workspace refresh failed:[/] {project_name}: main was promoted"
+        output.outcome(
+            project_name,
+            "promotion",
+            "failed",
+            "local main",
+            reason="main promoted; workspace refresh failed",
         )
         return False
     for finding in (*scan_result.vulnerabilities, *scan_result.updates):
@@ -692,13 +712,8 @@ def _finalise_local_changes(
             finding.flow = None
     remove_completed_findings(scan_result)
     save_scan_results(project_name, results_dir, scan_result)
-    console.print(f"[bold green]Promoted {project_name} to local main.[/]")
+    output.outcome(project_name, "promotion", "passed", "local main")
     return True
-
-
-def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
-    if not has_test_config(proj_config):
-        _fatal(f"{project} — no test configuration; automatic updates require tests")
 
 
 def _load_validated_scan(
@@ -723,7 +738,7 @@ def _load_validated_scan(
     ]
     updates = scan_result.updates
     if not actionable_vulns and not updates:
-        console.print(f"[bold green]{project}[/] — nothing to {workflow}.")
+        output.notice(f"No findings to {workflow} in {project}")
         sys.exit(ExitCode.OK)
     if group_findings(proj_config, [*actionable_vulns, *updates]):
         _require_test_config(project, proj_config)
@@ -834,6 +849,8 @@ def _run_resolve_findings(
     findings: list[Finding],
 ) -> int:
     """Process resolve candidates; stop on first failure, promote when all READY."""
+    output.heading(project)
+    _print_blocked_findings(scan_result, Workflow.RESOLVE)
     results = process_findings(
         findings,
         proj_config,
@@ -846,16 +863,13 @@ def _run_resolve_findings(
     if any(
         not r.passed and not r.blocked_reason for r in results
     ) or _ordered_failed_findings(scan_result, proj_config):
-        console.print(
-            f"  [bold yellow]Resolve paused.[/] Continue with "
-            f"[bold]mm resolve {project} --continue[/]."
-        )
+        output.notice(f"Resolve paused in {project}")
+        output.diagnostic("hint", f"mm resolve {project} --continue")
         return ExitCode.UPDATE_FAILED
 
     ready_findings = _ordered_ready_findings(
         scan_result, flow=Workflow.RESOLVE, proj_config=proj_config
     )
-    _print_blocked_findings(scan_result)
     if not ready_findings:
         return ExitCode.OK
     if not _finalise_local_changes(
@@ -887,37 +901,19 @@ def _cleanup_update_workspace(project: str, config: ProjectConfig) -> bool:
         remove_workspace(config.path, project)
         return True
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        console.print(f"[bold red]Cleanup failed:[/] {project} — {exc}")
+        output.diagnostic("error", f"Cleanup failed: {project} · {exc}")
         return False
 
 
 def _print_mass_update_summary(
     project_results: list[tuple[str, list[UpdateResult]]],
 ) -> None:
-    """Print a cross-project summary table."""
     if not project_results:
-        console.print("\n[dim]No projects had actionable findings.[/]")
+        output.notice("No projects had actionable findings")
         return
-
-    table = Table(title="Update Summary")
-    table.add_column("Project", style="bold")
-    table.add_column("Package")
-    table.add_column("Kind")
-    table.add_column("Result")
-
-    for proj_name, results in project_results:
-        for r in results:
-            status = (
-                f"[yellow]BLOCKED ({r.blocked_reason})[/]"
-                if r.blocked_reason
-                else "[green]PASS[/]"
-                if r.passed
-                else f"[red]FAIL ({r.failed_phase})[/]"
-            )
-            table.add_row(proj_name, r.pkg_name, r.kind, status)
-
-    console.print()
-    console.print(table)
+    _print_update_summary(
+        [result for _, results in project_results for result in results]
+    )
 
 
 def _deploy_one(
@@ -928,143 +924,121 @@ def _deploy_one(
     *,
     check: bool = False,
 ) -> DeployResult:
-    """Build and deploy a single project. Returns result, never raises."""
-    build_status = "skip"
-    deploy_status = "skip"
-
+    """Report one project's build, deploy and health outcomes together."""
+    output.heading(name)
+    build_status: Literal["pass", "fail", "skip"] = "skip"
     if proj_config.build_command:
-        console.print("  [bold]Building...[/]")
         try:
             _run_build_step(name, proj_config)
-        except BuildError as e:
-            console.print(f"  [bold red]Build failed:[/] {e}")
-            build_status = "fail"
-            return DeployResult(
-                project=name,
-                build_status=build_status,
-                deploy_status=deploy_status,
-            )
+        except BuildError as exc:
+            output.diagnostic("error", str(exc))
+            result = DeployResult(name, "fail", "skip")
+            _print_deploy_result(result)
+            return result
         build_status = "pass"
 
-    console.print("  [bold]Deploying...[/]")
     try:
         _run_deploy_step(name, proj_config, commit_id)
-    except DeployError as e:
-        console.print(f"  [bold red]Deploy failed:[/] {e}")
-        deploy_status = "fail"
-        return DeployResult(
-            project=name,
-            build_status=build_status,
-            deploy_status=deploy_status,
-        )
-    deploy_status = "pass"
-
+    except DeployError as exc:
+        output.diagnostic("error", str(exc))
+        result = DeployResult(name, build_status, "fail")
+        _print_deploy_result(result)
+        return result
+    result = DeployResult(name, build_status, "pass")
+    _print_deploy_result(result)
     if check and cfg.defaults.healthcheck_url:
-        _run_health_check_step(cfg.defaults.healthcheck_url, name, indent="  ")
-
-    return DeployResult(
-        project=name,
-        build_status=build_status,
-        deploy_status=deploy_status,
-    )
+        _run_health_check_step(cfg.defaults.healthcheck_url, name)
+    return result
 
 
 def _deploy_all(cfg: MmConfig, *, check: bool = False, force: bool = False) -> NoReturn:
-    """Deploy all configured projects that have a deploy_command."""
+    """Deploy configured projects, reporting each once before the next starts."""
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        output.notice("No projects configured · add projects to ~/.mm/config.toml")
         sys.exit(ExitCode.OK)
-
     activity = load_activity(_config.MM_HOME / "activity.json")
     results: list[DeployResult] = []
-
+    not_deployable: list[str] = []
     for name, proj_config in sorted(cfg.projects.items()):
         if not proj_config.deployable:
-            console.print(f"[dim]{name} — skipped (not deployable)[/]")
+            not_deployable.append(name)
             continue
-
         if not proj_config.deploy_command:
             continue
-
         if not proj_config.path.exists():
-            console.print(
-                f"[bold yellow]Warning:[/] {name} — "
-                f"path does not exist: {proj_config.path}"
+            output.diagnostic(
+                "warning", f"{name} · path does not exist: {proj_config.path}"
             )
-            results.append(
-                DeployResult(project=name, build_status="skip", deploy_status="fail")
+            result = DeployResult(name, "skip", "fail")
+            _print_deploy_result(result)
+        else:
+            decision, current_id = should_deploy(
+                name, proj_config.path, activity, force=force
             )
-            continue
-
-        decision, current_id = should_deploy(
-            name, proj_config.path, activity, force=force
-        )
-        if decision is GateDecision.SKIP_UNCHANGED:
-            console.print(f"[dim]{name} — unchanged since last deploy[/]")
-            results.append(
-                DeployResult(
-                    project=name, build_status="skip", deploy_status="unchanged"
+            if decision is GateDecision.SKIP_UNCHANGED:
+                result = DeployResult(name, "skip", "unchanged")
+                _print_deploy_result(result)
+            elif decision is GateDecision.SKIP_BLOCKED:
+                output.diagnostic(
+                    "warning", f"{name} · could not resolve main revision; skipping"
                 )
-            )
-            continue
-        if decision is GateDecision.SKIP_BLOCKED:
-            console.print(
-                f"[bold yellow]Warning:[/] {name} — could not resolve main "
-                f"revision; skipping (use --force to deploy anyway)"
-            )
-            results.append(
-                DeployResult(project=name, build_status="skip", deploy_status="blocked")
-            )
-            continue
-
-        console.print(f"\n{'═' * 40}")
-        console.print(f"[bold]{name}[/]")
-        console.print("═" * 40)
-
-        results.append(_deploy_one(name, proj_config, cfg, current_id, check=check))
-
+                output.diagnostic("hint", f"mm deploy {name} --force")
+                result = DeployResult(name, "skip", "blocked")
+                _print_deploy_result(result)
+            else:
+                result = _deploy_one(name, proj_config, cfg, current_id, check=check)
+        results.append(result)
+    if not_deployable:
+        output.notice(
+            f"{len(not_deployable)} projects are not deployable: "
+            + ", ".join(not_deployable)
+        )
     _print_deploy_summary(results)
-
-    # Only "fail" counts; "unchanged"/"blocked" are deliberate skips, not failures.
     any_failed = any(
         r.deploy_status == "fail" or r.build_status == "fail" for r in results
     )
     sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
 
 
+def _print_deploy_result(result: DeployResult) -> None:
+    output.heading(result.project)
+    output.outcome(
+        result.project, "build", _DEPLOY_STATES[result.build_status], "build"
+    )
+    output.outcome(
+        result.project,
+        "deploy",
+        _DEPLOY_STATES[result.deploy_status],
+        "deploy",
+        reason="build failed" if result.build_status == "fail" else "",
+    )
+
+
 def _print_deploy_summary(results: list[DeployResult]) -> None:
-    """Print a cross-project deploy summary table."""
     if not results:
-        console.print("\n[dim]No projects have deploy_command configured.[/]")
+        output.notice("No projects have deploy_command configured")
         return
+    counts: Counter[output.Status] = Counter(
+        "failed"
+        if result.build_status == "fail"
+        else _DEPLOY_STATES[result.deploy_status]
+        for result in results
+    )
+    output.summary(counts)
 
-    _STATUS_DISPLAY = {
-        "pass": "[green]PASS[/]",
-        "fail": "[red]FAIL[/]",
-        "skip": "[dim]SKIP[/]",
-        "unchanged": "[dim]UNCHANGED[/]",
-        "blocked": "[yellow]BLOCKED[/]",
-    }
 
-    table = Table(title="Deploy Summary")
-    table.add_column("Project", style="bold")
-    table.add_column("Build")
-    table.add_column("Deploy")
-
-    for r in results:
-        table.add_row(
-            r.project,
-            _STATUS_DISPLAY[r.build_status],
-            _STATUS_DISPLAY[r.deploy_status],
-        )
-
-    console.print()
-    console.print(table)
+_DEPLOY_STATES: dict[DeployPhaseStatus, output.Status] = {
+    "pass": "passed",
+    "fail": "failed",
+    "skip": "skipped",
+    "blocked": "blocked",
+    "unchanged": "unchanged",
+}
 
 
 def _warn_missing_healthcheck_url() -> None:
     """Warn when --check was requested but no healthcheck_url is configured."""
-    console.print("[dim]--check: no healthcheck_url configured in [defaults][/]")
+    output.diagnostic("warning", "--check: no healthcheck_url configured in [defaults]")
 
 
 def _record_deploy_activity(
@@ -1137,23 +1111,26 @@ def _run_deploy_step(
 def _run_health_check_step(
     healthcheck_url: str,
     project: str,
-    *,
-    indent: str = "",
 ) -> None:
     """Run a health check and print a consistent status message."""
     result = check_health(healthcheck_url, project)
     if result.is_up:
-        console.print(f"{indent}[bold green]Healthy:[/] {project} is up")
-    elif result.error:
-        console.print(f"{indent}[bold yellow]Warning:[/] {result.error}")
+        output.outcome(project, "health", "passed", "health check")
     else:
-        console.print(f"{indent}[bold yellow]Warning:[/] {project} is not healthy")
+        output.outcome(
+            project,
+            "health",
+            "failed",
+            "health check",
+            reason=result.error or "not healthy",
+        )
 
 
 @app.command
 def deploy(
     project: str | None = None,
     *,
+    verbose: bool = False,
     build: bool = False,
     check: bool = False,
     force: Annotated[bool, cyclopts.Parameter(name=["--force", "-f"])] = False,
@@ -1163,6 +1140,8 @@ def deploy(
 
     Parameters
     ----------
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     project: str | None
         Project name to deploy. Deploys all if omitted.
     build: bool
@@ -1176,6 +1155,7 @@ def deploy(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
 
     if not project:
@@ -1187,12 +1167,13 @@ def deploy(
     proj_config = _resolve_proj(cfg, project)
 
     if not proj_config.deployable:
-        console.print(f"[dim]{project} — skipped (not deployable)[/]")
+        output.heading(project)
+        output.outcome(project, "deploy", "skipped", "deploy", reason="not deployable")
         sys.exit(ExitCode.OK)
 
     if not proj_config.deploy_command:
         _fatal(
-            f"No deploy_command configured for [bold]{project}[/]. "
+            f"No deploy_command configured for {project}. "
             f"Add deploy_command to [projects.{project}] in ~/.mm/config.toml."
         )
 
@@ -1201,40 +1182,47 @@ def deploy(
         project, proj_config.path, activity, force=force
     )
     if decision is GateDecision.SKIP_UNCHANGED:
-        console.print(
-            f"[bold yellow]{project}[/] unchanged since last deploy "
-            f"(use --force to redeploy)."
+        output.heading(project)
+        output.outcome(
+            project,
+            "deploy",
+            "unchanged",
+            "deploy",
+            reason="unchanged since last deploy",
         )
+        output.diagnostic("hint", f"mm deploy {project} --force")
         sys.exit(ExitCode.OK)
     if decision is GateDecision.SKIP_BLOCKED:
         _fatal(
-            f"Could not resolve main revision for [bold]{project}[/]; refusing "
+            f"Could not resolve main revision for {project}; refusing "
             f"to deploy unverified state (use --force to override).",
             code=ExitCode.ERROR,
         )
 
+    output.heading(project)
     if build and proj_config.build_command:
-        console.print(f"[bold]Building {project}[/]\n")
         try:
             _run_build_step(project, proj_config)
         except BuildError as e:
+            output.outcome(project, "build", "failed", "build")
+            output.outcome(
+                project, "deploy", "skipped", "deploy", reason="build failed"
+            )
             _fatal(str(e), code=ExitCode.BUILD_FAILED)
-        console.print("\n[bold green]Build succeeded.[/]\n")
-
-    console.print(f"[bold]Deploying {project}[/]\n")
+        output.outcome(project, "build", "passed", "build")
 
     try:
         _run_deploy_step(project, proj_config, current_id)
     except DeployError as e:
+        output.outcome(project, "deploy", "failed", "deploy")
         _fatal(str(e), code=ExitCode.DEPLOY_FAILED)
 
-    console.print("\n[bold green]Deploy succeeded.[/]")
+    output.outcome(project, "deploy", "passed", "deploy")
 
     if check:
         if not cfg.defaults.healthcheck_url:
             _warn_missing_healthcheck_url()
         else:
-            console.print(f"\n[bold]Checking health of {project}...[/]")
             _run_health_check_step(cfg.defaults.healthcheck_url, project)
 
     sys.exit(ExitCode.OK)
@@ -1244,6 +1232,7 @@ def deploy(
 def test(
     project: str,
     *,
+    verbose: bool = False,
     config: Path | None = None,
 ) -> None:
     """Run a project's test suite.
@@ -1253,24 +1242,29 @@ def test(
 
     Parameters
     ----------
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     project: str
         Project name to test.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     _require_test_config(project, proj_config)
 
-    console.print(f"[bold]Testing {project}[/]\n")
+    output.heading(project)
 
     passed, failed_phase = run_test_phases(proj_config, proj_config.path)
 
     if passed:
-        console.print("\n[bold green]All test phases passed.[/]")
+        output.outcome(project, "test", "passed", "tests")
         sys.exit(ExitCode.OK)
     else:
-        console.print(f"\n[bold red]Failed:[/] {failed_phase} tests")
+        output.outcome(
+            project, "test", "failed", "tests", reason=f"{failed_phase} failed"
+        )
         sys.exit(ExitCode.TEST_FAILED)
 
 
@@ -1278,27 +1272,31 @@ def test(
 def build(
     project: str,
     *,
+    verbose: bool = False,
     config: Path | None = None,
 ) -> None:
     """Build a project's artefacts.
 
     Parameters
     ----------
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     project: str
         Project name to build.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
 
     if not proj_config.build_command:
         _fatal(
-            f"No build_command configured for [bold]{project}[/]. "
+            f"No build_command configured for {project}. "
             f"Add build_command to [projects.{project}] in ~/.mm/config.toml."
         )
 
-    console.print(f"[bold]Building {project}[/]\n")
+    output.heading(project)
 
     activity_path = _config.MM_HOME / "activity.json"
     branch = _current_label(proj_config.path)
@@ -1306,14 +1304,12 @@ def build(
         run_build(project, proj_config.build_command, proj_config.path)
     except BuildError as e:
         record_activity(activity_path, project, "build", success=False, branch=branch)
+        output.outcome(project, "build", "failed", "build")
         _fatal(str(e), code=ExitCode.BUILD_FAILED)
 
     record_activity(activity_path, project, "build", success=True, branch=branch)
-    console.print("\n[bold green]Build succeeded.[/]")
+    output.outcome(project, "build", "passed", "build")
     sys.exit(ExitCode.OK)
-
-
-_NO_DATA = "[dim]—[/]"
 
 
 @app.command(name=("list", "status", "st"))
@@ -1331,67 +1327,158 @@ def list_projects(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
-
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        output.notice("No projects configured")
+        output.diagnostic("hint", "mm init")
         return
 
-    results_dir = _config.MM_HOME / "scan-results"
     scan_results: dict[str, ScanResult] = {}
     for name in cfg.projects:
         try:
-            scan_results[name] = load_scan_results(name, results_dir)
+            scan_results[name] = load_scan_results(
+                name, _config.MM_HOME / "scan-results"
+            )
         except NoScanResultsError:
             pass
         except Exception:
-            console.print(
-                f"[yellow]Warning:[/] corrupt scan results for '{name}' — skipping"
-            )
-
-    activity = load_activity(_config.MM_HOME / "activity.json")
-
-    table = Table(title="Configured Projects")
-    for col, kw in [
-        ("Name", {"style": "bold"}),
-        ("Type", {}),
-        ("Vulns", {"justify": "right"}),
-        ("Updates", {"justify": "right"}),
-        ("Secrets", {"justify": "right"}),
-        ("Scanned", {}),
-        ("Built", {}),
-        ("Deployed", {}),
-    ]:
-        table.add_column(col, **kw)  # type: ignore
-
-    for name, project in sorted(cfg.projects.items()):
-        sr = scan_results.get(name)
-        if sr:
-            counts = (
-                str(sum(v.actionable for v in sr.vulnerabilities)),
-                str(len(sr.updates)),
-                str(len(sr.secrets)),
-                _relative_time(sr.scanned_at),
-            )
-        else:
-            counts = (_NO_DATA, _NO_DATA, _NO_DATA, "[dim]never[/]")
-
-        proj_activity = activity.get(name)
-        table.add_row(
-            name,
-            project.package_manager,
-            *counts,
-            _format_activity(proj_activity.last_build if proj_activity else None),
-            "[dim]n/a[/]"
-            if not project.deployable
-            else _format_activity(proj_activity.last_deploy if proj_activity else None),
-        )
-
-    console.print(table)
+            output.diagnostic("warning", f"corrupt scan results for {name}; skipped")
 
     if detail:
-        for name in sorted(scan_results):
-            _print_scan_result(scan_results[name])
+        clean = []
+        unscanned = []
+        for name in sorted(cfg.projects):
+            result = scan_results.get(name)
+            if result is None:
+                unscanned.append(name)
+            elif not result.has_findings:
+                clean.append(name)
+            else:
+                _print_scan_result(result)
+        if clean:
+            output.notice(f"{len(clean)} projects have no findings: {', '.join(clean)}")
+        if unscanned:
+            output.notice(
+                f"{len(unscanned)} projects have no saved scan: {', '.join(unscanned)}"
+            )
+        return
+
+    activity = load_activity(_config.MM_HOME / "activity.json")
+    headers = [
+        "project",
+        "type",
+        "vulns",
+        "updates",
+        "secrets",
+        "scanned",
+        "built",
+        "deployed",
+    ]
+    rows: list[list[str]] = []
+    pipe_rows: list[list[str]] = []
+    for name, project in sorted(cfg.projects.items()):
+        result = scan_results.get(name)
+        counts = (
+            [
+                str(sum(v.actionable for v in result.vulnerabilities)),
+                str(len(result.updates)),
+                str(len(result.secrets)),
+            ]
+            if result
+            else ["-"] * 3
+        )
+        events = activity.get(name)
+        built = events.last_build if events else None
+        deployed = events.last_deploy if events else None
+        build_status = (
+            "passed" if built and built.success else "failed" if built else "-"
+        )
+        deploy_status = (
+            "not deployable"
+            if not project.deployable
+            else "passed"
+            if deployed and deployed.success
+            else "failed"
+            if deployed
+            else "-"
+        )
+        scanned = output.timestamp(result.scanned_at) if result else "never"
+        built_text = output.timestamp(built.timestamp) if built else "-"
+        deployed_text = output.timestamp(deployed.timestamp) if deployed else "-"
+        rows.append(
+            [
+                name,
+                project.package_manager,
+                *counts,
+                scanned,
+                f"failed {built_text}" if build_status == "failed" else built_text,
+                "not deployable"
+                if not project.deployable
+                else f"failed {deployed_text}"
+                if deploy_status == "failed"
+                else deployed_text,
+            ]
+        )
+        pipe_rows.append(
+            [
+                name,
+                project.package_manager,
+                *counts,
+                result.scanned_at.isoformat() if result else "never",
+                built.timestamp.isoformat() if built else "-",
+                build_status,
+                deployed.timestamp.isoformat() if deployed else "-",
+                deploy_status,
+            ]
+        )
+
+    hidden = []
+    visible = [0]
+    for index, title in enumerate(headers[1:], 1):
+        values = {row[index] for row in rows}
+        comparable = len(rows) > 1 and len(values) == 1
+        if not comparable:
+            visible.append(index)
+        elif values == {"-"}:
+            hidden.append(f"{title} -")
+        elif values == {"0"}:
+            hidden.append(f"0 {title}")
+        else:
+            hidden.append(f"{title} {next(iter(values))}")
+    width_hidden = []
+    if output.terminal():
+        width = output.console().width
+        for index in (5, 6, 7, 1, 4, 3, 2):
+            required = sum(
+                max(
+                    len(headers[column]), min(24, max(len(row[column]) for row in rows))
+                )
+                + 2
+                for column in visible
+            )
+            if required <= width:
+                break
+            if index in visible:
+                visible.remove(index)
+                width_hidden.append(headers[index])
+    output.heading("projects", f"{len(rows)} configured")
+    output.project_records(
+        [headers[index] for index in visible],
+        [
+            [
+                output.literal(row[index], "bold" if index == 0 else "")
+                for index in visible
+            ]
+            for row in rows
+        ],
+        pipe_rows,
+        footer=(
+            " · ".join([*hidden, "hidden: " + ", ".join(width_hidden)])
+            if width_hidden
+            else " · ".join(hidden)
+        ),
+    )
 
 
 @app.command
@@ -1409,6 +1496,7 @@ def todo(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
 
     if project:
@@ -1417,7 +1505,7 @@ def todo(
         return
 
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        output.notice("No projects configured · add projects to ~/.mm/config.toml")
         return
 
     empty = []
@@ -1430,8 +1518,8 @@ def todo(
         else:
             empty.append(name)
 
-    for name in empty:
-        _print_project_todo(name, cfg.projects[name].path)
+    if empty:
+        output.notice(f"{len(empty)} projects have no TODO items: {', '.join(empty)}")
     for name in has_content:
         _print_project_todo(name, cfg.projects[name].path)
 
@@ -1440,16 +1528,19 @@ def todo(
 
 
 def _print_project_todo(name: str, project_path: Path) -> None:
-    """Print a single project's TODO.md content with header."""
-    todo_path = project_path / "TODO.md"
-    if not todo_path.exists():
-        console.print(Panel("[dim]no TODO.md[/]", title=name, border_style="dim"))
+    path = project_path / "TODO.md"
+    content = path.read_text() if path.exists() else ""
+    if not content.strip():
+        output.notice(f"No TODO items in {name}")
         return
-    content = todo_path.read_text().strip()
-    if not content:
-        console.print(Panel("[dim]empty[/]", title=name, border_style="dim"))
-        return
-    console.print(Panel(Markdown(content), title=name))
+    output.heading(name, "TODO.md")
+    lines = content.splitlines()
+    output.records(
+        name,
+        (),
+        [[line] for line in lines],
+        pipe_rows=[[str(index), line] for index, line in enumerate(lines, 1)],
+    )
 
 
 def _current_label(project_path: Path) -> str:
@@ -1460,8 +1551,12 @@ def _current_label(project_path: Path) -> str:
         return "unknown"
 
 
-def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
-    console.print(f"[bold red]Error:[/] {msg}")
+def _fatal(
+    msg: str, code: int = ExitCode.ERROR, *, hint: str | None = None
+) -> NoReturn:
+    output.diagnostic("error", msg)
+    if hint:
+        output.diagnostic("hint", hint)
     sys.exit(code)
 
 
@@ -1476,13 +1571,13 @@ def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
     try:
         return resolve_project(cfg, project)
     except ProjectNotFoundError as e:
-        _fatal(str(e))
+        _fatal(str(e), hint="mm list")
 
 
 def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
     if not has_test_config(proj_config):
         _fatal(
-            f"No test configuration for [bold]{project}[/]. "
+            f"No test configuration for {project}. "
             f"Add test_unit to [projects.{project}] in ~/.mm/config.toml."
         )
 
@@ -1497,68 +1592,63 @@ def _scan_exit_code(has_vulns: bool, has_updates: bool) -> ExitCode:
             return ExitCode.OK
 
 
-def _pluralise(n: int, singular: str, plural: str) -> str:
-    return f"{n} {singular if n == 1 else plural}"
-
-
-def _relative_time(dt: datetime, now: datetime | None = None) -> str:
-    """Format a datetime as a human-readable relative time string."""
-    now = now or datetime.now(timezone.utc)
-    total_seconds = int((now - dt).total_seconds())
-    match total_seconds:
-        case s if s < 60:
-            return "just now"
-        case s if s < 3600:
-            return f"{s // 60}m ago"
-        case s if s < 86400:
-            return f"{s // 3600}h ago"
-        case s:
-            return f"{s // 86400}d ago"
-
-
-def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -> str:
-    """Format an activity event as relative time with optional failure marker."""
-    if event is None:
-        return _NO_DATA
-    time_str = _relative_time(event.timestamp, now)
-    if not event.success:
-        return f"{time_str} [red]\\[F][/]"
-    return time_str
-
-
-def _scan_one(name: str, proj_config: ProjectConfig, min_age_days: int) -> ScanResult:
+def _scan_one(
+    name: str,
+    proj_config: ProjectConfig,
+    min_age_days: int,
+    *,
+    report_clean: bool = False,
+) -> ScanResult:
     """Scan a single project with timing output."""
     try:
         prune_stale_bookmarks(proj_config.path)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        console.print(f"[bold yellow]Warning:[/] {name} — failed to sync remote: {exc}")
+        output.diagnostic("warning", f"{name} · failed to sync remote: {exc}")
 
     t0 = time.monotonic()
     result = scan_project(name, proj_config, min_age_days)
     elapsed = time.monotonic() - t0
-    _print_scan_result(result, elapsed_s=elapsed)
+    if result.has_findings:
+        _print_scan_result(result, elapsed_s=elapsed)
+    elif report_clean:
+        output.notice(f"No findings in {name} · scanned in {elapsed:.1f}s")
     return result
 
 
 def _print_numbered_findings(
     vulns: list[VulnFinding], updates: list[UpdateFinding]
 ) -> list[VulnFinding | UpdateFinding]:
-    """Print numbered list of findings. Returns ordered list of findings."""
-    vulns = sort_vulns_by_severity(vulns)
-    numbered: list[VulnFinding | UpdateFinding] = []
-    for idx, v in enumerate(vulns, 1):
-        console.print(
-            f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {v.pkg_name} "
-            f"{v.installed_version} -> {v.fixed_version} ({v.vuln_id})"
+    numbered: list[VulnFinding | UpdateFinding] = [
+        *sort_vulns_by_severity(vulns),
+        *updates,
+    ]
+    screen = output.console(stderr=True)
+    rows = []
+    for finding in numbered:
+        if isinstance(finding, VulnFinding):
+            kind = "! vuln"
+            risk = f"{finding.severity.value.lower()} · {finding.vuln_id}"
+        else:
+            kind = "~ update"
+            risk = finding.semver_tier.value
+        rows.append(
+            (
+                kind,
+                risk,
+                f"{finding.installed_version} → {finding.target_version}",
+                finding.pkg_name,
+            )
         )
-        numbered.append(v)
-    for idx, u in enumerate(updates, len(vulns) + 1):
-        console.print(
-            f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {u.pkg_name} "
-            f"{u.installed_version} -> {u.latest_version} "
-            f"({u.semver_tier.value})"
+    risk_width = max((len(row[1]) for row in rows), default=0)
+    version_width = max((len(row[2]) for row in rows), default=0)
+    for index, (kind, risk, versions, package) in enumerate(rows, 1):
+        text = output.literal(
+            f"  {index:>3}  {kind:<8}  {risk:<{risk_width}}  "
+            f"{versions:<{version_width}}  {package}"
         )
-        numbered.append(u)
+        screen.print(
+            text, no_wrap=True, overflow="ellipsis", soft_wrap=not screen.is_terminal
+        )
     return numbered
 
 
@@ -1609,7 +1699,7 @@ def _execute_update(
     *,
     interactive: bool,
 ) -> tuple[list[UpdateResult], bool]:
-    _print_scan_result(scan_result)
+    output.heading(project)
     vulns = _selectable_vulns(scan_result.vulnerabilities)
     updates = _selectable_updates(scan_result.updates)
     if interactive and (vulns or updates):
@@ -1629,10 +1719,13 @@ def _execute_update(
     )
     _print_blocked_findings(scan_result)
     if not groups and not ready:
-        console.print(f"{project} — nothing eligible to update")
+        output.notice(f"{project} · nothing eligible to update")
         return [], _has_update_failures(scan_result)
     if not has_test_config(proj_config):
-        console.print(f"[bold red]{project} — no test configuration[/]")
+        output.outcome(
+            project, "update", "failed", "configuration", reason="no test configuration"
+        )
+        output.diagnostic("error", f"{project} · no test configuration")
         return [UpdateResult(project, "update", False, "configuration")], True
     results: list[UpdateResult] = []
     failed = False
@@ -1663,7 +1756,7 @@ def _execute_update(
             not r.passed and not r.blocked_reason for r in results
         ) or _has_update_failures(scan_result)
         if failed:
-            console.print(f"[yellow]{project}: pending because updates failed[/]")
+            output.notice(f"{project}: pending because updates failed")
         elif _ordered_ready_findings(
             scan_result, flow=Workflow.UPDATE, proj_config=proj_config
         ):
@@ -1678,7 +1771,8 @@ def _execute_update(
         OSError,
         subprocess.SubprocessError,
     ) as exc:
-        console.print(f"[bold red]Error:[/] {project} — {exc}")
+        output.diagnostic("error", f"{project} · {exc}")
+        output.outcome(project, "update", "failed", "setup", reason=str(exc))
         results.append(UpdateResult(project, "update", False, "setup"))
         failed = True
     finally:
@@ -1710,13 +1804,13 @@ def _update_batch(
     try:
         scan_result = load_scan_results(project, results_dir)
     except NoScanResultsError:
-        console.print(f"{project}: no saved scan; run mm scan {project} first")
+        output.notice(f"{project}: no saved scan; run mm scan {project} first")
         return [], False
     try:
         _assert_supported_in_progress_state(scan_result, project)
         _assert_no_conflicting_flow(scan_result, Workflow.UPDATE, project)
     except _FlowConflictError as exc:
-        console.print(f"[yellow]Skipped:[/] {project} — {exc}")
+        output.notice(f"Skipped: {project} · {exc}")
         return None
     return _execute_update(
         project, proj_config, scan_result, results_dir, interactive=False
@@ -1740,6 +1834,7 @@ def _update_interactive(cfg: MmConfig, project: str) -> NoReturn:
 def resolve(
     project: str,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
+    verbose: bool = False,
     config: Path | None = None,
 ) -> None:
     """Work through failed findings for a project.
@@ -1751,6 +1846,8 @@ def resolve(
 
     Parameters
     ----------
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     project: str
         Project name (required).
     continue_: bool
@@ -1758,6 +1855,7 @@ def resolve(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     results_dir = _config.MM_HOME / "scan-results"
@@ -1768,6 +1866,7 @@ def resolve(
     scan_result, actionable_vulns, updates = _load_validated_scan(
         project, results_dir, proj_config, Workflow.RESOLVE
     )
+    output.heading(project)
     if continue_:
         sys.exit(
             _handle_resolve_continue(project, proj_config, scan_result, results_dir)
@@ -1780,7 +1879,7 @@ def resolve(
         and not _has_update_progress(scan_result)
         and not _has_ready_resolve_progress(scan_result)
     ):
-        _print_blocked_findings(scan_result)
+        _print_blocked_findings(scan_result, Workflow.RESOLVE)
         sys.exit(ExitCode.OK)
     try:
         if current_change_has_changes(proj_config.path):
@@ -1838,9 +1937,9 @@ def _handle_resolve_continue(
             if blocker.gradle_target is not None:
                 block = validate_gradle_recovery(proj_config, blocker.gradle_target)
                 if block is not None:
-                    console.print(
-                        f"[red]Repair does not apply the saved target:[/] "
-                        f"{block.reason}"
+                    output.diagnostic(
+                        "error",
+                        f"Repair does not apply the saved target: {block.reason}",
                     )
                     return ExitCode.UPDATE_FAILED
         passed, failed_phase = run_test_phases(proj_config, proj_config.path)
@@ -1852,9 +1951,7 @@ def _handle_resolve_continue(
         if not passed:
             save_scan_results(project, results_dir, scan_result)
             names = ", ".join((b.pkg_name for b in failed))
-            console.print(
-                f"  [bold red]FAIL[/] {failed_phase} — still blocking: {names}"
-            )
+            output.diagnostic("error", f"{failed_phase} · still blocking: {names}")
             return ExitCode.UPDATE_FAILED
         # Keep the original base before moving the bookmark. If the later
         # READY save is interrupted, --continue can verify this same repair.
@@ -1869,7 +1966,15 @@ def _handle_resolve_continue(
         scan_result.resolve_repair_base = None
         save_scan_results(project, results_dir, scan_result)
         for blocker in failed:
-            console.print(f"  [bold green]PASS[/] {blocker.pkg_name}")
+            output.outcome(
+                project,
+                "resolve",
+                "passed",
+                blocker.pkg_name,
+                installed=blocker.installed_version,
+                target=blocker.target_version,
+                reason="manual repair",
+            )
     return _run_resolve_findings(
         project,
         proj_config,
@@ -1879,123 +1984,139 @@ def _handle_resolve_continue(
     )
 
 
-def _print_scan_result(
-    result: ScanResult,
-    elapsed_s: float | None = None,
-) -> None:
-    """Print a Rich-formatted summary of scan results for one project."""
-    actionable = sort_vulns_by_severity(
-        [v for v in result.vulnerabilities if v.actionable]
-    )
-    advisories = sort_vulns_by_severity(
-        [v for v in result.vulnerabilities if not v.actionable]
-    )
-    secrets = result.secrets
-    updates = result.updates
-
-    total = len(actionable) + len(advisories) + len(secrets) + len(updates)
-    timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
-
-    if total == 0:
-        console.print(f"[bold green]{result.project}[/] — clean{timing}")
+def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
+    rows: list[list[str | Text]] = []
+    pipe_rows: list[list[str]] = []
+    wins = {}
+    for vuln in result.vulnerabilities:
+        group = [
+            v
+            for v in result.vulnerabilities
+            if v.pkg_name == vuln.pkg_name and v.actionable
+        ]
+        if len(group) > 1:
+            wins[vuln.pkg_name] = highest_fix_version(group)
+    for vuln in sort_vulns_by_severity(result.vulnerabilities):
+        kind = "vuln" if vuln.actionable else "advisory"
+        reason = vuln.blocked_reason or ""
+        if vuln.fixed_version and wins.get(vuln.pkg_name) == vuln.fixed_version:
+            reason = " · ".join(filter(None, ["selected fix", reason]))
+        label = "! blocked" if vuln.blocked_reason else f"! {kind}"
+        versions = (
+            f"{vuln.installed_version} → {vuln.fixed_version}"
+            if vuln.fixed_version
+            else "no fix"
+        )
+        detail = " · ".join(filter(None, [vuln.pkg_name, vuln.vuln_id, reason]))
+        rows.append(
+            [
+                output.literal(
+                    label,
+                    "yellow" if kind == "advisory" or vuln.blocked_reason else "red",
+                ),
+                vuln.severity.value.lower(),
+                versions,
+                detail,
+            ]
+        )
+        pipe_rows.append(
+            [
+                kind,
+                vuln.pkg_name,
+                vuln.installed_version,
+                vuln.fixed_version or "-",
+                vuln.severity.value,
+                vuln.vuln_id,
+                vuln.published_date.isoformat() if vuln.published_date else "-",
+                "blocked" if vuln.blocked_reason else vuln.status,
+                reason or "-",
+            ]
+        )
+    for secret in result.secrets:
+        rows.append(
+            [
+                output.literal("! secret", "yellow"),
+                secret.severity.value.lower(),
+                "-",
+                f"{secret.file} · {secret.title}",
+            ]
+        )
+        pipe_rows.append(
+            [
+                "secret",
+                secret.file,
+                "-",
+                "-",
+                secret.severity.value,
+                secret.rule_id,
+                "-",
+                "found",
+                secret.title,
+            ]
+        )
+    for update in result.updates:
+        reason = update.blocked_reason or ""
+        age = (
+            f"{(datetime.now(timezone.utc) - update.published_date).days}d old"
+            if update.published_date
+            else ""
+        )
+        rows.append(
+            [
+                output.literal(
+                    "! blocked" if reason else "~ update", "yellow" if reason else ""
+                ),
+                update.semver_tier.value,
+                f"{update.installed_version} → {update.latest_version}",
+                " · ".join(filter(None, [update.pkg_name, age, reason])),
+            ]
+        )
+        pipe_rows.append(
+            [
+                "update",
+                update.pkg_name,
+                update.installed_version,
+                update.latest_version,
+                update.semver_tier.value,
+                "-",
+                update.published_date.isoformat() if update.published_date else "-",
+                "blocked" if reason else "available",
+                reason or "-",
+            ]
+        )
+    if not rows:
         return
-
-    categories = [
-        (actionable, "vulnerability", "vulnerabilities"),
-        (advisories, "advisory", "advisories"),
-        (secrets, "secret", "secrets"),
-        (updates, "update", "updates"),
-    ]
-    parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
-
-    console.print(f"\n[bold]{result.project}[/] — {', '.join(parts)}{timing}")
-
-    if actionable:
-        # Determine the winning fix version per package for the marker.
-        win_versions: dict[str, str] = {}
-        pkg_counts: dict[str, int] = {}
-        for v in actionable:
-            pkg_counts[v.pkg_name] = pkg_counts.get(v.pkg_name, 0) + 1
-        for pkg in pkg_counts:
-            if pkg_counts[pkg] > 1:
-                group = [v for v in actionable if v.pkg_name == pkg]
-                win_versions[pkg] = highest_fix_version(group)
-
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold red", width=4)
-        table.add_column("Package", overflow="fold")
-        table.add_column("Installed")
-        table.add_column("Fix")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in actionable:
-            fix_col = v.fixed_version or ""
-            if (
-                v.pkg_name in win_versions
-                and v.fixed_version == win_versions[v.pkg_name]
-            ):
-                fix_col += " ← fix"
-            table.add_row(
-                "VULN",
-                v.pkg_name,
-                v.installed_version,
-                fix_col,
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
-
-    if advisories:
-        table = Table(show_header=False, **_TABLE_STYLE)
-        table.add_column("", style="bold yellow", width=4)
-        table.add_column("Package", overflow="fold")
-        table.add_column("Installed")
-        table.add_column("Status")
-        table.add_column("Severity")
-        table.add_column("CVE")
-        for v in advisories:
-            table.add_row(
-                "ADV",
-                v.pkg_name,
-                v.installed_version,
-                v.status,
-                v.severity.value,
-                v.vuln_id,
-            )
-        console.print(table)
-
-    if secrets:
-        for s in secrets:
-            console.print(f"  [bold magenta]SECRET[/]  {s.file} — {s.title}")
-
-    if updates:
-        table = Table(show_header=True, **_TABLE_STYLE)
-        table.add_column("", style="bold cyan", width=6, no_wrap=True)
-        table.add_column("Package", overflow="fold")
-        table.add_column("Installed")
-        table.add_column("Latest")
-        table.add_column("Tier")
-        table.add_column("Age")
-        for u in updates:
-            age = ""
-            if u.published_date:
-                days = (datetime.now(timezone.utc) - u.published_date).days
-                age = f"({days} days old)"
-            table.add_row(
-                "UPDATE",
-                u.pkg_name,
-                u.installed_version,
-                u.latest_version,
-                u.semver_tier.value,
-                age,
-            )
-        console.print(table)
+    output.heading(result.project, f"{len(rows)} findings")
+    headers = ["kind", "severity", "versions", "package / detail"]
+    visible = [0, 1, 2, 3] if output.console().width >= 70 else [0, 3]
+    output.records(
+        result.project,
+        [headers[index] for index in visible],
+        [[row[index] for index in visible] for row in rows],
+        pipe_rows=pipe_rows,
+        footer="hidden: severity, versions · pipe for full records"
+        if len(visible) < 4
+        else "",
+    )
+    if elapsed_s is not None:
+        output.notice(f"Scanned {result.project} in {elapsed_s:.1f}s")
 
 
-def _print_blocked_findings(scan_result: ScanResult) -> None:
-    """Explain why an explicit update or resolve operation cannot proceed."""
+def _print_blocked_findings(
+    scan_result: ScanResult, flow: Workflow = Workflow.UPDATE
+) -> None:
     for finding in scan_result.blocked_findings:
-        console.print(
-            f"  [yellow]BLOCKED[/] {escape(finding.pkg_name)} — "
-            f"{escape(finding.blocked_reason or '')}"
+        target = (
+            finding.latest_version
+            if isinstance(finding, UpdateFinding)
+            else finding.fixed_version or "-"
+        )
+        output.outcome(
+            scan_result.project,
+            flow.value,
+            "blocked",
+            finding.pkg_name,
+            installed=finding.installed_version,
+            target=target,
+            reason=finding.blocked_reason or "",
         )

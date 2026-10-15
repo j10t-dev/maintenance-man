@@ -36,23 +36,44 @@ mm update -n api worker   # batch update all except api and worker
 mm update api -n worker   # same exclusion mode; flag position does not matter
 ```
 
-```bash
-➜  maintenance-man git:(main) ✗ mm --help
+```text
 Usage: mm COMMAND
 
 Config-driven CLI for routine software project maintenance.
 
-╭─ Commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ build           Build a project's artefacts.                                                                                                   │
-│ deploy          Deploy a project.                                                                                                              │
-│ list            List all configured projects with scan findings summary.                                                                       │
-│ scan            Scan projects for vulnerabilities and available updates.                                                                       │
-│ test            Run a project's test suite.                                                                                                    │
-│ update          Apply updates from scan results to a project.                                                                                  │
-│ --help (-h)     Display this message and exit.                                                                                                 │
-│ --version (-v)  Display application version.                                                                                                   │
-╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Commands:
+  build: Build a project's artefacts.
+  deploy: Deploy a project.
+  init: Initialise the ~/.mm directory and skeleton config.
+  list, status, st: List all configured projects with scan findings summary.
+  resolve: Work through failed findings for a project.
+  scan: Scan projects for vulnerabilities and available updates.
+  sync: Sync local main with remote for one, many, or all configured projects.
+  test: Run a project's test suite.
+  todo: Show TODO.md items for projects.
+  update: Apply updates from scan results to one, many, or all projects.
+  --help, -h: Display this message and exit.
+  --version, -v: Display application version.
 ```
+
+## Output and subprocess logs
+
+Build, test, deploy, update and resolve hide successful subprocess logs by default. Failed commands replay stdout and stderr once on stderr. Add `--verbose` to stream both child streams live to stderr, including successful commands. Timeouts and interruptions expose partial logs and ask the command to terminate, escalating to SIGKILL after two seconds. Commands share mm's terminal and process group, so prompts, Ctrl-C and Ctrl-Z behave as they would for the command run directly. Logging ends when the command exits; services started in the background should own their log destinations. Protocol queries keep their output captured for parsing.
+
+Terminal output uses grouped, borderless records. Status words remain readable without colour. Narrow terminals abbreviate long fields and omit secondary columns; pipe the command to retain full values. Footers name hidden columns and may wrap to preserve that information. `NO_COLOR`, `TERM=dumb` and an unset `TERM` disable colour. Progress appears only on a stderr terminal after 500 ms, never while the command can read the terminal, and disappears on completion.
+
+When stdout is redirected, records are headerless TSV. Warnings, prompts, errors, progress and totals go to stderr. Help and version remain human-readable text. Field order:
+
+| Command or record | Fields |
+| --- | --- |
+| `mm list` | project, type, vulns, updates, secrets, scanned_at, built_at, build_status, deployed_at, deploy_status |
+| `mm list --detail`, `mm scan` | project, kind, package/path, installed, target, severity/tier, identifier, published_at, status, reason |
+| Maintenance outcome | project, operation, status, subject, installed, target, reason |
+| `mm todo` | project, line_number, text |
+
+Timestamps use exact ISO 8601 in pipes and short relative values on a terminal. Unknown counts use `-`; known empty counts use `0`. Other absent values use `-`, with explicit reasons such as `never` or `not deployable` where relevant. TSV fields escape backslash, tab, carriage return and newline as `\\`, `\t`, `\r` and `\n`; other ASCII and C1 controls use `\xNN`, and Unicode line/paragraph separators use `\u2028`/`\u2029`. Bracketed text is literal. The reason field is human-readable explanation and may include `selected fix` for the chosen advisory fix.
+
+A passed package update and promotion to local main are separate outcomes. A failed build records deployment as skipped. Command exit codes and saved scan formats are unchanged.
 
 ## Application contract 
 
@@ -172,7 +193,7 @@ POM group and version fields may inherit literal values from a parent with compl
 
 Gradle uses the same update and resolve workflow as Bun, uv and Maven. `mm scan` discovers updates, maps vulnerabilities to editable catalogue groups, validates proposed versions and checks release age. It saves exact application targets and blocking reasons. A successful fresh scan replaces the previous saved findings and all pending statuses; it becomes the new source of truth. Failed scans leave the previous saved result intact.
 
-`mm update` consumes that saved scan. It never scans, discovers replacement versions or runs `build_command`. Configure at least one test phase for automatic updates. Each eligible change is applied and tested in the configured unit, integration, component order. PASS means the requested change is applied and all configured tests passed. Project promotion is reported separately, and Gradle results appear in the common batch summary.
+`mm update` consumes that saved scan. It never scans, discovers replacement versions or runs `build_command`. Configure at least one test phase for automatic updates. Each eligible change is applied and tested in the configured unit, integration, component order. `passed` means the requested change is applied and all configured tests passed. Project promotion is reported separately, and Gradle results appear in the common batch summary.
 
 If A and C pass while B fails, A and C remain on the pending bookmark. Without an intervening successful scan, the next update retries B without reapplying A and C. Once attempted failures are resolved, mm promotes the accepted stack to local main. Unresolved or withheld findings remain visible and do not block unrelated successful updates. No eligible work is a successful no-op.
 

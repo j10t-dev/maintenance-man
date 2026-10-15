@@ -305,7 +305,7 @@ class TestDeployCheck:
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "deployable", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
-        assert "--check: no healthcheck_url configured" in capsys.readouterr().out
+        assert "--check: no healthcheck_url configured" in capsys.readouterr().err
 
 
 class TestMassDeployCommand:
@@ -396,7 +396,7 @@ class TestMassDeployCommand:
         with pytest.raises(SystemExit):
             app(["deploy"], exit_on_error=False)
         output = capsys.readouterr().out
-        assert "Deploy Summary" in output
+        assert "deployable\tdeploy\tpassed" in output
 
     @patch(
         "maintenance_man.cli.check_health",
@@ -425,8 +425,8 @@ class TestMassDeployCommand:
         assert exc_info.value.code == ExitCode.OK
         assert mock_check.call_count == 2
         output = capsys.readouterr().out
-        assert "Healthy: deploy-only is up" in output
-        assert "Healthy: deployable is up" in output
+        assert "deploy-only\thealth\tpassed" in output
+        assert "deployable\thealth\tpassed" in output
 
     @patch("maintenance_man.cli.run_deploy")
     @patch("maintenance_man.cli.run_build")
@@ -441,7 +441,7 @@ class TestMassDeployCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy", "--check"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
-        assert "--check: no healthcheck_url configured" in capsys.readouterr().out
+        assert "--check: no healthcheck_url configured" in capsys.readouterr().err
 
     def test_no_projects_configured(
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]
@@ -454,7 +454,7 @@ class TestMassDeployCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["deploy"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.OK
-        assert "no projects" in capsys.readouterr().out.lower()
+        assert "no projects" in capsys.readouterr().err.lower()
 
 
 class TestDeployGateWiring:
@@ -490,7 +490,7 @@ class TestDeployGateWiring:
             app(["deploy", "deploy-only"], exit_on_error=False)
         assert exc.value.code == ExitCode.OK
         mock_deploy.assert_not_called()
-        assert "force" in capsys.readouterr().out.lower()
+        assert "hint: mm deploy deploy-only --force" in capsys.readouterr().err
 
     @patch("maintenance_man.cli.record_activity")
     @patch("maintenance_man.cli.run_deploy")
@@ -572,11 +572,12 @@ class TestDeployGateWiring:
         mock_deploy.assert_not_called()
 
     @patch("maintenance_man.cli.run_deploy")
-    def test_batch_blocked_exits_ok(
+    def test_batch_blocked_exits_ok_with_force_hint(
         self,
         mock_deploy: MagicMock,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         monkeypatch.setattr(
             "maintenance_man.cli.main_commit_id",
@@ -587,6 +588,9 @@ class TestDeployGateWiring:
             app(["deploy"], exit_on_error=False)
         assert exc.value.code == ExitCode.OK
         mock_deploy.assert_not_called()
+        err = capsys.readouterr().err
+        assert "warning: deploy-only · could not resolve main revision; skipping" in err
+        assert "hint: mm deploy deploy-only --force" in err
 
     @patch("maintenance_man.cli.run_build")
     @patch("maintenance_man.cli.run_deploy")

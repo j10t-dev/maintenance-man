@@ -41,7 +41,7 @@ def test_batch_reports_bookmark_access_error_without_requesting_rescan(
     assert outcome is not None
     results, failed = outcome
     assert failed and results[0].failed_phase == "setup"
-    output = " ".join(capsys.readouterr().out.split())
+    output = " ".join(capsys.readouterr().err.split())
     assert "permission denied" in output
     assert "rescan required" not in output
 
@@ -79,7 +79,7 @@ class TestUpdatePreChecks:
             "maintenance_man.vcs.check_gh_available",
             MagicMock(side_effect=GitHubCLINotFoundError("no gh")),
         )
-        monkeypatch.setattr("maintenance_man.cli.Prompt.ask", lambda *a, **k: "none")
+        monkeypatch.setattr("maintenance_man.output.prompt", lambda *a, **k: "none")
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 0
@@ -126,7 +126,7 @@ class TestUpdatePreChecks:
         monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
         monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -135,7 +135,7 @@ class TestUpdatePreChecks:
         assert exc_info.value.code == 1
         mock_vulns.assert_not_called()
         mock_updates.assert_not_called()
-        assert "no test configuration" in capsys.readouterr().out.lower()
+        assert "no test configuration" in capsys.readouterr().err.lower()
 
     def test_conflicting_resolve_flow_aborts(
         self,
@@ -152,7 +152,7 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 1
-        out = capsys.readouterr().out.lower()
+        out = capsys.readouterr().err.lower()
         assert "resolve" in out
         assert "vulnerable" in out
         assert "update" in out
@@ -172,7 +172,7 @@ class TestUpdatePreChecks:
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable", "clean"])
 
-        out = capsys.readouterr().out.lower()
+        out = capsys.readouterr().err.lower()
         assert exc_info.value.code == ExitCode.UPDATE_FAILED
         assert "vulnerable" in out
         assert "clean" in out
@@ -192,7 +192,7 @@ class TestUpdatePreChecks:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 1
-        assert "rescan" in capsys.readouterr().out.lower()
+        assert "rescan" in capsys.readouterr().err.lower()
 
 
 class TestUpdateNoOp:
@@ -273,7 +273,7 @@ class TestUpdateSelection:
         monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
         monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
+            "maintenance_man.output.prompt", MagicMock(return_value="none")
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -298,7 +298,7 @@ class TestUpdateSelection:
         monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
         monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+            "maintenance_man.output.prompt", MagicMock(return_value="vulns")
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -334,7 +334,7 @@ class TestUpdateExitCodes:
             MagicMock(side_effect=_mark_update),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -363,13 +363,13 @@ class TestUpdateExitCodes:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 4
 
-    def test_bookmark_failure_summary_uses_friendly_label(
+    def test_bookmark_failure_is_counted_in_summary(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -393,16 +393,16 @@ class TestUpdateExitCodes:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+            "maintenance_man.output.prompt", MagicMock(return_value="vulns")
         )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 4
-        assert "bookmark creation failed" in capsys.readouterr().out
+        assert "1 failed" in capsys.readouterr().err
 
-    def test_commit_failure_summary_uses_friendly_label(
+    def test_commit_failure_is_counted_in_summary(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: dict,
@@ -426,14 +426,14 @@ class TestUpdateExitCodes:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+            "maintenance_man.output.prompt", MagicMock(return_value="vulns")
         )
 
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
 
         assert exc_info.value.code == 4
-        assert "commit failed" in capsys.readouterr().out
+        assert "1 failed" in capsys.readouterr().err
 
 
 class TestUpdateNumberedSelection:
@@ -457,7 +457,7 @@ class TestUpdateNumberedSelection:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="1")
+            "maintenance_man.output.prompt", MagicMock(return_value="1")
         )
         with pytest.raises(SystemExit) as exc_info:
             app(["update", "vulnerable"])
@@ -511,7 +511,7 @@ class TestUpdateResume:
 
         mock_prompt = MagicMock()
         mock_promote = MagicMock(return_value=True)
-        monkeypatch.setattr("maintenance_man.cli.Prompt.ask", mock_prompt)
+        monkeypatch.setattr("maintenance_man.output.prompt", mock_prompt)
         monkeypatch.setattr(
             "maintenance_man.cli.promote_bookmark_to_main", mock_promote
         )
@@ -552,18 +552,17 @@ class TestUpdateResume:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
+            "maintenance_man.output.prompt", MagicMock(return_value="none")
         )
         monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: True)
 
         with pytest.raises(SystemExit):
             app(["update", "vulnerable"])
 
-        output = capsys.readouterr().out
+        output = capsys.readouterr().err
         assert "pkg-a" in output
         # The READY vuln should NOT appear in the numbered selection list
-        after_update_line = output.split("Select updates")[0].split("UPDATE pkg-a")[-1]
-        assert "some-pkg" not in after_update_line
+        assert "some-pkg" not in output
 
     def test_resume_ready_findings_preserved_through_promote(
         self,
@@ -649,7 +648,7 @@ class TestUpdateFinalise:
             MagicMock(side_effect=_mark_ready),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
             "maintenance_man.cli.promote_bookmark_to_main",
@@ -689,7 +688,7 @@ class TestUpdateFinalise:
             MagicMock(side_effect=_mark_ready),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
             "maintenance_man.cli.promote_bookmark_to_main",
@@ -707,8 +706,8 @@ class TestUpdateFinalise:
     @pytest.mark.parametrize(
         ("failing_operation", "expected_message"),
         [
-            ("promote_bookmark_to_main", "Promotion failed"),
-            ("refresh_working_copy_from_main", "Workspace refresh failed"),
+            ("promote_bookmark_to_main", "remains pending"),
+            ("refresh_working_copy_from_main", "workspace refresh failed"),
         ],
     )
     def test_finalise_failure_leaves_ready(
@@ -737,7 +736,7 @@ class TestUpdateFinalise:
             MagicMock(side_effect=_mark_ready),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
             f"maintenance_man.cli.{failing_operation}", MagicMock(return_value=False)
@@ -787,7 +786,7 @@ class TestUpdateFinalise:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+            "maintenance_man.output.prompt", MagicMock(return_value="vulns")
         )
         monkeypatch.setattr(
             "maintenance_man.cli.promote_bookmark_to_main", mock_promote
@@ -832,7 +831,7 @@ class TestUpdateFinalise:
             MagicMock(side_effect=_mark_ready),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
         monkeypatch.setattr(
             "maintenance_man.cli.remove_workspace", _track_remove_workspace
@@ -891,7 +890,7 @@ class TestUpdateFinalise:
             "maintenance_man.cli.process_updates", MagicMock(return_value=[])
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
 
         with pytest.raises(SystemExit):
@@ -990,7 +989,7 @@ class TestUpdateAll:
         monkeypatch.setattr("maintenance_man.cli.process_vulns", mock_vulns)
         monkeypatch.setattr("maintenance_man.cli.process_updates", mock_updates)
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -1175,7 +1174,7 @@ class TestUpdateTargetSelection:
             )
 
         assert exc_info.value.code == 0
-        assert "No target projects." in capsys.readouterr().out
+        assert "No target projects" in capsys.readouterr().err
 
     def test_unknown_project_in_include_mode_exits_1(
         self,
@@ -1186,7 +1185,7 @@ class TestUpdateTargetSelection:
             app(["update", "missing"])
 
         assert exc_info.value.code == 1
-        assert "Unknown project 'missing'" in capsys.readouterr().out
+        assert "Unknown project 'missing'" in capsys.readouterr().err
 
     def test_unknown_project_in_negate_mode_exits_1(
         self,
@@ -1197,7 +1196,7 @@ class TestUpdateTargetSelection:
             app(["update", "-n", "missing"])
 
         assert exc_info.value.code == 1
-        assert "Unknown project 'missing'" in capsys.readouterr().out
+        assert "Unknown project 'missing'" in capsys.readouterr().err
 
     def test_batch_continues_after_project_failure(
         self,
@@ -1341,7 +1340,7 @@ def gradle_update_cli(
     )
     # `mm update <one project>` is the interactive single-project path, so every
     # test here must answer the selection prompt; individual tests override this.
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", lambda *a, **k: "all")
+    monkeypatch.setattr("maintenance_man.output.prompt", lambda *a, **k: "all")
     return spies
 
 
@@ -1398,9 +1397,9 @@ def test_batch_summary_classifies_block_before_failed(capsys):
             )
         ]
     )
-    out = capsys.readouterr().out
-    assert "BLOCKED" in out
-    assert "FAIL" not in out
+    out = capsys.readouterr().err
+    assert "1 blocked" in out
+    assert "failed" not in out
 
 
 @pytest.mark.parametrize("batch", [False, True])
@@ -1599,7 +1598,18 @@ def test_cleanup_failure_keeps_pass_rows_and_batch_continues(
         app(["update", "vulnerable", "clean"])
     assert result.value.code == 4
     assert entered == ["vulnerable", "clean"]
-    output = capsys.readouterr().out
-    assert (
-        "cleanup broken" in output and "PASS" in output and "Update Summary" in output
-    )
+    captured = capsys.readouterr()
+    assert "cleanup broken" in captured.err
+    assert "2 passed" in captured.err
+    assert "vulnerable\tpromotion\tpassed" in captured.out
+    assert "clean\tpromotion\tpassed" in captured.out
+
+
+def test_batch_summary_with_no_results_names_the_empty_state(capsys):
+    from maintenance_man.cli import _print_mass_update_summary
+
+    _print_mass_update_summary([])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "No projects had actionable findings\n"

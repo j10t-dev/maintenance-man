@@ -883,6 +883,7 @@ def test_gradle_inventory_failure_preserves_previous_result_bytes(
         return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr="boom")
 
     monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", _run)
     with pytest.raises(GradleError):
         scan_project("android", gradle_project, 7)
     assert results_file.read_bytes() == previous
@@ -938,6 +939,7 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
             raise PermissionError("cleanup denied")
 
     monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", _run)
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
     monkeypatch.setattr("maintenance_man.scanner.get_outdated", lambda project: [])
     gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
@@ -995,6 +997,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
         raise failure
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", run)
     with pytest.raises(TrivyScanError, match="Trivy"):
         _run_gradle_vuln_scan(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()

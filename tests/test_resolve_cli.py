@@ -257,7 +257,7 @@ class TestResolvePreChecks:
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
 
-        out = capsys.readouterr().out.lower()
+        out = capsys.readouterr().err.lower()
         assert exc_info.value.code == 1
         assert "--continue" in out
         assert "resolve" in out
@@ -316,7 +316,7 @@ class TestResolvePreChecks:
             app(["resolve", "vulnerable"])
 
         assert exc_info.value.code == 1
-        assert "rescan" in capsys.readouterr().out.lower()
+        assert "rescan" in capsys.readouterr().err.lower()
         mock_process.assert_not_called()
 
     def test_missing_tests_prevent_resolve_promotion(
@@ -355,7 +355,7 @@ class TestResolvePreChecks:
         with pytest.raises(SystemExit) as exc_info:
             app(["resolve", "vulnerable"])
 
-        out = capsys.readouterr().out.lower()
+        out = capsys.readouterr().err.lower()
         assert exc_info.value.code == 1
         assert "no test configuration" in out
 
@@ -397,7 +397,7 @@ class TestResolveNoOp:
             app(["resolve", "vulnerable"])
 
         assert exc_info.value.code == 0
-        assert "nothing to resolve" in capsys.readouterr().out.lower()
+        assert "no findings to resolve" in capsys.readouterr().err.lower()
         mock_create.assert_not_called()
 
 
@@ -457,7 +457,7 @@ class TestResolveFlow:
 
         assert exc_info.value.code == 4
         mock_push.assert_not_called()
-        assert "mm resolve vulnerable --continue" in capsys.readouterr().out
+        assert "mm resolve vulnerable --continue" in capsys.readouterr().err
 
     def test_all_pass_promotes_locally(
         self,
@@ -536,7 +536,7 @@ class TestResolveFlow:
             app(["resolve", "vulnerable"])
 
         assert exc_info.value.code == 1
-        assert "--continue" in capsys.readouterr().out
+        assert "--continue" in capsys.readouterr().err
         mock_delete.assert_not_called()
         mock_process.assert_not_called()
 

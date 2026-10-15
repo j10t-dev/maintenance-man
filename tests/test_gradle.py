@@ -134,7 +134,9 @@ class TestDiscoverGradleUpdates:
     ):
         catalogue_path = Path(gradle_project.path) / "gradle" / "libs.versions.toml"
         before = _digest(catalogue_path)
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
 
         findings = discover_gradle_updates(gradle_project)
         by_name = {f.pkg_name: f for f in findings}
@@ -177,7 +179,9 @@ class TestDiscoverGradleUpdates:
     def test_rich_version_group_is_blocked_not_flattened(
         self, gradle_project: ProjectConfig, monkeypatch
     ):
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
 
         blocked = {
             f.pkg_name: f
@@ -193,7 +197,9 @@ class TestDiscoverGradleUpdates:
     def test_bom_managed_child_is_not_a_target(
         self, gradle_project: ProjectConfig, monkeypatch
     ):
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
 
         names = {f.pkg_name for f in discover_gradle_updates(gradle_project)}
 
@@ -205,7 +211,7 @@ class TestDiscoverGradleUpdates:
     ):
         """compose-ui has no catalogue version; a proposal for it must block."""
         report = '[libraries]\ncompose-ui = "androidx.compose.ui:ui:1.9.0"\n'
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(report))
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _fake_gradle(report))
 
         blocked = {
             f.pkg_name: f
@@ -223,7 +229,7 @@ class TestDiscoverGradleUpdates:
     ):
         """A quoted TOML key can smuggle control characters into findings."""
         report = (GRADLE_FIXTURES / "updates-unsafe.toml").read_text(encoding="utf-8")
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(report))
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _fake_gradle(report))
 
         with pytest.raises(GradleError, match="unsafe"):
             discover_gradle_updates(gradle_project)
@@ -264,7 +270,7 @@ class TestDiscoverGradleUpdates:
         reason_fragment,
     ):
         report = (GRADLE_FIXTURES / report_fixture).read_text(encoding="utf-8")
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(report))
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _fake_gradle(report))
 
         blocked = {
             f.pkg_name: f
@@ -293,7 +299,9 @@ class TestDiscoverGradleUpdates:
     ):
         existing = Path(gradle_project.path) / GRADLE_UPDATE_REPORT_RELPATH
         existing.write_text("# caller owned\n", encoding="utf-8")
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
 
         with pytest.raises(GradleError, match="Refusing to overwrite"):
             discover_gradle_updates(gradle_project)
@@ -306,7 +314,9 @@ class TestDiscoverGradleUpdates:
         target = Path(gradle_project.path) / "elsewhere.toml"
         target.write_text("# elsewhere\n", encoding="utf-8")
         (Path(gradle_project.path) / GRADLE_UPDATE_REPORT_RELPATH).symlink_to(target)
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
 
         with pytest.raises(GradleError, match="Refusing to overwrite"):
             discover_gradle_updates(gradle_project)
@@ -320,7 +330,9 @@ class TestDiscoverGradleUpdates:
         root = Path(gradle_project.path)
         (root / GRADLE_UPDATE_REPORT_RELPATH).write_text("# stale\n", encoding="utf-8")
         (root / GRADLE_REPORT_MARKER_RELPATH).write_bytes(b"")
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
 
         assert discover_gradle_updates(gradle_project)
 
@@ -411,7 +423,7 @@ class TestDiscoverGradleUpdates:
     def test_execution_and_output_failures_raise(
         self, gradle_project: ProjectConfig, monkeypatch, runner, expected
     ):
-        monkeypatch.setattr(subprocess, "run", runner)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", runner)
 
         with pytest.raises(GradleError, match=expected):
             discover_gradle_updates(gradle_project)
@@ -431,7 +443,7 @@ class TestDiscoverGradleUpdates:
         root = Path(gradle_project.path)
         before = (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
         runner = _fake_gradle(None, stdout=stdout, stderr=stderr)
-        monkeypatch.setattr(subprocess, "run", runner)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", runner)
 
         assert discover_gradle_updates(gradle_project) == []
         assert (root / GRADLE_CATALOGUE_RELPATH).read_bytes() == before
@@ -462,7 +474,7 @@ class TestDiscoverGradleUpdates:
     def test_no_updates_signal_cannot_hide_discovery_failures(
         self, gradle_project, monkeypatch, runner, expected
     ):
-        monkeypatch.setattr(subprocess, "run", runner)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", runner)
 
         with pytest.raises(GradleError, match=expected):
             discover_gradle_updates(gradle_project)
@@ -476,8 +488,7 @@ class TestDiscoverGradleUpdates:
     ):
         (Path(gradle_project.path) / "gradlew").unlink()
         monkeypatch.setattr(
-            subprocess,
-            "run",
+            "maintenance_man.gradle.run_logged",
             lambda *a, **k: pytest.fail("wrapper check must run first"),
         )
 
@@ -494,7 +505,7 @@ class TestDiscoverGradleUpdates:
             calls.append((cmd, kwargs))
             return runner(cmd, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", _record)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _record)
         discover_gradle_updates(gradle_project)
 
         cmd, kwargs = calls[0]
@@ -536,7 +547,7 @@ class TestGenerateGradleInventory:
             calls.append(cmd)
             return self._wrapper_writing("bom.json")(cmd, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", _record)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _record)
         root = Path(gradle_project.path)
 
         with generate_gradle_inventory(gradle_project) as bom:
@@ -565,7 +576,8 @@ class TestGenerateGradleInventory:
         self, gradle_project, monkeypatch, fixture, returncode, expected
     ):
         monkeypatch.setattr(
-            subprocess, "run", self._wrapper_writing(fixture, returncode=returncode)
+            "maintenance_man.gradle.run_logged",
+            self._wrapper_writing(fixture, returncode=returncode),
         )
 
         with pytest.raises(GradleError, match=expected):
@@ -591,7 +603,7 @@ class TestGenerateGradleInventory:
             bom.write_text(json.dumps(document), encoding="utf-8")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _run)
 
         if accepted:
             with generate_gradle_inventory(gradle_project) as bom:
@@ -608,7 +620,7 @@ class TestGenerateGradleInventory:
             bom.write_text("{not json", encoding="utf-8")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _run)
 
         with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
             with generate_gradle_inventory(gradle_project):
@@ -621,7 +633,8 @@ class TestGenerateGradleInventory:
         owned.mkdir()
         (owned / "keep.txt").write_text("caller owned\n", encoding="utf-8")
         monkeypatch.setattr(
-            subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
+            "maintenance_man.gradle.run_logged",
+            lambda *a, **k: pytest.fail("must refuse before running"),
         )
 
         with pytest.raises(GradleError, match="Refusing to overwrite"):
@@ -651,7 +664,7 @@ class TestGenerateGradleInventory:
             bom.write_text(json.dumps(document), encoding="utf-8")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _run)
         with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
             with generate_gradle_inventory(gradle_project):
                 pytest.fail("malformed inventory must not be yielded")
@@ -673,7 +686,8 @@ class TestGenerateGradleInventory:
         else:
             inventory.symlink_to(caller, target_is_directory=True)
         monkeypatch.setattr(
-            subprocess, "run", lambda *a, **k: pytest.fail("must refuse before running")
+            "maintenance_man.gradle.run_logged",
+            lambda *a, **k: pytest.fail("must refuse before running"),
         )
         with pytest.raises(GradleError, match="Refusing to overwrite"):
             with generate_gradle_inventory(gradle_project):
@@ -687,7 +701,9 @@ class TestGenerateGradleInventory:
     def test_body_exception_still_releases_the_inventory(
         self, gradle_project, monkeypatch
     ):
-        monkeypatch.setattr(subprocess, "run", self._wrapper_writing("bom.json"))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", self._wrapper_writing("bom.json")
+        )
 
         with pytest.raises(ValueError):
             with generate_gradle_inventory(gradle_project):
@@ -698,7 +714,8 @@ class TestGenerateGradleInventory:
 
 def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
     monkeypatch.setattr(
-        subprocess, "run", TestGenerateGradleInventory()._wrapper_writing("bom.json")
+        "maintenance_man.gradle.run_logged",
+        TestGenerateGradleInventory()._wrapper_writing("bom.json"),
     )
 
     def _cannot_remove(*args, **kwargs):
@@ -839,7 +856,7 @@ class TestApplyGradleUpdate:
             reports.append(report.read_text(encoding="utf-8"))
             return applier(cmd, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _run)
 
         assert apply_gradle_update(gradle_project, make_gradle_target()) is None
         assert 'room = "2.8.5"' in catalogue.read_text(encoding="utf-8")
@@ -860,7 +877,8 @@ class TestApplyGradleUpdate:
             encoding="utf-8",
         )
         monkeypatch.setattr(
-            subprocess, "run", lambda *a, **k: pytest.fail("no command may run")
+            "maintenance_man.gradle.run_logged",
+            lambda *a, **k: pytest.fail("no command may run"),
         )
 
         block = apply_gradle_update(gradle_project, make_gradle_target())
@@ -906,7 +924,8 @@ class TestApplyGradleUpdate:
         self, gradle_project, monkeypatch, edits, returncode, expected
     ):
         monkeypatch.setattr(
-            subprocess, "run", _apply_wrapper(edits, returncode=returncode)
+            "maintenance_man.gradle.run_logged",
+            _apply_wrapper(edits, returncode=returncode),
         )
 
         with pytest.raises(GradleError, match=expected):
@@ -922,7 +941,7 @@ class TestApplyGradleUpdate:
             calls.append(cmd)
             return applier(cmd, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", _run)
         apply_gradle_update(gradle_project, make_gradle_target())
 
         assert calls[0][1:] == [
@@ -976,7 +995,8 @@ def test_invalid_historical_target_shape_blocks_without_a_command(
     gradle_project, monkeypatch, target
 ):
     monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: pytest.fail("unsafe target must not apply")
+        "maintenance_man.gradle.run_logged",
+        lambda *a, **k: pytest.fail("unsafe target must not apply"),
     )
     block = apply_gradle_update(gradle_project, target)
     assert block is not None
@@ -999,8 +1019,7 @@ def test_application_preserves_bundles_and_rich_declarations(
         + '\n[bundles]\nroom = ["room-runtime"]\n\n[versions.rich]\nstrictly = "1.0"\n'
     )
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        "maintenance_man.gradle.run_logged",
         _apply_wrapper({'room = "2.8.4"': 'room = "2.8.5"', old: new}),
     )
     with pytest.raises(GradleError):
@@ -1011,7 +1030,7 @@ def test_apply_execution_oserror_is_an_adapter_error(gradle_project, monkeypatch
     def unavailable(cmd, **kwargs):
         raise OSError("wrapper unavailable")
 
-    monkeypatch.setattr(subprocess, "run", unavailable)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", unavailable)
     with pytest.raises(GradleError, match="wrapper unavailable"):
         apply_gradle_update(gradle_project, make_gradle_target())
 
@@ -1100,7 +1119,7 @@ def test_shared_reference_completeness_distinguishes_library_and_plugin_alias(
     report = '[libraries]\nsame = "org.example:library:1.0.1"\n'
     if complete:
         report += '[plugins]\nsame = "org.example.plugin:1.0.1"\n'
-    monkeypatch.setattr(subprocess, "run", _fake_gradle(report))
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", _fake_gradle(report))
     findings = discover_gradle_updates(gradle_project)
     assert len(findings) == 1
     finding = findings[0]
@@ -1146,7 +1165,7 @@ def test_owned_output_parent_symlink_refuses_before_external_mutation(
             cmd, 1, stdout="", stderr="unexpected command"
         )
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", run)
     with pytest.raises(GradleError):
         if operation == "discovery":
             discover_gradle_updates(gradle_project)
@@ -1174,7 +1193,7 @@ def test_discovery_keeps_active_owned_inventory_context(gradle_project, monkeypa
             (root / GRADLE_UPDATE_REPORT_RELPATH).write_text(_clean_report())
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", run)
     with generate_gradle_inventory(gradle_project) as bom:
         before = bom.read_bytes()
         assert discover_gradle_updates(gradle_project)
@@ -1199,7 +1218,7 @@ def test_report_cleanup_rechecks_parent_after_wrapper_launch(
         (root / "gradle").symlink_to(outside, target_is_directory=True)
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="wrapper failed")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", run)
     with pytest.raises(GradleError):
         discover_gradle_updates(gradle_project)
     assert report.exists()
@@ -1245,7 +1264,7 @@ def test_inventory_setup_filesystem_error_is_gradle_error_and_cleans_new_directo
     def forbidden(*args, **kwargs):
         pytest.fail("setup failure must not launch wrapper")
 
-    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", forbidden)
     with pytest.raises(GradleError, match="denied"):
         with generate_gradle_inventory(gradle_project):
             pytest.fail("setup failure must not yield")
@@ -1276,8 +1295,7 @@ def test_report_lifecycle_filesystem_errors_are_gradle_errors(
 
         monkeypatch.setattr(Path, "write_bytes", fail)
         monkeypatch.setattr(
-            subprocess,
-            "run",
+            "maintenance_man.gradle.run_logged",
             lambda *args, **kwargs: pytest.fail("marker failure must not launch"),
         )
     else:
@@ -1289,7 +1307,9 @@ def test_report_lifecycle_filesystem_errors_are_gradle_errors(
             return unlink(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "unlink", fail)
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
     with pytest.raises(GradleError, match="denied"):
         discover_gradle_updates(gradle_project)
     if phase == "marker":
@@ -1318,7 +1338,8 @@ def test_owned_context_cleanup_preserves_caller_exception(
 
     root = Path(gradle_project.path)
     monkeypatch.setattr(
-        subprocess, "run", TestGenerateGradleInventory()._wrapper_writing("bom.json")
+        "maintenance_man.gradle.run_logged",
+        TestGenerateGradleInventory()._wrapper_writing("bom.json"),
     )
     context = (
         generate_gradle_inventory(gradle_project)
@@ -1343,12 +1364,13 @@ def test_adapter_filesystem_read_failure_is_actionable_and_releases_outputs(
     root = Path(gradle_project.path)
     if read == "inventory":
         monkeypatch.setattr(
-            subprocess,
-            "run",
+            "maintenance_man.gradle.run_logged",
             TestGenerateGradleInventory()._wrapper_writing("bom.json"),
         )
     else:
-        monkeypatch.setattr(subprocess, "run", _fake_gradle(_clean_report()))
+        monkeypatch.setattr(
+            "maintenance_man.gradle.run_logged", _fake_gradle(_clean_report())
+        )
     method = Path.read_bytes if read == "digest" else Path.read_text
     blocked = root / (
         GRADLE_CATALOGUE_RELPATH
@@ -1454,20 +1476,12 @@ def test_present_falsey_catalogue_table_is_not_defaulted(gradle_project, table, 
 def test_present_falsey_report_table_is_not_a_clean_discovery(
     gradle_project, monkeypatch, table, value
 ):
-    monkeypatch.setattr(subprocess, "run", _fake_gradle(f"{table} = {value}\n"))
+    monkeypatch.setattr(
+        "maintenance_man.gradle.run_logged", _fake_gradle(f"{table} = {value}\n")
+    )
     with pytest.raises(GradleError, match="table"):
         discover_gradle_updates(gradle_project)
     assert not (Path(gradle_project.path) / GRADLE_UPDATE_REPORT_RELPATH).exists()
-
-
-def test_wrapper_output_decode_failure_is_gradle_error(gradle_project, monkeypatch):
-    def run(*args, **kwargs):
-        raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
-
-    monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(GradleError, match="gradlew"):
-        discover_gradle_updates(gradle_project)
-    assert not (Path(gradle_project.path) / GRADLE_REPORT_MARKER_RELPATH).exists()
 
 
 @pytest.mark.parametrize("parser", ["catalogue", "report"])

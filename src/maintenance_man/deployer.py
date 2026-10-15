@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from maintenance_man.env import project_env
+from maintenance_man.process import run_logged
 
 
 class BuildError(Exception):
@@ -26,13 +27,12 @@ def _run_script(
     error_cls: type[Exception],
     label: str,
 ) -> None:
-    """Run a shell command with live output. Raises error_cls on failure."""
+    """Run a shell command under the invocation log policy; raise on failure."""
     try:
-        result = subprocess.run(
+        result = run_logged(
             command,
             cwd=project_path,
             shell=True,
-            executable="/bin/bash",
             env=project_env(),
             timeout=600,
         )

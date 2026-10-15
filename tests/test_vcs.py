@@ -613,7 +613,7 @@ class TestEnsureMainBookmark:
         assert ensure_main_bookmark(tmp_path) is False
 
         captured = capsys.readouterr()
-        assert "jj backend failed" in captured.out
+        assert "jj backend failed" in captured.err
 
 
 class TestMainBookmarkConflictDetection:

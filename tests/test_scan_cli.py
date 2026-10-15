@@ -3,7 +3,6 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
-from rich.console import Console
 
 from maintenance_man import cli
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
@@ -103,11 +102,14 @@ class TestScanSingleProject:
         output = capsys.readouterr().out
         assert "CVE-" in output or "vuln" in output.lower()
 
-    def test_scan_clean_project_exits_0(self, mm_home_with_projects: Path):
+    def test_scan_clean_project_exits_0(
+        self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """mm scan clean — clean, should exit 0."""
         with pytest.raises(SystemExit) as exc_info:
             app(["scan", "clean"])
         assert exc_info.value.code == 0
+        assert "No findings in clean · scanned in " in capsys.readouterr().err
 
     def test_scan_unknown_project_exits_1(self, mm_home_with_projects: Path):
         """mm scan nonexistent — should exit 1."""
@@ -139,7 +141,7 @@ class TestScanUpdatesExitCodes:
         with pytest.raises(SystemExit):
             app(["scan", "outdated"])
         output = capsys.readouterr().out
-        assert "UPDATE" in output or "update" in output.lower()
+        assert "update" in output or "update" in output.lower()
         assert "axios" in output
 
     def test_scan_clean_still_exits_0(self, mm_home_with_projects: Path):
@@ -189,9 +191,9 @@ def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
 
     assert "clean" not in out
     assert "ksp" in out
-    assert "UPDATE" in out
+    assert "update" in out
     assert "Blocked" not in out
-    assert "publication date" not in out
+    assert "publication date" in out
 
 
 def test_blocked_update_candidates_still_exit_updates_found():
@@ -219,11 +221,9 @@ def test_blocked_update_candidates_still_exit_updates_found():
     )
 
 
-def test_scan_keeps_update_planning_diagnostics_out_of_standard_rows(monkeypatch):
+def test_scan_includes_blocked_reasons_in_complete_pipe_records(monkeypatch):
     output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=220, color_system=None)
-    )
+    monkeypatch.setattr("sys.stdout", output)
     result = _make_vulnerable_result()
     result.vulnerabilities[0].blocked_reason = "Cannot identify catalogue entry"
     result.vulnerabilities.append(
@@ -244,24 +244,22 @@ def test_scan_keeps_update_planning_diagnostics_out_of_standard_rows(monkeypatch
     cli._print_scan_result(result)
     lines = output.getvalue().splitlines()
     for label, package, reason in (
-        ("VULN", "some-pkg", "Cannot identify catalogue entry"),
-        ("ADV", "unfixed-pkg", "No published fix"),
-        ("UPDATE", "agp", "Publication lookup timed out"),
+        ("vuln", "some-pkg", "Cannot identify catalogue entry"),
+        ("advisory", "unfixed-pkg", "No published fix"),
+        ("update", "agp", "Publication lookup timed out"),
     ):
         rows = [line for line in lines if package in line]
         assert len(rows) == 1
         assert label in rows[0]
-        assert reason not in output.getvalue()
+        assert reason in rows[0]
     available = next(line for line in lines if "available" in line)
-    assert "UPDATE" in available
+    assert "update" in available
     assert "timed out" not in available
 
 
-def test_scan_wraps_long_package_names_without_crowding_out_cves(monkeypatch):
+def test_scan_pipe_preserves_long_package_names_and_cves(monkeypatch):
     output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=80, color_system=None)
-    )
+    monkeypatch.setattr("sys.stdout", output)
     result = _make_vulnerable_result()
     result.vulnerabilities[0].pkg_name = "org.apache.commons:commons-lang3"
     result.vulnerabilities[
@@ -270,7 +268,7 @@ def test_scan_wraps_long_package_names_without_crowding_out_cves(monkeypatch):
 
     cli._print_scan_result(result)
 
-    assert "VULN" in output.getvalue()
+    assert "vuln" in output.getvalue()
     assert "CVE-2024-0001" in output.getvalue()
     assert "…" not in output.getvalue()
 
@@ -284,14 +282,14 @@ def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
     cli._print_blocked_findings(result)
 
     out = capsys.readouterr().out
-    assert "BLOCKED example" in out
+    assert "vulnerable\tupdate\tblocked\texample" in out
     assert "apply failed" in out
 
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
     monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
 
-    def _boom(name, proj_config, min_age_days):
+    def _boom(name, proj_config, min_age_days, *, report_clean=False):
         raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
 
     monkeypatch.setattr("maintenance_man.cli._scan_one", _boom)
@@ -321,7 +319,7 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
 
     assert exc.value.code == ExitCode.ERROR
     assert "clean" in scanned or len(scanned) > 1
-    assert "boom" in capsys.readouterr().out
+    assert "boom" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("all_projects", [False, True])
@@ -581,6 +579,7 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", run)
     with pytest.raises(SystemExit) as exc:
         app(["scan"])
     assert exc.value.code == ExitCode.ERROR
@@ -686,6 +685,7 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
         )
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", run)
     with pytest.raises(SystemExit) as exc:
         app(["scan"])
     assert exc.value.code == ExitCode.ERROR
@@ -699,9 +699,7 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
 @pytest.mark.parametrize("manager", ["gradle", "uv", "bun", "mvn"])
 def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager):
     output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
+    monkeypatch.setattr("sys.stdout", output)
     scope = ":app/project/debugRuntimeClasspath"
     findings = [
         VulnFinding(
@@ -729,9 +727,9 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager):
     )
     rendered = output.getvalue()
     assert rendered.count("org.example:shared") == 2
-    assert "VULN" in rendered
-    assert "ADV" in rendered
-    assert "Fix" in rendered
+    assert "vuln" in rendered
+    assert "advisory" in rendered
+    assert [line.split("\t")[4] for line in rendered.splitlines()] == ["1.1", "-"]
     assert "1.1" in rendered
     assert "CVE-A" in rendered
     assert "CVE-B" in rendered
@@ -743,9 +741,7 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager):
 
 def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
     output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
+    monkeypatch.setattr("sys.stdout", output)
     result = ScanResult(
         project="android",
         scanned_at=datetime.now(timezone.utc),
@@ -765,5 +761,3 @@ def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
     )
     cli._print_scan_result(result)
     assert output.getvalue().count("org.example:shared") == 2
-
-

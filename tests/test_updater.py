@@ -362,7 +362,7 @@ class TestApplyUpdate:
                 args=[], returncode=0, stdout="", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
 
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is True
         assert [call.args[0] for call in mock_run.call_args_list] == [
@@ -398,11 +398,11 @@ class TestApplyUpdate:
                 ),
             ]
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
 
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
         assert mock_run.call_count == 2
-        assert "uv add --group dev pytest==9.0.3" in capsys.readouterr().out
+        assert "uv add --group dev pytest==9.0.3" in capsys.readouterr().err
 
     def test_uv_pyproject_read_failure_is_apply_failure(
         self,
@@ -412,11 +412,11 @@ class TestApplyUpdate:
     ):
         monkeypatch.setattr("maintenance_man.updater._project_env", lambda: {})
         mock_run = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
 
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path) is False
         assert mock_run.call_count == 0
-        assert "Failed to read" in capsys.readouterr().out
+        assert "Failed to read" in capsys.readouterr().err
 
 
 # -- run_test_phases --
@@ -429,7 +429,7 @@ class TestRunTestPhases:
                 args=[], returncode=0, stdout="", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -447,7 +447,7 @@ class TestRunTestPhases:
                 args=[], returncode=1, stdout="FAIL", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
         tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
         passed, failed_phase = run_test_phases(tc, tmp_path)
         assert passed is False
@@ -466,7 +466,7 @@ class TestRunTestPhases:
             )
 
         mock_run = MagicMock(side_effect=side_effect)
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -485,7 +485,7 @@ class TestRunTestPhases:
                 args=[], returncode=0, stdout="", stderr=""
             )
         )
-        monkeypatch.setattr("maintenance_man.updater.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
         tc = ProjectConfig(
             path=tmp_path, package_manager="bun", test_unit="bun test"
         )  # no integration or component
@@ -840,7 +840,10 @@ class TestProcessFindingsLocal:
         mock_local_vcs["commit_current_change"].assert_not_called()
 
     def test_commit_failure_marks_finding_failed_and_continues(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+        self,
+        mock_local_vcs: dict[str, MagicMock],
+        project_config: ProjectConfig,
+        capsys: pytest.CaptureFixture[str],
     ):
         mock_local_vcs["commit_current_change"].side_effect = [False, True]
         updates = [
@@ -855,8 +858,15 @@ class TestProcessFindingsLocal:
         assert results[0].failed_phase == "commit"
         assert results[1].passed is True
 
+        rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+        assert rows[0][1:4] == ["update", "failed", updates[0].pkg_name]
+        assert rows[0][-1] == "commit failed"
+
     def test_bookmark_advancement_failure_stops_after_successful_commit(
-        self, mock_local_vcs: dict[str, MagicMock], project_config: ProjectConfig
+        self,
+        mock_local_vcs: dict[str, MagicMock],
+        project_config: ProjectConfig,
+        capsys: pytest.CaptureFixture[str],
     ):
         mock_local_vcs["create_or_reset_bookmark"].return_value = False
         updates = [
@@ -872,6 +882,10 @@ class TestProcessFindingsLocal:
         mock_local_vcs["commit_current_change"].assert_called_once()
         mock_local_vcs["_apply_update"].assert_called_once()
         mock_local_vcs["discard_current_change"].assert_not_called()
+
+        rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+        assert rows[0][1:4] == ["update", "failed", updates[0].pkg_name]
+        assert rows[0][-1] == "bookmark failed"
 
     def test_noop_update_without_changes_counts_as_pass(
         self,

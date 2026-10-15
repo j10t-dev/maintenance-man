@@ -9,9 +9,8 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from packaging.version import InvalidVersion, Version
-from rich import print as rprint
 
-from maintenance_man import gradle, sanitise_project_name
+from maintenance_man import gradle, output, sanitise_project_name
 from maintenance_man.env import project_env
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
@@ -23,6 +22,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
+from maintenance_man.process import run_logged
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     UvDependencyLocation,
@@ -89,19 +89,16 @@ class _WorkflowConfig:
     """Parameters for a single maintenance workflow (vuln or update)."""
 
     kind: UpdateKind
-    label: str
     commit_fmt: str
 
 
 _VULN_STACK = _WorkflowConfig(
     kind="vuln",
-    label="[bold red]VULN[/]",
     commit_fmt="fix: upgrade {pkg} {old} -> {new} for {detail}",
 )
 
 _UPDATE_STACK = _WorkflowConfig(
     kind="update",
-    label="[bold cyan]UPDATE[/]",
     commit_fmt="chore: bump {pkg} {old} -> {new} ({detail})",
 )
 
@@ -532,17 +529,17 @@ def run_test_phases(
     for phase_name, command in phases:
         if command is None:
             continue
-        rprint(f"  [dim]$ {command}[/]")
+        if output.is_verbose():
+            output.notice(f"$ {command}")
         try:
-            completed = subprocess.run(
+            completed = run_logged(
                 shlex.split(command),
                 cwd=project_path,
                 timeout=600,
-                text=True,
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            rprint(f"  [bold red]FAIL[/] {phase_name} timed out after 600s")
+            output.diagnostic("error", f"{phase_name} timed out after 600s")
             return False, phase_name
         if completed.returncode != 0:
             return False, phase_name
@@ -573,19 +570,41 @@ def process_findings(
     project_path = Path(project_config.path)
     has_tests = has_test_config(project_config)
 
+    def report(finding: Finding, result: UpdateResult, detail: str = "") -> None:
+        results.append(result)
+        status = (
+            "blocked"
+            if result.blocked_reason
+            else "passed"
+            if result.passed
+            else "failed"
+        )
+        reason = result.blocked_reason or " · ".join(
+            filter(
+                None,
+                [
+                    f"{result.failed_phase} failed" if result.failed_phase else "",
+                    detail,
+                ],
+            )
+        )
+        output.outcome(
+            project_name or project_path.name,
+            flow.value,
+            status,
+            finding.pkg_name,
+            installed=finding.installed_version,
+            target=finding.target_version,
+            reason=reason,
+        )
+
     for f in findings:
         if f.update_status in (UpdateStatus.READY, UpdateStatus.COMPLETED):
             continue
         flow_cfg = _workflow_config(f, cfg)
-        rprint(
-            f"\n  {flow_cfg.label} {f.pkg_name} {f.installed_version} "
-            f"-> {f.target_version} ({f.detail})"
-        )
 
         if not has_tests:
-            results.append(
-                UpdateResult(f.pkg_name, flow_cfg.kind, False, "configuration")
-            )
+            report(f, UpdateResult(f.pkg_name, flow_cfg.kind, False, "configuration"))
             continue
         outcome = apply_finding(project_config, f)
         if isinstance(outcome, Blocked):
@@ -598,15 +617,16 @@ def process_findings(
                     original.failed_phase = None
                     original.flow = None
             _persist_status(scan_result, project_name, results_dir)
-            results.append(
+            report(
+                f,
                 UpdateResult(
                     f.pkg_name, flow_cfg.kind, False, blocked_reason=outcome.reason
-                )
+                ),
             )
             continue
         if isinstance(outcome, ApplyFailed):
-            rprint(f"  [bold red]FAIL[/] {outcome.reason}")
-            results.append(
+            report(
+                f,
                 _record_failure(
                     f,
                     flow_cfg.kind,
@@ -617,7 +637,8 @@ def process_findings(
                     project_name,
                     results_dir,
                     discard=on_failure == "continue",
-                )
+                ),
+                outcome.reason,
             )
             if on_failure == "stop" or results[-1].failed_phase == "rollback":
                 break
@@ -629,7 +650,6 @@ def process_findings(
 
         if passed:
             if not current_change_has_changes(project_path):
-                rprint(f"  [bold green]PASS[/] {f.pkg_name} [dim](already applied)[/]")
                 f.update_status = UpdateStatus.READY
                 f.failed_phase = None
                 f.flow = flow
@@ -641,7 +661,8 @@ def process_findings(
                     detail=f.detail,
                 )
                 if not commit_current_change(project_path, msg):
-                    results.append(
+                    report(
+                        f,
                         _record_failure(
                             f,
                             flow_cfg.kind,
@@ -652,7 +673,7 @@ def process_findings(
                             project_name,
                             results_dir,
                             discard=on_failure == "continue",
-                        )
+                        ),
                     )
                     if on_failure == "stop" or results[-1].failed_phase == "rollback":
                         break
@@ -660,7 +681,8 @@ def process_findings(
                 if not create_or_reset_bookmark(
                     _WORKFLOW_BOOKMARKS[flow], project_path, "@-"
                 ):
-                    results.append(
+                    report(
+                        f,
                         _record_failure(
                             f,
                             flow_cfg.kind,
@@ -671,15 +693,13 @@ def process_findings(
                             project_name,
                             results_dir,
                             discard=False,
-                        )
+                        ),
                     )
                     break
-                rprint(f"  [bold green]PASS[/] {f.pkg_name}")
                 f.update_status = UpdateStatus.READY
                 f.failed_phase = None
                 f.flow = flow
         else:
-            rprint(f"  [bold red]FAIL[/] {f.pkg_name} — {failed_phase} failed")
             if on_failure == "continue" and not discard_current_change(project_path):
                 failed_phase = "rollback"
             f.update_status = UpdateStatus.FAILED
@@ -687,13 +707,14 @@ def process_findings(
             f.flow = flow
 
         _persist_status(scan_result, project_name, results_dir)
-        results.append(
+        report(
+            f,
             UpdateResult(
                 pkg_name=f.pkg_name,
                 kind=flow_cfg.kind,
                 passed=passed,
                 failed_phase=failed_phase,
-            )
+            ),
         )
 
         if not passed and (on_failure == "stop" or failed_phase == "rollback"):
@@ -773,39 +794,35 @@ def _apply_update(
     try:
         commands = get_update_commands(package_manager, pkg_name, version, project_path)
     except (UvDependencyError, ValueError) as e:
-        rprint(f"  [bold red]FAIL[/] {e}")
+        output.diagnostic("error", f"{e}")
         return False
 
     for cmd in commands:
-        completed = subprocess.run(
+        completed = run_logged(
             cmd,
             cwd=project_path,
             timeout=300,
-            capture_output=True,
-            text=True,
             env=env,
         )
         if completed.returncode != 0:
-            rprint(
-                f"  [bold red]FAIL[/] Package manager command failed: "
-                f"{' '.join(cmd)}\n  {completed.stderr.strip()}"
+            output.diagnostic(
+                "error",
+                f"Package manager command failed: {' '.join(cmd)} "
+                f"(exit {completed.returncode})",
             )
             return False
 
     # Maven needs a second command to finalise
     if package_manager == "mvn":
-        commit = subprocess.run(
+        commit = run_logged(
             ["mvn", "versions:commit"],
             cwd=project_path,
             timeout=120,
-            capture_output=True,
-            text=True,
             env=env,
         )
         if commit.returncode != 0:
-            rprint(
-                f"  [bold red]FAIL[/] mvn versions:commit failed: "
-                f"{commit.stderr.strip()}"
+            output.diagnostic(
+                "error", f"mvn versions:commit failed: exit {commit.returncode}"
             )
             return False
     return True

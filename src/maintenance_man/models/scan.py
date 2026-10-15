@@ -175,6 +175,10 @@ class ScanResult(BaseModel):
         return bool(self.updates)
 
     @property
+    def has_findings(self) -> bool:
+        return bool(self.vulnerabilities or self.updates or self.secrets)
+
+    @property
     def blocked_findings(self) -> list[VulnFinding | UpdateFinding]:
         """Findings withheld by current policy. Orthogonal to update lifecycle."""
         return [

@@ -18,6 +18,23 @@ from maintenance_man.models.scan import (
 )
 from tests.conftest import make_scan_result, make_update
 
+_FIXED_VULN = VulnFinding(
+    vuln_id="CVE-2026-0001",
+    pkg_name="pyasn1",
+    installed_version="0.6.1",
+    fixed_version="0.6.2",
+    severity=Severity.HIGH,
+    title="fixed",
+    description="fixed",
+    status="fixed",
+)
+_SECRET = SecretFinding(
+    file="secrets.env",
+    rule_id="generic-api-key",
+    title="API Key",
+    severity=Severity.HIGH,
+)
+
 
 class TestVulnFinding:
     def test_vuln_finding_with_fix(self):
@@ -208,6 +225,25 @@ class TestScanResult:
             trivy_target="/tmp/project-gamma",
         )
         assert result.has_updates is False
+
+    @pytest.mark.parametrize(
+        "findings, expected",
+        [
+            ({}, False),
+            ({"vulnerabilities": [_FIXED_VULN]}, True),
+            ({"updates": [make_update()]}, True),
+            ({"secrets": [_SECRET]}, True),
+        ],
+        ids=["none", "vulnerability", "update", "secret"],
+    )
+    def test_has_findings_when_any_category_is_present(self, findings, expected):
+        result = ScanResult(
+            project="project-gamma",
+            scanned_at=datetime(2026, 1, 30, tzinfo=timezone.utc),
+            trivy_target="/tmp/project-gamma",
+            **findings,
+        )
+        assert result.has_findings is expected
 
 
 class TestUpdateFinding:

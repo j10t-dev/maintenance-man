@@ -3,10 +3,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from rich import print as rprint
-
 from maintenance_man import config as _config
-from maintenance_man import sanitise_project_name
+from maintenance_man import output, sanitise_project_name
 
 
 class GitHubCLINotFoundError(Exception):
@@ -155,9 +153,8 @@ def bookmark_exists(bookmark: str, path: Path) -> bool:
 def create_or_reset_bookmark(bookmark: str, path: Path, revision: str) -> bool:
     result = _run(["jj", "bookmark", "set", bookmark, "-r", revision], path)
     if result.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] jj bookmark set {bookmark} failed: "
-            f"{result.stderr.strip()}"
+        output.diagnostic(
+            "warning", f"jj bookmark set {bookmark} failed: {result.stderr.strip()}"
         )
         return False
     return True
@@ -166,9 +163,8 @@ def create_or_reset_bookmark(bookmark: str, path: Path, revision: str) -> bool:
 def edit_new_change(path: Path, revision: str) -> bool:
     result = _run(["jj", "new", revision], path)
     if result.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] jj new {revision} failed: "
-            f"{result.stderr.strip()}"
+        output.diagnostic(
+            "warning", f"jj new {revision} failed: {result.stderr.strip()}"
         )
         return False
     return True
@@ -177,7 +173,7 @@ def edit_new_change(path: Path, revision: str) -> bool:
 def commit_current_change(path: Path, message: str) -> bool:
     result = _run(["jj", "commit", "-m", message], path)
     if result.returncode != 0:
-        rprint(f"  [bold red]FAIL[/] jj commit failed: {result.stderr.strip()}")
+        output.diagnostic("error", f"jj commit failed: {result.stderr.strip()}")
         return False
     return True
 
@@ -218,7 +214,7 @@ def _current_change_is_reusable_empty(path: Path) -> bool:
 def discard_current_change(path: Path) -> bool:
     result = _run(["jj", "restore", "--from", "@-"], path)
     if result.returncode != 0:
-        rprint(f"  [bold yellow]Warning:[/] jj restore failed: {result.stderr.strip()}")
+        output.diagnostic("warning", f"jj restore failed: {result.stderr.strip()}")
         return False
     return True
 
@@ -228,7 +224,7 @@ def _refresh_working_copy_from_main_result(path: Path) -> tuple[bool, str]:
         descendant = is_ancestor(path, "main", "@")
         if not descendant.ok:
             message = f"failed to inspect working copy ancestry: {descendant.error}"
-            rprint(f"  [bold yellow]Warning:[/] {message}")
+            output.diagnostic("warning", f"{message}")
             return False, message
         if descendant.value:
             return True, ""
@@ -238,14 +234,14 @@ def _refresh_working_copy_from_main_result(path: Path) -> tuple[bool, str]:
             message = (
                 f"failed to rebase working copy onto main: {result.stderr.strip()}"
             )
-            rprint(f"  [bold yellow]Warning:[/] {message}")
+            output.diagnostic("warning", f"{message}")
             return False, message
         return True, ""
 
     descendant = is_ancestor(path, "main", "@")
     if not descendant.ok:
         message = f"failed to inspect working copy ancestry: {descendant.error}"
-        rprint(f"  [bold yellow]Warning:[/] {message}")
+        output.diagnostic("warning", f"{message}")
         return False, message
     if descendant.value:
         return True, ""
@@ -253,7 +249,7 @@ def _refresh_working_copy_from_main_result(path: Path) -> tuple[bool, str]:
     result = _run(["jj", "new", "main"], path)
     if result.returncode != 0:
         message = f"failed to refresh working copy from main: {result.stderr.strip()}"
-        rprint(f"  [bold yellow]Warning:[/] {message}")
+        output.diagnostic("warning", f"{message}")
         return False, message
     return True, ""
 
@@ -266,9 +262,8 @@ def refresh_working_copy_from_main(path: Path) -> bool:
 def delete_bookmark(bookmark: str, path: Path) -> bool:
     result = _run(["jj", "bookmark", "delete", bookmark], path)
     if result.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] jj bookmark delete {bookmark} failed: "
-            f"{result.stderr.strip()}"
+        output.diagnostic(
+            "warning", f"jj bookmark delete {bookmark} failed: {result.stderr.strip()}"
         )
         return False
     return True
@@ -320,8 +315,8 @@ def create_workspace(repo_path: Path, project: str, revision: str) -> bool:
         timeout=30,
     )
     if result.returncode != 0:
-        rprint(
-            f"  [bold red]Error:[/] workspace creation failed: {result.stderr.strip()}"
+        output.diagnostic(
+            "error", f"workspace creation failed: {result.stderr.strip()}"
         )
         return False
     return True
@@ -413,18 +408,15 @@ def ensure_main_bookmark(path: Path) -> bool:
         return True
     origin_check = _revision_check(path, "main@origin")
     if not origin_check.ok:
-        rprint(
-            f"  [bold red]Error:[/] could not check main@origin: {origin_check.error}"
-        )
+        output.diagnostic("error", f"could not check main@origin: {origin_check.error}")
         return False
     if not origin_check.value:
-        rprint("  [bold red]Error:[/] main bookmark not found")
+        output.diagnostic("error", "main bookmark not found")
         return False
     result = _run(["jj", "bookmark", "create", "main", "-r", "main@origin"], path)
     if result.returncode != 0:
-        rprint(
-            f"  [bold red]Error:[/] could not create main bookmark: "
-            f"{result.stderr.strip()}"
+        output.diagnostic(
+            "error", f"could not create main bookmark: {result.stderr.strip()}"
         )
         return False
     return True
@@ -498,9 +490,8 @@ def prune_stale_bookmarks(project_path: Path) -> bool:
         ["jj", "git", "fetch", "--remote", "origin"], project_path, timeout=120
     )
     if fetch_result.returncode != 0:
-        rprint(
-            f"  [bold yellow]Warning:[/] jj git fetch failed: "
-            f"{fetch_result.stderr.strip()}"
+        output.diagnostic(
+            "warning", f"jj git fetch failed: {fetch_result.stderr.strip()}"
         )
         return False
 

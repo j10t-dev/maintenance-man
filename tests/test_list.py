@@ -1,10 +1,9 @@
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from maintenance_man.cli import _relative_time, app
+from maintenance_man.cli import app
 from maintenance_man.models.activity import record_activity
 from maintenance_man.models.scan import (
     ScanResult,
@@ -14,6 +13,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
+from maintenance_man.output import relative_time
 
 _NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -78,7 +78,7 @@ class TestRelativeTime:
         ids=["seconds", "minutes", "1hour", "hours", "1day", "days"],
     )
     def test_relative_time(self, delta: timedelta, expected: str):
-        assert _relative_time(_NOW - delta, _NOW) == expected
+        assert relative_time(_NOW - delta, _NOW) == expected
 
 
 class TestListCommand:
@@ -86,7 +86,7 @@ class TestListCommand:
         with pytest.raises(SystemExit) as exc_info:
             app(["list"])
         assert exc_info.value.code == 0
-        assert "no projects" in capsys.readouterr().out.lower()
+        assert "no projects" in capsys.readouterr().err.lower()
 
     def test_list_shows_projects(
         self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
@@ -120,10 +120,7 @@ class TestListFindings:
             app(["list"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
-        # Look for the table having a Scanned column and a row with "never"
-        assert "Scanned" in output
-        # Match pattern: ends of table rows that should have "never" as last column
-        assert re.search(r"\│\s+never\s+\│", output, re.IGNORECASE)
+        assert output.strip().split("\t")[5] == "never"
 
     def test_summary_shows_counts(
         self,
@@ -160,9 +157,9 @@ class TestListFindings:
         with pytest.raises(SystemExit) as exc_info:
             app(["list"])
         assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "myapp" in output
-        assert "Warning" in output
+        captured = capsys.readouterr()
+        assert "myapp" in captured.out
+        assert "warning:" in captured.err
 
     @pytest.mark.parametrize(
         "expected_substring",
@@ -247,7 +244,7 @@ class TestListFindings:
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """'← fix' marks the highest fix version for duplicate-package vulns."""
+        """'selected fix' marks the highest fix version for duplicate-package vulns."""
         vulns = [
             VulnFinding(
                 vuln_id="CVE-0001",
@@ -285,7 +282,7 @@ class TestListFindings:
         assert "2.32.4" in output
         # Find lines containing the marker
         lines_with_marker = [
-            line for line in output.splitlines() if "\u2190 fix" in line
+            line for line in output.splitlines() if "selected fix" in line
         ]
         assert len(lines_with_marker) == 1
         assert "2.32.4" in lines_with_marker[0]
@@ -333,7 +330,7 @@ class TestListFindings:
         assert output.index("CVE-CRIT") < output.index("CVE-HIGH")
         # Marker on the row with 2.32.4 (the HIGH one)
         lines_with_marker = [
-            line for line in output.splitlines() if "\u2190 fix" in line
+            line for line in output.splitlines() if "selected fix" in line
         ]
         assert len(lines_with_marker) == 1
         assert "2.32.4" in lines_with_marker[0]
@@ -343,7 +340,7 @@ class TestListFindings:
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Single-vuln packages should not get the '← fix' marker."""
+        """Single-vuln packages should not get the 'selected fix' marker."""
         result = ScanResult(
             project="myapp",
             scanned_at=_NOW,
@@ -355,7 +352,7 @@ class TestListFindings:
             app(["list", "--detail"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
-        assert "\u2190 fix" not in output
+        assert "selected fix" not in output
 
 
 class TestListActivity:
@@ -369,8 +366,7 @@ class TestListActivity:
             app(["list"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
-        assert "Built" in output
-        assert "Deployed" in output
+        assert output.strip().split("\t")[6:10] == ["-", "-", "-", "-"]
 
     def test_shows_relative_time_for_build(
         self,
@@ -384,7 +380,7 @@ class TestListActivity:
             app(["list"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
-        assert "just now" in output.lower() or "0m ago" in output or "1m ago" in output
+        assert datetime.fromisoformat(output.strip().split("\t")[6]).tzinfo is not None
 
     def test_shows_failure_marker(
         self,
@@ -398,4 +394,43 @@ class TestListActivity:
             app(["list"])
         assert exc_info.value.code == 0
         output = capsys.readouterr().out
-        assert "[F]" in output
+        assert output.strip().split("\t")[7] == "failed"
+
+
+def test_given_single_project_when_listed_on_terminal_then_columns_stay_visible(
+    list_project_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_output import TerminalStream
+
+    _write_scan_result(
+        list_project_home,
+        "myapp",
+        ScanResult(
+            project="myapp",
+            scanned_at=_NOW,
+            trivy_target=".",
+            vulnerabilities=[_VULN],
+            updates=[_UPDATE, _UPDATE],
+        ),
+    )
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("COLUMNS", "120")
+
+    with pytest.raises(SystemExit):
+        app(["list"])
+
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 3
+    assert lines[1].split() == [
+        "project",
+        "type",
+        "vulns",
+        "updates",
+        "secrets",
+        "scanned",
+        "built",
+        "deployed",
+    ]
+    assert lines[2].split()[:5] == ["myapp", "uv", "1", "2", "0"]

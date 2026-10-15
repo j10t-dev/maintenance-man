@@ -31,6 +31,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     classify_semver,
 )
+from maintenance_man.process import run_logged
 
 GRADLE_CATALOGUE_RELPATH = "gradle/libs.versions.toml"
 GRADLE_UPDATE_REPORT_RELPATH = "gradle/libs.versions.updates.toml"
@@ -507,11 +508,10 @@ def run_gradle(
 
     label = label or args[0]
     try:
-        completed = subprocess.run(
+        completed = run_logged(
             [str(wrapper), *args],
             cwd=root,
-            capture_output=True,
-            text=True,
+            capture=True,
             timeout=GRADLE_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             env=project_env(),
@@ -521,13 +521,12 @@ def run_gradle(
             f"./gradlew {label} timed out after {GRADLE_TIMEOUT_SECONDS}s in {root}"
         ) from e
 
-    except (OSError, UnicodeDecodeError) as e:
+    except OSError as e:
         raise GradleError(f"Could not run ./gradlew {label} in {root}: {e}") from e
 
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()[-2000:]
         raise GradleError(
-            f"./gradlew {label} failed (exit {completed.returncode}): {detail}"
+            f"./gradlew {label} failed (exit {completed.returncode}) in {root}"
         )
     return completed
 
