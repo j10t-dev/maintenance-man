@@ -12,11 +12,9 @@ from maintenance_man.outdated import (
     OutdatedCheckError,
     _get_uv_direct_dep_names,
     bun_outdated,
-    classify_semver,
     mvn_outdated,
     uv_outdated,
 )
-from maintenance_man.uv_dependencies import normalise_pkg_name
 from tests.conftest import completed, make_project
 from tests.fakes import FakeCommands
 
@@ -43,49 +41,6 @@ def _fake_commands(
     for index, result in enumerate(results):
         commands.add(command_lines[index], cwd=project.path, result=result)
     return commands
-
-
-class TestClassifySemver:
-    def test_patch_update(self):
-        assert classify_semver("1.2.3", "1.2.4") == SemverTier.PATCH
-
-    def test_minor_update(self):
-        assert classify_semver("1.2.3", "1.3.0") == SemverTier.MINOR
-
-    def test_major_update(self):
-        assert classify_semver("1.2.3", "2.0.0") == SemverTier.MAJOR
-
-    def test_major_update_no_reset(self):
-        assert classify_semver("1.2.3", "2.1.0") == SemverTier.MAJOR
-
-    def test_same_version(self):
-        assert classify_semver("1.2.3", "1.2.3") == SemverTier.UNKNOWN
-
-    def test_non_semver_input(self):
-        assert classify_semver("abc", "def") == SemverTier.UNKNOWN
-
-    def test_two_part_version(self):
-        assert classify_semver("1.2", "1.3") == SemverTier.MINOR
-
-    def test_four_part_version(self):
-        assert classify_semver("1.2.3.4", "1.2.4.0") == SemverTier.PATCH
-
-
-class TestNormalisePkgName:
-    def test_lowercase(self):
-        assert normalise_pkg_name("Requests") == "requests"
-
-    def test_underscores_to_hyphens(self):
-        assert normalise_pkg_name("pydantic_core") == "pydantic-core"
-
-    def test_dots_to_hyphens(self):
-        assert normalise_pkg_name("zope.interface") == "zope-interface"
-
-    def test_consecutive_separators(self):
-        assert normalise_pkg_name("Foo-_.Bar") == "foo-bar"
-
-    def test_already_normalised(self):
-        assert normalise_pkg_name("rich") == "rich"
 
 
 class TestGetUvDirectDepNames:

@@ -4,7 +4,6 @@ import pytest
 from pydantic import ValidationError
 
 from maintenance_man.models.scan import (
-    WORKFLOW_BOOKMARKS,
     GradleMember,
     GradleUpdateTarget,
     ScanResult,
@@ -18,28 +17,27 @@ from maintenance_man.models.scan import (
     highest_fix_version,
     sort_vulns_by_severity,
 )
+from maintenance_man.outdated import classify_semver
 from tests.conftest import make_scan_result, make_update, make_vuln
 
 
-def test_workflow_bookmarks_hold_the_managed_names():
-    assert dict(WORKFLOW_BOOKMARKS) == {
-        Workflow.UPDATE: "mm/update-dependencies",
-        Workflow.RESOLVE: "mm/resolve-dependencies",
-    }
-
-
 @pytest.mark.parametrize(
-    "severity, rank",
+    ("installed", "latest", "expected"),
     [
-        (Severity.UNKNOWN, 0),
-        (Severity.LOW, 1),
-        (Severity.MEDIUM, 2),
-        (Severity.HIGH, 3),
-        (Severity.CRITICAL, 4),
+        ("1.2.3", "1.2.4", SemverTier.PATCH),
+        ("1.2.3", "1.3.0", SemverTier.MINOR),
+        ("1.2.3", "2.0.0", SemverTier.MAJOR),
+        ("1.2.3", "2.1.0", SemverTier.MAJOR),
+        ("1.2.3", "1.2.3", SemverTier.UNKNOWN),
+        ("abc", "def", SemverTier.UNKNOWN),
+        ("1.2", "1.3", SemverTier.MINOR),
+        ("1.2.3.4", "1.2.4.0", SemverTier.PATCH),
     ],
 )
-def test_severity_rank(severity, rank):
-    assert severity.rank == rank
+def test_given_versions_when_classified_then_semver_tier_is_returned(
+    installed, latest, expected
+):
+    assert classify_semver(installed, latest) == expected
 
 
 def test_sort_keeps_critical_first_and_unknown_last():

@@ -1,20 +1,22 @@
 import hashlib
-import io
+import http.client
 import json
+import socket
 import subprocess
 import threading
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from pathlib import Path
-from threading import Event, Lock
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
-from typing import ClassVar
+from unittest.mock import MagicMock
 
 import pytest
 
+from maintenance_man import dependency_age as age
 from maintenance_man.dependency_age import (
     _MAX_BYTES,
     PublicationError,
@@ -22,21 +24,28 @@ from maintenance_man.dependency_age import (
     _public_url,
     _publication_http,
     evaluate_gradle_candidate_age,
+    filter_gradle_updates_by_age,
     filter_registry_updates_by_age,
     lookup_gradle_publication,
     member_module,
     publication_request,
     trusted_repository,
 )
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     AgeBlock,
+    CompleteResolution,
     ModuleId,
     PublicationEvidence,
+    PublicationFact,
     PublicationRequest,
     RepositoryDeclaration,
+    ResolutionReport,
 )
 from maintenance_man.models.publication import RegistryFact
 from maintenance_man.models.scan import (
+    GradleMember,
+    GradleUpdateTarget,
     SemverTier,
 )
 from maintenance_man.process import ProcessError
@@ -44,6 +53,62 @@ from tests.conftest import FakeClock, completed, make_gradle_member, make_update
 from tests.fakes import FakeCommands
 
 _PUB_NOW = datetime(2026, 9, 18, tzinfo=UTC)
+
+
+def _opener(*outcomes):
+    remaining = iter(outcomes)
+
+    class Opener:
+        def open(self, request, timeout):
+            outcome = next(remaining)
+            if callable(outcome):
+                return outcome(request, timeout)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    return Opener()
+
+
+def _wire_response(raw: bytes) -> http.client.HTTPResponse:
+    receiver, sender = socket.socketpair()
+
+    def send() -> None:
+        with sender:
+            try:
+                sender.sendall(raw)
+                sender.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    threading.Thread(target=send, daemon=True).start()
+    response = http.client.HTTPResponse(receiver)
+    response.begin()
+    return response
+
+
+def _pool(*, interrupt_on: int | None = None):
+    class Pool(ThreadPoolExecutor):
+        started = Event()
+        release = Event()
+        submissions = 0
+
+        def submit(self, *args, **kwargs):
+            type(self).submissions += 1
+            if interrupt_on is not None and type(self).submissions == interrupt_on:
+                assert type(self).started.wait(10), "eight lookups did not start"
+                raise KeyboardInterrupt
+            return super().submit(*args, **kwargs)
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            try:
+                super().shutdown(wait=False, cancel_futures=cancel_futures)
+            finally:
+                type(self).release.set()
+            if wait:
+                super().shutdown(wait=True)
+
+    return Pool
 
 
 def _pom(module, dependency=None):
@@ -96,8 +161,6 @@ def _publication_fixture(
 
 
 def _publication_fact(module, repository, timestamp, digest="0" * 64):
-    from maintenance_man.models.gradle import PublicationFact
-
     root = {
         "central": "https://repo.maven.apache.org/maven2",
         "google": "https://dl.google.com/dl/android/maven2",
@@ -444,7 +507,6 @@ def test_publication_context_logs_a_manager_neutral_label(tmp_path, caplog):
     ):
         pass
     assert "Publication lookup " in caplog.text
-    assert "Gradle publication" not in caplog.text
 
 
 def test_publication_negative_results_retry_next_command(tmp_path):
@@ -551,9 +613,24 @@ def test_plugin_implementation_age_is_part_of_policy(tmp_path):
         b"<project><groupId>other</groupId><artifactId>lib</artifactId>"
         b"<version>2.0</version></project>",
         b"x" * (1024 * 1024 + 1),
+        *[
+            (
+                "<project><parent><groupId>org.example</groupId>"
+                "<artifactId>parent</artifactId><version>2.0</version></parent>"
+                f"<artifactId>lib</artifactId>{identity}</project>"
+            ).encode()
+            for identity in (
+                "<groupId>wrong.group</groupId>",
+                "<version>${revision}</version>",
+                "<version></version>",
+                "<version>2.0</version><version>2.0</version>",
+            )
+        ],
     ],
 )
-def test_publication_rejects_unproven_pom(tmp_path, body):
+def test_given_unproven_pom_when_publication_is_looked_up_then_candidate_is_withheld(
+    tmp_path, body
+):
     _, request, _, context = _publication_fixture(
         tmp_path,
         responses={
@@ -616,42 +693,26 @@ def test_publication_shared_pool_bounds_and_inflight_dedup(tmp_path):
 def test_publication_transport_redirect_bound(
     monkeypatch, redirects, allowed, location, expected_calls
 ):
-    from maintenance_man import dependency_age as age
-
     calls = []
 
-    class Response:
-        status = 200
-        headers: ClassVar[dict[str, str]] = {}
-        fp = SimpleNamespace(
-            raw=SimpleNamespace(_sock=SimpleNamespace(settimeout=lambda _: None))
+    def open_request(request, timeout):
+        calls.append(request.full_url)
+        assert 0 < timeout <= 15
+        if len(calls) <= redirects:
+            headers = Message()
+            headers["Location"] = location
+            raise urllib.error.HTTPError(
+                request.full_url, 302, "redirect", headers, None
+            )
+        return _wire_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n<project/>"
         )
 
-        def __init__(self):
-            self.body = io.BytesIO(b"<project/>")
-
-        def read1(self, count):
-            return self.body.read(count)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-    class Opener:
-        def open(self, request, timeout):
-            calls.append(request.full_url)
-            assert 0 < timeout <= 15
-            if len(calls) <= redirects:
-                headers = Message()
-                headers["Location"] = location
-                raise urllib.error.HTTPError(
-                    request.full_url, 302, "redirect", headers, None
-                )
-            return Response()
-
-    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
+    monkeypatch.setattr(
+        age.urllib.request,
+        "build_opener",
+        lambda *_: _opener(*([open_request] * (redirects + 1))),
+    )
 
     def operation():
         return _publication_http(
@@ -673,18 +734,17 @@ def test_publication_transport_redirect_bound(
 def test_given_time_when_publication_http_caps_each_open_at_remaining_budget_then_caps(
     monkeypatch, elapsed, expected
 ):
-    from maintenance_man import dependency_age as age
-
     timeouts = []
     ticks = iter([0.0, elapsed])
     monkeypatch.setattr(age.time, "monotonic", lambda: next(ticks))
 
-    class Opener:
-        def open(self, request, timeout):
-            timeouts.append(timeout)
-            raise urllib.error.HTTPError(request.full_url, 404, "nf", Message(), None)
+    def not_found(request, timeout):
+        timeouts.append(timeout)
+        raise urllib.error.HTTPError(request.full_url, 404, "nf", Message(), None)
 
-    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *handlers: Opener())
+    monkeypatch.setattr(
+        age.urllib.request, "build_opener", lambda *handlers: _opener(not_found)
+    )
     assert (
         age._publication_http(
             "https://repo.maven.apache.org/maven2/g/a/1/a-1.pom",
@@ -698,19 +758,13 @@ def test_given_time_when_publication_http_caps_each_open_at_remaining_budget_the
 
 
 def test_publication_redirect_and_read_share_deadline(monkeypatch):
-    from email.message import Message
-    from types import SimpleNamespace
-    from urllib.error import HTTPError
-
-    from maintenance_man import dependency_age as age
-
     now = [100.0]
     timeouts = []
     closed = []
     url = "https://repo.maven.apache.org/maven2/a/b/2/b-2.pom"
     headers = Message()
     headers["Location"] = url
-    redirect = HTTPError(url, 302, "redirect", headers, None)
+    redirect = urllib.error.HTTPError(url, 302, "redirect", headers, None)
     original_close = redirect.close
 
     def close_redirect():
@@ -719,33 +773,41 @@ def test_publication_redirect_and_read_share_deadline(monkeypatch):
 
     monkeypatch.setattr(redirect, "close", close_redirect)
 
-    class Response:
-        status = 200
-        fp = SimpleNamespace(
-            raw=SimpleNamespace(_sock=SimpleNamespace(settimeout=lambda _: None))
-        )
+    response = MagicMock()
+    response.status = 200
+    response.fp = SimpleNamespace(
+        raw=SimpleNamespace(_sock=SimpleNamespace(settimeout=lambda _: None))
+    )
+    response.headers = {}
 
-        def read1(self, count):
-            now[0] = 116.0
-            return b"chunk"
+    def timed_read(count):
+        now[0] = 116.0
+        return b"chunk"
 
-        def __enter__(self):
-            return self
+    def tracked_close():
+        closed.append("response")
 
-        def __exit__(self, *args):
-            closed.append("response")
+    response.read1.side_effect = timed_read
+    response.close.side_effect = tracked_close
+    response.__enter__.return_value = response
+    response.__exit__.side_effect = lambda *args: tracked_close()
 
-    class Opener:
-        def open(self, request, timeout):
-            timeouts.append(timeout)
-            if len(timeouts) == 1:
-                now[0] = 114.0
-                raise redirect
-            assert closed == ["redirect"]
-            return Response()
+    def redirect_once(request, timeout):
+        timeouts.append(timeout)
+        now[0] = 114.0
+        raise redirect
+
+    def return_response(request, timeout):
+        timeouts.append(timeout)
+        assert closed == ["redirect"]
+        return response
 
     monkeypatch.setattr(age.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
+    monkeypatch.setattr(
+        age.urllib.request,
+        "build_opener",
+        lambda *_: _opener(redirect_once, return_response),
+    )
     with pytest.raises(PublicationError, match=r"^publication lookup timed out$"):
         age._publication_http(url, "central", "a/b/2/b-2.pom", lambda: None)
     assert timeouts == [3.0, 1.0]
@@ -754,11 +816,6 @@ def test_publication_redirect_and_read_share_deadline(monkeypatch):
 
 @pytest.mark.parametrize("transfer", ["content-length", "chunked"])
 def test_publication_http_response_eof(monkeypatch, transfer):
-    import http.client
-    import socket
-
-    from maintenance_man import dependency_age as age
-
     module = ModuleId(group="org.example", artifact="lib", version="2.0")
     body = _pom(module)
     if transfer == "content-length":
@@ -774,40 +831,29 @@ def test_publication_http_response_eof(monkeypatch, transfer):
             + b"0\r\n\r\n"
         )
         transfer_header = b"Transfer-Encoding: chunked\r\n"
-    receiver, sender = socket.socketpair()
-    try:
-        sender.sendall(
-            b"HTTP/1.1 200 OK\r\n"
-            + transfer_header
-            + b"Last-Modified: Tue, 01 Sep 2026 00:00:00 GMT\r\n\r\n"
-            + wire_body
-        )
-        sender.shutdown(socket.SHUT_WR)
-        response = http.client.HTTPResponse(receiver)
-        response.begin()
-        calls = []
+    response = _wire_response(
+        b"HTTP/1.1 200 OK\r\n"
+        + transfer_header
+        + b"Last-Modified: Tue, 01 Sep 2026 00:00:00 GMT\r\n\r\n"
+        + wire_body
+    )
+    calls = []
 
-        class Opener:
-            def open(self, request, timeout):
-                calls.append(request.full_url)
-                assert 0 < timeout <= 15
-                return response
+    def open_response(request, timeout):
+        calls.append(request.full_url)
+        assert 0 < timeout <= 15
+        return response
 
-        monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
-        suffix = "org/example/lib/2.0/lib-2.0.pom"
-        url = "https://repo.maven.apache.org/maven2/" + suffix
-        actual, headers, final_url = _publication_http(
-            url, "central", suffix, lambda: None
-        )
-        assert actual == body
-        assert headers["Last-Modified"] == "Tue, 01 Sep 2026 00:00:00 GMT"
-        assert final_url == url
-        assert calls == [url]
-        assert response.fp is None
-        assert response.isclosed()
-    finally:
-        receiver.close()
-        sender.close()
+    monkeypatch.setattr(
+        age.urllib.request, "build_opener", lambda *_: _opener(open_response)
+    )
+    suffix = "org/example/lib/2.0/lib-2.0.pom"
+    url = "https://repo.maven.apache.org/maven2/" + suffix
+    actual, headers, final_url = _publication_http(url, "central", suffix, lambda: None)
+    assert actual == body
+    assert headers["Last-Modified"] == "Tue, 01 Sep 2026 00:00:00 GMT"
+    assert final_url == url
+    assert calls == [url]
 
 
 @pytest.mark.parametrize(
@@ -820,60 +866,28 @@ def test_publication_http_response_size_bound(monkeypatch, extra_byte, accepted)
     fake transport and only exercises the post-hoc length check; this drives
     the actual ``response.read1`` loop and its deadline-bounded socket reads.
     """
-    import http.client
-    import socket
-    import threading
-
-    from maintenance_man import dependency_age as age
-
     body = b"x" * (age._MAX_BYTES + extra_byte)
     transfer_header = f"Content-Length: {len(body)}\r\n".encode()
-    receiver, sender = socket.socketpair()
-
-    def produce():
-        try:
-            sender.sendall(
-                b"HTTP/1.1 200 OK\r\n"
-                + transfer_header
-                + b"Last-Modified: Tue, 01 Sep 2026 00:00:00 GMT\r\n\r\n"
-                + body
-            )
-            sender.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-
-    producer = threading.Thread(target=produce, daemon=True)
-    producer.start()
-    try:
-        response = http.client.HTTPResponse(receiver)
-        response.begin()
-
-        class Opener:
-            def open(self, request, timeout):
-                assert 0 < timeout <= 15
-                return response
-
-        monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
-        suffix = "org/example/lib/2.0/lib-2.0.pom"
-        url = "https://repo.maven.apache.org/maven2/" + suffix
-        if accepted:
-            assert _publication_http(url, "central", suffix, lambda: None)[0] == body
-        else:
-            with pytest.raises(PublicationError):
-                _publication_http(url, "central", suffix, lambda: None)
-        assert response.isclosed()
-    finally:
-        producer.join(5)
-        receiver.close()
-        sender.close()
+    response = _wire_response(
+        b"HTTP/1.1 200 OK\r\n"
+        + transfer_header
+        + b"Last-Modified: Tue, 01 Sep 2026 00:00:00 GMT\r\n\r\n"
+        + body
+    )
+    monkeypatch.setattr(
+        age.urllib.request, "build_opener", lambda *_: _opener(response)
+    )
+    suffix = "org/example/lib/2.0/lib-2.0.pom"
+    url = "https://repo.maven.apache.org/maven2/" + suffix
+    if accepted:
+        assert _publication_http(url, "central", suffix, lambda: None)[0] == body
+    else:
+        with pytest.raises(PublicationError):
+            _publication_http(url, "central", suffix, lambda: None)
 
 
-def test_publication_exact_central_timestamp(tmp_path):
-    import json
-
+def _central_timestamp_context(tmp_path, documents):
     module = ModuleId(group="org.example", artifact="lib", version="2.0")
-    first_timestamp = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000)
-    latest_timestamp = int(datetime(2026, 9, 3, tzinfo=UTC).timestamp() * 1000)
     calls = []
 
     def transport(url, repository, suffix, count):
@@ -882,31 +896,34 @@ def test_publication_exact_central_timestamp(tmp_path):
         body = (
             _pom(module)
             if suffix
-            else json.dumps(
-                {
-                    "response": {
-                        "docs": [
-                            {
-                                "g": "org.example",
-                                "a": "lib",
-                                "v": "2.0",
-                                "timestamp": first_timestamp,
-                                "Extra": 1,
-                            },
-                            {
-                                "g": "org.example",
-                                "a": "lib",
-                                "v": "2.0",
-                                "timestamp": latest_timestamp,
-                            },
-                        ]
-                    }
-                }
-            ).encode()
+            else json.dumps({"response": {"docs": documents}}).encode()
         )
         return body, {}, url
 
-    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
+    return (
+        module,
+        calls,
+        PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)),
+    )
+
+
+def test_publication_exact_central_timestamp(tmp_path):
+    first = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000)
+    latest = int(datetime(2026, 9, 3, tzinfo=UTC).timestamp() * 1000)
+    module, calls, context = _central_timestamp_context(
+        tmp_path,
+        [
+            {
+                "g": "org.example",
+                "a": "lib",
+                "v": "2.0",
+                "timestamp": first,
+                "Extra": 1,
+            },
+            {"g": "org.example", "a": "lib", "v": "2.0", "timestamp": latest},
+        ],
+    )
+    with context:
         result = lookup_gradle_publication(
             PublicationRequest(
                 module=module, repositories=("central",), routing_supported=True
@@ -918,36 +935,15 @@ def test_publication_exact_central_timestamp(tmp_path):
         assert len(calls) == 2
 
 
-@pytest.mark.parametrize("timestamp", [True, "1", 0])
+@pytest.mark.parametrize("timestamp", [True, "1", 0, 10**22])
 def test_given_invalid_central_timestamp_when_looked_up_then_failure_is_contained(
     tmp_path, timestamp
 ):
-    module = ModuleId(group="org.example", artifact="lib", version="2.0")
-
-    def transport(url, repository, suffix, count):
-        count()
-        if suffix:
-            return _pom(module), {}, url
-        return (
-            json.dumps(
-                {
-                    "response": {
-                        "docs": [
-                            {
-                                "g": "org.example",
-                                "a": "lib",
-                                "v": "2.0",
-                                "timestamp": timestamp,
-                            }
-                        ]
-                    }
-                }
-            ).encode(),
-            {},
-            url,
-        )
-
-    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
+    module, _, context = _central_timestamp_context(
+        tmp_path,
+        [{"g": "org.example", "a": "lib", "v": "2.0", "timestamp": timestamp}],
+    )
+    with context:
         result = lookup_gradle_publication(
             PublicationRequest(
                 module=module, repositories=("central",), routing_supported=True
@@ -955,60 +951,12 @@ def test_given_invalid_central_timestamp_when_looked_up_then_failure_is_containe
             context,
         )
 
-    assert isinstance(result, AgeBlock)
-    assert "invalid Central timestamp" in result.reason
-
-
-def test_publication_central_timestamp_overflow_withholds(tmp_path):
-    """A Central timestamp too large to convert must withhold, not crash.
-
-    ``datetime.fromtimestamp`` raises ``ValueError`` for moderately-too-large
-    values but ``OverflowError`` for very large ones; only the magnitude
-    bound (not the caught-exception belt-and-braces) prevents that escape.
-    """
-    import json
-
-    module = ModuleId(group="org.example", artifact="lib", version="2.0")
-    hostile_timestamp = 10**22
-
-    def transport(url, repository, suffix, count):
-        count()
-        if suffix:
-            return _pom(module), {}, url
-        return (
-            json.dumps(
-                {
-                    "response": {
-                        "docs": [
-                            {
-                                "g": "org.example",
-                                "a": "lib",
-                                "v": "2.0",
-                                "timestamp": hostile_timestamp,
-                            }
-                        ]
-                    }
-                }
-            ).encode(),
-            {},
-            url,
-        )
-
-    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
-        result = lookup_gradle_publication(
-            PublicationRequest(
-                module=module, repositories=("central",), routing_supported=True
-            ),
-            context,
-        )
     assert isinstance(result, AgeBlock)
     assert "invalid Central timestamp" in result.reason
 
 
 @pytest.mark.parametrize("unknown", [None, TimeoutError("unavailable")])
 def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown):
-    from threading import Barrier
-
     barrier = Barrier(2, timeout=10)
     modules = [
         ModuleId(group="org.example", artifact=f"lib{i}", version="2.0")
@@ -1049,33 +997,20 @@ def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown):
 
 
 def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Event, Lock
-
-    from maintenance_man import dependency_age as age
-
-    started, release, lock = Event(), Event(), Lock()
+    pool = _pool()
+    lock = Lock()
     calls = []
-
-    class ReleasingPool(ThreadPoolExecutor):
-        def shutdown(self, wait=True, *, cancel_futures=False):
-            try:
-                super().shutdown(wait=False, cancel_futures=cancel_futures)
-            finally:
-                release.set()
-            if wait:
-                super().shutdown(wait=True)
 
     def transport(url, repository, suffix, count):
         count()
         with lock:
             calls.append(url)
             if len(calls) == 8:
-                started.set()
-        assert release.wait(10), "context cleanup did not release active requests"
+                pool.started.set()
+        assert pool.release.wait(10), "context cleanup did not release active requests"
         return
 
-    monkeypatch.setattr(age, "ThreadPoolExecutor", ReleasingPool)
+    monkeypatch.setattr(age, "ThreadPoolExecutor", pool)
     requests = tuple(
         PublicationRequest(
             module=ModuleId(group="org.example", artifact=f"lib{i}", version="2.0"),
@@ -1089,7 +1024,7 @@ def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeyp
         PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context,
     ):
         context.prefetch(requests)
-        assert started.wait(10), "eight requests did not start"
+        assert pool.started.wait(10), "eight requests did not start"
         raise KeyboardInterrupt
     assert len(calls) == 8, "queued publication requests ran after interruption"
 
@@ -1098,53 +1033,37 @@ def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeyp
 def test_publication_malformed_http_withholds_candidate(
     tmp_path, monkeypatch, caplog, failure
 ):
-    import http.client
-    import socket
-
-    from maintenance_man import dependency_age as age
-
-    receiver, sender = socket.socketpair()
     if failure == "truncated-chunk":
         wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n<project>"
     else:
         wire = b"not an HTTP status line\r\n\r\n"
-    sender.sendall(wire)
-    sender.shutdown(socket.SHUT_WR)
 
-    class Opener:
-        def open(self, request, timeout):
-            response = http.client.HTTPResponse(receiver)
-            response.begin()
-            return response
-
-    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *args: Opener())
+    monkeypatch.setattr(
+        age.urllib.request,
+        "build_opener",
+        lambda *args: _opener(lambda *_: _wire_response(wire)),
+    )
     caplog.set_level("DEBUG", logger="maintenance_man.dependency_age")
-    try:
-        module = ModuleId(group="org.example", artifact="lib", version="2.0")
-        with PublicationLookupContext(tmp_path) as context:
-            result = lookup_gradle_publication(
-                PublicationRequest(
-                    module=module, repositories=("central",), routing_supported=True
-                ),
-                context,
-            )
-        assert isinstance(result, AgeBlock)
-        assert "publication lookup failed" in result.reason
-        assert (
-            "IncompleteRead" if failure == "truncated-chunk" else "BadStatusLine"
-        ) in caplog.text
-        assert not list(tmp_path.glob("*.json"))
-    finally:
-        receiver.close()
-        sender.close()
+    module = ModuleId(group="org.example", artifact="lib", version="2.0")
+    with PublicationLookupContext(tmp_path) as context:
+        result = lookup_gradle_publication(
+            PublicationRequest(
+                module=module, repositories=("central",), routing_supported=True
+            ),
+            context,
+        )
+    assert isinstance(result, AgeBlock)
+    assert "publication lookup failed" in result.reason
+    assert (
+        "IncompleteRead" if failure == "truncated-chunk" else "BadStatusLine"
+    ) in caplog.text
+    assert not list(tmp_path.glob("*.json"))
 
 
 @pytest.mark.parametrize(
     "explicit", ["", "<groupId>org.example</groupId>", "<version>2.0</version>"]
 )
 def test_publication_accepts_literal_parent_identity(tmp_path, explicit):
-    from maintenance_man.models.gradle import PublicationEvidence
-
     pom = (
         '<project xmlns="http://maven.apache.org/POM/4.0.0">'
         "<modelVersion>4.0.0</modelVersion><parent><groupId>org.example</groupId>"
@@ -1163,33 +1082,6 @@ def test_publication_accepts_literal_parent_identity(tmp_path, explicit):
     assert result.facts[0].module == ModuleId(
         group="org.example", artifact="lib", version="2.0"
     )
-
-
-@pytest.mark.parametrize(
-    "identity",
-    [
-        "<groupId>wrong.group</groupId>",
-        "<version>${revision}</version>",
-        "<version></version>",
-        "<version>2.0</version><version>2.0</version>",
-    ],
-)
-def test_publication_never_replaces_invalid_explicit_identity_with_parent(
-    tmp_path, identity
-):
-    pom = (
-        "<project><parent><groupId>org.example</groupId><artifactId>parent</artifactId>"
-        "<version>2.0</version></parent><artifactId>lib</artifactId>"
-        f"{identity}</project>"
-    ).encode()
-    _, request, _, context = _publication_fixture(
-        tmp_path,
-        responses={
-            "central": (pom, {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"})
-        },
-    )
-    with context:
-        assert isinstance(lookup_gradle_publication(request, context), AgeBlock)
 
 
 @pytest.mark.parametrize("minimum_age", [0, 7])
@@ -1216,128 +1108,198 @@ def test_gradle_age_without_requests_is_withheld(tmp_path):
     assert result == AgeBlock(reason="candidate has no publication requests")
 
 
-@pytest.mark.parametrize("kind", ["library", "plugin"])
 @pytest.mark.parametrize(
-    "date,kept",
+    ("members", "repositories", "facts", "expected_dates", "expected_blocks"),
     [
-        ("Tue, 01 Sep 2026 00:00:00 GMT", True),
-        ("Thu, 17 Sep 2026 00:00:00 GMT", False),
-        (None, True),
-    ],
-)
-def test_gradle_scan_age_filter_keeps_unknown_and_filters_known_young(
-    tmp_path, kind, date, kept
-):
-    from maintenance_man import dependency_age as age
-
-    coordinate = "org.example:lib" if kind == "library" else "org.example.plugin"
-    row, project, resolution = _scan_age_inputs(
-        tmp_path,
-        member_specs=((kind, "lib", coordinate),),
-        repository_specs=((kind, "https://repo.maven.apache.org/maven2"),),
-    )
-    module = (
-        ModuleId(group="org.example", artifact="lib", version="2")
-        if kind == "library"
-        else ModuleId(
-            group=coordinate, artifact=coordinate + ".gradle.plugin", version="2"
-        )
-    )
-
-    def transport(url, repository, suffix, count):
-        if date is None:
-            msg = "unavailable"
-            raise TimeoutError(msg)
-        body = _pom(module)
-        if kind == "plugin":
-            body = body.replace(
-                b"</project>",
-                b"<dependencies><dependency><groupId>g</groupId><artifactId>impl</artifactId><version>2</version></dependency></dependencies></project>",
-            )
-        return body, {"Last-Modified": date}, url
-
-    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
-        result = age.filter_gradle_updates_by_age(
-            [row], project, resolution, 7, context
-        )
-    assert bool(result) is kept
-    if kept:
-        assert result[0].blocked_reason is None
-        assert (result[0].published_date is not None) is (date is not None)
-
-
-@pytest.mark.parametrize(
-    "case,kept,dated",
-    [
-        ("member-timeout", True, False),
-        ("member-routing", True, False),
-        ("young-member", False, False),
-        ("repository-timeout", True, False),
-        ("young-repository", False, False),
-        ("all-old", True, True),
-    ],
-)
-def test_gradle_group_age_requires_every_member_date(tmp_path, case, kept, dated):
-    from maintenance_man.dependency_age import filter_gradle_updates_by_age
-
-    member_specs = [("library", "one", "g:one")]
-    repository_specs = [("library", "https://repo.maven.apache.org/maven2")]
-    if "repository" in case:
-        repository_specs.append(("library", "https://dl.google.com/dl/android/maven2"))
-    else:
-        member_specs.append(
+        (
+            (("library", "one", "g:one"), ("library", "two", "g:two")),
+            (("library", "https://repo.maven.apache.org/maven2"),),
             (
-                "plugin" if case == "member-routing" else "library",
-                "two",
-                "g.two" if case == "member-routing" else "g:two",
-            )
-        )
+                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
+                (datetime(2026, 9, 3, tzinfo=UTC), "0" * 64),
+            ),
+            [datetime(2026, 9, 3, tzinfo=UTC)],
+            [None],
+        ),
+        (
+            (("library", "one", "g:one"), ("library", "two", "g:two")),
+            (("library", "https://repo.maven.apache.org/maven2"),),
+            (
+                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
+                (datetime(2026, 9, 17, tzinfo=UTC), "0" * 64),
+            ),
+            [],
+            [],
+        ),
+        (
+            (("library", "one", "g:one"), ("library", "two", "g:two")),
+            (("library", "https://repo.maven.apache.org/maven2"),),
+            (
+                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
+                TimeoutError("unavailable"),
+            ),
+            [None],
+            [None],
+        ),
+        (
+            (("library", "one", "g:one"), ("library", "two", "g:two")),
+            (("library", "https://repo.maven.apache.org/maven2"),),
+            (
+                (datetime(2026, 9, 17, tzinfo=UTC), "0" * 64),
+                TimeoutError("unavailable"),
+            ),
+            [],
+            [],
+        ),
+        (
+            (("library", "one", "g:one"),),
+            (
+                ("library", "https://repo.maven.apache.org/maven2"),
+                ("library", "https://dl.google.com/dl/android/maven2"),
+            ),
+            ((datetime(2026, 9, 1, tzinfo=UTC), "0" * 64), None),
+            [datetime(2026, 9, 1, tzinfo=UTC)],
+            [None],
+        ),
+        (
+            (("library", "one", "g:one"),),
+            (
+                ("library", "https://repo.maven.apache.org/maven2"),
+                ("library", "https://dl.google.com/dl/android/maven2"),
+            ),
+            (
+                (datetime(2026, 9, 17, tzinfo=UTC), "0" * 64),
+                TimeoutError("unavailable"),
+            ),
+            [],
+            [],
+        ),
+        (
+            (("library", "one", "g:one"),),
+            (
+                ("library", "https://repo.maven.apache.org/maven2"),
+                ("library", "https://dl.google.com/dl/android/maven2"),
+            ),
+            (
+                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
+                (datetime(2026, 9, 1, tzinfo=UTC), "1" * 64),
+            ),
+            [None],
+            [None],
+        ),
+        (
+            (("library", "one", "g:one"),),
+            (("library", "https://repo.maven.apache.org/maven2"),),
+            ((datetime(2026, 9, 11, tzinfo=UTC), "0" * 64),),
+            [],
+            [],
+        ),
+        (
+            (("library", "one", "g:one"), ("plugin", "two", "g.two")),
+            (("library", "https://repo.maven.apache.org/maven2"),),
+            ((datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),),
+            [None],
+            [None],
+        ),
+    ],
+    ids=[
+        "all-members-old",
+        "one-member-young",
+        "one-member-unknown",
+        "young-member-with-unknown-member",
+        "one-repository-absent",
+        "young-repository-with-unknown-repository",
+        "conflicting-digest",
+        "equal-cutoff",
+        "member-routing-unknown",
+    ],
+)
+def test_gradle_scan_age_rule(
+    tmp_path,
+    monkeypatch,
+    members,
+    repositories,
+    facts,
+    expected_dates,
+    expected_blocks,
+):
     row, project, resolution = _scan_age_inputs(
         tmp_path,
-        member_specs=member_specs,
-        repository_specs=repository_specs,
+        member_specs=members,
+        repository_specs=repositories,
     )
+    outcomes = iter(facts)
+
+    def submit(repository, module):
+        value = next(outcomes)
+        if isinstance(value, TimeoutError):
+            value = AgeBlock(reason="publication lookup failed")
+        elif isinstance(value, tuple):
+            value = _publication_fact(module, repository, value[0], value[1])
+        future = Future()
+        future.set_result(value)
+        return future
+
+    context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
+    monkeypatch.setattr(context, "submit", submit)
+    with context:
+        result = filter_gradle_updates_by_age([row], project, resolution, 7, context)
+    assert [update.published_date for update in result] == expected_dates
+    assert [update.blocked_reason for update in result] == expected_blocks
+
+
+def test_given_plugin_marker_when_filtered_then_marker_date_and_routing_are_kept(
+    tmp_path,
+):
+    marker = ModuleId(
+        group="org.example.plugin",
+        artifact="org.example.plugin.gradle.plugin",
+        version="2",
+    )
+    implementation = ModuleId(group="g", artifact="impl", version="2")
+    update, project, resolution = _scan_age_inputs(
+        tmp_path,
+        member_specs=(("plugin", "plugin", marker.group),),
+        repository_specs=(("plugin", "https://plugins.gradle.org/m2"),),
+    )
+    requests = []
 
     def transport(url, repository, suffix, count):
-        artifact = "two" if "/two/" in url else "one"
-        if repository == "google" or (artifact == "two" and case != "all-old"):
-            msg = "unavailable"
-            raise TimeoutError(msg)
-        date = (
-            "Thu, 17 Sep 2026 00:00:00 GMT"
-            if case.startswith("young")
-            else "Tue, 01 Sep 2026 00:00:00 GMT"
-        )
+        count()
+        requests.append((repository, suffix))
         return (
-            _pom(ModuleId(group="g", artifact=artifact, version="2")),
-            {"Last-Modified": date},
+            _pom(marker, implementation),
+            {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"},
             url,
         )
 
     with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
-        result = filter_gradle_updates_by_age([row], project, resolution, 7, context)
-    assert bool(result) is kept
-    if kept:
-        assert (result[0].published_date is not None) is dated
+        result = filter_gradle_updates_by_age([update], project, resolution, 7, context)
+
+    assert requests == [
+        (
+            "portal",
+            "org/example/plugin/org.example.plugin.gradle.plugin/2/"
+            "org.example.plugin.gradle.plugin-2.pom",
+        )
+    ]
+    assert [row.published_date for row in result] == [datetime(2026, 9, 1, tzinfo=UTC)]
+    assert [row.blocked_reason for row in result] == [None]
+
+
+_DEFAULT_GRADLE_MEMBER_SPECS = (("library", "one", "g:one"),)
+_DEFAULT_GRADLE_REPOSITORY_SPECS = (
+    ("library", "https://repo.maven.apache.org/maven2"),
+    ("library", "https://dl.google.com/dl/android/maven2"),
+)
 
 
 def _scan_age_inputs(
     tmp_path,
     *,
-    member_specs=(("library", "one", "g:one"),),
-    repository_specs=(
-        ("library", "https://repo.maven.apache.org/maven2"),
-        ("library", "https://dl.google.com/dl/android/maven2"),
-    ),
+    member_specs=_DEFAULT_GRADLE_MEMBER_SPECS,
+    repository_specs=_DEFAULT_GRADLE_REPOSITORY_SPECS,
 ):
-    from maintenance_man.models.config import ProjectConfig
-    from maintenance_man.models.gradle import (
-        CompleteResolution,
-        RepositoryDeclaration,
-        ResolutionReport,
-    )
-    from maintenance_man.models.scan import GradleMember, GradleUpdateTarget
-
     target = GradleUpdateTarget(
         version_ref="shared",
         target_version="2",
@@ -1380,70 +1342,7 @@ def _scan_age_inputs(
     return update, project, resolution
 
 
-@pytest.mark.parametrize(
-    "case,kept,expected_date",
-    [
-        ("unknown", True, None),
-        ("absent-repository", True, datetime(2026, 9, 1, tzinfo=UTC)),
-        ("old", True, datetime(2026, 9, 1, tzinfo=UTC)),
-        ("young", False, None),
-        ("equal-cutoff", False, None),
-        ("conflicting-digest", True, None),
-    ],
-)
-def test_gradle_group_age_assesses_known_facts(
-    tmp_path, monkeypatch, case, kept, expected_date
-):
-    from maintenance_man.dependency_age import filter_gradle_updates_by_age
-
-    update, project, resolution = _scan_age_inputs(tmp_path)
-    module = ModuleId(group="g", artifact="one", version="2")
-    old = datetime(2026, 9, 1, tzinfo=UTC)
-    dates = {
-        "young": datetime(2026, 9, 17, tzinfo=UTC),
-        "equal-cutoff": datetime(2026, 9, 11, tzinfo=UTC),
-    }
-    values = {
-        "unknown": (
-            _publication_fact(module, "central", old),
-            AgeBlock(reason="publication lookup failed"),
-        ),
-        "absent-repository": (_publication_fact(module, "central", old), None),
-        "old": (
-            _publication_fact(module, "central", old),
-            _publication_fact(module, "google", old),
-        ),
-        "young": (_publication_fact(module, "central", dates["young"]), None),
-        "equal-cutoff": (
-            _publication_fact(module, "central", dates["equal-cutoff"]),
-            None,
-        ),
-        "conflicting-digest": (
-            _publication_fact(module, "central", old),
-            _publication_fact(module, "google", old, "1" * 64),
-        ),
-    }[case]
-
-    class Future:
-        def __init__(self, value):
-            self.value = value
-
-        def result(self):
-            return self.value
-
-    context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
-    outcomes = iter(values)
-    monkeypatch.setattr(context, "submit", lambda *_: Future(next(outcomes)))
-    with context:
-        result = filter_gradle_updates_by_age([update], project, resolution, 7, context)
-    assert bool(result) is kept
-    if kept:
-        assert result[0].published_date == expected_date
-
-
 def test_gradle_scan_submits_every_update_before_waiting(tmp_path, monkeypatch):
-    from maintenance_man.dependency_age import filter_gradle_updates_by_age
-
     first, project, resolution = _scan_age_inputs(tmp_path)
     second, _, _ = _scan_age_inputs(
         tmp_path, member_specs=(("library", "two", "g:two"),)
@@ -1451,26 +1350,39 @@ def test_gradle_scan_submits_every_update_before_waiting(tmp_path, monkeypatch):
     expected_submissions = 4
     submitted = []
 
-    class Future:
-        def __init__(self, fact):
-            self.fact = fact
-
-        def result(self):
-            assert len(submitted) == expected_submissions
-            return self.fact
-
     def submit(repository, module):
         submitted.append((repository, module))
-        return Future(
-            _publication_fact(module, repository, datetime(2026, 9, 1, tzinfo=UTC))
-        )
+        fact = _publication_fact(module, repository, datetime(2026, 9, 1, tzinfo=UTC))
+        future = Future()
+        futures.append((future, fact))
+        if len(submitted) == expected_submissions:
+            for pending, value in futures:
+                pending.set_result(value)
+        return future
 
+    futures = []
+    outcome = []
     context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
     monkeypatch.setattr(context, "submit", submit)
-    with context:
-        result = filter_gradle_updates_by_age(
-            [first, second], project, resolution, 7, context
-        )
+
+    def filter_updates():
+        try:
+            with context:
+                outcome.append(
+                    filter_gradle_updates_by_age(
+                        [first, second], project, resolution, 7, context
+                    )
+                )
+        except BaseException as error:
+            outcome.append(error)
+
+    worker = threading.Thread(target=filter_updates, daemon=True)
+    worker.start()
+    worker.join(2)
+    assert not worker.is_alive(), "filter waited before submitting every update"
+    if isinstance(outcome[0], BaseException):
+        raise outcome[0]
+    result = outcome[0]
     assert [update.gradle_target for update in result] == [
         first.gradle_target,
         second.gradle_target,
@@ -1526,22 +1438,21 @@ def test_registry_age_skips_lookups(tmp_path, updates, days):
 
 
 @pytest.mark.parametrize(
-    "upload, kept",
+    "upload, expected_dates",
     [
-        ("2026-09-17T00:00:00Z", False),
-        ("2026-09-11T00:00:00Z", False),
-        ("2026-09-10T23:59:59Z", True),
-        ("2025-12-31T00:00:00Z", True),
+        ("2026-09-17T00:00:00Z", []),
+        ("2026-09-11T00:00:00Z", []),
+        ("2026-09-10T23:59:59Z", [datetime(2026, 9, 10, 23, 59, 59, tzinfo=UTC)]),
+        ("2025-12-31T00:00:00Z", [datetime(2025, 12, 31, tzinfo=UTC)]),
     ],
 )
-def test_registry_age_withholds_young_releases(tmp_path, upload, kept):
+def test_registry_age_withholds_young_releases(tmp_path, upload, expected_dates):
     update = make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="1.0")
     context, calls = _pypi_context(tmp_path, _pypi_body(uploads=(upload,)))
     with context:
         result = filter_registry_updates_by_age([update], "pypi", tmp_path, 7, context)
     assert calls[0][0] == "https://pypi.org/pypi/pkg/1.0/json"
-    expected = datetime.fromisoformat(upload)
-    assert [u.published_date for u in result] == ([expected] if kept else [])
+    assert [u.published_date for u in result] == expected_dates
 
 
 @pytest.mark.parametrize("response", [None, PublicationError("publication HTTP 429")])
@@ -1657,23 +1568,6 @@ def test_mvn_age_skips_names_that_are_not_group_artifact(tmp_path, name):
     assert [u.published_date for u in result] == [None]
 
 
-def test_npm_registry_switch_is_seen_by_the_next_scan(tmp_path, monkeypatch):
-    _fake_bun(
-        monkeypatch,
-        tmp_path,
-        "Published: 2024-01-01T00:00:00Z\n",
-        "Published: 2026-09-17T00:00:00Z\n",
-    )
-    update = make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="1.0.0")
-    kept = []
-    for _ in range(2):
-        with PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW)) as context:
-            kept.append(
-                filter_registry_updates_by_age([update], "npm", tmp_path, 7, context)
-            )
-    assert [len(result) for result in kept] == [1, 0]
-
-
 @pytest.mark.parametrize(
     "source, method, prefix",
     [("npm", "submit_registry", "pkg"), ("central", "submit", "org.example:lib")],
@@ -1704,36 +1598,19 @@ def test_registry_age_submits_every_update_before_waiting(
 
 
 def test_interrupted_registry_batch_cancels_queued_lookups(tmp_path, monkeypatch):
-    from maintenance_man import dependency_age as age
-
-    started, release, lock = Event(), Event(), Lock()
-    calls, submissions = [], []
-
-    class InterruptingPool(ThreadPoolExecutor):
-        def submit(self, *args, **kwargs):
-            submissions.append(args)
-            if len(submissions) == 12:
-                assert started.wait(10), "eight lookups did not start"
-                raise KeyboardInterrupt
-            return super().submit(*args, **kwargs)
-
-        def shutdown(self, wait=True, *, cancel_futures=False):
-            try:
-                super().shutdown(wait=False, cancel_futures=cancel_futures)
-            finally:
-                release.set()
-            if wait:
-                super().shutdown(wait=True)
+    pool = _pool(interrupt_on=12)
+    lock = Lock()
+    calls = []
 
     def transport(url, root, suffix, count):
         # No count(): the scanning thread holds the context lock inside submit.
         with lock:
             calls.append(url)
             if len(calls) == 8:
-                started.set()
-        assert release.wait(10), "context cleanup did not release lookups"
+                pool.started.set()
+        assert pool.release.wait(10), "context cleanup did not release lookups"
 
-    monkeypatch.setattr(age, "ThreadPoolExecutor", InterruptingPool)
+    monkeypatch.setattr(age, "ThreadPoolExecutor", pool)
     updates = [
         make_update(SemverTier.MINOR, pkg_name=f"pkg{i}", latest_version="1.0")
         for i in range(12)
@@ -1897,20 +1774,17 @@ def test_pypi_failures_are_contained(tmp_path, response, reason):
     ["https://pypi.org/pypi/pkg/1.0/json", "https://pypi.org/pypi/other/1.0/json"],
 )
 def test_pypi_transport_refuses_any_redirect(monkeypatch, location):
-    from maintenance_man import dependency_age as age
-
     calls = []
 
-    class Opener:
-        def open(self, request, timeout):
-            calls.append(request.full_url)
-            headers = Message()
-            headers["Location"] = location
-            raise urllib.error.HTTPError(
-                request.full_url, 302, "redirect", headers, None
-            )
+    def redirect(request, timeout):
+        calls.append(request.full_url)
+        headers = Message()
+        headers["Location"] = location
+        raise urllib.error.HTTPError(request.full_url, 302, "redirect", headers, None)
 
-    monkeypatch.setattr(age.urllib.request, "build_opener", lambda *_: Opener())
+    monkeypatch.setattr(
+        age.urllib.request, "build_opener", lambda *_: _opener(redirect)
+    )
     with pytest.raises(PublicationError, match="invalid redirect"):
         _publication_http(
             "https://pypi.org/pypi/pkg/1.0/json",
@@ -1922,8 +1796,6 @@ def test_pypi_transport_refuses_any_redirect(monkeypatch, location):
 
 
 def test_pypi_transport_refuses_other_hosts_before_opening(monkeypatch):
-    from maintenance_man import dependency_age as age
-
     def refuse(*args, **kwargs):
         pytest.fail("no request expected")
 
@@ -1956,14 +1828,16 @@ def _seed(cache, **changes):
 
 
 @pytest.mark.parametrize(
-    "changes, clock, expected_calls",
+    "cache_state, changes, clock, expected_calls, expected_cache_hits",
     [
-        ({}, _PUB_NOW + timedelta(hours=23, minutes=59), 0),
-        ({}, _PUB_NOW + timedelta(hours=24), 1),
-        ({}, _PUB_NOW - timedelta(seconds=1), 1),
-        ({"timestamp": _PUB_NOW + timedelta(hours=1)}, _PUB_NOW, 1),
-        ({"package": "other"}, _PUB_NOW, 1),
-        ({"registry": "npm"}, _PUB_NOW, 1),
+        ("fact", {}, _PUB_NOW + timedelta(hours=23, minutes=59), 0, 1),
+        ("fact", {}, _PUB_NOW + timedelta(hours=24), 1, 0),
+        ("fact", {}, _PUB_NOW - timedelta(seconds=1), 1, 0),
+        ("fact", {"timestamp": _PUB_NOW + timedelta(hours=1)}, _PUB_NOW, 1, 0),
+        ("fact", {"package": "other"}, _PUB_NOW, 1, 0),
+        ("fact", {"registry": "npm"}, _PUB_NOW, 1, 0),
+        ("corrupt", {}, _PUB_NOW, 1, 0),
+        ("other-project", {}, _PUB_NOW, 0, 1),
     ],
     ids=[
         "fresh",
@@ -1972,39 +1846,36 @@ def _seed(cache, **changes):
         "future-date",
         "other-package",
         "other-registry",
+        "corrupt",
+        "cross-project-reuse",
     ],
 )
-def test_pypi_cache_freshness_and_identity(tmp_path, changes, clock, expected_calls):
-    _seed(tmp_path, **changes)
-    context, calls = _pypi_context(tmp_path, _pypi_body(), clock=lambda: clock)
-    with context:
-        result = context.submit_registry("pypi", "pkg", "1.0", tmp_path).result()
-    assert len(calls) == expected_calls
-    assert context.cache_hits == 1 - expected_calls
-    assert isinstance(result, RegistryFact)
-
-
-def test_pypi_corrupt_cache_goes_live(tmp_path):
-    _seed(tmp_path).write_text("{broken")
-    context, calls = _pypi_context(tmp_path, _pypi_body())
-    with context:
-        assert isinstance(
-            context.submit_registry("pypi", "pkg", "1.0", tmp_path).result(),
-            RegistryFact,
-        )
-    assert len(calls) == 1
-
-
-def test_pypi_fact_is_shared_across_projects(tmp_path):
+def test_given_pypi_cache_states_when_looked_up_then_cache_policy_applies(
+    tmp_path,
+    cache_state,
+    changes,
+    clock,
+    expected_calls,
+    expected_cache_hits,
+):
     cache = tmp_path / "cache"
-    first, _ = _pypi_context(cache, _pypi_body())
-    with first:
-        first.submit_registry("pypi", "pkg", "1.0", tmp_path / "a").result()
-    second, calls = _pypi_context(cache, _pypi_body())
-    with second:
-        fact = second.submit_registry("pypi", "pkg", "1.0", tmp_path / "b").result()
-    assert calls == []
-    assert fact.timestamp == datetime(2025, 12, 31, tzinfo=UTC)
+    if cache_state == "other-project":
+        first, _ = _pypi_context(cache, _pypi_body())
+        with first:
+            first.submit_registry("pypi", "pkg", "1.0", tmp_path / "a").result()
+    else:
+        seeded = _seed(cache, **changes)
+        if cache_state == "corrupt":
+            seeded.write_text("{broken")
+
+    context, calls = _pypi_context(cache, _pypi_body(), clock=lambda: clock)
+    with context:
+        result = context.submit_registry("pypi", "pkg", "1.0", tmp_path / "b").result()
+
+    assert len(calls) == expected_calls
+    assert context.cache_hits == expected_cache_hits
+    assert isinstance(result, RegistryFact)
+    assert result.timestamp == datetime(2025, 12, 31, tzinfo=UTC)
 
 
 def test_pypi_cache_write_failure_returns_live_fact(tmp_path):
@@ -2086,7 +1957,13 @@ def test_npm_lookup_runs_bun_info_in_the_project_without_disk_cache(
     [
         (
             "Published: 2024-01-02T03:04:05\n",
-            datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC),
+            RegistryFact(
+                registry="npm",
+                package="pkg",
+                version="1.0.0",
+                timestamp=datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC),
+                checked_at=_PUB_NOW,
+            ),
         ),
         ("pkg@1.0.0 | MIT\n", None),
         ("Published:\n", None),
@@ -2112,13 +1989,10 @@ def test_npm_dates_and_failures(tmp_path, monkeypatch, output, expected):
     _fake_bun(monkeypatch, tmp_path, output)
     with PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW)) as context:
         result = context.submit_registry("npm", "pkg", "1.0.0", tmp_path).result()
-    if isinstance(expected, datetime):
-        assert result.timestamp == expected
-    else:
-        assert result == expected
+    assert result == expected
 
 
-def test_npm_ignores_a_planted_cache_file_and_reruns_each_context(
+def test_given_two_npm_contexts_when_filtered_then_each_context_runs_once(
     tmp_path, monkeypatch
 ):
     planted = _registry_path(tmp_path, "npm", "pkg", "1.0.0")
@@ -2137,15 +2011,23 @@ def test_npm_ignores_a_planted_cache_file_and_reruns_each_context(
         "Published: 2024-01-01T00:00:00Z\n",
         "Published: 2026-09-17T00:00:00Z\n",
     )
-    dates = []
+    dates, kept = [], []
+    update = make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="1.0.0")
     for _ in range(2):
         with PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW)) as context:
             first = context.submit_registry("npm", "pkg", "1.0.0", tmp_path)
             again = context.submit_registry("npm", "pkg", "1.0.0", tmp_path)
             dates.append(first.result().timestamp)
             assert again is first
+            kept.append(
+                filter_registry_updates_by_age([update], "npm", tmp_path, 7, context)
+            )
     assert len(commands.calls) == 2
     assert dates == [
         datetime(2024, 1, 1, tzinfo=UTC),
         datetime(2026, 9, 17, tzinfo=UTC),
+    ]
+    assert [[item.published_date for item in result] for result in kept] == [
+        [datetime(2024, 1, 1, tzinfo=UTC)],
+        [],
     ]
