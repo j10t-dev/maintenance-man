@@ -297,7 +297,7 @@ def _read_publication_body(response, deadline):
             raise PublicationError(msg)
         # HTTPResponse.read1 performs at most one underlying read.
         # Bound that read by the remaining operation deadline.
-        response.fp.raw._sock.settimeout(remaining)
+        response.fp.raw._sock.settimeout(remaining)  # noqa: SLF001 http.client exposes no public socket accessor
         chunk = response.read1(min(65536, _MAX_BYTES + 1 - size))
         if not chunk:
             break
