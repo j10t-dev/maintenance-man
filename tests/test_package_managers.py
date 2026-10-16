@@ -10,10 +10,8 @@ from maintenance_man.package_managers import (
     PackageManagerOps,
     UnsupportedPackageManagerError,
     UpdateCommandError,
-    _uv_update_command,
     package_manager_ops,
 )
-from maintenance_man.uv_dependencies import UvDependencyLocation
 
 
 def test_table_covers_every_configurable_manager_except_gradle():
@@ -167,17 +165,6 @@ class TestUpdateCommands:
             package_manager_ops(manager).update_commands(pkg, version, tmp_path)
             == expected
         )
-
-    def test_uv_group_command_requires_group_name(self):
-        with pytest.raises(
-            UpdateCommandError,
-            match="group dependency location missing",
-        ):
-            _uv_update_command(
-                "pytest",
-                "9.0.3",
-                UvDependencyLocation(kind="group"),
-            )
 
     def test_uv_unreadable_pyproject_is_an_update_command_error(self, tmp_path):
         with pytest.raises(UpdateCommandError, match="Failed to read"):

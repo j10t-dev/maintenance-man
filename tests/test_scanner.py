@@ -134,7 +134,7 @@ def test_uv_audit_runs_isolated_and_accepts_findings_status(tmp_path, monkeypatc
     "scan, match",
     [
         (lambda path: scanner._run_uv_audit(path), "uv audit"),
-        (lambda path: scanner._run_trivy_scan(path, scan_secrets=False), "Trivy"),
+        (lambda path: scanner._run_trivy_scan(path, scanners="vuln"), "Trivy"),
     ],
 )
 @pytest.mark.parametrize(
@@ -180,7 +180,7 @@ def test_given_malformed_consumed_secret_fields_when_scanned_then_scan_error(
     )
 
     with pytest.raises(ScanError, match="Trivy"):
-        scanner._run_trivy_scan(tmp_path, scan_secrets=True)
+        scanner._run_trivy_scan(tmp_path, scanners="vuln,secret")
 
 
 def test_stale_comparison_context_is_a_gradle_error(gradle_project, monkeypatch):
@@ -385,7 +385,7 @@ class TestScanProjectWithUpdates:
             ),
             patch(
                 "maintenance_man.scanner.filter_registry_updates_by_age",
-                return_value=fake_updates,
+                side_effect=lambda updates, *args, **kwargs: updates,
             ),
         ):
             result = scan_project("clean", project)
@@ -436,7 +436,7 @@ class TestScanProjectWithUpdates:
             ),
             patch(
                 "maintenance_man.scanner.filter_registry_updates_by_age",
-                return_value=fake_updates,
+                side_effect=lambda updates, *args, **kwargs: updates,
             ),
         ):
             result = scan_project("vulnerable", project)
@@ -1566,7 +1566,7 @@ def test_scan_steps_follow_the_table_vulnerability_source(
         calls.append("uv-audit")
         return []
 
-    def trivy(path, scan_secrets, skip_dirs):
+    def trivy(path, skip_dirs, *, scanners):
         calls.append("trivy")
         return [], []
 
@@ -1604,7 +1604,7 @@ def test_scan_dates_bun_updates_with_bun_info_in_the_project(
             cmd, 0, "zod | MIT\nPublished: 2024-01-01T00:00:00Z\n", ""
         )
 
-    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args: ([], []))
+    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args, **kwargs: ([], []))
     monkeypatch.setattr(
         scanner,
         "package_manager_ops",
@@ -1646,9 +1646,53 @@ def test_non_gradle_scan_filters_through_one_publication_context(
         "package_manager_ops",
         ops_with_outdated(lambda project: [make_update()]),
     )
-    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args: ([], []))
+    monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args, **kwargs: ([], []))
     monkeypatch.setattr(scanner, "_run_uv_audit", lambda *args: [])
     project = ProjectConfig(path=tmp_path, package_manager=manager, scan_secrets=False)
     scanner.scan_project("demo", project, 9)
     assert opened == [paths.publications_dir()]
     assert filtered == [(source, tmp_path, 9, True)]
+
+
+def test_given_vulnerable_update_when_scanned_then_only_clean_is_looked_up_and_saved(
+    mm_home, tmp_path, monkeypatch
+):
+    from maintenance_man import dependency_age
+    from tests.test_dependency_age import _pypi_body, _scan_age_inputs
+
+    vulnerable, _, _ = _scan_age_inputs(tmp_path)
+    clean, _, _ = _scan_age_inputs(tmp_path)
+    raw_updates = [
+        vulnerable.model_copy(
+            update={"pkg_name": "pkg-a", "latest_version": "2.0", "gradle_target": None}
+        ),
+        clean.model_copy(
+            update={"pkg_name": "pkg-b", "latest_version": "2.0", "gradle_target": None}
+        ),
+    ]
+    requested = []
+
+    def transport(url, repository, suffix, count):
+        count()
+        requested.append(suffix)
+        return _pypi_body("pkg-b", "2.0"), {}, url
+
+    monkeypatch.setattr(dependency_age, "_publication_http", transport)
+    monkeypatch.setattr(
+        scanner, "_run_uv_audit", lambda path: [make_vuln(pkg_name="pkg-a")]
+    )
+    monkeypatch.setattr(
+        scanner, "package_manager_ops", ops_with_outdated(lambda project: raw_updates)
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+
+    result = scan_project(
+        "demo",
+        project,
+        7,
+        clock=FakeClock(datetime(2026, 9, 18, tzinfo=UTC)),
+    )
+
+    assert requested == ["pypi/pkg-b/2.0/json"]
+    assert [update.pkg_name for update in result.updates] == ["pkg-b"]
+    assert load_scan_results("demo").updates == result.updates

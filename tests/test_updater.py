@@ -43,7 +43,7 @@ from maintenance_man.updater import (
     sort_updates_by_risk,
 )
 from maintenance_man.uv_dependencies import (
-    UvDependencyLocation,
+    UvUngroupedLocation,
     get_uv_dependency_locations,
 )
 from maintenance_man.vcs_workflow import VcsServices
@@ -213,7 +213,7 @@ class TestGetUvDependencyLocations:
         )
 
         result = get_uv_dependency_locations(tmp_path, "urllib3")
-        assert result == [UvDependencyLocation(kind="transitive")]
+        assert result == [UvUngroupedLocation(kind="transitive")]
 
     def test_returns_transitive_for_optional_dependency(self, tmp_path: Path):
         # project.optional-dependencies are intentionally not scanned for direct deps;
@@ -226,7 +226,7 @@ class TestGetUvDependencyLocations:
         )
 
         result = get_uv_dependency_locations(tmp_path, "rich")
-        assert result == [UvDependencyLocation(kind="transitive")]
+        assert result == [UvUngroupedLocation(kind="transitive")]
 
 
 class TestApplyUpdate:

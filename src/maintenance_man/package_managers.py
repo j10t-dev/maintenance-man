@@ -13,6 +13,7 @@ from maintenance_man.outdated import bun_outdated, mvn_outdated, uv_outdated
 from maintenance_man.uv_dependencies import (
     UvDependencyError,
     UvDependencyLocation,
+    UvGroupLocation,
     get_uv_dependency_locations,
 )
 
@@ -71,16 +72,11 @@ def _uv_update_commands(pkg: str, version: str, workspace: Path) -> list[list[st
 def _uv_update_command(
     pkg: str, version: str, location: UvDependencyLocation
 ) -> list[str]:
+    if isinstance(location, UvGroupLocation):
+        return ["uv", "add", "--group", location.group, f"{pkg}=={version}"]
     if location.kind == "transitive":
         return ["uv", "lock", "--upgrade-package", pkg]
-    command = ["uv", "add"]
-    if location.kind == "group":
-        if location.group is None:
-            msg = "UV group dependency location missing group name"
-            raise UpdateCommandError(msg)
-        command.extend(["--group", location.group])
-    command.append(f"{pkg}=={version}")
-    return command
+    return ["uv", "add", f"{pkg}=={version}"]
 
 
 def _mvn_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:

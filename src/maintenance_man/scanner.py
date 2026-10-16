@@ -97,7 +97,9 @@ def scan_project(
                     )
                 case "trivy":
                     vulns, secrets = _run_trivy_scan(
-                        project_path, project.scan_secrets, project.scan_skip_dirs
+                        project_path,
+                        project.scan_skip_dirs,
+                        scanners="vuln,secret" if project.scan_secrets else "vuln",
                     )
                 case unreachable:
                     assert_never(unreachable)
@@ -151,15 +153,15 @@ def _check_outdated(
 ) -> list[UpdateFinding]:
     """Run the table's outdated check and return aged, de-duplicated findings."""
     raw_updates = ops.outdated(project)
-    aged_updates = filter_registry_updates_by_age(
-        raw_updates,
+    vuln_pkgs = {v.pkg_name for v in vulns}
+    eligible_updates = [u for u in raw_updates if u.pkg_name not in vuln_pkgs]
+    return filter_registry_updates_by_age(
+        eligible_updates,
         ops.publication_source,
         project.path,
         min_age_days=min_version_age_days,
         context=publication,
     )
-    vuln_pkgs = {v.pkg_name for v in vulns}
-    return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
 
 
 def scan_gradle(
@@ -411,21 +413,18 @@ def scan_secrets(
     skip_dirs: list[str] | None = None,
 ) -> list[SecretFinding]:
     """Run Trivy secrets-only scan against *project_path*."""
-    _, secrets = _run_trivy_scan(
-        project_path, scan_secrets=True, skip_dirs=skip_dirs, scanners="secret"
-    )
+    _, secrets = _run_trivy_scan(project_path, skip_dirs, scanners="secret")
     return secrets
 
 
 def _run_trivy_scan(
     project_path: Path,
-    scan_secrets: bool,
     skip_dirs: list[str] | None = None,
-    scanners: str | None = None,
+    *,
+    scanners: str,
 ) -> tuple[list[VulnFinding], list[SecretFinding]]:
     """Run Trivy against *project_path* and return parsed findings."""
     require_tool("trivy", TRIVY_INSTALL_HINT)
-    scanners = scanners or ("vuln,secret" if scan_secrets else "vuln")
     cmd = [
         "trivy",
         "fs",
@@ -446,7 +445,7 @@ def _run_trivy_scan(
     )
 
     response = _parse_trivy_response(
-        completed.stdout, "Trivy", consume_secrets=scan_secrets
+        completed.stdout, "Trivy", consume_secrets="secret" in scanners
     )
     try:
         return _parse_vulns(response.results), _parse_secrets(response.results)

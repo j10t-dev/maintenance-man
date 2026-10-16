@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import re
 import tomllib
 from dataclasses import dataclass
@@ -20,9 +18,20 @@ _PEP503_NORMALISE_RE = re.compile(r"[-_.]+")
 # [project.optional-dependencies] are not scanned; packages declared only there
 # (or packages that are purely transitive) fall through to kind="transitive".
 @dataclass(frozen=True, slots=True)
-class UvDependencyLocation:
-    kind: Literal["runtime", "group", "transitive"]
-    group: str | None = None
+class UvUngroupedLocation:
+    """A runtime declaration or package found only through resolution."""
+
+    kind: Literal["runtime", "transitive"]
+
+
+@dataclass(frozen=True, slots=True)
+class UvGroupLocation:
+    """A dependency declaration in the named uv dependency group."""
+
+    group: str
+
+
+type UvDependencyLocation = UvUngroupedLocation | UvGroupLocation
 
 
 def normalise_pkg_name(name: str) -> str:
@@ -53,7 +62,7 @@ def get_uv_dependency_locations(
     """Return UV declaration locations for *pkg_name*.
 
     Returns runtime and/or group locations when the package is declared directly.
-    Returns ``[UvDependencyLocation(kind="transitive")]`` when no direct declaration
+    Returns ``[UvUngroupedLocation(kind="transitive")]`` when no direct declaration
     is found (transitive dependency or optional-extras-only declaration).
     """
     data = _load_pyproject(project_path)
@@ -62,14 +71,14 @@ def get_uv_dependency_locations(
 
     runtime_specs = _iter_runtime_dependency_specs(data)
     if any(_extract_requirement_name(spec) == target for spec in runtime_specs):
-        locations.append(UvDependencyLocation(kind="runtime"))
+        locations.append(UvUngroupedLocation(kind="runtime"))
 
     for group, specs in _iter_dependency_groups(data):
         if any(_extract_requirement_name(spec) == target for spec in specs):
-            locations.append(UvDependencyLocation(kind="group", group=group))
+            locations.append(UvGroupLocation(group=group))
 
     if not locations:
-        return [UvDependencyLocation(kind="transitive")]
+        return [UvUngroupedLocation(kind="transitive")]
 
     return locations
 

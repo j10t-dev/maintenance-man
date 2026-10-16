@@ -1,7 +1,5 @@
 """Structured Gradle resolution and catalogue ownership; no lifecycle state."""
 
-from __future__ import annotations
-
 import json
 import logging
 import re
@@ -12,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import TypedDict
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError
@@ -21,6 +19,7 @@ from maintenance_man.clock import Clock
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     evaluate_gradle_candidate_age,
+    member_module,
     publication_request,
 )
 from maintenance_man.gradle import (
@@ -48,6 +47,7 @@ from maintenance_man.models.gradle import (
     IncompleteResolution,
     KnownOwner,
     ModuleId,
+    OwnerKind,
     OwnerResolution,
     ResolutionEdge,
     ResolutionOutcome,
@@ -222,8 +222,7 @@ def _editable_version(catalogue: Catalogue, entry: CatalogueEntry) -> str | None
     return version.value
 
 
-type _OwnerKind = Literal["direct", "parent", "platform", "plugin"]
-type _OwnerEvidence = tuple[str, _OwnerKind]
+type _OwnerEvidence = tuple[str, OwnerKind]
 
 
 def _editable_library_roots(
@@ -262,7 +261,7 @@ def _reverse_owner_evidence(
         if (component_id, constrained) in visited:
             continue
         visited.add((component_id, constrained))
-        kind: _OwnerKind = (
+        kind: OwnerKind = (
             "direct" if distance == 0 else "platform" if constrained else "parent"
         )
         for group in editable.get(component_id, ()):
@@ -779,6 +778,14 @@ def attach_gradle_publications(
             for repository in resolution.report.repositories
             if repository.domain == domain and repository.project_path in paths | {":"}
         )
+        module = member_module(member, candidate.target.target_version)
+        if module is None:
+            return CandidateWithheld(
+                group_key=candidate.target.group_key,
+                coordinate=member.coordinate,
+                installed_version=member.installed_version,
+                reason="unsupported catalogue member coordinate",
+            )
         if member.kind == "plugin":
             implementations = {row.implementation for row in rows}
             if len(implementations) != 1 or None in implementations:
@@ -788,25 +795,15 @@ def attach_gradle_publications(
                     installed_version=member.installed_version,
                     reason="conflicting marker implementations",
                 )
-            module = ModuleId(
-                group=member.coordinate,
-                artifact=f"{member.coordinate}.gradle.plugin",
-                version=candidate.target.target_version,
-            )
             requests.append(
                 publication_request(
                     module, repositories, implementation=next(iter(implementations))
                 )
             )
         else:
-            group, artifact = member.coordinate.split(":")
             requests.append(
                 publication_request(
-                    ModuleId(
-                        group=group,
-                        artifact=artifact,
-                        version=candidate.target.target_version,
-                    ),
+                    module,
                     repositories,
                 )
             )

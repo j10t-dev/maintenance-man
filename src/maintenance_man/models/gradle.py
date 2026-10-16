@@ -1,12 +1,13 @@
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from maintenance_man.models.publication import UtcDatetime
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     GradleKind,
@@ -173,18 +174,10 @@ class PublicationFact(BaseModel):
     source_url: str
     method: Literal["last_modified", "central_timestamp"]
     artifact_digest: str
-    timestamp: datetime
-    checked_at: datetime
+    timestamp: UtcDatetime
+    checked_at: UtcDatetime
     trust_policy_version: Literal[1] = 1
     implementation: ModuleId | None = None
-
-    @field_validator("timestamp", "checked_at")
-    @classmethod
-    def utc_date(cls, value):
-        if value.tzinfo is None:
-            msg = "publication dates require a timezone"
-            raise ValueError(msg)
-        return value.astimezone(UTC)
 
     @field_validator("artifact_digest")
     @classmethod
@@ -222,8 +215,11 @@ class GradleCandidate(GradleRecord):
     publication_requests: tuple[PublicationRequest, ...] = ()
 
 
+type OwnerKind = Literal["direct", "parent", "platform", "plugin"]
+
+
 class KnownOwner(GradleRecord):
-    kind: Literal["direct", "parent", "platform", "plugin"]
+    kind: OwnerKind
     group_key: str
     scope: ScopeId
 
@@ -350,10 +346,6 @@ class ComparisonContext(BaseModel):
     @property
     def identity(self) -> str:
         return content_identity(self)
-
-    @property
-    def context_identity(self) -> str:
-        return self.identity
 
 
 class GradleSnapshot(BaseModel):

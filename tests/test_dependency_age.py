@@ -23,6 +23,7 @@ from maintenance_man.dependency_age import (
     evaluate_gradle_candidate_age,
     filter_registry_updates_by_age,
     lookup_gradle_publication,
+    member_module,
     publication_request,
     trusted_repository,
 )
@@ -38,6 +39,7 @@ from maintenance_man.models.scan import (
     SemverTier,
     UpdateFinding,
 )
+from tests.conftest import make_gradle_member
 
 _PATCH_SUBRUN = "maintenance_man.process.subprocess.run"
 
@@ -1596,9 +1598,35 @@ def test_mvn_age_uses_the_exact_central_pom_and_cache(tmp_path):
         )
     ]
     assert [u.published_date for u in result] == [datetime(2026, 9, 1, tzinfo=UTC)]
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "fb29466986f75a2600e7519a519c1f6e9ee01a1acf330824582b5facbc4e22cf.json"
+    ]
     with PublicationLookupContext(tmp_path, _no_transport, lambda: _PUB_NOW) as again:
         cached = filter_registry_updates_by_age([update], "central", tmp_path, 7, again)
     assert [u.published_date for u in cached] == [datetime(2026, 9, 1, tzinfo=UTC)]
+
+
+@pytest.mark.parametrize(
+    ("coordinate", "kind", "expected"),
+    [
+        ("g:a", "library", ModuleId(group="g", artifact="a", version="1")),
+        ("g:", "library", None),
+        ("g:a:b", "library", None),
+        (
+            "p.id",
+            "plugin",
+            ModuleId(group="p.id", artifact="p.id.gradle.plugin", version="1"),
+        ),
+    ],
+)
+def test_given_gradle_member_when_resolved_then_only_valid_coordinates_map(
+    coordinate, kind, expected
+):
+    member = make_gradle_member(kind=kind, coordinate=coordinate)
+
+    result = member_module(member, "1")
+
+    assert result == expected
 
 
 @pytest.mark.parametrize("name", ["lib", "a:b:c", ":lib", "org.example:"])
@@ -1727,6 +1755,32 @@ def test_pypi_lookup_uses_exact_url_and_earliest_upload(tmp_path):
         checked_at=_PUB_NOW,
     )
     assert _registry_path(tmp_path, "pypi", "requests", "2.31.0").is_file()
+
+
+def test_given_pypi_fact_when_reopened_then_literal_cache_path_is_reused(
+    tmp_path,
+):
+    context, _ = _pypi_context(tmp_path, _pypi_body("demo", "2.0"))
+    with context:
+        context.submit_registry("pypi", "demo", "2.0", tmp_path).result()
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "9b296d4647468663160fcfdf13877ac156038d877cb11ab95c5ac04b2cd124c2.json"
+    ]
+    with PublicationLookupContext(
+        tmp_path, _no_transport, lambda: _PUB_NOW
+    ) as cached_context:
+        cached = cached_context.submit_registry(
+            "pypi", "demo", "2.0", tmp_path
+        ).result()
+
+    assert cached == RegistryFact(
+        registry="pypi",
+        package="demo",
+        version="2.0",
+        timestamp=datetime(2025, 12, 31, tzinfo=UTC),
+        checked_at=_PUB_NOW,
+    )
 
 
 @pytest.mark.parametrize(
