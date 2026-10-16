@@ -15,7 +15,7 @@ class TestTestCommand:
             app(["test", "no-tests"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
 
-    @patch("maintenance_man.cli.run_test_phases", return_value=(True, None))
+    @patch("maintenance_man.cli.run_test_phases", return_value=None)
     def test_all_phases_pass(self, mock_run, mm_home_with_projects: Path) -> None:
         """Exit 0 when all test phases pass."""
         with pytest.raises(SystemExit) as exc_info:
@@ -25,7 +25,7 @@ class TestTestCommand:
 
     @patch(
         "maintenance_man.cli.run_test_phases",
-        return_value=(False, "integration"),
+        return_value="integration",
     )
     def test_phase_failure(self, mock_run, mm_home_with_projects: Path) -> None:
         """Exit TEST_FAILED when a phase fails."""

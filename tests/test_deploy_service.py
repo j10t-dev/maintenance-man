@@ -145,11 +145,11 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         error=RevisionError("no main"),
         path=projects["c"].path,
     )
-    built: list[tuple[str, str, object]] = []
-    deployed: list[tuple[str, str, object]] = []
-    monkeypatch.setattr(deploy_service, "run_build", lambda *args: built.append(args))
+    runs: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
-        deploy_service, "run_deploy", lambda *args: deployed.append(args)
+        deploy_service,
+        "run_live",
+        lambda *args, **kwargs: runs.append((args, kwargs)),
     )
     monkeypatch.setattr(
         deploy_service,
@@ -181,8 +181,16 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         deploy_service.DeployResult("c", "skip", "blocked"),
         deploy_service.DeployResult("d", "skip", "fail"),
     )
-    assert built == [("a", "build", projects["a"].path)]
-    assert deployed == [("a", "deploy", projects["a"].path)]
+    assert runs == [
+        (
+            ("build", projects["a"].path),
+            {"timeout": 600, "label": "Build for a", "error": BuildError},
+        ),
+        (
+            ("deploy", projects["a"].path),
+            {"timeout": 600, "label": "Deploy for a", "error": DeployError},
+        ),
+    ]
     assert emit.events == [
         ProjectStarted("a"),
         DeployStepStarted("a", DeployStep.BUILD),
@@ -204,7 +212,7 @@ def test_deploy_all_checks_health_after_success(tmp_path, monkeypatch) -> None:
     state = FakeJjState()
     project = make_project(tmp_path / "a", deploy_command="deploy")
     state.seed_repository(project.path, files={})
-    monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
+    monkeypatch.setattr(deploy_service, "run_live", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         deploy_service,
         "check_health",
@@ -238,15 +246,15 @@ def test_deploy_all_build_failure_stops_project_and_records_failure(
         tmp_path / "a", build_command="build", deploy_command="deploy"
     )
     state.seed_repository(project.path, files={})
-    monkeypatch.setattr(
-        deploy_service,
-        "run_build",
-        lambda *args: (_ for _ in ()).throw(BuildError("build failed")),
-    )
+    error = BuildError("build failed")
+
+    def run(command, path, **kwargs):
+        if kwargs["error"] is BuildError:
+            raise error
+        deployed.append(command)
+
     deployed: list[str] = []
-    monkeypatch.setattr(
-        deploy_service, "run_deploy", lambda name, *args: deployed.append(name)
-    )
+    monkeypatch.setattr(deploy_service, "run_live", run)
     emit = RecordingEmit()
 
     results = deploy_service.deploy_all(
@@ -296,7 +304,9 @@ def test_deploy_project_refuses_unresolvable_main_without_force(
     state.fail("resolve_revision", error=RevisionError("no main"), path=project.path)
     deployed: list[tuple[object, ...]] = []
     monkeypatch.setattr(
-        deploy_service, "run_deploy", lambda *args: deployed.append(args)
+        deploy_service,
+        "run_live",
+        lambda *args, **kwargs: deployed.append(args),
     )
 
     with pytest.raises(
@@ -324,7 +334,9 @@ def test_deploy_project_force_allows_unresolvable_main(tmp_path, monkeypatch) ->
     state.fail("resolve_revision", error=RevisionError("no main"), path=project.path)
     deployed: list[str] = []
     monkeypatch.setattr(
-        deploy_service, "run_deploy", lambda name, *args: deployed.append(name)
+        deploy_service,
+        "run_live",
+        lambda command, *args, **kwargs: deployed.append(command),
     )
 
     result = deploy_service.deploy_project(
@@ -339,7 +351,7 @@ def test_deploy_project_force_allows_unresolvable_main(tmp_path, monkeypatch) ->
     )
 
     assert result == deploy_service.DeployResult("api", "skip", "pass")
-    assert deployed == ["api"]
+    assert deployed == ["deploy"]
     recorded = load_activity(paths.activity_path())["api"].last_deploy
     assert recorded is not None
     assert recorded.commit_id is None
@@ -371,7 +383,7 @@ def test_deploy_project_reports_unconfigured_health_after_success(
     state = FakeJjState()
     project = make_project(tmp_path / "api", deploy_command="deploy")
     state.seed_repository(project.path, files={})
-    monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
+    monkeypatch.setattr(deploy_service, "run_live", lambda *args, **kwargs: None)
     health_checks: list[tuple[str, str]] = []
 
     def check_health(url: str, name: str) -> HealthCheckResult:
@@ -411,7 +423,7 @@ def test_deploy_all_leaves_unconfigured_health_to_the_cli(
     state = FakeJjState()
     project = make_project(tmp_path / "api", deploy_command="deploy")
     state.seed_repository(project.path, files={})
-    monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
+    monkeypatch.setattr(deploy_service, "run_live", lambda *args, **kwargs: None)
     health_checks: list[tuple[str, str]] = []
 
     def check_health(url: str, name: str) -> HealthCheckResult:
@@ -444,8 +456,8 @@ def test_deploy_all_leaves_unconfigured_health_to_the_cli(
 @pytest.mark.parametrize(
     "failure, error, expected_statuses",
     [
-        ("run_build", BuildError("build failed"), ("fail", "skip")),
-        ("run_deploy", DeployError("deploy failed"), ("pass", "fail")),
+        (BuildError, BuildError("build failed"), ("fail", "skip")),
+        (DeployError, DeployError("deploy failed"), ("pass", "fail")),
     ],
 )
 def test_failed_deploy_has_no_health_hint(
@@ -456,13 +468,12 @@ def test_failed_deploy_has_no_health_hint(
         tmp_path / "api", build_command="build", deploy_command="deploy"
     )
     state.seed_repository(project.path, files={"dep.txt": "version=1\n"})
-    monkeypatch.setattr(deploy_service, "run_build", lambda *args: None)
-    monkeypatch.setattr(deploy_service, "run_deploy", lambda *args: None)
 
-    def fail(*args):
-        raise error
+    def run(*args, **kwargs):
+        if kwargs["error"] is failure:
+            raise error
 
-    monkeypatch.setattr(deploy_service, failure, fail)
+    monkeypatch.setattr(deploy_service, "run_live", run)
     emit = RecordingEmit()
     result = deploy_service.deploy_project(
         "api",

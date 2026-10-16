@@ -799,11 +799,11 @@ def test(
 
     console.print(f"[bold]Testing {escape(project)}[/]\n")
 
-    passed, failed_phase = run_test_phases(
+    failed_phase = run_test_phases(
         proj_config, proj_config.path, emit=_Renderer(batch=False)
     )
 
-    if passed:
+    if failed_phase is None:
         console.print("\n[bold green]All test phases passed.[/]")
         sys.exit(ExitCode.OK)
     else:

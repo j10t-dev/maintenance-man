@@ -392,7 +392,7 @@ class TestResolveContinue:
         monkeypatch.setattr(updater, "_apply_update", mock_apply)
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda cfg, p, *, emit: (True, None),
+            lambda cfg, p, *, emit: None,
         )
         monkeypatch.setattr(
             "maintenance_man.services.resolve.process_findings",
@@ -423,7 +423,7 @@ class TestResolveContinue:
     ) -> None:
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda cfg, p, *, emit: (True, None),
+            lambda cfg, p, *, emit: None,
         )
         monkeypatch.setattr(
             "maintenance_man.services.resolve.process_findings",
@@ -475,7 +475,7 @@ class TestResolveContinue:
         state.clear_calls()
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda _cfg, _path, *, emit: (True, None),
+            lambda _cfg, _path, *, emit: None,
         )
         monkeypatch.setattr(
             updater,
@@ -504,7 +504,7 @@ class TestResolveContinue:
     ) -> None:
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda cfg, p, *, emit: (True, None),
+            lambda cfg, p, *, emit: None,
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -535,7 +535,7 @@ class TestResolveContinue:
     ) -> None:
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda cfg, p, *, emit: (True, None),
+            lambda cfg, p, *, emit: None,
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -568,7 +568,7 @@ class TestResolveContinue:
     ) -> None:
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda cfg, p, *, emit: (True, None),
+            lambda cfg, p, *, emit: None,
         )
 
         mock_process = MagicMock(return_value=[])
@@ -590,7 +590,7 @@ class TestResolveContinue:
     ) -> None:
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda cfg, p, *, emit: (False, "unit"),
+            lambda cfg, p, *, emit: "unit",
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]
@@ -624,7 +624,7 @@ class TestResolveContinue:
         and tests pass (operator committed the fix manually)."""
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases",
-            lambda cfg, p, *, emit: (True, None),
+            lambda cfg, p, *, emit: None,
         )
 
         scan_result: ScanResult = mock_resolve_cli_deps["scan_result"]

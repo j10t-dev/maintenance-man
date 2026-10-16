@@ -315,7 +315,7 @@ def test_continue_failing_retest_persists_phase_and_reports_blockers(
         bookmark=_BOOKMARK, revision="main"
     )
     monkeypatch.setattr(
-        resolve_service, "run_test_phases", lambda *_args, **_kwargs: (False, "unit")
+        resolve_service, "run_test_phases", lambda *_args, **_kwargs: "unit"
     )
     emit = RecordingEmit()
 
@@ -356,7 +356,7 @@ def test_continue_passing_retest_marks_blocker_passed_then_submits(
         bookmark=_BOOKMARK, revision="main"
     )
     monkeypatch.setattr(
-        resolve_service, "run_test_phases", lambda *_args, **_kwargs: (True, None)
+        resolve_service, "run_test_phases", lambda *_args, **_kwargs: None
     )
     processor = FakeFindingProcessor({"pkg-a": (True, None)})
     processed: list[tuple[str, ...]] = []
@@ -559,7 +559,7 @@ def test_bookmark_move_failure_saves_before_refusal(
         path=project.path,
     )
     monkeypatch.setattr(
-        resolve_service, "run_test_phases", lambda *_args, **_kwargs: (True, None)
+        resolve_service, "run_test_phases", lambda *_args, **_kwargs: None
     )
     saves: list[tuple[UpdateStatus | None, str | None, Workflow | None]] = []
 

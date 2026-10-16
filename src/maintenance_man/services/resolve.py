@@ -251,7 +251,8 @@ def _retest_blockers(
     repo: Repository,
     emit: Emit,
 ) -> bool:
-    passed, failed_phase = run_test_phases(project, project.path, emit=emit)
+    failed_phase = run_test_phases(project, project.path, emit=emit)
+    passed = failed_phase is None
     for blocker in failed:
         blocker.flow = Workflow.RESOLVE
         if not passed:

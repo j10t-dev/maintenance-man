@@ -1344,7 +1344,7 @@ def gradle_update_cli(
     spies: dict[str, list] = {"tests": [], "applies": []}
     monkeypatch.setattr(
         "maintenance_man.updater.run_test_phases",
-        lambda cfg, path: (spies["tests"].append(1), (True, None))[1],
+        lambda cfg, path: spies["tests"].append(1),
     )
     monkeypatch.setattr(
         "maintenance_man.gradle_updates.apply_gradle_update",

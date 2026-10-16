@@ -39,7 +39,9 @@ def test_label_failure_does_not_block_persisted_build_activity(
         'build_command = "build"\n',
     )
     monkeypatch.setattr(cli, "make_vcs_services", state.services)
-    monkeypatch.setattr("maintenance_man.services.deploy.run_build", lambda *args: None)
+    monkeypatch.setattr(
+        "maintenance_man.services.deploy.run_live", lambda *args, **kwargs: None
+    )
 
     assert run_mm("build", "demo") == ExitCode.OK
 
@@ -67,7 +69,7 @@ class TestBuildCommand:
             app(["build", "deploy-only"], exit_on_error=False)
         assert exc_info.value.code == ExitCode.ERROR
 
-    @patch("maintenance_man.services.deploy.run_build")
+    @patch("maintenance_man.services.deploy.run_live")
     def test_successful_build(
         self,
         mock_build: MagicMock,
@@ -82,7 +84,7 @@ class TestBuildCommand:
         assert any(call.method == "revision_bookmarks" for call in _build_vcs.attempts)
 
     @patch(
-        "maintenance_man.services.deploy.run_build",
+        "maintenance_man.services.deploy.run_live",
         side_effect=BuildError("build failed"),
     )
     def test_failed_build(
@@ -105,7 +107,7 @@ class TestBuildCommand:
         assert exc_info.value.code == ExitCode.ERROR
 
     @patch("maintenance_man.services.deploy.record_activity")
-    @patch("maintenance_man.services.deploy.run_build")
+    @patch("maintenance_man.services.deploy.run_live")
     def test_successful_build_records_activity(
         self,
         mock_build: MagicMock,
@@ -122,7 +124,7 @@ class TestBuildCommand:
 
     @patch("maintenance_man.services.deploy.record_activity")
     @patch(
-        "maintenance_man.services.deploy.run_build",
+        "maintenance_man.services.deploy.run_live",
         side_effect=BuildError("build failed"),
     )
     def test_failed_build_records_activity(

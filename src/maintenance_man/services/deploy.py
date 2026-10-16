@@ -9,8 +9,6 @@ from maintenance_man.deployer import (
     BuildError,
     DeployError,
     check_health,
-    run_build,
-    run_deploy,
 )
 from maintenance_man.models.activity import ProjectActivity
 from maintenance_man.models.config import MmConfig, ProjectConfig
@@ -26,6 +24,7 @@ from maintenance_man.models.events import (
     ProjectStarted,
     SkipReason,
 )
+from maintenance_man.process import run_live
 from maintenance_man.services import WorkflowError
 from maintenance_man.storage import load_activity, record_activity
 from maintenance_man.vcs import RevisionError
@@ -92,41 +91,32 @@ def _record_activity(
 
 def build_project(name: str, project: ProjectConfig, *, vcs: VcsServices) -> None:
     """Run a configured build and record its result."""
-    assert project.build_command is not None
-    try:
-        run_build(name, project.build_command, project.path)
-    except BuildError:
-        _record_activity(
-            name,
-            "build",
-            success=False,
-            project_path=project.path,
-            vcs=vcs,
-        )
-        raise
-    _record_activity(
-        name,
-        "build",
-        success=True,
-        project_path=project.path,
-        vcs=vcs,
-    )
+    _run_recorded(name, project, "build", None, vcs=vcs)
 
 
-def _deploy_step(
+def _run_recorded(
     name: str,
     project: ProjectConfig,
+    kind: Literal["build", "deploy"],
     commit_id: str | None,
     *,
     vcs: VcsServices,
 ) -> None:
-    assert project.deploy_command is not None
+    command = project.build_command if kind == "build" else project.deploy_command
+    assert command is not None
+    error = BuildError if kind == "build" else DeployError
     try:
-        run_deploy(name, project.deploy_command, project.path)
-    except DeployError:
+        run_live(
+            command,
+            project.path,
+            timeout=600,
+            label=f"{kind.capitalize()} for {name}",
+            error=error,
+        )
+    except BuildError, DeployError:
         _record_activity(
             name,
-            "deploy",
+            kind,
             success=False,
             project_path=project.path,
             vcs=vcs,
@@ -134,10 +124,10 @@ def _deploy_step(
         raise
     _record_activity(
         name,
-        "deploy",
+        kind,
         success=True,
         project_path=project.path,
-        commit_id=commit_id,
+        commit_id=commit_id if kind == "deploy" else None,
         vcs=vcs,
     )
 
@@ -165,7 +155,7 @@ def _run_steps(
 
     emit(DeployStepStarted(name, DeployStep.DEPLOY))
     try:
-        _deploy_step(name, project, commit_id, vcs=vcs)
+        _run_recorded(name, project, "deploy", commit_id, vcs=vcs)
     except DeployError as exc:
         emit(DeployStepFailed(name, DeployStep.DEPLOY, str(exc)))
         return DeployResult(name, build_status, "fail")

@@ -5,9 +5,6 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
-
-from maintenance_man.process import run_live
 
 
 class BuildError(Exception):
@@ -16,33 +13,6 @@ class BuildError(Exception):
 
 class DeployError(Exception):
     pass
-
-
-def _run_script(
-    command: str,
-    project_name: str,
-    project_path: Path,
-    error_cls: type[Exception],
-    label: str,
-) -> None:
-    """Run a shell command with live output. Raises error_cls on failure."""
-    run_live(
-        command,
-        project_path,
-        timeout=600,
-        label=f"{label} for {project_name}",
-        error=error_cls,
-    )
-
-
-def run_build(project_name: str, build_command: str, project_path: Path) -> None:
-    """Run a project's build command. Raises BuildError on failure."""
-    _run_script(build_command, project_name, project_path, BuildError, "Build")
-
-
-def run_deploy(project_name: str, deploy_command: str, project_path: Path) -> None:
-    """Run a project's deploy command. Raises DeployError on failure."""
-    _run_script(deploy_command, project_name, project_path, DeployError, "Deploy")
 
 
 @dataclass

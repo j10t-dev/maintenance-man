@@ -668,11 +668,11 @@ def test_checked_capture_rejects_context_expiring_during_build(workflow, monkeyp
     clock = FakeClock(workflow.context.created_at + timedelta(hours=23, minutes=59))
     monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
     monkeypatch.setattr(
-        updater, "run_build", lambda *args: clock.advance(timedelta(minutes=2))
+        updater,
+        "run_live",
+        lambda *args, **kwargs: clock.advance(timedelta(minutes=2)),
     )
-    monkeypatch.setattr(
-        updater, "run_test_phases", lambda *args, **kwargs: (True, None)
-    )
+    monkeypatch.setattr(updater, "run_test_phases", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         updater, "capture_gradle_snapshot", scanner.capture_gradle_snapshot
     )
@@ -948,12 +948,14 @@ def test_check_evidence_uses_clock_after_effects(workflow, monkeypatch):
     clock = FakeClock(datetime(2030, 1, 1, tzinfo=UTC))
     start = clock()
     monkeypatch.setattr(
-        updater, "run_build", lambda *args: clock.advance(timedelta(hours=1))
+        updater,
+        "run_live",
+        lambda *args, **kwargs: clock.advance(timedelta(hours=1)),
     )
 
     def tests(*args, **kwargs):
         clock.advance(timedelta(minutes=2))
-        return True, None
+        return
 
     monkeypatch.setattr(updater, "run_test_phases", tests)
     result = real_run_gradle_checks(
@@ -1601,11 +1603,11 @@ def test_gradle_driver_stamps_evidence_with_the_injected_clock(driver, monkeypat
     clock = FakeClock(start)
     monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
     monkeypatch.setattr(
-        updater, "run_build", lambda *args: clock.advance(timedelta(minutes=1))
+        updater,
+        "run_live",
+        lambda *args, **kwargs: clock.advance(timedelta(minutes=1)),
     )
-    monkeypatch.setattr(
-        updater, "run_test_phases", lambda *args, **kwargs: (True, None)
-    )
+    monkeypatch.setattr(updater, "run_test_phases", lambda *args, **kwargs: None)
 
     forwarded = {}
 
@@ -1660,7 +1662,7 @@ def test_gradle_driver_stamps_evidence_with_the_injected_clock(driver, monkeypat
 
 def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
     monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
-    monkeypatch.setattr(updater, "run_build", lambda *args: None)
+    monkeypatch.setattr(updater, "run_live", lambda *args, **kwargs: None)
     calls = 0
 
     def run_test(command, *_args, **_kwargs):
@@ -1999,7 +2001,7 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
     monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
     effects = []
 
-    def build(*args):
+    def build(*args, **kwargs):
         effects.append("build")
         if failure == "build":
             msg = "build failed"
@@ -2007,9 +2009,9 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
 
     def tests(*args, **kwargs):
         effects.append("tests")
-        return False, "unit"
+        return "unit"
 
-    monkeypatch.setattr(updater, "run_build", build)
+    monkeypatch.setattr(updater, "run_live", build)
     monkeypatch.setattr(updater, "run_test_phases", tests)
     monkeypatch.setattr(
         updater,
@@ -2024,7 +2026,7 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
 
 
 def test_gradle_checks_run_configured_tests_through_bash(tmp_path, monkeypatch):
-    monkeypatch.setattr(updater, "run_build", lambda *args: None)
+    monkeypatch.setattr(updater, "run_live", lambda *args, **kwargs: None)
     project = ProjectConfig(
         path=tmp_path,
         package_manager="gradle",

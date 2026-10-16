@@ -3,7 +3,6 @@ from __future__ import annotations
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -46,38 +45,28 @@ FailureStrategy = Literal["continue", "stop"]
 class FindingStep:
     failed_phase: str | None
     discardable: bool = True
-    already_applied: bool = False
 
     @property
     def passed(self) -> bool:
         return self.failed_phase is None
 
 
-class NextAction(StrEnum):
-    CONTINUE = "continue"
-    STOP = "stop"
-
-
-def finding_transition(
-    step: FindingStep, flow: Workflow
-) -> tuple[UpdateStatus, str | None, Workflow]:
+def finding_transition(step: FindingStep) -> tuple[UpdateStatus, str | None]:
     if step.passed:
-        return UpdateStatus.READY, None, flow
-    return UpdateStatus.FAILED, step.failed_phase, flow
+        return UpdateStatus.READY, None
+    return UpdateStatus.FAILED, step.failed_phase
 
 
 def should_discard(step: FindingStep, on_failure: FailureStrategy) -> bool:
     return not step.passed and step.discardable and on_failure == "continue"
 
 
-def next_action(
+def should_stop(
     step: FindingStep, on_failure: FailureStrategy, discarded: bool | None
-) -> NextAction:
+) -> bool:
     if step.passed:
-        return NextAction.CONTINUE
-    if not step.discardable or on_failure == "stop" or discarded is False:
-        return NextAction.STOP
-    return NextAction.CONTINUE
+        return False
+    return not step.discardable or on_failure == "stop" or discarded is False
 
 
 class Finding(Protocol):
@@ -257,10 +246,10 @@ def remove_completed_findings(scan_result: ScanResult) -> None:
 
 def run_test_phases(
     project_config: ProjectConfig, project_path: Path, *, emit: Emit
-) -> tuple[bool, str | None]:
-    """Run configured test phases sequentially. Returns (passed, failed_phase).
+) -> str | None:
+    """Run configured test phases sequentially and return the failed phase.
 
-    Stops on first failure. Returns (True, None) if all phases pass.
+    Stops on first failure. Returns ``None`` if all phases pass.
     """
     for phase_name, command in project_config.test_phases:
         emit(TestCommandStarted(command))
@@ -268,8 +257,8 @@ def run_test_phases(
             run_live(command, project_path, timeout=600, label=f"{phase_name} tests")
         except ProcessError as exc:
             emit(FindingStepFailed(FindingStepKind.TEST, str(exc)))
-            return False, phase_name
-    return True, None
+            return phase_name
+    return None
 
 
 def process_findings(
@@ -306,15 +295,14 @@ def process_findings(
             )
         )
         step = _attempt_finding(finding, kind, project_config, repo, flow, emit)
-        finding.update_status, finding.failed_phase, finding.flow = finding_transition(
-            step, flow
-        )
+        finding.update_status, finding.failed_phase = finding_transition(step)
+        finding.flow = flow
         save_scan_results(scan_result.project, scan_result)
         discarded = _discard(repo, emit) if should_discard(step, on_failure) else None
         results.append(
             UpdateResult(finding.pkg_name, kind, step.passed, step.failed_phase)
         )
-        if next_action(step, on_failure, discarded) is NextAction.STOP:
+        if should_stop(step, on_failure, discarded):
             break
 
     return results
@@ -342,11 +330,10 @@ def _attempt_finding(
     ):
         return FindingStep("apply")
 
-    passed, failed_phase = run_test_phases(project_config, project_path, emit=emit)
-    if not passed:
-        phase = failed_phase or "test"
-        emit(FindingFailed(finding.pkg_name, phase))
-        return FindingStep(phase)
+    failed_phase = run_test_phases(project_config, project_path, emit=emit)
+    if failed_phase is not None:
+        emit(FindingFailed(finding.pkg_name, failed_phase))
+        return FindingStep(failed_phase)
 
     try:
         has_changes = repo.has_changes()
@@ -355,7 +342,7 @@ def _attempt_finding(
         return FindingStep("commit", discardable=False)
     if not has_changes:
         emit(FindingPassed(finding.pkg_name, True))
-        return FindingStep(None, already_applied=True)
+        return FindingStep(None)
 
     return _commit_finding(finding, kind, repo, flow, emit)
 

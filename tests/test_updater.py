@@ -32,15 +32,14 @@ from maintenance_man.process import ProcessError
 from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
     FindingStep,
-    NextAction,
     _apply_update,
     consolidate_vulns,
     finding_transition,
-    next_action,
     process_findings,
     remove_completed_findings,
     run_test_phases,
     should_discard,
+    should_stop,
     sort_updates_by_risk,
 )
 from maintenance_man.uv_dependencies import (
@@ -56,38 +55,56 @@ from tests.fakes import RecordingEmit
 
 
 PASSED = FindingStep(None)
-ALREADY = FindingStep(None, already_applied=True)
 FAILED = FindingStep("unit")
 UNSAFE = FindingStep("commit", discardable=False)
 
 
 @pytest.mark.parametrize(
-    "step,on_failure,discarded,discard,action",
+    "step,on_failure,discard",
     [
-        (PASSED, "continue", None, False, NextAction.CONTINUE),
-        (ALREADY, "stop", None, False, NextAction.CONTINUE),
-        (FAILED, "continue", True, True, NextAction.CONTINUE),
-        (FAILED, "continue", False, True, NextAction.STOP),
-        (FAILED, "stop", None, False, NextAction.STOP),
-        (UNSAFE, "continue", None, False, NextAction.STOP),
-        (UNSAFE, "stop", None, False, NextAction.STOP),
+        (PASSED, "continue", False),
+        (FAILED, "continue", True),
+        (FAILED, "stop", False),
+        (UNSAFE, "continue", False),
+        (UNSAFE, "stop", False),
     ],
 )
-def test_finding_decisions(step, on_failure, discarded, discard, action):
+def test_given_finding_step_when_deciding_to_discard_then_returns_expected_decision(
+    step, on_failure, discard
+):
     assert should_discard(step, on_failure) is discard
-    assert next_action(step, on_failure, discarded) is action
+
+
+@pytest.mark.parametrize(
+    "failed_phase,discardable,on_failure,discarded,expected",
+    [
+        (None, True, "continue", None, False),
+        ("unit", True, "continue", True, False),
+        ("unit", True, "continue", False, True),
+        ("unit", False, "continue", None, True),
+        ("unit", True, "stop", None, True),
+    ],
+)
+def test_given_finding_step_when_deciding_to_stop_then_returns_expected_decision(
+    failed_phase, discardable, on_failure, discarded, expected
+):
+    step = FindingStep(failed_phase, discardable)
+
+    result = should_stop(step, on_failure, discarded)
+
+    assert result is expected
 
 
 @pytest.mark.parametrize(
     "step,expected",
     [
-        (PASSED, (UpdateStatus.READY, None, Workflow.RESOLVE)),
-        (FAILED, (UpdateStatus.FAILED, "unit", Workflow.RESOLVE)),
-        (UNSAFE, (UpdateStatus.FAILED, "commit", Workflow.RESOLVE)),
+        (PASSED, (UpdateStatus.READY, None)),
+        (FAILED, (UpdateStatus.FAILED, "unit")),
+        (UNSAFE, (UpdateStatus.FAILED, "commit")),
     ],
 )
 def test_finding_transition(step, expected):
-    assert finding_transition(step, Workflow.RESOLVE) == expected
+    assert finding_transition(step) == expected
 
 
 def make_vuln(**overrides: Any) -> VulnFinding:
@@ -408,8 +425,7 @@ class TestRunTestPhases:
             test_unit="bun test",
             test_integration="bun run test:integration",
         )
-        passed, failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert passed is True
+        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert failed_phase is None
         assert mock_run.call_count == 2
 
@@ -421,8 +437,7 @@ class TestRunTestPhases:
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
-        passed, failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert passed is False
+        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert failed_phase == "unit"
         assert mock_run.call_count == 1
 
@@ -444,8 +459,7 @@ class TestRunTestPhases:
             test_unit="bun test",
             test_integration="bun run test:integration",
         )
-        passed, failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert passed is False
+        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert failed_phase == "integration"
 
     def test_skips_unconfigured_phases(
@@ -460,8 +474,8 @@ class TestRunTestPhases:
         tc = ProjectConfig(
             path=tmp_path, package_manager="bun", test_unit="bun test"
         )  # no integration or component
-        passed, _ = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert passed is True
+        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
+        assert failed_phase is None
         assert mock_run.call_count == 1  # only unit
 
     def test_blank_phase_is_skipped(self, monkeypatch, tmp_path):
@@ -477,7 +491,7 @@ class TestRunTestPhases:
             test_unit="  ",
             test_integration="bun run test:integration",
         )
-        assert run_test_phases(tc, tmp_path, emit=RecordingEmit()) == (True, None)
+        assert run_test_phases(tc, tmp_path, emit=RecordingEmit()) is None
         assert [c.args[0] for c in mock_run.call_args_list] == [
             "bun run test:integration"
         ]
@@ -489,7 +503,7 @@ def test_test_phases_run_through_bash(tmp_path):
         package_manager="bun",
         test_unit="printf '%s' 'a b' > out.txt && test \"$(cat out.txt)\" = 'a b'",
     )
-    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) == (True, None)
+    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) is None
     # Under shlex.split printf prints every argument and exits 0; only Bash
     # performs the redirect.
     assert (tmp_path / "out.txt").read_text() == "a b"
@@ -502,17 +516,14 @@ def test_first_failed_phase_stops_later_phases(tmp_path):
         test_unit="exit 3",
         test_integration="touch integration-ran",
     )
-    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) == (False, "unit")
+    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) == "unit"
     assert not (tmp_path / "integration-ran").exists()
 
 
 def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
     config = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="true")
     emit = RecordingEmit()
-    assert run_test_phases(config, tmp_path / "missing", emit=emit) == (
-        False,
-        "unit",
-    )
+    assert run_test_phases(config, tmp_path / "missing", emit=emit) == "unit"
     assert emit.events[0] == CommandStartedEvent("true")
     assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.TEST
     assert "Could not run unit tests" in emit.of_type(FindingStepFailed)[0].error
@@ -1217,9 +1228,10 @@ def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
 
     monkeypatch.setattr(subprocess, "run", _timeout)
 
-    assert run_test_phases(
-        project_config, Path(project_config.path), emit=RecordingEmit()
-    ) == (False, "unit")
+    assert (
+        run_test_phases(project_config, Path(project_config.path), emit=RecordingEmit())
+        == "unit"
+    )
 
 
 def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(

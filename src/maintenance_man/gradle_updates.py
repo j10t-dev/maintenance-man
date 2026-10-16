@@ -15,7 +15,7 @@ from maintenance_man.dependency_age import (
     PublicationLookupContext,
     evaluate_gradle_candidate_age,
 )
-from maintenance_man.deployer import BuildError, run_build
+from maintenance_man.deployer import BuildError
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GradleError,
@@ -59,6 +59,7 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     Workflow,
 )
+from maintenance_man.process import run_live
 from maintenance_man.scanner import ScanError, capture_gradle_snapshot
 from maintenance_man.storage import atomic_write_text
 from maintenance_man.updater import run_test_phases
@@ -253,7 +254,13 @@ def run_gradle_checks(
     commands = gradle_check_commands(project)
     checks_started = time.monotonic()
     try:
-        run_build(project_name, commands[0], project.path)
+        run_live(
+            commands[0],
+            project.path,
+            timeout=600,
+            label=f"Build for {project_name}",
+            error=BuildError,
+        )
     except BuildError as exc:
         msg = (
             f"Build prerequisite/failure: {exc}; "
@@ -264,7 +271,8 @@ def run_gradle_checks(
         "Gradle baseline/update build %.3fs", time.monotonic() - checks_started
     )
     tests_started = time.monotonic()
-    passed, phase = run_test_phases(project, project.path, emit=emit)
+    phase = run_test_phases(project, project.path, emit=emit)
+    passed = phase is None
     logging.getLogger(__name__).info(
         "Gradle configured tests %.3fs", time.monotonic() - tests_started
     )
