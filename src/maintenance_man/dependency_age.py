@@ -1,11 +1,8 @@
 import functools
 import hashlib
 import http.client
-import itertools
 import json
 import logging
-import socket
-import ssl
 import threading
 import time
 import urllib.error
@@ -105,98 +102,12 @@ class PublicationError(Exception):
     """Publication evidence could not be trusted or obtained."""
 
 
-# One unreachable address must not consume the whole lookup deadline.
-_CONNECT_ATTEMPT_SECONDS = 3.0
-
-
-def _interleaved(infos):
-    """Alternate address families, keeping resolver order within each family."""
-    families = {}
-    for info in infos:
-        families.setdefault(info[0], []).append(info)
-    return [
-        info
-        for group in itertools.zip_longest(*families.values())
-        for info in group
-        if info is not None
-    ]
-
-
 def _remaining(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         msg = "publication lookup timed out"
         raise PublicationError(msg)
     return remaining
-
-
-def _deadline_connect(deadline):
-    """Return a ``create_connection`` bounded per address and by *deadline*.
-
-    The returned socket's timeout never outlasts *deadline*, so the TLS
-    handshake that follows stays inside the lookup's bound.
-    """
-
-    def create_connection(address, timeout=None, source_address=None):
-        host, port = address
-        error = None
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        for family, kind, proto, _, sockaddr in _interleaved(infos):
-            try:
-                remaining = _remaining(deadline)
-            except PublicationError as expired:
-                raise expired from error
-            sock = None
-            try:
-                sock = socket.socket(family, kind, proto)
-                sock.settimeout(min(remaining, _CONNECT_ATTEMPT_SECONDS))
-                if source_address:
-                    sock.bind(source_address)
-                sock.connect(sockaddr)
-            except OSError as failure:
-                if sock is not None:
-                    sock.close()
-                error = failure
-                continue
-            try:
-                limit = _remaining(deadline)
-            except PublicationError:
-                sock.close()
-                raise
-            numeric = isinstance(timeout, int | float)
-            sock.settimeout(min(timeout, limit) if numeric else limit)
-            return sock
-        if error is None:
-            msg = f"no address for {host}"
-            raise PublicationError(msg)
-        raise error
-
-    return create_connection
-
-
-class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, *, deadline, **kwargs):
-        super().__init__(host, **kwargs)
-        self._create_connection = _deadline_connect(deadline)
-
-
-class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
-    """HTTPS handler whose connections share one transport deadline."""
-
-    def __init__(self, deadline):
-        context = ssl.create_default_context()
-        # Match http.client's default HTTPS context.
-        context.set_alpn_protocols(["http/1.1"])
-        context.post_handshake_auth = True
-        super().__init__(context=context)
-        self.context = context
-        self.deadline = deadline
-
-    def connection(self, host, **kwargs):
-        return _DeadlineHTTPSConnection(host, deadline=self.deadline, **kwargs)
-
-    def https_open(self, req):
-        return self.do_open(self.connection, req, context=self.context)
 
 
 _LOOKUP_ERRORS = (
@@ -240,20 +151,19 @@ def _public_url(url, repository, suffix=None):
 def _publication_http(url, repository, suffix, count):
     """Fetch *url* under the 15-second/five-redirect/1 MiB trust bounds."""
     deadline = time.monotonic() + 15
-    opener = urllib.request.build_opener(_NoRedirect(), _DeadlineHTTPSHandler(deadline))
+    opener = urllib.request.build_opener(_NoRedirect())
     for redirects in range(6):
         if suffix is not None:
             _public_url(url, repository, suffix)
         elif urllib.parse.urlsplit(url).netloc != "search.maven.org":
             msg = "untrusted Central timestamp endpoint"
             raise PublicationError(msg)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            msg = "publication lookup timed out"
-            raise PublicationError(msg)
+        remaining = _remaining(deadline)
         count()
         try:
-            response = opener.open(urllib.request.Request(url), timeout=remaining)
+            response = opener.open(
+                urllib.request.Request(url), timeout=min(remaining, 3.0)
+            )
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 error.close()
