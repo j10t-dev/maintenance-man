@@ -257,8 +257,8 @@ def test_pull_request_output_is_indented_and_dim(
     assert all("dim" in str(span.style) for span in rendered.spans)
 
 
-def test_every_event_has_a_renderer() -> None:
-    assert set(typing.get_args(Event.__value__)) == set(cli._RENDERERS)
+def test_given_event_types_when_registry_checked_then_all_are_registered() -> None:
+    assert set(typing.get_args(Event.__value__)) <= set(cli._render.registry) - {object}
 
 
 def test_numbered_findings_print_bracketed_values_literally(

@@ -1,3 +1,4 @@
+import functools
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from maintenance_man.config import (
 )
 from maintenance_man.deployer import BuildError
 from maintenance_man.exit_codes import ExitCode
+from maintenance_man.gradle import GradleError
 from maintenance_man.models.activity import ActivityEvent
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
@@ -79,7 +81,9 @@ from maintenance_man.models.scan import (
     highest_fix_version,
     sort_vulns_by_severity,
 )
+from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
+from maintenance_man.scanner import ScanError
 from maintenance_man.services import WorkflowError
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.services import resolve as resolve_service
@@ -92,22 +96,44 @@ from maintenance_man.storage import (
     load_scan_results,
 )
 from maintenance_man.updater import run_test_phases
+from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import make_vcs_services
 
 console = Console()
 
 _TABLE_STYLE: dict[str, Any] = {"show_edge": False, "pad_edge": False, "box": None}
+_NO_PROJECTS = "No projects configured. Edit ~/.mm/config.toml to add projects."
 
-type _Render = Callable[[Any, bool], None]
-_RENDERERS: dict[type, _Render] = {}
+_EXIT_FOR: dict[type[Exception], ExitCode] = {
+    WorkflowError: ExitCode.ERROR,
+    ConfigError: ExitCode.ERROR,
+    ProjectNotFoundError: ExitCode.ERROR,
+    ToolNotFoundError: ExitCode.ERROR,
+    BuildError: ExitCode.BUILD_FAILED,
+    ScanError: ExitCode.ERROR,
+    GradleError: ExitCode.ERROR,
+    RevisionError: ExitCode.ERROR,
+    OutdatedCheckError: ExitCode.ERROR,
+}
 
 
-def _renders(kind: type) -> Callable[[_Render], _Render]:
-    def register(render: _Render) -> _Render:
-        _RENDERERS[kind] = render
-        return render
+def _command[**P](function: Callable[P, None]) -> Callable[P, None]:
+    @functools.wraps(function)
+    def mapped_command(*args: P.args, **kwargs: P.kwargs) -> None:
+        try:
+            function(*args, **kwargs)
+        except tuple(_EXIT_FOR) as exc:
+            code = next(
+                code for kind, code in _EXIT_FOR.items() if isinstance(exc, kind)
+            )
+            _fatal(str(exc), code=code)
 
-    return register
+    return mapped_command
+
+
+@functools.singledispatch
+def _render(event: Event, *, batch: bool) -> None:
+    raise NotImplementedError(type(event))
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,91 +141,67 @@ class _Renderer:
     batch: bool
 
     def __call__(self, event: Event) -> None:
-        _RENDERERS[type(event)](event, self.batch)
+        _render(event, batch=self.batch)
 
 
-_SKIP_TEXT: dict[SkipReason, tuple[str | None, str | None]] = {
+_SKIP_TEXT: dict[SkipReason, str] = {
     SkipReason.PATH_MISSING: (
-        "[bold yellow]Warning:[/] {name} — path does not exist: {detail}",
-        "[bold yellow]Warning:[/] {name} — path does not exist: {detail}",
+        "[bold yellow]Warning:[/] {name} — path does not exist: {detail}"
     ),
     SkipReason.NO_SCAN_RESULTS: (
-        "[bold green]{name}[/] — no scan results; nothing to do.",
-        None,
+        "[bold green]{name}[/] — no scan results; nothing to do."
     ),
-    SkipReason.NOTHING_TO_DO: (
-        "[bold green]{name}[/] — nothing to {detail}.",
-        "[dim]  {name} — nothing to update[/]",
-    ),
-    SkipReason.FLOW_CONFLICT: (
-        "  [bold yellow]Skipped:[/] {name} — {detail}",
-        "  [bold yellow]Skipped:[/] {name} — {detail}",
-    ),
-    SkipReason.NOT_DEPLOYABLE: (
-        "[dim]{name} — skipped (not deployable)[/]",
-        "[dim]{name} — skipped (not deployable)[/]",
-    ),
+    SkipReason.NOTHING_TO_DO: "[bold green]{name}[/] — nothing to {detail}.",
+    SkipReason.FLOW_CONFLICT: "  [bold yellow]Skipped:[/] {name} — {detail}",
+    SkipReason.NOT_DEPLOYABLE: "[dim]{name} — skipped (not deployable)[/]",
     SkipReason.UNCHANGED: (
-        "[bold yellow]{name}[/] unchanged since last deploy (use --force to redeploy).",
-        "[dim]{name} — unchanged since last deploy[/]",
+        "[bold yellow]{name}[/] unchanged since last deploy (use --force to redeploy)."
     ),
     SkipReason.BLOCKED: (
         "[bold yellow]Warning:[/] {name} — could not resolve main revision; "
-        "skipping (use --force to deploy anyway)",
-        "[bold yellow]Warning:[/] {name} — could not resolve main revision; "
-        "skipping (use --force to deploy anyway)",
+        "skipping (use --force to deploy anyway)"
     ),
 }
 
-_OPERATION_TEXT: dict[Operation, tuple[str, str]] = {
-    Operation.UPDATE_SETUP: (
-        "  [bold red]Error:[/] {name} — {error}",
-        "  [bold red]Error:[/] {name} — {error}",
-    ),
-    Operation.PROMOTE: (
-        "[bold red]Promotion failed:[/] {error}",
-        "[bold red]Promotion failed:[/] {error}",
-    ),
-    Operation.REFRESH: (
-        "[bold red]Workspace refresh failed:[/] {name}: {error}",
-        "[bold red]Workspace refresh failed:[/] {name}: {error}",
-    ),
-    Operation.WORKSPACE_CLEANUP: (
-        "[bold red]Workspace cleanup failed:[/] {error}",
-        "  [bold red]Workspace cleanup failed:[/] {error}",
-    ),
-    Operation.BOOKMARK_CLEANUP: (
-        "[bold red]Bookmark cleanup failed:[/] {error}",
-        "  [bold red]Bookmark cleanup failed:[/] {name} — {error}",
-    ),
-    Operation.RESOLVE_SETUP: (
-        "  [bold red]Resolve setup failed:[/] {error}",
-        "  [bold red]Resolve setup failed:[/] {error}",
-    ),
+_SKIP_BATCH_OVERRIDES: dict[SkipReason, str | None] = {
+    SkipReason.NO_SCAN_RESULTS: None,
+    SkipReason.NOTHING_TO_DO: "[dim]  {name} — nothing to update[/]",
+    SkipReason.UNCHANGED: "[dim]{name} — unchanged since last deploy[/]",
+}
+
+_OPERATION_TEXT: dict[Operation, str] = {
+    Operation.UPDATE_SETUP: "  [bold red]Error:[/] {name} — {error}",
+    Operation.PROMOTE: "[bold red]Promotion failed:[/] {error}",
+    Operation.REFRESH: "[bold red]Workspace refresh failed:[/] {name}: {error}",
+    Operation.WORKSPACE_CLEANUP: "[bold red]Workspace cleanup failed:[/] {error}",
+    Operation.BOOKMARK_CLEANUP: "[bold red]Bookmark cleanup failed:[/] {error}",
+    Operation.RESOLVE_SETUP: "  [bold red]Resolve setup failed:[/] {error}",
     Operation.SUBMIT: (
         "  [dim]{error}[/]\n  [bold yellow]Submit failed.[/] Keeping {bookmark} "
-        "for manual recovery.",
-        "  [dim]{error}[/]\n  [bold yellow]Submit failed.[/] Keeping {bookmark} "
-        "for manual recovery.",
+        "for manual recovery."
     ),
     Operation.REMOTE_SYNC: (
-        "[bold yellow]Warning:[/] {name} — failed to sync remote: {error}",
-        "[bold yellow]Warning:[/] {name} — failed to sync remote: {error}",
+        "[bold yellow]Warning:[/] {name} — failed to sync remote: {error}"
     ),
-    Operation.SCAN: (
-        "[bold red]Error:[/] {name} — {error}",
-        "[bold red]Error:[/] {name} — {error}",
-    ),
-    Operation.SYNC: (
-        "[bold red]  {name} — {error}[/]",
-        "[bold red]  {name} — {error}[/]",
+    Operation.SCAN: "[bold red]Error:[/] {name} — {error}",
+    Operation.SYNC: "[bold red]  {name} — {error}[/]",
+}
+
+_OPERATION_BATCH_OVERRIDES: dict[Operation, str] = {
+    Operation.WORKSPACE_CLEANUP: "  [bold red]Workspace cleanup failed:[/] {error}",
+    Operation.BOOKMARK_CLEANUP: (
+        "  [bold red]Bookmark cleanup failed:[/] {name} — {error}"
     ),
 }
 
 
-@_renders(ProjectSkipped)
-def _render_project_skipped(event: ProjectSkipped, batch: bool) -> None:
-    template = _SKIP_TEXT[event.reason][int(batch)]
+@_render.register
+def _render_project_skipped(event: ProjectSkipped, *, batch: bool) -> None:
+    template = (
+        _SKIP_BATCH_OVERRIDES.get(event.reason, _SKIP_TEXT[event.reason])
+        if batch
+        else _SKIP_TEXT[event.reason]
+    )
     if template is None:
         return
     console.print(
@@ -207,9 +209,15 @@ def _render_project_skipped(event: ProjectSkipped, batch: bool) -> None:
     )
 
 
-@_renders(OperationFailed)
-def _render_operation_failed(event: OperationFailed, batch: bool) -> None:
-    template = _OPERATION_TEXT[event.operation][int(batch)]
+@_render.register
+def _render_operation_failed(event: OperationFailed, *, batch: bool) -> None:
+    template = (
+        _OPERATION_BATCH_OVERRIDES.get(
+            event.operation, _OPERATION_TEXT[event.operation]
+        )
+        if batch
+        else _OPERATION_TEXT[event.operation]
+    )
     console.print(
         template.format(
             name=escape(event.project),
@@ -219,84 +227,75 @@ def _render_operation_failed(event: OperationFailed, batch: bool) -> None:
     )
 
 
-@_renders(ScanReported)
-def _render_scan_reported(event: ScanReported, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_scan_reported(event: ScanReported, *, batch: bool) -> None:
     _print_scan_result(event.result, elapsed_s=event.elapsed_s)
 
 
-@_renders(MissingTestConfig)
-def _render_missing_test_config(event: MissingTestConfig, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_missing_test_config(event: MissingTestConfig, *, batch: bool) -> None:
     console.print(
         f"  [bold yellow]Warning:[/] {escape(event.project)} — no test "
         "configuration (test phases will be skipped)"
     )
 
 
-@_renders(ProcessingStarted)
-def _render_processing_started(event: ProcessingStarted, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_processing_started(event: ProcessingStarted, *, batch: bool) -> None:
     if event.vulns:
         console.print(f"\n[bold]Processing {event.vulns} vuln fix(es)...[/]")
     if event.updates:
         console.print(f"\n[bold]Processing {event.updates} update(s)...[/]")
 
 
-@_renders(FindingsProcessed)
-def _render_findings_processed(event: FindingsProcessed, batch: bool) -> None:
+@_render.register
+def _render_findings_processed(event: FindingsProcessed, *, batch: bool) -> None:
     if not batch:
         _print_update_summary(list(event.results))
 
 
-@_renders(Promoted)
-def _render_promoted(event: Promoted, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_promoted(event: Promoted, *, batch: bool) -> None:
     console.print(f"[bold green]Promoted {escape(event.bookmark)} to main.[/]")
 
 
-@_renders(ResolvePaused)
-def _render_resolve_paused(event: ResolvePaused, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_resolve_paused(event: ResolvePaused, *, batch: bool) -> None:
     console.print(
         f"  [bold yellow]Resolve paused.[/] Continue with "
         f"[bold]mm resolve {escape(event.project)} --continue[/]."
     )
 
 
-@_renders(FindingsBlocked)
-def _render_findings_blocked(event: FindingsBlocked, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_findings_blocked(event: FindingsBlocked, *, batch: bool) -> None:
     for package, reason in event.findings:
         console.print(f"  [yellow]BLOCKED[/] {escape(package)} — {escape(reason)}")
 
 
-@_renders(SubmissionBlocked)
-def _render_submission_blocked(event: SubmissionBlocked, batch: bool) -> None:
-    del event, batch
+@_render.register
+def _render_submission_blocked(event: SubmissionBlocked, *, batch: bool) -> None:
     console.print(
         "  [bold yellow]Not submitting:[/] blocked findings remain. "
         "Rescan or resolve them manually."
     )
 
 
-@_renders(BlockersStillFailing)
-def _render_blockers_still_failing(event: BlockersStillFailing, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_blockers_still_failing(event: BlockersStillFailing, *, batch: bool) -> None:
     console.print(
         f"  [bold red]FAIL[/] {escape(event.phase)} — still blocking: "
         f"{escape(', '.join(event.pkgs))}"
     )
 
 
-@_renders(SyncCompleted)
-def _render_sync_completed(event: SyncCompleted, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_sync_completed(event: SyncCompleted, *, batch: bool) -> None:
     console.print(f"  {escape(event.project)} — {escape(event.action)}")
 
 
-@_renders(ProjectStarted)
-def _render_project_started(event: ProjectStarted, batch: bool) -> None:
+@_render.register
+def _render_project_started(event: ProjectStarted, *, batch: bool) -> None:
     if not batch:
         return
     console.print(f"\n{'═' * 40}")
@@ -304,9 +303,8 @@ def _render_project_started(event: ProjectStarted, batch: bool) -> None:
     console.print("═" * 40)
 
 
-@_renders(FindingStarted)
-def _render_finding_started(event: FindingStarted, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_finding_started(event: FindingStarted, *, batch: bool) -> None:
     label = "[bold red]VULN[/]" if event.kind == "vuln" else "[bold cyan]UPDATE[/]"
     console.print(
         f"\n  {label} {escape(event.pkg)} {escape(event.installed)} -> "
@@ -314,15 +312,13 @@ def _render_finding_started(event: FindingStarted, batch: bool) -> None:
     )
 
 
-@_renders(TestCommandStarted)
-def _render_test_command_started(event: TestCommandStarted, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_test_command_started(event: TestCommandStarted, *, batch: bool) -> None:
     console.print(f"  [dim]$ {escape(event.command)}[/]")
 
 
-@_renders(FindingStepFailed)
-def _render_finding_step_failed(event: FindingStepFailed, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_finding_step_failed(event: FindingStepFailed, *, batch: bool) -> None:
     error = escape(event.error)
     if event.step is FindingStepKind.PACKAGE_COMMAND:
         console.print(f"  [bold red]FAIL[/] Package manager command failed: {error}")
@@ -330,23 +326,21 @@ def _render_finding_step_failed(event: FindingStepFailed, batch: bool) -> None:
         console.print(f"  [bold red]FAIL[/] {error}")
 
 
-@_renders(FindingPassed)
-def _render_finding_passed(event: FindingPassed, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_finding_passed(event: FindingPassed, *, batch: bool) -> None:
     suffix = " [dim](already applied)[/]" if event.already_applied else ""
     console.print(f"  [bold green]PASS[/] {escape(event.pkg)}{suffix}")
 
 
-@_renders(FindingFailed)
-def _render_finding_failed(event: FindingFailed, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_finding_failed(event: FindingFailed, *, batch: bool) -> None:
     console.print(
         f"  [bold red]FAIL[/] {escape(event.pkg)} — {escape(event.phase)} failed"
     )
 
 
-@_renders(DeployStepStarted)
-def _render_deploy_step_started(event: DeployStepStarted, batch: bool) -> None:
+@_render.register
+def _render_deploy_step_started(event: DeployStepStarted, *, batch: bool) -> None:
     if batch:
         if event.step is DeployStep.BUILD:
             console.print("  [bold]Building...[/]")
@@ -362,8 +356,8 @@ def _render_deploy_step_started(event: DeployStepStarted, batch: bool) -> None:
         console.print(f"\n[bold]Checking health of {escape(event.project)}...[/]")
 
 
-@_renders(DeployStepSucceeded)
-def _render_deploy_step_succeeded(event: DeployStepSucceeded, batch: bool) -> None:
+@_render.register
+def _render_deploy_step_succeeded(event: DeployStepSucceeded, *, batch: bool) -> None:
     if batch:
         return
     if event.step is DeployStep.BUILD:
@@ -372,8 +366,8 @@ def _render_deploy_step_succeeded(event: DeployStepSucceeded, batch: bool) -> No
         console.print("\n[bold green]Deploy succeeded.[/]")
 
 
-@_renders(DeployStepFailed)
-def _render_deploy_step_failed(event: DeployStepFailed, batch: bool) -> None:
+@_render.register
+def _render_deploy_step_failed(event: DeployStepFailed, *, batch: bool) -> None:
     error = escape(event.error)
     if not batch:
         console.print(f"[bold red]Error:[/] {error}")
@@ -383,8 +377,8 @@ def _render_deploy_step_failed(event: DeployStepFailed, batch: bool) -> None:
         console.print(f"  [bold red]Deploy failed:[/] {error}")
 
 
-@_renders(HealthChecked)
-def _render_health_checked(event: HealthChecked, batch: bool) -> None:
+@_render.register
+def _render_health_checked(event: HealthChecked, *, batch: bool) -> None:
     indent = "  " if batch else ""
     if event.is_up:
         console.print(f"{indent}[bold green]Healthy:[/] {escape(event.project)} is up")
@@ -396,54 +390,47 @@ def _render_health_checked(event: HealthChecked, batch: bool) -> None:
         )
 
 
-@_renders(HealthcheckUnconfigured)
+@_render.register
 def _render_healthcheck_unconfigured(
-    event: HealthcheckUnconfigured, batch: bool
+    event: HealthcheckUnconfigured, *, batch: bool
 ) -> None:
-    del event, batch
     console.print("[dim]--check: no healthcheck_url configured in \\[defaults][/]")
 
 
-@_renders(PullRequestOutput)
-def _render_pull_request_output(event: PullRequestOutput, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_pull_request_output(event: PullRequestOutput, *, batch: bool) -> None:
     console.print(f"[dim]  {escape(event.text)}[/]")
 
 
-@_renders(GradleWithheld)
-def _render_gradle_withheld(event: GradleWithheld, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_gradle_withheld(event: GradleWithheld, *, batch: bool) -> None:
     console.print(f"Withheld {escape(event.label)}: {escape(event.reason)}")
 
 
-@_renders(NoEligibleGradleChanges)
+@_render.register
 def _render_no_eligible_gradle_changes(
-    event: NoEligibleGradleChanges, batch: bool
+    event: NoEligibleGradleChanges, *, batch: bool
 ) -> None:
-    del event, batch
     console.print("No eligible Gradle changes")
 
 
-@_renders(GradleRunArchived)
-def _render_gradle_run_archived(event: GradleRunArchived, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_gradle_run_archived(event: GradleRunArchived, *, batch: bool) -> None:
     console.print(
         f"Archived failed Gradle run to {escape(str(event.path))}; "
         "rebuilding candidates from main"
     )
 
 
-@_renders(GradleFlowFailed)
-def _render_gradle_flow_failed(event: GradleFlowFailed, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_gradle_flow_failed(event: GradleFlowFailed, *, batch: bool) -> None:
     console.print(
         f"Cannot complete Gradle {escape(event.flow.value)}: {escape(event.error)}"
     )
 
 
-@_renders(GradleRunReported)
-def _render_gradle_run_reported(event: GradleRunReported, batch: bool) -> None:
-    del batch
+@_render.register
+def _render_gradle_run_reported(event: GradleRunReported, *, batch: bool) -> None:
     _print_scan_result(event.scan)
     _print_gradle_run_summary(event.run)
 
@@ -461,6 +448,7 @@ def main() -> None:
 
 
 @app.command
+@_command
 def init() -> None:
     """Initialise the ~/.mm directory and skeleton config."""
     ensure_mm_home()
@@ -469,6 +457,7 @@ def init() -> None:
 
 
 @app.command
+@_command
 def scan(
     project: str | None = None,
     *,
@@ -486,23 +475,20 @@ def scan(
     cfg = _load_cfg(config)
 
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        console.print(_NO_PROJECTS)
         return
 
     vcs = make_vcs_services()
 
     if project:
         proj_config = _resolve_proj(cfg, project)
-        try:
-            result = scan_service.scan_one(
-                project,
-                proj_config,
-                minimum_age_days=cfg.defaults.min_version_age_days,
-                vcs=vcs,
-                emit=_Renderer(batch=False),
-            )
-        except scan_service.SCAN_ERRORS as e:
-            _fatal(str(e))
+        result = scan_service.scan_one(
+            project,
+            proj_config,
+            minimum_age_days=cfg.defaults.min_version_age_days,
+            vcs=vcs,
+            emit=_Renderer(batch=False),
+        )
         sys.exit(_scan_exit_code(ScanSummary.of(result)))
 
     summary = scan_service.scan_all(cfg, vcs=vcs, emit=_Renderer(batch=True))
@@ -511,7 +497,7 @@ def scan(
 
 def _exit_if_no_update_targets(cfg: MmConfig, target_names: list[str]) -> None:
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        console.print(_NO_PROJECTS)
         sys.exit(ExitCode.OK)
 
     if not target_names:
@@ -520,6 +506,7 @@ def _exit_if_no_update_targets(cfg: MmConfig, target_names: list[str]) -> None:
 
 
 @app.command
+@_command
 def update(
     *projects: str,
     negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
@@ -539,36 +526,25 @@ def update(
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
     cfg = _load_cfg(config)
-    try:
-        mode, targets = update_service.resolve_update_targets(
-            cfg, projects, negate=negate
-        )
-    except ProjectNotFoundError as exc:
-        _fatal(str(exc))
+    mode, targets = update_service.resolve_update_targets(cfg, projects, negate=negate)
 
     _exit_if_no_update_targets(cfg, targets)
 
-    try:
-        vcs_workflow.require_vcs_tools()
-    except ToolNotFoundError as e:
-        _fatal(str(e))
+    vcs_workflow.require_vcs_tools()
 
     vcs = make_vcs_services()
     if mode == "single":
         name = targets[0]
         proj_config = _resolve_proj(cfg, name)
-        try:
-            result = update_service.update_project(
-                name,
-                proj_config,
-                minimum_age_days=cfg.defaults.min_version_age_days,
-                choose=_choose_findings,
-                choose_gradle=_choose_gradle_candidates,
-                vcs=vcs,
-                emit=_Renderer(batch=False),
-            )
-        except WorkflowError as exc:
-            _fatal(str(exc))
+        result = update_service.update_project(
+            name,
+            proj_config,
+            minimum_age_days=cfg.defaults.min_version_age_days,
+            choose=_choose_findings,
+            choose_gradle=_choose_gradle_candidates,
+            vcs=vcs,
+            emit=_Renderer(batch=False),
+        )
         sys.exit(
             ExitCode.OK
             if result.outcome is Outcome.SUCCEEDED
@@ -591,6 +567,7 @@ def update(
 
 
 @app.command
+@_command
 def sync(
     *projects: str,
     config: Path | None = None,
@@ -607,19 +584,16 @@ def sync(
     cfg = _load_cfg(config)
 
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        console.print(_NO_PROJECTS)
         sys.exit(ExitCode.OK)
 
     vcs_services = make_vcs_services()
-    try:
-        outcome = scan_service.sync_projects(
-            cfg,
-            projects,
-            vcs=vcs_services,
-            emit=_Renderer(batch=True),
-        )
-    except ProjectNotFoundError as exc:
-        _fatal(str(exc))
+    outcome = scan_service.sync_projects(
+        cfg,
+        projects,
+        vcs=vcs_services,
+        emit=_Renderer(batch=True),
+    )
     sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
 
@@ -633,7 +607,6 @@ def _print_update_summary(all_results: list[UpdateResult]) -> None:
     if failed:
         phase_labels = {
             "apply": "install failed",
-            "branch": "bookmark creation failed",
             "commit": "commit failed",
         }
         for r in failed:
@@ -701,6 +674,7 @@ def _print_deploy_summary(results: list[deploy_service.DeployResult]) -> None:
 
 
 @app.command
+@_command
 def deploy(
     project: str | None = None,
     *,
@@ -735,9 +709,7 @@ def deploy(
         if check and not cfg.defaults.healthcheck_url:
             renderer(HealthcheckUnconfigured())
         if not cfg.projects:
-            console.print(
-                "No projects configured. Edit ~/.mm/config.toml to add projects."
-            )
+            console.print(_NO_PROJECTS)
             sys.exit(ExitCode.OK)
         results = deploy_service.deploy_all(
             cfg,
@@ -755,19 +727,16 @@ def deploy(
 
     assert project is not None
     proj_config = _resolve_proj(cfg, project)
-    try:
-        result = deploy_service.deploy_project(
-            project,
-            proj_config,
-            healthcheck_url=cfg.defaults.healthcheck_url,
-            build=build,
-            check=check,
-            force=force,
-            vcs=vcs,
-            emit=renderer,
-        )
-    except WorkflowError as exc:
-        _fatal(str(exc))
+    result = deploy_service.deploy_project(
+        project,
+        proj_config,
+        healthcheck_url=cfg.defaults.healthcheck_url,
+        build=build,
+        check=check,
+        force=force,
+        vcs=vcs,
+        emit=renderer,
+    )
     if result.build_status == "fail":
         sys.exit(ExitCode.BUILD_FAILED)
     if result.deploy_status == "fail":
@@ -776,6 +745,7 @@ def deploy(
 
 
 @app.command
+@_command
 def test(
     project: str,
     *,
@@ -812,6 +782,7 @@ def test(
 
 
 @app.command
+@_command
 def build(
     project: str,
     *,
@@ -838,10 +809,7 @@ def build(
 
     console.print(f"[bold]Building {escape(project)}[/]\n")
 
-    try:
-        deploy_service.build_project(project, proj_config, vcs=vcs)
-    except BuildError as e:
-        _fatal(str(e), code=ExitCode.BUILD_FAILED)
+    deploy_service.build_project(project, proj_config, vcs=vcs)
 
     console.print("\n[bold green]Build succeeded.[/]")
     sys.exit(ExitCode.OK)
@@ -851,6 +819,7 @@ _NO_DATA = "[dim]—[/]"
 
 
 @app.command(name=("list", "status", "st"))
+@_command
 def list_projects(
     *,
     detail: Annotated[bool, cyclopts.Parameter(name=("--detail", "-d"))] = False,
@@ -868,7 +837,7 @@ def list_projects(
     cfg = _load_cfg(config)
 
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        console.print(_NO_PROJECTS)
         return
 
     scan_results: dict[str, ScanResult] = {}
@@ -929,6 +898,7 @@ def list_projects(
 
 
 @app.command
+@_command
 def todo(
     project: str | None = None,
     *,
@@ -951,7 +921,7 @@ def todo(
         return
 
     if not cfg.projects:
-        console.print("No projects configured. Edit ~/.mm/config.toml to add projects.")
+        console.print(_NO_PROJECTS)
         return
 
     empty = []
@@ -994,17 +964,11 @@ def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
 
 
 def _load_cfg(config: Path | None) -> MmConfig:
-    try:
-        return load_config(config_path=config)
-    except ConfigError as e:
-        _fatal(str(e))
+    return load_config(config)
 
 
 def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
-    try:
-        return resolve_project(cfg, project)
-    except ProjectNotFoundError as e:
-        _fatal(str(e))
+    return resolve_project(cfg, project)
 
 
 def _require_test_config(project: str, proj_config: ProjectConfig) -> None:
@@ -1185,6 +1149,7 @@ def _choose_gradle_candidates(
 
 
 @app.command
+@_command
 def resolve(
     project: str,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
@@ -1209,22 +1174,16 @@ def resolve(
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     minimum_age_days = cfg.defaults.min_version_age_days
-    try:
-        vcs_workflow.require_vcs_tools()
-    except ToolNotFoundError as e:
-        _fatal(str(e))
+    vcs_workflow.require_vcs_tools()
     vcs = make_vcs_services()
-    try:
-        outcome = resolve_service.resolve_project(
-            project,
-            proj_config,
-            minimum_age_days=minimum_age_days,
-            continue_=continue_,
-            vcs=vcs,
-            emit=_Renderer(batch=False),
-        )
-    except WorkflowError as exc:
-        _fatal(str(exc))
+    outcome = resolve_service.resolve_project(
+        project,
+        proj_config,
+        minimum_age_days=minimum_age_days,
+        continue_=continue_,
+        vcs=vcs,
+        emit=_Renderer(batch=False),
+    )
     sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)
 
 

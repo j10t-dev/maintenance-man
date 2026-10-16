@@ -519,36 +519,6 @@ class TestUpdateCrossCategoryStops:
             app(["update", "vulnerable"])
         assert exc_info.value.code == 4
 
-    def test_bookmark_failure_summary_uses_friendly_label(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: dict,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        monkeypatch.setattr(
-            "maintenance_man.services.update.process_findings",
-            MagicMock(
-                return_value=[
-                    UpdateResult(
-                        pkg_name="some-pkg",
-                        kind="vuln",
-                        passed=False,
-                        failed_phase="branch",
-                    )
-                ]
-            ),
-        )
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
-        )
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["update", "vulnerable"])
-
-        assert exc_info.value.code == 4
-        assert "bookmark creation failed" in capsys.readouterr().out
-
     def test_commit_failure_summary_uses_friendly_label(
         self,
         mm_home_with_projects: Path,

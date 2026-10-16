@@ -1,12 +1,102 @@
 from io import StringIO
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from rich.console import Console
 
 from maintenance_man import __version__, cli
 from maintenance_man.cli import app
-from tests.conftest import run_mm
+from maintenance_man.deployer import BuildError
+from maintenance_man.gradle import GradleError
+from maintenance_man.outdated import OutdatedCheckError
+from maintenance_man.scanner import ScanError
+from maintenance_man.services import WorkflowError
+from maintenance_man.services.update import UpdateSetupError
+from maintenance_man.vcs import RevisionError
+from tests.conftest import configure_fake_vcs, run_mm
+
+
+@pytest.mark.parametrize(
+    ("argv", "service_seam", "error", "expected_code"),
+    [
+        (
+            ("scan", "vulnerable"),
+            "maintenance_man.services.scan.scan_one",
+            ScanError("trivy failed"),
+            1,
+        ),
+        (
+            ("scan", "vulnerable"),
+            "maintenance_man.services.scan.scan_one",
+            GradleError("report failed"),
+            1,
+        ),
+        (
+            ("scan", "vulnerable"),
+            "maintenance_man.services.scan.scan_one",
+            RevisionError("jj failed"),
+            1,
+        ),
+        (
+            ("scan", "vulnerable"),
+            "maintenance_man.services.scan.scan_one",
+            OutdatedCheckError("uv failed"),
+            1,
+        ),
+        (
+            ("update", "vulnerable"),
+            "maintenance_man.services.update.update_project",
+            WorkflowError("refused"),
+            1,
+        ),
+        (
+            ("update", "vulnerable"),
+            "maintenance_man.services.update.update_project",
+            UpdateSetupError("refused"),
+            1,
+        ),
+        (
+            ("build", "deployable"),
+            "maintenance_man.services.deploy.build_project",
+            BuildError("make failed"),
+            6,
+        ),
+    ],
+    ids=[
+        "scan-error",
+        "gradle-error",
+        "revision-error",
+        "outdated-check-error",
+        "workflow-error",
+        "workflow-error-subclass",
+        "build-error",
+    ],
+)
+def test_given_a_service_refusal_when_a_command_runs_then_it_maps_to_one_error_line(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, str],
+    service_seam: str,
+    error: Exception,
+    expected_code: int,
+) -> None:
+    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+    monkeypatch.setattr(service_seam, MagicMock(side_effect=error))
+
+    code = run_mm(*argv)
+    error_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("Error:")
+    ]
+
+    assert (code, error_lines) == (
+        expected_code,
+        [f"Error: {error}"],
+    )
 
 
 class TestHelp:
