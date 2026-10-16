@@ -29,6 +29,7 @@ from maintenance_man.dependency_age import (
 from maintenance_man.models.gradle import (
     AgeBlock,
     ModuleId,
+    PublicationEvidence,
     PublicationRequest,
     RepositoryDeclaration,
 )
@@ -100,6 +101,32 @@ def _publication_fixture(
 
     context = PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW)
     return module, request, calls, context
+
+
+def _publication_fact(module, repository, timestamp, digest="0" * 64):
+    from maintenance_man.models.gradle import PublicationFact
+
+    root = {
+        "central": "https://repo.maven.apache.org/maven2",
+        "google": "https://dl.google.com/dl/android/maven2",
+    }[repository]
+    path = "/".join(
+        (
+            module.group.replace(".", "/"),
+            module.artifact,
+            module.version,
+            f"{module.artifact}-{module.version}.pom",
+        )
+    )
+    return PublicationFact(
+        repository=repository,
+        module=module,
+        source_url=f"{root}/{path}",
+        method="last_modified",
+        artifact_digest=digest,
+        timestamp=timestamp,
+        checked_at=_PUB_NOW,
+    )
 
 
 @pytest.mark.parametrize(
@@ -219,17 +246,17 @@ def test_publication_routing_withheld_before_any_transport_call(
     [(False, ("central",)), (True, ())],
     ids=["routing_unsupported", "no_repositories"],
 )
-def test_publication_candidate_age_allows_unknown_routing(
+def test_publication_candidate_age_propagates_routing_withholding(
     tmp_path, routing_supported, repositories
 ):
-    """Unsupported routing leaves age unknown and does not veto updates."""
     _, request, calls, context = _publication_fixture(
         tmp_path, repositories=repositories, routing_supported=routing_supported
     )
     candidate = SimpleNamespace(publication_requests=(request,))
     with context:
-        result = evaluate_gradle_candidate_age(candidate, 7, context, _PUB_NOW)
-    assert result is None
+        result = evaluate_gradle_candidate_age(candidate, 0, context, _PUB_NOW)
+    assert isinstance(result, AgeBlock)
+    assert result.reason == "unsupported or missing scoped repository routing"
     assert calls == []
 
 
@@ -237,11 +264,11 @@ def test_publication_candidate_age_allows_unknown_routing(
     "date,days,blocked",
     [
         ("Tue, 01 Sep 2026 00:00:00 GMT", 7, False),
-        ("Fri, 11 Sep 2026 00:00:00 GMT", 7, True),
+        ("Fri, 11 Sep 2026 00:00:00 GMT", 7, False),
         ("Thu, 17 Sep 2026 00:00:00 GMT", 0, False),
-        ("Sat, 19 Sep 2026 00:00:00 GMT", 0, False),
-        ("broken", 0, False),
-        (None, 0, False),
+        ("Sat, 19 Sep 2026 00:00:00 GMT", 0, True),
+        ("broken", 0, True),
+        (None, 0, True),
     ],
 )
 def test_publication_policy(tmp_path, date, days, blocked):
@@ -257,7 +284,114 @@ def test_publication_policy(tmp_path, date, days, blocked):
             SimpleNamespace(publication_requests=(request,)), days, context, _PUB_NOW
         )
     assert isinstance(result, AgeBlock) == blocked
-    assert len(calls) == (1 if days else 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "lookup_result,minimum_age_days,expected_result,same_instance",
+    [
+        (
+            AgeBlock(reason="marker implementation disagrees with native resolution"),
+            7,
+            AgeBlock(reason="marker implementation disagrees with native resolution"),
+            True,
+        ),
+        (
+            PublicationEvidence(
+                facts=(
+                    _publication_fact(
+                        ModuleId(group="org.example", artifact="lib", version="2.0"),
+                        "central",
+                        datetime(2026, 9, 18, 0, 0, 1, tzinfo=UTC),
+                    ),
+                )
+            ),
+            0,
+            AgeBlock(reason="publication evidence is in the future"),
+            False,
+        ),
+        (
+            PublicationEvidence(
+                facts=(
+                    _publication_fact(
+                        ModuleId(group="org.example", artifact="lib", version="2.0"),
+                        "central",
+                        datetime(2026, 9, 11, tzinfo=UTC),
+                    ),
+                )
+            ),
+            7,
+            None,
+            False,
+        ),
+        (
+            PublicationEvidence(
+                facts=(
+                    _publication_fact(
+                        ModuleId(group="org.example", artifact="lib", version="2.0"),
+                        "central",
+                        datetime(2026, 9, 11, 0, 0, 1, tzinfo=UTC),
+                    ),
+                )
+            ),
+            7,
+            AgeBlock(reason="publication younger than required 7 days"),
+            False,
+        ),
+    ],
+    ids=["age_block", "future", "exact_wait", "younger"],
+)
+def test_given_lookup_result_when_evaluated_then_policy_result_is_returned(
+    tmp_path,
+    monkeypatch,
+    lookup_result,
+    minimum_age_days,
+    expected_result,
+    same_instance,
+):
+    _, request, calls, context = _publication_fixture(tmp_path, routing_supported=False)
+    monkeypatch.setattr(
+        "maintenance_man.dependency_age.lookup_gradle_publication",
+        lambda request, context: lookup_result,
+    )
+
+    with context:
+        result = evaluate_gradle_candidate_age(
+            SimpleNamespace(publication_requests=(request,)),
+            minimum_age_days,
+            context,
+            _PUB_NOW,
+        )
+
+    assert result == expected_result
+    assert (result is lookup_result) is same_instance
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "now,minimum_age_days",
+    [(datetime(2026, 9, 18), 0), (_PUB_NOW, -1)],
+    ids=["naive_now", "negative_wait"],
+)
+def test_given_an_invalid_policy_when_gradle_age_is_evaluated_then_transport_is_skipped(
+    tmp_path, now, minimum_age_days
+):
+    _, request, calls, context = _publication_fixture(tmp_path)
+
+    with (
+        context,
+        pytest.raises(
+            ValueError, match="current UTC date and nonnegative minimum age required"
+        ),
+    ):
+        evaluate_gradle_candidate_age(
+            SimpleNamespace(publication_requests=(request,)),
+            minimum_age_days,
+            context,
+            now,
+        )
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -842,7 +976,7 @@ def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown):
             for candidate in candidates
         ]
     assert blocks[0] is None
-    assert blocks[1] is None
+    assert isinstance(blocks[1], AgeBlock)
 
 
 def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeypatch):
@@ -990,32 +1124,27 @@ def test_publication_never_replaces_invalid_explicit_identity_with_parent(
 
 
 @pytest.mark.parametrize("minimum_age", [0, 7])
-def test_unknown_gradle_publication_does_not_veto_update(tmp_path, minimum_age):
+def test_failed_gradle_publication_lookup_withholds_update(tmp_path, minimum_age):
     _, request, calls, context = _publication_fixture(
         tmp_path, responses={"central": TimeoutError("unavailable")}
     )
     with context:
-        assert (
-            evaluate_gradle_candidate_age(
-                SimpleNamespace(publication_requests=(request,)),
-                minimum_age,
-                context,
-                _PUB_NOW,
-            )
-            is None
+        result = evaluate_gradle_candidate_age(
+            SimpleNamespace(publication_requests=(request,)),
+            minimum_age,
+            context,
+            _PUB_NOW,
         )
-    if minimum_age == 0:
-        assert calls == []
+    assert result == AgeBlock(reason="org.example:lib:2.0: publication lookup failed")
+    assert len(calls) == 1
 
 
-def test_gradle_age_without_requests_is_unknown(tmp_path):
+def test_gradle_age_without_requests_is_withheld(tmp_path):
     with PublicationLookupContext(tmp_path) as context:
-        assert (
-            evaluate_gradle_candidate_age(
-                SimpleNamespace(publication_requests=()), 7, context, _PUB_NOW
-            )
-            is None
+        result = evaluate_gradle_candidate_age(
+            SimpleNamespace(publication_requests=()), 7, context, _PUB_NOW
         )
+    assert result == AgeBlock(reason="candidate has no publication requests")
 
 
 @pytest.mark.parametrize("kind", ["library", "plugin"])
@@ -1178,32 +1307,6 @@ def _scan_age_inputs(
         )
     )
     return update, project, resolution
-
-
-def _publication_fact(module, repository, timestamp, digest="0" * 64):
-    from maintenance_man.models.gradle import PublicationFact
-
-    root = {
-        "central": "https://repo.maven.apache.org/maven2",
-        "google": "https://dl.google.com/dl/android/maven2",
-    }[repository]
-    path = "/".join(
-        (
-            module.group.replace(".", "/"),
-            module.artifact,
-            module.version,
-            f"{module.artifact}-{module.version}.pom",
-        )
-    )
-    return PublicationFact(
-        repository=repository,
-        module=module,
-        source_url=f"{root}/{path}",
-        method="last_modified",
-        artifact_digest=digest,
-        timestamp=timestamp,
-        checked_at=_PUB_NOW,
-    )
 
 
 @pytest.mark.parametrize(

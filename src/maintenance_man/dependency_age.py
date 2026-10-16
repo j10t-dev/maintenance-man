@@ -792,21 +792,29 @@ def lookup_gradle_publication(request, context):
 
 
 def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
-    """Withhold only releases with a known date inside the waiting period."""
+    """Return an ``AgeBlock`` unless every publication request is proven old enough.
+
+    Exact-artifact evidence is required even when ``minimum_age_days`` is zero:
+    an unresolved lookup withholds the candidate rather than passing it.
+    """
     if now.tzinfo is None or minimum_age_days < 0:
         msg = "current UTC date and nonnegative minimum age required"
         raise ValueError(msg)
-    if minimum_age_days == 0:
-        return None
     requests = candidate.publication_requests
+    if not requests:
+        return AgeBlock(reason="candidate has no publication requests")
     context.prefetch(requests)
     for request in requests:
         result = lookup_gradle_publication(request, context)
         if isinstance(result, AgeBlock):
-            continue
-        if result.timestamp >= now - timedelta(days=minimum_age_days):
+            return result
+        if result.timestamp > now:
+            return AgeBlock(reason="publication evidence is in the future")
+        if minimum_age_days and result.timestamp > now - timedelta(
+            days=minimum_age_days
+        ):
             return AgeBlock(
-                reason=f"release younger than required {minimum_age_days} days"
+                reason=f"publication younger than required {minimum_age_days} days"
             )
     return None
 

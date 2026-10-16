@@ -1447,7 +1447,7 @@ def report_stub():
 @pytest.mark.parametrize(
     "offset,minimum,withheld",
     [
-        (timedelta(days=7), 7, True),
+        (timedelta(days=7), 7, False),
         (timedelta(days=7) + timedelta(microseconds=1), 7, False),
         (timedelta(days=7) - timedelta(microseconds=1), 7, True),
         (timedelta(0), 0, False),
@@ -1457,15 +1457,13 @@ def test_candidate_age_boundary_uses_the_injected_clock(offset, minimum, withhel
     prepared = _prepare_with_publication(_NOW - offset, minimum, FakeClock(_NOW))
     assert (prepared.block is not None) is withheld
     if withheld:
-        assert prepared.block.reason == "release younger than required 7 days"
+        assert prepared.block.reason == "publication younger than required 7 days"
 
 
 def test_candidate_age_reads_the_clock_after_prefetch():
     clock = FakeClock(_NOW)
-    published = _NOW - timedelta(days=7)
-    # Exactly seven days old is withheld at the start...
+    published = _NOW - timedelta(days=7) + timedelta(microseconds=1)
     assert _prepare_with_publication(published, 7, clock).block is not None
-    # ...but a fetch that advances time makes it old enough for the live decision.
     advanced = _prepare_with_publication(
         published,
         7,

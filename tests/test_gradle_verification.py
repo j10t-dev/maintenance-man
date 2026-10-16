@@ -62,6 +62,7 @@ from maintenance_man.models.gradle import (
     ScopeId,
     ScopeResolution,
     VerifiedComparison,
+    WithheldAttempt,
 )
 from maintenance_man.models.scan import (
     GradleMember,
@@ -4697,7 +4698,7 @@ def test_gradle_updates_without_declared_public_routing(driver):
     ]
 
 
-def test_checked_gradle_update_can_record_unknown_publication(
+def test_checked_gradle_update_withholds_unknown_publication(
     workflow, monkeypatch, tmp_path
 ):
     from maintenance_man.dependency_age import (
@@ -4729,9 +4730,8 @@ def test_checked_gradle_update_can_record_unknown_publication(
         result = updater.process_gradle_run(
             run, workflow.project, publication, 7, emit=RecordingEmit()
         )
-        assert isinstance(result.attempts[0], ReadyAttempt)
-        assert result.attempts[0].receipt.publications == ()
-        assert result.attempts[0].receipt.checks.success
-        updater.gradle_run_finalization_check(result, workflow.project, publication, 7)
+    attempt = result.attempts[0]
+    assert isinstance(attempt, WithheldAttempt)
+    assert attempt.reason == "g:lib:2: publication lookup failed"
     assert len(calls) == 1
-    assert workflow.effects == ["apply", "commit", "bookmark"]
+    assert workflow.effects == []
