@@ -507,17 +507,22 @@ def test_write_file_none_deletes_registered_file(repository_case: RepositoryCase
     assert c.repo.changed_paths() == frozenset({"dep.txt"})
 
 
-def test_missing_and_conflicted_bookmarks_are_distinct(repository_case: RepositoryCase):
+def test_given_conflicted_bookmark_when_resolving_then_raises_and_direct_id_resolves(
+    repository_case: RepositoryCase,
+):
     c = repository_case
     assert c.repo.bookmark_exists(bookmark=MANAGED) is False
-    base = c.repo.resolve_revision(revision="main")
     c.repo.new_change(revision="main")
     c.write_file("dep.txt", "side=1\n")
-    side = c.repo.resolve_revision(revision="@")
-    c.conflict_bookmark(MANAGED, base, side)
+    left = c.repo.resolve_revision(revision="@")
+    c.repo.new_change(revision="main")
+    c.write_file("dep.txt", "side=2\n")
+    right = c.repo.resolve_revision(revision="@")
+    c.conflict_bookmark(MANAGED, left, right)
     assert c.repo.bookmark_exists(bookmark=MANAGED) is True
     assert c.repo.bookmark_conflicted(bookmark=MANAGED) is True
-    with pytest.raises(RevisionError, match="exactly one"):
+    assert c.repo.resolve_revision(revision=left) == left
+    with pytest.raises(RevisionError):
         c.repo.resolve_revision(revision=MANAGED)
 
 

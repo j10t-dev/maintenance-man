@@ -222,12 +222,6 @@ class JjRepository:
         return len(names) > 1
 
     def resolve_revision(self, *, revision: str, read_only: bool = False) -> str:
-        if (
-            revision in self.local_bookmarks()
-            and len(self._bookmark_listing(revision)) > 1
-        ):
-            msg = f"{revision} must resolve to exactly one commit, got multiple targets"
-            raise RevisionError(msg)
         prefix = ["--ignore-working-copy", "--color", "never"] if read_only else []
         result = self._run(
             [

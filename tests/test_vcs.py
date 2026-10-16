@@ -10,6 +10,7 @@ from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import VcsServices
 from tests.conftest import make_project
 from tests.fake_vcs import FakeJjState
+from tests.fakes import FakeCommands
 
 
 @pytest.mark.parametrize("failing_step", ["add_workspace", "new_change"])
@@ -47,6 +48,44 @@ def _completed(
     return subprocess.CompletedProcess(
         args=[], returncode=returncode, stdout=stdout, stderr=stderr
     )
+
+
+def test_given_distinct_revision_ids_when_same_revision_runs_then_it_uses_two_log_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands = FakeCommands()
+    monkeypatch.setattr(vcs, "run_captured", commands)
+    commands.add(
+        (
+            "jj",
+            "log",
+            "-r",
+            "main",
+            "--no-graph",
+            "-T",
+            'commit_id ++ "\\n"',
+        ),
+        cwd=tmp_path,
+        result=_completed(stdout=f"{'a' * 40}\n"),
+    )
+    commands.add(
+        (
+            "jj",
+            "log",
+            "-r",
+            "main@origin",
+            "--no-graph",
+            "-T",
+            'commit_id ++ "\\n"',
+        ),
+        cwd=tmp_path,
+        result=_completed(stdout=f"{'b' * 40}\n"),
+    )
+
+    same = vcs.JjRepository(tmp_path).same_revision(left="main", right="main@origin")
+
+    assert same is False
+    assert len(commands.calls) == 2
 
 
 @pytest.mark.parametrize("existing", [False, True], ids=["absent", "existing"])
