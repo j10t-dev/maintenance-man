@@ -56,8 +56,6 @@ def scan_project(
     name: str,
     project: ProjectConfig,
     min_version_age_days: int = 7,
-    *,
-    vcs: VcsServices | None = None,
 ) -> ScanResult:
     """Run Trivy and outdated checks against a project and return parsed results.
 

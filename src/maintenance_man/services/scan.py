@@ -70,7 +70,7 @@ def scan_one(
         emit(OperationFailed(Operation.REMOTE_SYNC, name, str(exc)))
 
     started = time.monotonic()
-    result = scan_project(name, project, minimum_age_days, vcs=vcs)
+    result = scan_project(name, project, minimum_age_days)
     emit(ScanReported(result, time.monotonic() - started))
     return result
 

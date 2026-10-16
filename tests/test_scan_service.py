@@ -45,8 +45,8 @@ def test_scan_all_continues_after_failure_and_summarises_results(
     third = make_scan_result(vulns=[], updates=[])
     third.project = "third"
 
-    def fake_scan(name, project, minimum_age_days, *, vcs):
-        del project, minimum_age_days, vcs
+    def fake_scan(name, project, minimum_age_days):
+        del project, minimum_age_days
         if name == "second":
             msg = "boom"
             raise ScanError(msg)

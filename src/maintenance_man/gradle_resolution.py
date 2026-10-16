@@ -702,7 +702,9 @@ def validate_gradle_candidates(
             if response.is_symlink():
                 msg = "Candidate validation output is a symlink"
                 raise GradleError(msg)
-            batch = CandidateValidationBatch.model_validate_json(response.read_text())
+            batch = CandidateValidationBatch.model_validate_json(
+                response.read_text(encoding="utf-8")
+            )
             expected = {request["request_id"]: request for request in requests}
             actual = {result.request_id: result for result in batch.results}
             if len(actual) != len(batch.results) or actual.keys() != expected.keys():
