@@ -165,12 +165,6 @@ def _submit(
     emit: Emit,
 ) -> Outcome:
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    if scan_result.blocked_findings:
-        emit(FindingsBlocked(_blocked_rows(scan_result)))
-        emit(SubmissionBlocked(name))
-        save_scan_results(name, scan_result)
-        return Outcome.FAILED
-
     for finding in ready_findings:
         finding.failed_phase = None
 
@@ -224,6 +218,7 @@ def _run_candidates(
     ready = _ordered_ready_findings(scan_result, flow=Workflow.RESOLVE)
     if scan_result.blocked_findings:
         emit(FindingsBlocked(_blocked_rows(scan_result)))
+        emit(SubmissionBlocked(name))
         save_scan_results(name, scan_result)
         return Outcome.FAILED
     if not ready:

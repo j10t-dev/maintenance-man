@@ -14,6 +14,7 @@ from maintenance_man.models.events import (
     Outcome,
     PullRequestOutput,
     ResolvePaused,
+    SubmissionBlocked,
 )
 from maintenance_man.models.scan import UpdateStatus, Workflow
 from maintenance_man.services import WorkflowError
@@ -255,11 +256,15 @@ def test_blocked_finding_is_saved_and_reported(
     )
 
     assert outcome is Outcome.FAILED
-    assert emit.events[-1] == FindingsBlocked((("blocked", "No published fix"),))
+    assert emit.events[-2:] == [
+        FindingsBlocked((("blocked", "No published fix"),)),
+        SubmissionBlocked("api"),
+    ]
     assert [finding.pkg_name for finding in load_scan_results("api").findings] == [
         "some-pkg",
         "blocked",
     ]
+    assert not any(call.method == "create_pr" for call in state.effects)
 
 
 def test_host_failure_after_push_emits_submit_failure_and_keeps_ready(
