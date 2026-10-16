@@ -32,7 +32,12 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     SemverTier,
 )
-from tests.conftest import GRADLE_FIXTURES, fixture_runner, make_gradle_target
+from tests.conftest import (
+    GRADLE_FIXTURES,
+    completed,
+    fixture_runner,
+    make_gradle_target,
+)
 
 
 def _digest(path: Path) -> str:
@@ -62,9 +67,7 @@ def _fake_gradle(
                 catalogue.read_text(encoding="utf-8").replace("2.8.4", "2.8.5"),
                 encoding="utf-8",
             )
-        return subprocess.CompletedProcess(
-            cmd, returncode, stdout=stdout, stderr=stderr
-        )
+        return completed(cmd, returncode=returncode, stdout=stdout, stderr=stderr)
 
     return _run
 
@@ -616,7 +619,7 @@ def _report_wrapper(*, returncode: int = 0):
             (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr="boom")
+        return completed(cmd, returncode=returncode, stdout="", stderr="boom")
 
     return _run
 
@@ -765,7 +768,7 @@ def _apply_wrapper(edits: dict[str, str] | None = None, *, returncode: int = 0):
         for old, new in (edits or {}).items():
             text = text.replace(old, new, 1)
         catalogue.write_text(text, encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr="boom")
+        return completed(cmd, returncode=returncode, stdout="", stderr="boom")
 
     return _run
 
@@ -1282,9 +1285,7 @@ def test_owned_output_parent_symlink_refuses_before_external_mutation(
 
     def run(cmd, **kwargs):
         commands.append(cmd)
-        return subprocess.CompletedProcess(
-            cmd, 1, stdout="", stderr="unexpected command"
-        )
+        return completed(cmd, returncode=1, stdout="", stderr="unexpected command")
 
     monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(GradleError):
@@ -1309,7 +1310,7 @@ def test_discovery_keeps_active_owned_inventory_context(gradle_project, monkeypa
     def run(cmd, **kwargs):
         assert cmd[1] == "versionCatalogUpdate"
         (root / GRADLE_UPDATE_REPORT_RELPATH).write_text(_clean_report())
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return completed(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
     with generate_gradle_report(gradle_project) as generated:
@@ -1335,7 +1336,7 @@ def test_report_cleanup_rechecks_parent_after_wrapper_launch(
     def run(cmd, **kwargs):
         (root / "gradle").rename(tmp_path / "original-gradle")
         (root / "gradle").symlink_to(outside, target_is_directory=True)
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="wrapper failed")
+        return completed(cmd, returncode=1, stdout="", stderr="wrapper failed")
 
     monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(GradleError):

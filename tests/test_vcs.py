@@ -8,7 +8,7 @@ from maintenance_man.gradle import GradleError
 from maintenance_man.gradle_updates import gradle_evidence_workspace
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import VcsServices
-from tests.conftest import make_project
+from tests.conftest import completed, make_project
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeCommands
 
@@ -42,14 +42,6 @@ def test_proof_setup_error_survives_cleanup_failure(
     assert any("busy" in note for note in caught.value.__notes__)
 
 
-def _completed(
-    returncode: int = 0, stdout: str = "", stderr: str = ""
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(
-        args=[], returncode=returncode, stdout=stdout, stderr=stderr
-    )
-
-
 def test_given_distinct_revision_ids_when_same_revision_runs_then_it_uses_two_log_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -66,7 +58,7 @@ def test_given_distinct_revision_ids_when_same_revision_runs_then_it_uses_two_lo
             'commit_id ++ "\\n"',
         ),
         cwd=tmp_path,
-        result=_completed(stdout=f"{'a' * 40}\n"),
+        result=completed(stdout=f"{'a' * 40}\n"),
     )
     commands.add(
         (
@@ -79,7 +71,7 @@ def test_given_distinct_revision_ids_when_same_revision_runs_then_it_uses_two_lo
             'commit_id ++ "\\n"',
         ),
         cwd=tmp_path,
-        result=_completed(stdout=f"{'b' * 40}\n"),
+        result=completed(stdout=f"{'b' * 40}\n"),
     )
 
     same = vcs.JjRepository(tmp_path).same_revision(left="main", right="main@origin")
@@ -144,19 +136,97 @@ def test_assert_safe_workspace_path_rejects_final_symlink_and_preserves_sibling(
     assert candidate.is_symlink()
 
 
+def _resolve_command(revision: str, *, read_only: bool = False) -> tuple[str, ...]:
+    prefix = ("--ignore-working-copy", "--color", "never") if read_only else ()
+    return (
+        "jj",
+        *prefix,
+        "log",
+        "-r",
+        revision,
+        "--no-graph",
+        "-T",
+        'commit_id ++ "\\n"',
+    )
+
+
+def _file_list_command(commit_id: str, filename: str) -> tuple[str, ...]:
+    return (
+        "jj",
+        "--ignore-working-copy",
+        "--color",
+        "never",
+        "file",
+        "list",
+        "-r",
+        commit_id,
+        "-T",
+        'file_type ++ "\\n"',
+        f"root-file:{filename}",
+    )
+
+
+def _revision_file_commands(tmp_path: Path, listing: str) -> FakeCommands:
+    commands = FakeCommands()
+    commands.add(
+        _resolve_command("main", read_only=True),
+        cwd=tmp_path,
+        result=completed(stdout="a" * 40 + "\n"),
+    )
+    commands.add(
+        _file_list_command("a" * 40, "dep.txt"),
+        cwd=tmp_path,
+        result=completed(stdout=listing),
+    )
+    return commands
+
+
 class TestJjRepositoryBoundary:
     def test_command_launch_failure_is_a_revision_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         failure = FileNotFoundError(2, "No such file or directory", "jj")
-
-        def fail(*args, **kwargs):
-            raise failure
-
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", fail)
+        error = vcs.RevisionError("Could not run jj")
+        error.__cause__ = failure
+        commands = FakeCommands()
+        commands.add(
+            (
+                "jj",
+                "--ignore-working-copy",
+                "--color",
+                "never",
+                "bookmark",
+                "list",
+                "-T",
+                'if(remote == "origin" || !present, "", name ++ "\\n")',
+            ),
+            cwd=tmp_path,
+            result=error,
+        )
+        monkeypatch.setattr(vcs, "run_captured", commands)
         with pytest.raises(vcs.RevisionError, match="Could not run jj") as caught:
             vcs.JjRepository(tmp_path).local_bookmarks()
         assert caught.value.__cause__ is failure
+        ((actual_argv, cwd, kwargs),) = commands.calls
+        assert actual_argv == (
+            "jj",
+            "--ignore-working-copy",
+            "--color",
+            "never",
+            "bookmark",
+            "list",
+            "-T",
+            'if(remote == "origin" || !present, "", name ++ "\\n")',
+        )
+        assert cwd == tmp_path
+        assert kwargs == {
+            "timeout": 30,
+            "label": (
+                "jj --ignore-working-copy --color never bookmark list -T "
+                '\'if(remote == "origin" || !present, "", name ++ "\\n")\''
+            ),
+            "error": vcs.RevisionError,
+        }
 
     def test_temporary_workspace_normalizes_allocation_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -225,13 +295,15 @@ class TestJjRepositoryBoundary:
         stdout: str,
         message: str,
     ):
-        repo = vcs.JjRepository(tmp_path)
-        monkeypatch.setattr(repo, "local_bookmarks", lambda: frozenset())
-        monkeypatch.setattr(
-            repo, "_run", lambda arguments, **kwargs: _completed(stdout=stdout)
+        commands = FakeCommands()
+        commands.add(
+            ("jj", "log", "-r", "main", "--no-graph", "-T", 'commit_id ++ "\\n"'),
+            cwd=tmp_path,
+            result=completed(stdout=stdout),
         )
+        monkeypatch.setattr(vcs, "run_captured", commands)
         with pytest.raises(vcs.RevisionError, match=message):
-            repo.resolve_revision(revision="main")
+            vcs.JjRepository(tmp_path).resolve_revision(revision="main")
 
     @pytest.mark.parametrize("listing", ["file\nfile\n", "unknown\n", "\nfile\n"])
     def test_revision_file_rejects_malformed_listing(
@@ -240,13 +312,12 @@ class TestJjRepositoryBoundary:
         monkeypatch: pytest.MonkeyPatch,
         listing: str,
     ):
-        repo = vcs.JjRepository(tmp_path)
-        monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
-        monkeypatch.setattr(
-            repo, "_run", lambda arguments, **kwargs: _completed(stdout=listing)
-        )
+        commands = _revision_file_commands(tmp_path, listing)
+        monkeypatch.setattr(vcs, "run_captured", commands)
         with pytest.raises(vcs.RevisionError, match="Unexpected revision file listing"):
-            repo.revision_file(revision="main", filename="dep.txt")
+            vcs.JjRepository(tmp_path).revision_file(
+                revision="main", filename="dep.txt"
+            )
 
     @pytest.mark.parametrize(
         ("listing", "regular"),
@@ -265,14 +336,11 @@ class TestJjRepositoryBoundary:
         listing: str,
         regular: bool,
     ):
-        repo = vcs.JjRepository(tmp_path)
-        monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
-        monkeypatch.setattr(
-            repo, "_run", lambda arguments, **kwargs: _completed(stdout=listing)
-        )
-        assert repo.revision_file(revision="main", filename="dep.txt") == (
-            vcs.RevisionFile(commit_id="a" * 40, is_regular=regular)
-        )
+        commands = _revision_file_commands(tmp_path, listing)
+        monkeypatch.setattr(vcs, "run_captured", commands)
+        assert vcs.JjRepository(tmp_path).revision_file(
+            revision="main", filename="dep.txt"
+        ) == (vcs.RevisionFile(commit_id="a" * 40, is_regular=regular))
 
     @pytest.mark.parametrize("phase", ["resolve", "list"])
     @pytest.mark.parametrize("failure", ["rejected", "launch", "timeout"])
@@ -283,27 +351,32 @@ class TestJjRepositoryBoundary:
         phase: str,
         failure: str,
     ):
-        observed: list[str] = []
         raised: BaseException | None = None
-
-        def run(command: list[str], **_kwargs):
-            nonlocal raised
-            if "bookmark" in command:
-                return subprocess.CompletedProcess(command, 0, "", "")
-            current = "resolve" if "log" in command else "list"
-            observed.append(current)
-            if current != phase:
-                stdout = "a" * 40 + "\n" if current == "resolve" else "file\n"
-                return subprocess.CompletedProcess(command, 0, stdout, "")
-            if failure == "rejected":
-                return subprocess.CompletedProcess(command, 1, "file\n", "")
-            if failure == "launch":
-                raised = FileNotFoundError(2, "No such file or directory", "jj")
-            else:
-                raised = subprocess.TimeoutExpired(command, 30)
-            raise raised
-
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+        commands = FakeCommands()
+        resolve_command = _resolve_command("main", read_only=True)
+        list_command = _file_list_command("a" * 40, "local.properties")
+        if failure == "rejected":
+            failed: subprocess.CompletedProcess[str] | BaseException = (
+                vcs.RevisionError("jj file list failed (exit 1): file")
+            )
+        elif failure == "launch":
+            raised = FileNotFoundError(2, "No such file or directory", "jj")
+            failed = vcs.RevisionError("Could not run jj")
+            failed.__cause__ = raised
+        else:
+            raised = subprocess.TimeoutExpired(
+                list(resolve_command if phase == "resolve" else list_command), 30
+            )
+            failed = vcs.RevisionError("jj command timed out")
+            failed.__cause__ = raised
+        commands.add(
+            resolve_command,
+            cwd=tmp_path,
+            result=failed if phase == "resolve" else completed(stdout="a" * 40 + "\n"),
+        )
+        if phase == "list":
+            commands.add(list_command, cwd=tmp_path, result=failed)
+        monkeypatch.setattr(vcs, "run_captured", commands)
 
         with pytest.raises(vcs.RevisionError) as caught:
             vcs.JjRepository(tmp_path).revision_file(
@@ -316,7 +389,25 @@ class TestJjRepositoryBoundary:
             "timeout": "timed out",
         }
         assert expected[failure] in str(caught.value)
-        assert observed == (["resolve"] if phase == "resolve" else ["resolve", "list"])
+        assert len(commands.calls) == (1 if phase == "resolve" else 2)
+        expected_labels = {
+            resolve_command: (
+                "jj --ignore-working-copy --color never log -r main --no-graph "
+                "-T 'commit_id ++ \"\\n\"'"
+            ),
+            list_command: (
+                "jj --ignore-working-copy --color never file list -r "
+                f"{'a' * 40} -T 'file_type ++ \"\\n\"' "
+                "root-file:local.properties"
+            ),
+        }
+        for argv, cwd, kwargs in commands.calls:
+            assert cwd == tmp_path
+            assert kwargs == {
+                "timeout": 30,
+                "label": expected_labels[argv],
+                "error": vcs.RevisionError,
+            }
         if raised is not None:
             assert caught.value.__cause__ is raised
 
@@ -329,13 +420,20 @@ class TestJjRepositoryBoundary:
         monkeypatch: pytest.MonkeyPatch,
         inspector: str,
     ):
-        repo = vcs.JjRepository(tmp_path)
-        monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
-        monkeypatch.setattr(
-            repo, "_run", lambda arguments, **kwargs: _completed(stdout=inspector)
+        commands = FakeCommands()
+        commands.add(
+            _resolve_command("main"),
+            cwd=tmp_path,
+            result=completed(stdout="a" * 40 + "\n"),
         )
+        commands.add(
+            ("jj", "debug", "object", "commit", "a" * 40),
+            cwd=tmp_path,
+            result=completed(stdout=inspector),
+        )
+        monkeypatch.setattr(vcs, "run_captured", commands)
         with pytest.raises(vcs.RevisionError, match="Cannot identify"):
-            repo.tree_id(revision="main")
+            vcs.JjRepository(tmp_path).tree_id(revision="main")
 
     @pytest.mark.parametrize(
         ("main_only", "arguments"),
@@ -356,7 +454,7 @@ class TestJjRepositoryBoundary:
 
         def run(command: list[str], *, timeout: int = 30):
             calls.append((command, timeout))
-            return _completed()
+            return completed()
 
         monkeypatch.setattr(repo, "_run", run)
         repo.fetch(main_only=main_only)

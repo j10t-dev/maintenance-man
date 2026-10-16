@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man.cli import _relative_time, app
+from maintenance_man.cli import _relative_time
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -14,6 +14,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.storage import record_activity
+from tests.conftest import run_mm, write_config
 
 _NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
@@ -45,8 +46,8 @@ def list_project_home(mm_home: Path) -> Path:
     mm_home.mkdir(parents=True)
     (mm_home / "scan-results").mkdir()
     (mm_home / "workspaces").mkdir()
-    (mm_home / "config.toml").write_text(
-        f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "uv"\n'
+    write_config(
+        mm_home, f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "uv"\n'
     )
     return mm_home
 
@@ -94,17 +95,13 @@ class TestRelativeTime:
 
 class TestListCommand:
     def test_list_no_projects(self, mm_home: Path, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         assert "no projects" in capsys.readouterr().out.lower()
 
     def test_list_shows_projects(
         self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
     ):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         output = capsys.readouterr().out
         assert "myapp" in output
         assert "uv" in output
@@ -112,9 +109,7 @@ class TestListCommand:
     def test_st_alias_shows_projects(
         self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
     ):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["st"])
-        assert exc_info.value.code == 0
+        assert run_mm("st") == 0
         output = capsys.readouterr().out
         assert "myapp" in output
         assert "uv" in output
@@ -125,15 +120,12 @@ class TestListCommand:
         project = tmp_path / "project"
         project.mkdir()
         mm_home.mkdir(parents=True)
-        (mm_home / "config.toml").write_text(
+        write_config(
+            mm_home,
             f'[projects."a[b]"]\npath = "{project}"\npackage_manager = "uv"\n',
-            encoding="utf-8",
         )
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         assert "a[b]" in capsys.readouterr().out
 
 
@@ -144,9 +136,7 @@ class TestListFindings:
         capsys: pytest.CaptureFixture[str],
     ):
         """Projects without scan results show 'never' in scanned column."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         output = capsys.readouterr().out
         # Look for the table having a Scanned column and a row with "never"
         assert "Scanned" in output
@@ -168,9 +158,7 @@ class TestListFindings:
             secrets=[_SECRET],
         )
         _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         output = capsys.readouterr().out
         row = _table_row(output, "myapp")
         assert row[2:5] == ("2", "3", "1")
@@ -185,9 +173,7 @@ class TestListFindings:
             "NOT VALID JSON",
             encoding="utf-8",
         )
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         output = capsys.readouterr().out
         assert "myapp" in output
         assert "Warning" in output
@@ -211,9 +197,7 @@ class TestListFindings:
             vulnerabilities=[_VULN],
         )
         _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
+        assert run_mm("list", "--detail") == 0
         assert expected_substring in capsys.readouterr().out
 
     def test_detail_sorts_by_severity(
@@ -261,9 +245,7 @@ class TestListFindings:
             vulnerabilities=vulns,
         )
         _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
+        assert run_mm("list", "--detail") == 0
         output = capsys.readouterr().out
         crit_pos = output.index("CVE-CRIT")
         high_pos = output.index("CVE-HIGH")
@@ -320,9 +302,7 @@ class TestListFindings:
             vulnerabilities=vulns,
         )
         _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
+        assert run_mm("list", "--detail") == 0
         output = capsys.readouterr().out
         assert "2.32.4" in output
         lines_with_marker = [
@@ -346,9 +326,7 @@ class TestListFindings:
             vulnerabilities=[_VULN],
         )
         _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
+        assert run_mm("list", "--detail") == 0
         output = capsys.readouterr().out
         assert "\u2190 fix" not in output
 
@@ -360,9 +338,7 @@ class TestListActivity:
         capsys: pytest.CaptureFixture[str],
     ):
         """Projects with no activity show dash in Built/Deployed columns."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         output = capsys.readouterr().out
         assert "Built" in output
         assert "Deployed" in output
@@ -377,9 +353,7 @@ class TestListActivity:
         """Build activity shows relative time."""
         activity_path = list_project_home / "activity.json"
         record_activity(activity_path, "myapp", "build", success=True, branch="main")
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         output = capsys.readouterr().out
         assert "just now" in output.lower() or "0m ago" in output or "1m ago" in output
 
@@ -391,8 +365,6 @@ class TestListActivity:
         """Failed build/deploy shows [F] marker."""
         activity_path = list_project_home / "activity.json"
         record_activity(activity_path, "myapp", "build", success=False, branch="main")
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
+        assert run_mm("list") == 0
         output = capsys.readouterr().out
         assert "[F]" in output

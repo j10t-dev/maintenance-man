@@ -6,7 +6,7 @@ import pytest
 from rich.console import Console
 
 from maintenance_man import __version__, cli
-from maintenance_man.cli import app
+from maintenance_man.config import ConfigError
 from maintenance_man.deployer import BuildError
 from maintenance_man.gradle import GradleError
 from maintenance_man.outdated import OutdatedCheckError
@@ -14,7 +14,7 @@ from maintenance_man.scanner import ScanError
 from maintenance_man.services import WorkflowError
 from maintenance_man.services.update import UpdateSetupError
 from maintenance_man.vcs import RevisionError
-from tests.conftest import configure_fake_vcs, run_mm
+from tests.conftest import configure_fake_vcs, run_mm, write_config
 
 
 @pytest.mark.parametrize(
@@ -101,17 +101,13 @@ def test_given_a_service_refusal_when_a_command_runs_then_it_maps_to_one_error_l
 
 class TestHelp:
     def test_help_contains_description(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["--help"])
-        assert exc_info.value.code == 0
+        assert run_mm("--help") == 0
         assert "maintenance" in capsys.readouterr().out.lower()
 
 
 class TestVersion:
     def test_version_prints_version(self, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["--version"])
-        assert exc_info.value.code == 0
+        assert run_mm("--version") == 0
         assert __version__ in capsys.readouterr().out
 
 
@@ -119,9 +115,7 @@ class TestInitCommand:
     def test_init_uses_redirected_home(
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]
     ):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["init"])
-        assert exc_info.value.code == 0
+        assert run_mm("init") == 0
         out = capsys.readouterr().out.replace("\n", "")
         assert str(mm_home) in out
         assert (mm_home / "config.toml").is_file()
@@ -136,10 +130,7 @@ class TestInitCommand:
             cli, "console", Console(file=output, width=220, color_system=None)
         )
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["init"])
-
-        assert exc_info.value.code == 0
+        assert run_mm("init") == 0
         assert str(home) in output.getvalue()
 
 
@@ -151,9 +142,11 @@ def test_fatal_prints_bracketed_plain_text_literally(
         cli, "console", Console(file=output, width=220, color_system=None)
     )
 
-    with pytest.raises(SystemExit):
-        cli._fatal("bad [projects.x]")
+    monkeypatch.setattr(
+        cli, "_load_cfg", MagicMock(side_effect=ConfigError("bad [projects.x]"))
+    )
 
+    assert run_mm("scan") == 1
     assert "Error: bad [projects.x]" in output.getvalue()
 
 
@@ -161,9 +154,7 @@ def test_config_validation_error_keeps_pydantic_type_suffix(
     mm_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mm_home.mkdir(parents=True)
-    (mm_home / "config.toml").write_text(
-        '[projects.api]\npackage_manager = "uv"\n', encoding="utf-8"
-    )
+    write_config(mm_home, '[projects.api]\npackage_manager = "uv"\n')
 
     assert run_mm("scan") == 1
 
@@ -188,9 +179,9 @@ def test_missing_command_error_keeps_config_table_literal(
     project = tmp_path / "project"
     project.mkdir()
     mm_home.mkdir(parents=True)
-    (mm_home / "config.toml").write_text(
+    write_config(
+        mm_home,
         f'[projects.api]\npath = "{project}"\npackage_manager = "uv"\n',
-        encoding="utf-8",
     )
 
     assert run_mm(command, "api") == 1
@@ -202,7 +193,7 @@ def test_deploy_check_hint_keeps_defaults_table_literal(
     mm_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mm_home.mkdir(parents=True)
-    (mm_home / "config.toml").write_text("[defaults]\n", encoding="utf-8")
+    write_config(mm_home, "[defaults]\n")
 
     assert run_mm("deploy", "--check") == 0
 
@@ -215,16 +206,12 @@ class TestDeployCommand:
         mm_home.mkdir(parents=True, exist_ok=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
-        (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
-        with pytest.raises(SystemExit) as exc_info:
-            app(["deploy"])
-        assert exc_info.value.code == 0
+        write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
+        assert run_mm("deploy") == 0
 
     def test_deploy_unknown_project_exits_error(self, mm_home):
         """Deploy with unknown project exits with ERROR."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["deploy", "project-alpha"])
-        assert exc_info.value.code == 1
+        assert run_mm("deploy", "project-alpha") == 1
 
 
 class TestTodoCommand:
@@ -243,9 +230,10 @@ class TestTodoCommand:
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
-        (mm_home / "config.toml").write_text(
+        write_config(
+            mm_home,
             f'[projects.alpha]\npath = "{alpha_dir}"\npackage_manager = "uv"\n\n'
-            f'[projects.beta]\npath = "{beta_dir}"\npackage_manager = "uv"\n'
+            f'[projects.beta]\npath = "{beta_dir}"\npackage_manager = "uv"\n',
         )
         return mm_home
 
@@ -253,9 +241,7 @@ class TestTodoCommand:
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
         """mm todo shows content and missing-file status for all projects."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["todo"])
-        assert exc_info.value.code == 0
+        assert run_mm("todo") == 0
         output = capsys.readouterr().out
         assert "alpha" in output
         assert "Fix the widget" in output
@@ -268,9 +254,7 @@ class TestTodoCommand:
         """mm todo shows 'empty' for projects with blank TODO.md."""
         alpha_dir = mm_home_with_todos.parent / "alpha"
         (alpha_dir / "TODO.md").write_text("   \n\n  ")
-        with pytest.raises(SystemExit) as exc_info:
-            app(["todo"])
-        assert exc_info.value.code == 0
+        assert run_mm("todo") == 0
         output = capsys.readouterr().out
         assert "alpha" in output
         assert "empty" in output
@@ -279,9 +263,7 @@ class TestTodoCommand:
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
         """mm todo <project> shows that project's TODO.md."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["todo", "alpha"])
-        assert exc_info.value.code == 0
+        assert run_mm("todo", "alpha") == 0
         output = capsys.readouterr().out
         assert "alpha" in output
         assert "Fix the widget" in output
@@ -291,17 +273,13 @@ class TestTodoCommand:
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
         """mm todo <project> with no TODO.md logs missing file, exits 0."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["todo", "beta"])
-        assert exc_info.value.code == 0
+        assert run_mm("todo", "beta") == 0
         output = capsys.readouterr().out
         assert "no TODO.md" in output
 
     def test_todo_unknown_project_exits_error(self, mm_home_with_todos: Path):
         """mm todo <unknown> exits with error (config error, not missing file)."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["todo", "nonexistent"])
-        assert exc_info.value.code == 1
+        assert run_mm("todo", "nonexistent") == 1
 
     def test_todo_no_projects_configured(
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]
@@ -310,10 +288,8 @@ class TestTodoCommand:
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
-        (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
-        with pytest.raises(SystemExit) as exc_info:
-            app(["todo"])
-        assert exc_info.value.code == 0
+        write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
+        assert run_mm("todo") == 0
         assert "no projects" in capsys.readouterr().out.lower()
 
     def test_todo_prints_bracketed_panel_title_literally(
@@ -323,9 +299,9 @@ class TestTodoCommand:
         project.mkdir()
         (project / "TODO.md").write_text("# Keep *Markdown*\n", encoding="utf-8")
         mm_home.mkdir(parents=True)
-        (mm_home / "config.toml").write_text(
+        write_config(
+            mm_home,
             f'[projects."a[b]"]\npath = "{project}"\npackage_manager = "uv"\n',
-            encoding="utf-8",
         )
 
         assert run_mm("todo", "a[b]") == 0

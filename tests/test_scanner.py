@@ -2,11 +2,9 @@ import dataclasses
 import hashlib
 import json
 import shutil
-import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -48,6 +46,7 @@ from tests.conftest import (
     FakeClock,
     completed,
     fixture_runner,
+    make_project,
     make_update,
     make_vuln,
     ops_with_outdated,
@@ -113,7 +112,9 @@ def test_outdated_failure_fails_the_scan_and_keeps_the_saved_result(
         assert (results / "demo.json").read_bytes() == previous
 
 
-def test_uv_audit_runs_isolated_and_accepts_findings_status(tmp_path, monkeypatch):
+def test_given_uv_audit_when_status_has_findings_then_command_contract_accepts_it(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
     commands = FakeCommands()
     commands.add(
@@ -121,20 +122,32 @@ def test_uv_audit_runs_isolated_and_accepts_findings_status(tmp_path, monkeypatc
         cwd=tmp_path,
         result=completed(("uv", "audit", "--locked"), returncode=1),
     )
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", commands)
+    monkeypatch.setattr(scanner, "run_captured", commands)
     assert scanner._run_uv_audit(tmp_path) == []
     ((cmd, cwd, kwargs),) = commands.calls
     assert cmd == ("uv", "audit", "--locked")
     assert cwd == tmp_path
-    assert kwargs["timeout"] == 300
-    assert "VIRTUAL_ENV" not in kwargs["env"]
+    assert kwargs == {
+        "timeout": 300,
+        "label": "uv audit --locked",
+        "error": ScanError,
+        "ok_codes": {0, 1},
+    }
 
 
 @pytest.mark.parametrize(
-    "scan, match",
+    "scan, argv, label",
     [
-        (lambda path: scanner._run_uv_audit(path), "uv audit"),
-        (lambda path: scanner._run_trivy_scan(path, scanners="vuln"), "Trivy"),
+        (
+            lambda path: scanner._run_uv_audit(path),
+            ("uv", "audit", "--locked"),
+            "uv audit --locked",
+        ),
+        (
+            lambda path: scanner._run_trivy_scan(path, scanners="vuln"),
+            ("trivy", "fs", "--format", "json", "--scanners", "vuln", "."),
+            "Trivy filesystem scan",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -144,15 +157,23 @@ def test_uv_audit_runs_isolated_and_accepts_findings_status(tmp_path, monkeypatc
         UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
     ],
 )
-def test_scanner_execution_failure_is_a_scan_error(
-    tmp_path, monkeypatch, scan, match, raised
+def test_given_command_execution_failure_when_scanning_then_scan_error_is_requested(
+    tmp_path, monkeypatch, scan, argv, label, raised
 ):
-    def run(cmd, **kwargs):
-        raise raised
-
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
-    with pytest.raises(ScanError, match=match):
+    commands = FakeCommands()
+    error = ScanError(f"Could not run {label} in {tmp_path}: {raised}")
+    error.__cause__ = raised
+    commands.add(argv, cwd=tmp_path, result=error)
+    monkeypatch.setattr(scanner, "run_captured", commands)
+    with pytest.raises(ScanError, match=label):
         scan(tmp_path)
+    ((actual_argv, cwd, kwargs),) = commands.calls
+    assert actual_argv == argv
+    assert cwd == tmp_path
+    expected = {"timeout": 300, "label": label, "error": ScanError}
+    if argv == ("uv", "audit", "--locked"):
+        expected["ok_codes"] = {0, 1}
+    assert kwargs == expected
 
 
 @pytest.mark.parametrize(
@@ -172,12 +193,13 @@ def test_given_malformed_consumed_secret_fields_when_scanned_then_scan_error(
     tmp_path, monkeypatch, result
 ):
     monkeypatch.setattr(scanner, "require_tool", lambda *args: None)
-    monkeypatch.setattr(
-        "maintenance_man.process.subprocess.run",
-        lambda cmd, **kwargs: subprocess.CompletedProcess(
-            cmd, 0, json.dumps({"Results": [result]}), ""
-        ),
+    commands = FakeCommands()
+    commands.add(
+        ("trivy", "fs", "--format", "json", "--scanners", "vuln,secret", "."),
+        cwd=tmp_path,
+        result=completed(stdout=json.dumps({"Results": [result]})),
     )
+    monkeypatch.setattr(scanner, "run_captured", commands)
 
     with pytest.raises(ScanError, match="Trivy"):
         scanner._run_trivy_scan(tmp_path, scanners="vuln,secret")
@@ -210,12 +232,6 @@ def test_capture_checks_the_context_at_the_injected_time(gradle_project, monkeyp
             gradle_project, MagicMock(), vcs=FakeJjState().services(), clock=clock
         )
     assert observed == [clock.current]
-
-
-def _make_project(
-    path: str | Path, pm: Literal["bun", "uv", "mvn"] = "uv"
-) -> ProjectConfig:
-    return ProjectConfig(path=Path(path), package_manager=pm)
 
 
 class TestUvAuditParsing:
@@ -281,12 +297,7 @@ def test_scan_requires_trivy_only_for_trivy_work(
     monkeypatch.setattr(
         scanner, "package_manager_ops", ops_with_outdated(lambda project: [])
     )
-    monkeypatch.setattr(
-        "maintenance_man.process.subprocess.run",
-        lambda *args, **kwargs: pytest.fail(
-            "no Trivy command may run without its prerequisite check"
-        ),
-    )
+    monkeypatch.setattr(scanner, "run_captured", FakeCommands())
     project = ProjectConfig(
         path=tmp_path, package_manager=manager, scan_secrets=secrets
     )
@@ -314,7 +325,9 @@ def test_gradle_scan_requires_trivy_before_generating_a_report(
 class TestScanProject:
     def test_scan_project_with_vulns(self, scan_results_dir: Path):
         """Scan vulnerable fixture — known to have vulnerabilities."""
-        project = _make_project(FIXTURES_DIR / "vulnerable-project")
+        project = make_project(
+            Path(FIXTURES_DIR / "vulnerable-project"), package_manager="uv"
+        )
         result = scan_project("vulnerable", project)
 
         assert isinstance(result, ScanResult)
@@ -334,7 +347,9 @@ class TestScanProject:
 
     def test_scan_project_clean(self, scan_results_dir: Path):
         """Scan clean fixture — expected to have no vulnerabilities."""
-        project = _make_project(FIXTURES_DIR / "clean-project")
+        project = make_project(
+            Path(FIXTURES_DIR / "clean-project"), package_manager="uv"
+        )
         result = scan_project("clean", project)
 
         assert isinstance(result, ScanResult)
@@ -344,7 +359,9 @@ class TestScanProject:
 
     def test_scan_writes_results_file(self, scan_results_dir: Path):
         """Scan should write JSON results to scan-results dir."""
-        project = _make_project(FIXTURES_DIR / "vulnerable-project")
+        project = make_project(
+            Path(FIXTURES_DIR / "vulnerable-project"), package_manager="uv"
+        )
         scan_project("vulnerable", project)
 
         results_file = scan_results_dir / "vulnerable.json"
@@ -361,7 +378,7 @@ class TestScanProject:
 
     def test_scan_nonexistent_path(self, scan_results_dir: Path):
         """Scan a path that doesn't exist — should raise."""
-        project = _make_project("/nonexistent/path")
+        project = make_project(Path("/nonexistent/path"), package_manager="uv")
         with pytest.raises(FileNotFoundError):
             scan_project("ghost", project)
 
@@ -369,7 +386,9 @@ class TestScanProject:
 class TestScanProjectWithUpdates:
     def test_scan_includes_updates(self, scan_results_dir: Path):
         """When outdated check returns updates, they appear in ScanResult."""
-        project = _make_project(FIXTURES_DIR / "clean-project")
+        project = make_project(
+            Path(FIXTURES_DIR / "clean-project"), package_manager="uv"
+        )
         fake_updates = [
             UpdateFinding(
                 pkg_name="requests",
@@ -415,21 +434,21 @@ class TestScanProjectWithUpdates:
                 semver_tier=SemverTier.MAJOR,
             ),
         ]
-        audit = subprocess.CompletedProcess(
-            args=[],
+        audit = completed(
+            [],
             returncode=1,
-            stdout=(
-                "Found 1 known vulnerability and no adverse project statuses in "
-                "1 package\n\n"
-                "Vulnerabilities:\n\n"
-                "cryptography 42.0.0 has 1 known vulnerability:\n\n"
-                "- GHSA-test: test vulnerability\n\n"
-                "  Fixed in: 43.0.0\n"
-            ),
+            stdout="Found 1 known vulnerability and no adverse project statuses in "
+            "1 package\n\n"
+            "Vulnerabilities:\n\n"
+            "cryptography 42.0.0 has 1 known vulnerability:\n\n"
+            "- GHSA-test: test vulnerability\n\n"
+            "  Fixed in: 43.0.0\n",
             stderr="",
         )
+        commands = FakeCommands()
+        commands.add(("uv", "audit", "--locked"), cwd=project.path, result=audit)
         with (
-            patch("maintenance_man.process.subprocess.run", return_value=audit),
+            patch("maintenance_man.scanner.run_captured", commands),
             patch(
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: fake_updates),
@@ -453,12 +472,14 @@ class TestUvNativeScan:
         self, scan_results_dir: Path, tmp_path: Path
     ):
         project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
-        audit = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="Found no known vulnerabilities", stderr=""
+        audit = completed(
+            [], returncode=0, stdout="Found no known vulnerabilities", stderr=""
         )
+        commands = FakeCommands()
+        commands.add(("uv", "audit", "--locked"), cwd=tmp_path, result=audit)
 
         with (
-            patch("maintenance_man.process.subprocess.run", return_value=audit) as run,
+            patch("maintenance_man.scanner.run_captured", commands),
             patch(
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: []),
@@ -468,17 +489,17 @@ class TestUvNativeScan:
 
         assert result.vulnerabilities == []
         assert result.secrets == []
-        assert run.call_args.args[0] == ["uv", "audit", "--locked"]
+        assert commands.calls[0][0] == ("uv", "audit", "--locked")
 
     def test_uv_project_scans_secrets_when_enabled(
         self, scan_results_dir: Path, tmp_path: Path
     ):
         project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=True)
-        audit = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="Found no known vulnerabilities", stderr=""
+        audit = completed(
+            [], returncode=0, stdout="Found no known vulnerabilities", stderr=""
         )
-        trivy = subprocess.CompletedProcess(
-            args=[],
+        trivy = completed(
+            [],
             returncode=0,
             stdout=json.dumps(
                 {
@@ -499,11 +520,16 @@ class TestUvNativeScan:
             ),
             stderr="",
         )
+        commands = FakeCommands()
+        commands.add(("uv", "audit", "--locked"), cwd=tmp_path, result=audit)
+        commands.add(
+            ("trivy", "fs", "--format", "json", "--scanners", "secret", "."),
+            cwd=tmp_path,
+            result=trivy,
+        )
 
         with (
-            patch(
-                "maintenance_man.process.subprocess.run", side_effect=[audit, trivy]
-            ) as run,
+            patch("maintenance_man.scanner.run_captured", commands),
             patch(
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: []),
@@ -520,8 +546,8 @@ class TestUvNativeScan:
                 severity=Severity.HIGH,
             )
         ]
-        assert run.call_args_list[0].args[0] == ["uv", "audit", "--locked"]
-        assert run.call_args_list[1].args[0][4:6] == ["--scanners", "secret"]
+        assert commands.calls[0][0] == ("uv", "audit", "--locked")
+        assert commands.calls[1][0][4:6] == ("--scanners", "secret")
 
 
 class TestRunTrivyScanSkipDirs:
@@ -534,14 +560,27 @@ class TestRunTrivyScanSkipDirs:
             package_manager="bun",
             scan_skip_dirs=["tests/fixtures", "vendor"],
         )
-        fake_result = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout='{"Results": []}', stderr=""
+        fake_result = completed([], returncode=0, stdout='{"Results": []}', stderr="")
+        commands = FakeCommands()
+        commands.add(
+            (
+                "trivy",
+                "fs",
+                "--format",
+                "json",
+                "--scanners",
+                "vuln,secret",
+                "--skip-dirs",
+                "tests/fixtures",
+                "--skip-dirs",
+                "vendor",
+                ".",
+            ),
+            cwd=tmp_path,
+            result=fake_result,
         )
         with (
-            patch(
-                "maintenance_man.process.subprocess.run",
-                return_value=fake_result,
-            ) as mock_run,
+            patch("maintenance_man.scanner.run_captured", commands),
             patch(
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: []),
@@ -549,7 +588,7 @@ class TestRunTrivyScanSkipDirs:
         ):
             scan_project("test-proj", project)
 
-        cmd = mock_run.call_args.args[0]
+        cmd = commands.calls[0][0]
         assert cmd.count("--skip-dirs") == 2
         dirs_indices = [i for i, v in enumerate(cmd) if v == "--skip-dirs"]
         assert cmd[dirs_indices[0] + 1] == "tests/fixtures"
@@ -558,14 +597,15 @@ class TestRunTrivyScanSkipDirs:
     def test_no_skip_dirs_by_default(self, scan_results_dir: Path, tmp_path: Path):
         """Without scan_skip_dirs, no --skip-dirs flags are added."""
         project = ProjectConfig(path=tmp_path, package_manager="bun")
-        fake_result = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout='{"Results": []}', stderr=""
+        fake_result = completed([], returncode=0, stdout='{"Results": []}', stderr="")
+        commands = FakeCommands()
+        commands.add(
+            ("trivy", "fs", "--format", "json", "--scanners", "vuln,secret", "."),
+            cwd=tmp_path,
+            result=fake_result,
         )
         with (
-            patch(
-                "maintenance_man.process.subprocess.run",
-                return_value=fake_result,
-            ) as mock_run,
+            patch("maintenance_man.scanner.run_captured", commands),
             patch(
                 "maintenance_man.scanner.package_manager_ops",
                 ops_with_outdated(lambda project: []),
@@ -573,7 +613,7 @@ class TestRunTrivyScanSkipDirs:
         ):
             scan_project("test-proj", project)
 
-        cmd = mock_run.call_args.args[0]
+        cmd = commands.calls[0][0]
         assert "--skip-dirs" not in cmd
 
 
@@ -895,18 +935,29 @@ def _yield_fixture_bom(project):
     return _generate
 
 
-def _trivy_sbom(monkeypatch, *, returncode: int = 0, stdout: str | None = None):
+def _trivy_sbom(
+    monkeypatch,
+    gradle_project: ProjectConfig,
+    *,
+    returncode: int = 0,
+    stdout: str | None = None,
+    bom: Path | None = None,
+):
     payload = (
         stdout
         if stdout is not None
         else (GRADLE_FIXTURES / "trivy-sbom.json").read_text(encoding="utf-8")
     )
 
-    def _run(cmd, **kwargs):
-        assert cmd[:5] == ["trivy", "sbom", "--format", "json", "--scanners"]
-        return subprocess.CompletedProcess(cmd, returncode, stdout=payload, stderr="")
-
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", _run)
+    if bom is None:
+        bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
+    commands = FakeCommands()
+    commands.add(
+        ("trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)),
+        cwd=gradle_project.path,
+        result=completed(returncode=returncode, stdout=payload),
+    )
+    monkeypatch.setattr(scanner, "run_captured", commands)
 
 
 def test_gradle_scan_unreadable_bom_is_gradle_error(gradle_project, monkeypatch):
@@ -918,10 +969,7 @@ def test_gradle_scan_unreadable_bom_is_gradle_error(gradle_project, monkeypatch)
         return completed
 
     monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", runner)
-    monkeypatch.setattr(
-        "maintenance_man.process.subprocess.run",
-        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
-    )
+    monkeypatch.setattr(scanner, "run_captured", FakeCommands())
     with pytest.raises(GradleError, match="cyclonedxBom produced no inventory"):
         scan_gradle(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
@@ -958,7 +1006,7 @@ def test_gradle_scan_inventory_module_without_resolution_identity_is_error(
             shutil.rmtree(bom.parent, ignore_errors=True)
 
     monkeypatch.setattr("maintenance_man.scanner.generate_gradle_report", _generate)
-    _trivy_sbom(monkeypatch, stdout='{"Results": []}')
+    _trivy_sbom(monkeypatch, gradle_project, stdout='{"Results": []}')
 
     with pytest.raises(GradleError, match="no selected resolution identity"):
         scan_gradle(gradle_project)
@@ -984,6 +1032,7 @@ def test_gradle_scan_finding_without_resolution_scope_is_error(
     }
     _trivy_sbom(
         monkeypatch,
+        gradle_project,
         stdout=json.dumps(
             {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [unmapped_finding]}]}
         ),
@@ -1018,7 +1067,7 @@ def test_gradle_scan_rejects_omitted_resolved_modules(
         "maintenance_man.scanner.discover_gradle_updates", lambda project: []
     )
     gradle_project = gradle_project.model_copy(update={"scan_secrets": False})
-    _trivy_sbom(monkeypatch, stdout='{"Results": []}')
+    _trivy_sbom(monkeypatch, gradle_project, stdout='{"Results": []}')
     with pytest.raises(GradleError, match="resolved module missing from inventory"):
         scan_project("android", gradle_project, 7)
     assert previous.read_bytes() == b'{"previous": true}\n'
@@ -1039,7 +1088,7 @@ def test_gradle_scan_records_selected_resolution_scopes(gradle_project, monkeypa
         "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
-    _trivy_sbom(monkeypatch)
+    _trivy_sbom(monkeypatch, gradle_project)
 
     findings, _ = scan_gradle(gradle_project)
 
@@ -1085,15 +1134,17 @@ def test_gradle_inventory_failure_preserves_previous_result_bytes(
     previous = b'{"previous": true}\n'
     results_file.write_bytes(previous)
 
-    def _run(cmd, **kwargs):
-        assert cmd[1] == "mmGradleReport"
+    def run_gradle(root, args, *, label):
+        assert args[0] == "mmGradleReport"
+        assert label == "mmGradleReport"
         if payload is not None:
-            (Path(kwargs["cwd"]) / GRADLE_INVENTORY_BOM_RELPATH).write_text(
-                payload, encoding="utf-8"
-            )
-        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr="boom")
+            (root / GRADLE_INVENTORY_BOM_RELPATH).write_text(payload, encoding="utf-8")
+        if returncode != 0:
+            message = "mmGradleReport failed (exit 1): boom"
+            raise GradleError(message)
+        return completed(args, stdout="", stderr="boom")
 
-    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", run_gradle)
     with pytest.raises(GradleError):
         scan_project("android", gradle_project, 7)
     assert results_file.read_bytes() == previous
@@ -1107,7 +1158,7 @@ def test_gradle_scan_runs_the_existing_secret_scan_when_enabled(
         "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
-    _trivy_sbom(monkeypatch, stdout='{"Results": []}')
+    _trivy_sbom(monkeypatch, gradle_project, stdout='{"Results": []}')
     monkeypatch.setattr(
         "maintenance_man.scanner.discover_gradle_updates", lambda project: []
     )
@@ -1134,24 +1185,21 @@ def test_gradle_inventory_cleanup_failure_preserves_previous_results(
         (Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH).read_bytes()
     ).hexdigest()
 
-    def _run(cmd, **kwargs):
-        if cmd[1] == "mmGradleReport":
-            owned = Path(gradle_project.path) / ".mm-gradle-inventory"
-            (owned / "bom.json").write_bytes(
-                (GRADLE_FIXTURES / "bom.json").read_bytes()
-            )
-            (owned / "report.json").write_text(
-                json.dumps(_gradle_report_payload(catalogue_digest))
-            )
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout='{"Results": []}', stderr="")
+    def run_gradle(root, args, *, label):
+        owned = root / ".mm-gradle-inventory"
+        (owned / "bom.json").write_bytes((GRADLE_FIXTURES / "bom.json").read_bytes())
+        (owned / "report.json").write_text(
+            json.dumps(_gradle_report_payload(catalogue_digest))
+        )
+        return completed(args)
 
     def _cannot_remove(*args, **kwargs):
         if not kwargs.get("ignore_errors"):
             msg = "cleanup denied"
             raise PermissionError(msg)
 
-    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", run_gradle)
+    _trivy_sbom(monkeypatch, gradle_project, stdout='{"Results": []}')
     monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", _cannot_remove)
     monkeypatch.setattr(
         "maintenance_man.scanner.discover_gradle_updates", lambda project: []
@@ -1183,7 +1231,7 @@ def test_gradle_trivy_malformed_shape_is_scan_error(
         "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
-    _trivy_sbom(monkeypatch, stdout=json.dumps(payload))
+    _trivy_sbom(monkeypatch, gradle_project, stdout=json.dumps(payload))
     with pytest.raises(ScanError, match="Trivy"):
         scan_gradle(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
@@ -1207,12 +1255,34 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
         _yield_fixture_bom(gradle_project),
     )
 
-    def run(*args, **kwargs):
-        raise failure
-
-    monkeypatch.setattr(subprocess, "run", run)
+    bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
+    error = ScanError(f"Could not run Trivy SBOM scan: {failure}")
+    error.__cause__ = failure
+    commands = FakeCommands()
+    commands.add(
+        ("trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)),
+        cwd=gradle_project.path,
+        result=error,
+    )
+    monkeypatch.setattr(scanner, "run_captured", commands)
     with pytest.raises(ScanError, match="Trivy"):
         scan_gradle(gradle_project)
+    ((actual_argv, cwd, kwargs),) = commands.calls
+    assert actual_argv == (
+        "trivy",
+        "sbom",
+        "--format",
+        "json",
+        "--scanners",
+        "vuln",
+        str(bom),
+    )
+    assert cwd == gradle_project.path
+    assert kwargs == {
+        "timeout": 300,
+        "label": "Trivy SBOM scan",
+        "error": ScanError,
+    }
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
 
@@ -1424,10 +1494,7 @@ def test_scan_gradle_incomplete_resolution_raises_before_binding_or_trivy(
         )
 
     monkeypatch.setattr(scanner, "generate_gradle_report", capture)
-    monkeypatch.setattr(
-        "maintenance_man.process.subprocess.run",
-        lambda *args, **kwargs: pytest.fail("Trivy must not run"),
-    )
+    monkeypatch.setattr(scanner, "run_captured", FakeCommands())
     with pytest.raises(GradleError, match="Incomplete Gradle resolution"):
         scanner.scan_gradle(gradle_project)
 
@@ -1516,9 +1583,11 @@ def test_gradle_scan_checks_local_project_provenance(
             bom.unlink()
 
     monkeypatch.setattr(scanner, "generate_gradle_report", generate)
+    bom = Path(gradle_project.path) / "fixture-bom.json"
     if variant == "local-finding":
         _trivy_sbom(
             monkeypatch,
+            gradle_project,
             stdout=json.dumps(
                 {
                     "Results": [
@@ -1536,9 +1605,10 @@ def test_gradle_scan_checks_local_project_provenance(
                     ]
                 }
             ),
+            bom=bom,
         )
     else:
-        _trivy_sbom(monkeypatch)
+        _trivy_sbom(monkeypatch, gradle_project, bom=bom)
     if variant == "local":
         findings, _ = scanner.scan_gradle(gradle_project)
         assert findings
@@ -1596,25 +1666,27 @@ def test_scan_steps_follow_the_table_vulnerability_source(
 def test_scan_dates_bun_updates_with_bun_info_in_the_project(
     mm_home, tmp_path, monkeypatch
 ):
-    calls = []
-
-    def run(cmd, **kwargs):
-        calls.append((cmd, kwargs["cwd"]))
-        return subprocess.CompletedProcess(
-            cmd, 0, "zod | MIT\nPublished: 2024-01-01T00:00:00Z\n", ""
-        )
-
     monkeypatch.setattr(scanner, "_run_trivy_scan", lambda *args, **kwargs: ([], []))
     monkeypatch.setattr(
         scanner,
         "package_manager_ops",
         ops_with_outdated(lambda project: [make_update(pkg_name="zod")]),
     )
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
     project = ProjectConfig(path=tmp_path, package_manager="bun")
-    result = scanner.scan_project("demo", project, 7)
     latest = make_update(pkg_name="zod").latest_version
-    assert calls == [(["bun", "info", f"zod@{latest}"], tmp_path)]
+    commands = FakeCommands()
+    commands.add(
+        ("bun", "info", f"zod@{latest}"),
+        cwd=tmp_path,
+        result=completed(stdout="zod | MIT\nPublished: 2024-01-01T00:00:00Z\n"),
+    )
+    monkeypatch.setattr("maintenance_man.dependency_age.run_captured", commands)
+
+    result = scanner.scan_project("demo", project, 7)
+
+    assert [(cmd, cwd) for cmd, cwd, _ in commands.calls] == [
+        (("bun", "info", f"zod@{latest}"), tmp_path)
+    ]
     assert [u.published_date for u in result.updates] == [_OLD]
 
 

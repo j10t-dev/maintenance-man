@@ -21,22 +21,9 @@ from maintenance_man.services import WorkflowError
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from tests.conftest import make_project
+from tests.conftest import make_activity, make_project
 from tests.fake_vcs import FakeJjState
 from tests.fakes import RecordingEmit
-
-
-def _activity(*, success: bool, commit_id: str | None) -> dict[str, ProjectActivity]:
-    return {
-        "app": ProjectActivity(
-            last_deploy=ActivityEvent(
-                timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                success=success,
-                branch="main",
-                commit_id=commit_id,
-            )
-        )
-    }
 
 
 @pytest.mark.parametrize(
@@ -64,10 +51,10 @@ def test_gate_decision(tmp_path, resolved, prior, force, expected) -> None:
             path=project_path,
         )
     activity = {
-        "same-success": _activity(success=True, commit_id=expected_id),
-        "old-success": _activity(success=True, commit_id="OLD"),
-        "same-failure": _activity(success=False, commit_id=expected_id),
-        "missing-id": _activity(success=True, commit_id=None),
+        "same-success": make_activity(success=True, commit_id=expected_id),
+        "old-success": make_activity(success=True, commit_id="OLD"),
+        "same-failure": make_activity(success=False, commit_id=expected_id),
+        "missing-id": make_activity(success=True, commit_id=None),
         "none": {},
     }[prior]
 

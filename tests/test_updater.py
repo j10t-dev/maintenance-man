@@ -1,7 +1,7 @@
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import TypedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,10 +22,8 @@ from maintenance_man.models.events import (
 from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,
-    Severity,
     UpdateFinding,
     UpdateStatus,
-    VulnFinding,
     Workflow,
 )
 from maintenance_man.process import ProcessError
@@ -47,12 +45,9 @@ from maintenance_man.uv_dependencies import (
     get_uv_dependency_locations,
 )
 from maintenance_man.vcs_workflow import VcsServices
-from tests.conftest import make_gradle_target
+from tests.conftest import completed, make_gradle_target, make_update, make_vuln
 from tests.fake_vcs import FakeJj, FakeJjState
 from tests.fakes import RecordingEmit
-
-# -- Factory helpers --
-
 
 PASSED = FindingStep(None)
 FAILED = FindingStep("unit")
@@ -107,36 +102,6 @@ def test_finding_transition(step, expected):
     assert finding_transition(step) == expected
 
 
-def make_vuln(**overrides: Any) -> VulnFinding:
-    defaults = {
-        "vuln_id": "CVE-2024-0001",
-        "pkg_name": "some-pkg",
-        "installed_version": "1.0.0",
-        "fixed_version": "1.0.1",
-        "severity": Severity.HIGH,
-        "title": "Test vuln",
-        "description": "desc",
-        "status": "fixed",
-    }
-    return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
-
-
-def make_update(tier: SemverTier = SemverTier.PATCH, **overrides: Any) -> UpdateFinding:
-    tier_defaults = {
-        SemverTier.PATCH: ("pkg-a", "1.0.0", "1.0.1"),
-        SemverTier.MINOR: ("pkg-b", "1.0.0", "1.1.0"),
-        SemverTier.MAJOR: ("pkg-c", "1.0.0", "2.0.0"),
-    }
-    name, installed, latest = tier_defaults.get(tier, ("pkg-x", "1.0.0", "2.0.0"))
-    defaults = {
-        "pkg_name": name,
-        "installed_version": installed,
-        "latest_version": latest,
-        "semver_tier": tier,
-    }
-    return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
-
-
 def _scan_result_for(
     project_config: ProjectConfig, updates: list[UpdateFinding]
 ) -> ScanResult:
@@ -186,7 +151,7 @@ def processor_vcs(
         assert kwargs == {"timeout": 300, "label": " ".join(cmd)}
         current = (path / "dep.txt").read_text(encoding="utf-8")
         (path / "dep.txt").write_text(f"{current}{cmd[-1]}\n", encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        return completed(cmd, returncode=0, stdout="", stderr="")
 
     def run_phase(command, cwd, **kwargs):
         assert command == "bun test"
@@ -241,9 +206,7 @@ class TestApplyUpdate:
             encoding="utf-8",
         )
         mock_run = MagicMock(
-            return_value=subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+            return_value=completed([], returncode=0, stdout="", stderr="")
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
 
@@ -271,15 +234,9 @@ class TestApplyUpdate:
         )
         mock_run = MagicMock(
             side_effect=[
-                subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="", stderr=""
-                ),
-                subprocess.CompletedProcess(
-                    args=[], returncode=1, stdout="", stderr="boom"
-                ),
-                subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout="", stderr=""
-                ),
+                completed([], returncode=0, stdout="", stderr=""),
+                completed([], returncode=1, stdout="", stderr="boom"),
+                completed([], returncode=0, stdout="", stderr=""),
             ]
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
@@ -355,7 +312,7 @@ def test_maven_finalisation_execution_failure_is_an_apply_failure(
         calls.append((cmd, kwargs["timeout"]))
         if cmd == ["mvn", "versions:commit"]:
             raise raised
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        return completed(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
     assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
@@ -373,7 +330,7 @@ def test_maven_finalisation_does_not_run_after_a_failed_update(tmp_path, monkeyp
 
     def run(cmd, **kwargs):
         calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 1, "", "no such dependency")
+        return completed(cmd, returncode=1, stdout="", stderr="no such dependency")
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
     assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
@@ -414,9 +371,7 @@ def test_package_boundary_failure_is_persisted_as_a_failed_apply(
 class TestRunTestPhases:
     def test_all_green(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         mock_run = MagicMock(
-            return_value=subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+            return_value=completed([], returncode=0, stdout="", stderr="")
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(
@@ -431,9 +386,7 @@ class TestRunTestPhases:
 
     def test_unit_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         mock_run = MagicMock(
-            return_value=subprocess.CompletedProcess(
-                args=[], returncode=1, stdout="FAIL", stderr=""
-            )
+            return_value=completed([], returncode=1, stdout="FAIL", stderr="")
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
@@ -444,12 +397,8 @@ class TestRunTestPhases:
     def test_integration_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         def side_effect(*args, **kwargs):
             if "integration" in args[0]:
-                return subprocess.CompletedProcess(
-                    args=[], returncode=1, stdout="", stderr=""
-                )
-            return subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+                return completed([], returncode=1, stdout="", stderr="")
+            return completed([], returncode=0, stdout="", stderr="")
 
         mock_run = MagicMock(side_effect=side_effect)
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
@@ -466,9 +415,7 @@ class TestRunTestPhases:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
         mock_run = MagicMock(
-            return_value=subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+            return_value=completed([], returncode=0, stdout="", stderr="")
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(
@@ -480,9 +427,7 @@ class TestRunTestPhases:
 
     def test_blank_phase_is_skipped(self, monkeypatch, tmp_path):
         mock_run = MagicMock(
-            return_value=subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+            return_value=completed([], returncode=0, stdout="", stderr="")
         )
         monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
         tc = ProjectConfig(
@@ -737,8 +682,8 @@ def test_already_applied_is_ready_without_a_commit(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
-    processor_vcs["package"].side_effect = lambda cmd, cwd, **kwargs: (
-        subprocess.CompletedProcess(cmd, 0, "", "")
+    processor_vcs["package"].side_effect = lambda cmd, cwd, **kwargs: completed(
+        cmd, returncode=0, stdout="", stderr=""
     )
     update = make_update()
 
@@ -958,7 +903,7 @@ def test_apply_failure_discards_and_continues(
 ):
     processor_vcs["package"].side_effect = [
         ProcessError("package failed"),
-        subprocess.CompletedProcess([], 0, "", ""),
+        completed([], returncode=0, stdout="", stderr=""),
     ]
     findings = [make_update(), make_update(SemverTier.MINOR)]
 

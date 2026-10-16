@@ -13,6 +13,7 @@ from maintenance_man.process import (
     run_captured,
     run_live,
 )
+from tests.conftest import completed
 
 
 class _DomainError(Exception):
@@ -75,12 +76,11 @@ def test_tool_only_in_the_host_virtualenv_is_unavailable(tmp_path, monkeypatch):
 def test_captured_run_is_isolated_and_non_interactive(tmp_path, monkeypatch):
     _host_venv(monkeypatch)
     calls = []
-    completed = subprocess.CompletedProcess(["tool", "--flag"], 0, "out", "")
-    monkeypatch.setattr(process.subprocess, "run", _fake(completed, calls=calls))
+    result = completed(["tool", "--flag"], returncode=0, stdout="out", stderr="")
+    monkeypatch.setattr(process.subprocess, "run", _fake(result, calls=calls))
 
     assert (
-        run_captured(["tool", "--flag"], tmp_path, timeout=42, label="tool")
-        is completed
+        run_captured(["tool", "--flag"], tmp_path, timeout=42, label="tool") is result
     )
 
     ((cmd, kwargs),) = calls
@@ -143,8 +143,8 @@ def test_captured_mechanical_failure_raises_selected_error(
 def test_captured_rejected_status_reports_label_status_and_diagnostic(
     tmp_path, monkeypatch, stdout, stderr, expected
 ):
-    completed = subprocess.CompletedProcess(["tool"], 3, stdout, stderr)
-    monkeypatch.setattr(process.subprocess, "run", _fake(completed))
+    result = completed(["tool"], returncode=3, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(process.subprocess, "run", _fake(result))
     with pytest.raises(ProcessError) as caught:
         run_captured(["tool"], tmp_path, timeout=5, label="tool")
     assert str(caught.value) == expected
@@ -153,11 +153,11 @@ def test_captured_rejected_status_reports_label_status_and_diagnostic(
 
 @pytest.mark.parametrize("ok_codes, status", [(frozenset({0, 1}), 1), (None, 7)])
 def test_captured_returns_accepted_statuses(tmp_path, monkeypatch, ok_codes, status):
-    completed = subprocess.CompletedProcess(["tool"], status, "", "")
-    monkeypatch.setattr(process.subprocess, "run", _fake(completed))
+    result = completed(["tool"], returncode=status, stdout="", stderr="")
+    monkeypatch.setattr(process.subprocess, "run", _fake(result))
     assert (
         run_captured(["tool"], tmp_path, timeout=5, label="tool", ok_codes=ok_codes)
-        is completed
+        is result
     )
 
 
@@ -224,7 +224,7 @@ def test_live_run_inherits_standard_streams(tmp_path, monkeypatch):
     monkeypatch.setattr(
         process.subprocess,
         "run",
-        _fake(subprocess.CompletedProcess("true", 0), calls=calls),
+        _fake(completed("true", returncode=0), calls=calls),
     )
     run_live("true", tmp_path, timeout=5, label="noop")
     ((command, kwargs),) = calls

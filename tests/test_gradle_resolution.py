@@ -1,5 +1,4 @@
 import json
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,7 +50,13 @@ from maintenance_man.models.scan import (
     Severity,
     VulnFinding,
 )
-from tests.conftest import FakeClock, fixture_runner, report_payload
+from tests.conftest import (
+    FakeClock,
+    completed,
+    fixture_runner,
+    make_project,
+    report_payload,
+)
 
 
 @pytest.mark.parametrize(
@@ -114,14 +119,14 @@ def test_malformed_report_is_boundary_error(change):
         parse_resolution_report(json.dumps(value))
 
 
-def make_project(tmp_path):
+def _write_gradle_project_files(tmp_path: Path) -> None:
     (tmp_path / "gradle").mkdir()
     (tmp_path / "gradle/libs.versions.toml").write_text('[versions]\nx = "1.0"\n')
-    return ProjectConfig(path=tmp_path, package_manager="gradle")
 
 
 def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
     with patch(
         "maintenance_man.gradle_resolution.run_gradle", side_effect=fixture_runner
     ):
@@ -135,7 +140,8 @@ def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):
 
 
 def test_captured_inventory_bytes_and_models_survive_cleanup(tmp_path):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
     with patch(
         "maintenance_man.gradle_resolution.run_gradle", side_effect=fixture_runner
     ):
@@ -150,7 +156,8 @@ def test_captured_inventory_bytes_and_models_survive_cleanup(tmp_path):
 
 
 def test_inventory_envelope_is_refused_before_the_report_is_parsed(tmp_path):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
 
     def runner(root, args, *, label):
         completed = fixture_runner(root, args, label=label)
@@ -521,7 +528,8 @@ def candidate():
 
 @pytest.mark.parametrize("response_kind", ["success", "unresolved", "missing"])
 def test_metadata_batch_is_complete_and_does_not_mutate(tmp_path, response_kind):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
     before = (tmp_path / "gradle/libs.versions.toml").read_bytes()
     calls = []
 
@@ -550,7 +558,7 @@ def test_metadata_batch_is_complete_and_does_not_mutate(tmp_path, response_kind)
                 }
             )
         )
-        return subprocess.CompletedProcess(args, 0, "", "")
+        return completed(args, returncode=0, stdout="", stderr="")
 
     with patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner):
         if response_kind == "missing":
@@ -645,7 +653,8 @@ def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
 def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_root(
     tmp_path,
 ):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
     selected = two_member_candidate().model_copy(
         update={
             "scopes": (
@@ -1012,7 +1021,7 @@ def _validation_runner(build_response):
             "requests"
         ]
         build_response(root, directory, requests)
-        return subprocess.CompletedProcess(args, 0, "", "")
+        return completed(args, returncode=0, stdout="", stderr="")
 
     return runner
 
@@ -1030,7 +1039,8 @@ def test_shared_members_validate_only_in_projects_that_resolve_them(
     from maintenance_man.gradle import ReportProposal, build_update_findings
     from maintenance_man.models.gradle import ResolutionEdge
 
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
     catalogue_path = tmp_path / "gradle/libs.versions.toml"
     catalogue_path.write_text(
         '[versions]\ngrp = "1.0.0"\n[libraries]\n'
@@ -1210,7 +1220,8 @@ def test_shared_members_validate_only_in_projects_that_resolve_them(
 def test_validate_gradle_candidates_refuses_invalid_native_response(
     tmp_path, case, candidate_factory, rows_for, reason
 ):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
     catalogue = tmp_path / "gradle/libs.versions.toml"
     before = catalogue.read_bytes()
 
@@ -1232,7 +1243,8 @@ def test_validate_gradle_candidates_refuses_invalid_native_response(
 
 
 def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
 
     def runner(root, args, *, label):
         directory = root / ".mm-gradle-inventory"
@@ -1244,7 +1256,7 @@ def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
             json.dumps({"schema_version": 1, "results": [_success_row(request)]})
         )
         (directory / "candidate-validation.json").symlink_to(external)
-        return subprocess.CompletedProcess(args, 0, "", "")
+        return completed(args, returncode=0, stdout="", stderr="")
 
     with (
         patch("maintenance_man.gradle_resolution.run_gradle", side_effect=runner),
@@ -1256,7 +1268,8 @@ def test_validate_gradle_candidates_refuses_symlinked_response(tmp_path):
 
 
 def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
 
     def build_response(root, directory, requests):
         rows = [_success_row(requests[0])]
@@ -1281,7 +1294,8 @@ def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
 def test_both_report_tasks_use_the_shared_init_script_command(tmp_path, task):
     from maintenance_man.gradle_resolution import _report_command
 
-    project = make_project(tmp_path)
+    _write_gradle_project_files(tmp_path)
+    project = make_project(tmp_path, package_manager="gradle")
     script = tmp_path / ".mm-gradle-inventory" / "gradle-report.gradle"
     expected = [
         task,

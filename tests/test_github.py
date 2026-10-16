@@ -8,12 +8,7 @@ import pytest
 
 from maintenance_man import github, process
 from maintenance_man.github import CodeHostError, GitHubCodeHost
-
-
-def _completed(
-    *, stdout: str = "", stderr: str = "", returncode: int = 0
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+from tests.conftest import completed
 
 
 @pytest.mark.parametrize(
@@ -33,7 +28,7 @@ def test_pr_bookmarks_returns_every_head_name(
 
     def run(command, cwd, **kwargs):
         calls.append((list(command), Path(cwd), kwargs))
-        return _completed(stdout=stdout)
+        return completed(stdout=stdout)
 
     monkeypatch.setattr(github, "run_captured", run)
     host = GitHubCodeHost(tmp_path)
@@ -88,7 +83,7 @@ def test_pr_bookmarks_normalizes_subprocess_failures(
 ) -> None:
     def run(command, **kwargs):
         if failure == "status":
-            return subprocess.CompletedProcess(command, 2, "", "host rejected")
+            return completed(command, returncode=2, stdout="", stderr="host rejected")
         if failure == "launch":
             msg = "cannot launch"
             raise OSError(msg)
@@ -107,7 +102,7 @@ def test_create_pr_returns_stripped_output_and_uses_guarded_arguments(
 
     def run(command, cwd, **kwargs):
         calls.append((list(command), Path(cwd), kwargs))
-        return _completed(stdout=" https://example.invalid/pr/1 \n")
+        return completed(stdout=" https://example.invalid/pr/1 \n")
 
     monkeypatch.setattr(github, "run_captured", run)
 
@@ -146,7 +141,7 @@ def test_create_pr_normalizes_existing_pr_message(
     monkeypatch.setattr(
         github,
         "run_captured",
-        lambda *_args, **_kwargs: _completed(
+        lambda *_args, **_kwargs: completed(
             returncode=1, stderr="a pull request already EXISTS for this branch"
         ),
     )
@@ -172,7 +167,7 @@ def test_given_failed_pr_creation_when_create_pr_runs_then_shared_message_is_rai
     monkeypatch.setattr(
         github,
         "run_captured",
-        lambda *_args, **_kwargs: _completed(returncode=2, stderr=stderr),
+        lambda *_args, **_kwargs: completed(returncode=2, stderr=stderr),
     )
 
     with pytest.raises(CodeHostError) as caught:

@@ -28,29 +28,10 @@ from tests.conftest import (
     make_scan_result,
     make_update,
     make_vuln,
+    seed_project,
 )
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor, RecordingEmit, pick_findings
-
-
-def _seed_project(
-    tmp_path: Path,
-    name: str,
-    scan,
-    *,
-    test_unit: str | None = "pytest",
-) -> tuple[FakeJjState, ProjectConfig]:
-    project = make_project(tmp_path / name, test_unit=test_unit)
-    state = FakeJjState()
-    state.seed_repository(project.path, files={"dep.txt": "version=1\n"})
-    state.register_files(
-        project.path,
-        "mm-fixture-pkg-a.txt",
-        "mm-fixture-pkg-b.txt",
-    )
-    scan.project = name
-    save_scan_results(name, scan)
-    return state, project
 
 
 def test_update_processes_in_managed_workspace(tmp_path: Path, monkeypatch) -> None:
@@ -99,7 +80,7 @@ def test_update_emits_processing_result_and_promotion_events(
             make_update(pkg_name="pkg-b"),
         ],
     )
-    state, project = _seed_project(tmp_path, "api", scan)
+    state, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(
         update_service,
         "process_findings",
@@ -144,7 +125,7 @@ def test_resume_new_change_failure_removes_workspace(
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)],
     )
-    state, project = _seed_project(tmp_path, "api", scan)
+    state, project = seed_project(tmp_path, "api", scan)
     repo = state.repository(project.path)
     repo.create_bookmark(bookmark="mm/update-dependencies", revision="main")
     workspace = paths.workspaces_dir() / "api"
@@ -175,7 +156,7 @@ def test_typed_equal_risk_selection_order_reaches_processor(
         vulns=[],
         updates=[make_update(pkg_name="pkg-a"), make_update(pkg_name="pkg-b")],
     )
-    state, project = _seed_project(tmp_path, "api", scan)
+    state, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(
         update_service,
         "process_findings",
@@ -218,7 +199,7 @@ def test_update_nothing_actionable_is_a_success(tmp_path: Path) -> None:
         vulns=[make_vuln(fixed_version=None)],
         updates=[],
     )
-    state, project = _seed_project(tmp_path, "api", scan)
+    state, project = seed_project(tmp_path, "api", scan)
     emit = RecordingEmit()
 
     result = update_service.update_project(
@@ -238,7 +219,7 @@ def test_update_nothing_actionable_is_a_success(tmp_path: Path) -> None:
 def test_missing_test_config_is_reported_before_workspace_setup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state, project = _seed_project(
+    state, project = seed_project(
         tmp_path,
         "api",
         make_scan_result(vulns=[], updates=[make_update()]),
@@ -276,7 +257,7 @@ def test_update_rejects_findings_owned_by_resolve(tmp_path: Path) -> None:
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = _seed_project(tmp_path, "api", scan)
+    state, project = seed_project(tmp_path, "api", scan)
 
     with pytest.raises(
         FlowConflictError,
@@ -300,7 +281,7 @@ def test_missing_progress_bookmark_requires_rescan(tmp_path: Path) -> None:
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.UPDATE)],
     )
-    state, project = _seed_project(tmp_path, "api", scan)
+    state, project = seed_project(tmp_path, "api", scan)
 
     with pytest.raises(
         update_service.UpdateSetupError,
@@ -318,7 +299,7 @@ def test_missing_progress_bookmark_requires_rescan(tmp_path: Path) -> None:
 
 
 def test_workspace_revision_error_is_wrapped_with_cause(tmp_path: Path) -> None:
-    state, project = _seed_project(
+    state, project = seed_project(
         tmp_path, "api", make_scan_result(vulns=[], updates=[make_update()])
     )
     original = RevisionError("locked")
@@ -352,7 +333,7 @@ def test_finalisation_failures_emit_operation_and_fail(
     method: str,
     operation: Operation,
 ) -> None:
-    state, project = _seed_project(
+    state, project = seed_project(
         tmp_path, "api", make_scan_result(vulns=[], updates=[make_update()])
     )
     monkeypatch.setattr(

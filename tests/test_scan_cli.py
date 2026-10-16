@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.text import Text
 
 from maintenance_man import cli, scanner, vcs_workflow
-from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
+from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
@@ -47,14 +47,15 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.outdated import OutdatedCheckError
-from maintenance_man.process import ToolNotFoundError
 from maintenance_man.services import scan as scan_service
 from maintenance_man.services.scan import ScanSummary
 from maintenance_man.storage import load_scan_results
 from maintenance_man.vcs import RevisionError
 from tests.conftest import (
+    completed,
     make_scan_result,
     make_update,
+    missing_tool,
     ops_with_outdated,
     run_mm,
     write_config,
@@ -403,10 +404,11 @@ def _two_project_config(mm_home, tmp_path):
     first.mkdir()
     second.mkdir()
     mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
+    write_config(
+        mm_home,
         f'[projects.first]\npath = "{first}"\npackage_manager = "bun"\n'
         f'[projects.second]\npath = "{second}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n"
+        "scan_secrets = false\n",
     )
     results = mm_home / "scan-results"
     results.mkdir(exist_ok=True)
@@ -414,24 +416,14 @@ def _two_project_config(mm_home, tmp_path):
     return results
 
 
-def _missing(tool):
-    def require(name, hint):
-        if name == tool:
-            msg = f"{name} is not installed or not on PATH. {hint}"
-            raise ToolNotFoundError(msg)
-        return Path("/usr/bin") / name
-
-    return require
-
-
 def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys):
     mm_home.mkdir(parents=True)
-    (mm_home / "config.toml").write_text("")
-    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("trivy"))
-    monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == 0
+    write_config(mm_home, "")
+    monkeypatch.setattr(
+        "maintenance_man.vcs_workflow.require_tool", missing_tool("trivy")
+    )
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
+    assert run_mm("scan") == 0
     output = capsys.readouterr().out
     assert "No projects configured" in output
     assert "trivy" not in output.lower()
@@ -440,11 +432,11 @@ def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys
 def test_scan_without_trivy_reports_an_unknown_project(
     mm_home_with_projects, monkeypatch, capsys
 ):
-    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("trivy"))
-    monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
-    with pytest.raises(SystemExit) as exc:
-        app(["scan", "nonexistent"])
-    assert exc.value.code == 1
+    monkeypatch.setattr(
+        "maintenance_man.vcs_workflow.require_tool", missing_tool("trivy")
+    )
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
+    assert run_mm("scan", "nonexistent") == 1
     assert "trivy" not in capsys.readouterr().out.lower()
 
 
@@ -452,12 +444,10 @@ def test_scan_without_trivy_reports_an_unknown_project(
 def test_scan_warns_and_continues_without_housekeeping_tools(
     mm_home_with_projects, monkeypatch, capsys, tool
 ):
-    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing(tool))
+    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", missing_tool(tool))
     prune = MagicMock(return_value=True)
     monkeypatch.setattr("maintenance_man.services.scan.prune_stale_bookmarks", prune)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan", "clean"])
-    assert exc.value.code == 0
+    assert run_mm("scan", "clean") == 0
     prune.assert_not_called()
     assert f"{tool} is not installed" in capsys.readouterr().out
 
@@ -470,16 +460,16 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
     monkeypatch.setattr(
         "maintenance_man.services.scan.scan_project", scanner.scan_project
     )
-    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", _missing("trivy"))
-    monkeypatch.setattr("maintenance_man.scanner.require_tool", _missing("trivy"))
+    monkeypatch.setattr(
+        "maintenance_man.vcs_workflow.require_tool", missing_tool("trivy")
+    )
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
     monkeypatch.setattr(
         "maintenance_man.scanner.package_manager_ops",
         ops_with_outdated(lambda project: []),
     )
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm("scan") == ExitCode.ERROR
     assert not (results / "first.json").exists()
     assert (results / "second.json").is_file()
 
@@ -511,9 +501,7 @@ def test_failed_project_scan_keeps_its_result_and_exits_error(
     monkeypatch.setattr(
         "maintenance_man.scanner.package_manager_ops", ops_with_outdated(outdated)
     )
-    with pytest.raises(SystemExit) as exc:
-        app(argv)
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm(*argv) == ExitCode.ERROR
     assert (results / "first.json").read_bytes() == b"previous first result"
     assert (results / "second.json").is_file() is (argv == ["scan"])
 
@@ -526,64 +514,49 @@ def test_scan_warns_and_continues_when_bookmark_pruning_cannot_run(
         raise RevisionError(msg)
 
     monkeypatch.setattr("maintenance_man.services.scan.prune_stale_bookmarks", fail)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan", "clean"])
-    assert exc.value.code == 0
+    assert run_mm("scan", "clean") == 0
     assert "failed to sync remote" in capsys.readouterr().out
 
 
 class TestScanSingleProject:
     def test_scan_project_with_vulns_exits_2(self, mm_home_with_projects: Path):
         """mm scan vulnerable — has vulns, should exit 2."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "vulnerable"])
-        assert exc_info.value.code == 2
+        assert run_mm("scan", "vulnerable") == 2
 
     def test_scan_project_with_vulns_shows_findings(
         self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
     ):
         """Output should contain vulnerability information."""
-        with pytest.raises(SystemExit):
-            app(["scan", "vulnerable"])
+        assert run_mm("scan", "vulnerable") == 2
         output = capsys.readouterr().out
         assert "CVE-2024-0001" in output
         assert "some-pkg" in output
 
     def test_scan_clean_project_exits_0(self, mm_home_with_projects: Path):
         """mm scan clean — clean, should exit 0."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "clean"])
-        assert exc_info.value.code == 0
+        assert run_mm("scan", "clean") == 0
 
     def test_scan_unknown_project_exits_1(self, mm_home_with_projects: Path):
         """mm scan nonexistent — should exit 1."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "nonexistent"])
-        assert exc_info.value.code == 1
+        assert run_mm("scan", "nonexistent") == 1
 
 
 class TestScanAllProjects:
     def test_scan_all_exits_worst_case(self, mm_home_with_projects: Path):
         """mm scan (no args) — should exit 2 if any project has vulns."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan"])
-        # vulnerable has vulns, so worst case is 2
-        assert exc_info.value.code == 2
+        assert run_mm("scan") == 2
 
 
 class TestScanUpdatesExitCodes:
     def test_scan_updates_only_exits_3(self, mm_home_with_projects: Path):
         """mm scan outdated — updates only, no vulns, should exit 3."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "outdated"])
-        assert exc_info.value.code == 3
+        assert run_mm("scan", "outdated") == 3
 
     def test_scan_updates_output_shows_update_rows(
         self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
     ):
         """Output should contain update information."""
-        with pytest.raises(SystemExit):
-            app(["scan", "outdated"])
+        assert run_mm("scan", "outdated") == 3
         output = capsys.readouterr().out
         assert "UPDATE" in output or "update" in output.lower()
         assert "axios" in output
@@ -601,9 +574,7 @@ class TestScanUpdatesExitCodes:
             "maintenance_man.services.scan.scan_project",
             lambda *args, **kwargs: mixed,
         )
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "vulnerable"])
-        assert exc_info.value.code == 2
+        assert run_mm("scan", "vulnerable") == 2
 
 
 def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
@@ -734,10 +705,7 @@ def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
 
     monkeypatch.setattr("maintenance_man.services.scan.scan_one", _boom)
 
-    with pytest.raises(SystemExit) as exc:
-        app(["scan", "android"])
-
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm("scan", "android") == ExitCode.ERROR
 
 
 def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
@@ -754,10 +722,7 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
 
     monkeypatch.setattr("maintenance_man.services.scan.scan_one", _scan)
 
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm("scan") == ExitCode.ERROR
     assert "clean" in scanned or len(scanned) > 1
     assert "boom" in capsys.readouterr().out
 
@@ -776,8 +741,9 @@ def test_scan_blocked_no_fix_vulnerability_exit(
     with_vulnerability,
 ):
     mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
-        f'[projects.sample]\npath = "{tmp_path}"\npackage_manager = "{manager}"\n'
+    write_config(
+        mm_home,
+        f'[projects.sample]\npath = "{tmp_path}"\npackage_manager = "{manager}"\n',
     )
     result = make_scan_result(
         vulns=[
@@ -806,10 +772,9 @@ def test_scan_blocked_no_fix_vulnerability_exit(
     monkeypatch.setattr(
         "maintenance_man.services.scan.scan_project", lambda *args, **kwargs: result
     )
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"] if all_projects else ["scan", "sample"])
     expected = 3 if with_updates else 0
-    assert exc.value.code == expected
+    argv = ["scan"] if all_projects else ["scan", "sample"]
+    assert run_mm(*argv) == expected
 
 
 def test_all_scan_real_wrapper_launch_error_preserves_results_and_scans_next(
@@ -823,19 +788,18 @@ def test_all_scan_real_wrapper_launch_error_preserves_results_and_scans_next(
     root = Path(gradle_project.path)
     (root / "gradlew").write_text("#!/definitely/missing/mm-interpreter\n")
     mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
+    write_config(
+        mm_home,
         f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
         f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n"
+        "scan_secrets = false\n",
     )
     results = mm_home / "scan-results"
     results.mkdir()
     (results / "android.json").write_bytes(b"previous scan results\n")
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr("maintenance_man.scanner._check_outdated", lambda *args: [])
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm("scan") == ExitCode.ERROR
     assert (results / "android.json").read_bytes() == b"previous scan results\n"
     assert (results / "remaining.json").is_file()
     assert not (root / GRADLE_INVENTORY_RELPATH).exists()
@@ -934,9 +898,7 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
     )
     _inject_scan_filesystem_failure(monkeypatch, phase, root)
     commands = _prepare_scan_filesystem_error_commands(monkeypatch, phase, root)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm("scan") == ExitCode.ERROR
     assert (results / "android.json").read_bytes() == b"old result bytes"
     assert (results / "remaining.json").is_file()
     if phase == "inventory-cleanup":
@@ -951,11 +913,12 @@ def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaini
 
 def _seed_scan_filesystem_error_config(mm_home: Path, root: Path) -> Path:
     mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
+    write_config(
+        mm_home,
         f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
         "scan_secrets = false\n"
         f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n"
+        "scan_secrets = false\n",
     )
     results = mm_home / "scan-results"
     results.mkdir()
@@ -1047,16 +1010,14 @@ def _prepare_scan_filesystem_error_commands(
                 ).write_text(_gradle_report_json_for_fixture_bom(root))
             else:
                 assert cmd[:2] == ["trivy", "sbom"]
-                return subprocess.CompletedProcess(
-                    cmd, 0, stdout='{"Results": []}', stderr=""
-                )
+                return completed(cmd, returncode=0, stdout='{"Results": []}', stderr="")
         else:
             assert phase == "report-cleanup"
             assert cmd[1] == "versionCatalogUpdate"
             (root / GRADLE_UPDATE_REPORT_RELPATH).write_bytes(
                 (GRADLE_FIXTURES / "updates-clean.toml").read_bytes()
             )
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return completed(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
     return commands
@@ -1121,11 +1082,11 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
             (root / GRADLE_INVENTORY_BOM_RELPATH).parent.joinpath(
                 "report.json"
             ).write_text(_gradle_report_json_for_fixture_bom(root))
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return completed(cmd, returncode=0, stdout="", stderr="")
         if cmd[1] == "versionCatalogUpdate":
             assert failure == "report-false"
             (root / GRADLE_UPDATE_REPORT_RELPATH).write_text("libraries = false\n")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return completed(cmd, returncode=0, stdout="", stderr="")
         assert cmd[:2] == ["trivy", "sbom"]
         if failure == "trivy-launch":
             msg = "missing interpreter"
@@ -1138,14 +1099,10 @@ def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
             "trivy-results": {"Results": False},
             "trivy-row": {"Results": [None]},
         }[failure]
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(payload), stderr=""
-        )
+        return completed(cmd, returncode=0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm("scan") == ExitCode.ERROR
     assert (results / "android.json").read_bytes() == b"old result bytes"
     assert (results / "remaining.json").is_file()
     assert not (root / GRADLE_INVENTORY_RELPATH).exists()

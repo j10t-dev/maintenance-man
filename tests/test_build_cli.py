@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from maintenance_man import cli, paths
-from maintenance_man.cli import ExitCode, app
+from maintenance_man.cli import ExitCode
 from maintenance_man.deployer import BuildError
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
@@ -57,17 +57,13 @@ class TestBuildCommand:
         self, mm_home_with_projects: Path, _build_vcs: FakeJjState
     ) -> None:
         """Error when project has no build_command configured."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["build", "no-deploy"], exit_on_error=False)
-        assert exc_info.value.code == ExitCode.ERROR
+        assert run_mm("build", "no-deploy") == ExitCode.ERROR
 
     def test_no_build_config_deploy_only_project(
         self, mm_home_with_projects: Path, _build_vcs: FakeJjState
     ) -> None:
         """Error when project has deploy_command but no build_command."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["build", "deploy-only"], exit_on_error=False)
-        assert exc_info.value.code == ExitCode.ERROR
+        assert run_mm("build", "deploy-only") == ExitCode.ERROR
 
     @patch("maintenance_man.services.deploy.run_live")
     def test_successful_build(
@@ -77,9 +73,7 @@ class TestBuildCommand:
         _build_vcs: FakeJjState,
     ) -> None:
         """Exit 0 on successful build."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["build", "deployable"], exit_on_error=False)
-        assert exc_info.value.code == ExitCode.OK
+        assert run_mm("build", "deployable") == ExitCode.OK
         mock_build.assert_called_once()
         assert any(call.method == "revision_bookmarks" for call in _build_vcs.attempts)
 
@@ -94,17 +88,13 @@ class TestBuildCommand:
         _build_vcs: FakeJjState,
     ) -> None:
         """Exit BUILD_FAILED on build failure."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["build", "deployable"], exit_on_error=False)
-        assert exc_info.value.code == ExitCode.BUILD_FAILED
+        assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
 
     def test_unknown_project(
         self, mm_home_with_projects: Path, _build_vcs: FakeJjState
     ) -> None:
         """Error when project doesn't exist."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["build", "nonexistent"], exit_on_error=False)
-        assert exc_info.value.code == ExitCode.ERROR
+        assert run_mm("build", "nonexistent") == ExitCode.ERROR
 
     @patch("maintenance_man.services.deploy.record_activity")
     @patch("maintenance_man.services.deploy.run_live")
@@ -116,8 +106,7 @@ class TestBuildCommand:
         _build_vcs: FakeJjState,
     ) -> None:
         """Successful build records activity event."""
-        with pytest.raises(SystemExit):
-            app(["build", "deployable"], exit_on_error=False)
+        assert run_mm("build", "deployable") == ExitCode.OK
         mock_record.assert_called_once()
         _, kwargs = mock_record.call_args
         assert kwargs["success"] is True
@@ -135,8 +124,7 @@ class TestBuildCommand:
         _build_vcs: FakeJjState,
     ) -> None:
         """Failed build still records activity event with success=False."""
-        with pytest.raises(SystemExit):
-            app(["build", "deployable"], exit_on_error=False)
+        assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
         mock_record.assert_called_once()
         _, kwargs = mock_record.call_args
         assert kwargs["success"] is False

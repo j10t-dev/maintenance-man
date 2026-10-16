@@ -8,6 +8,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.message import Message
+from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
 from typing import ClassVar
@@ -37,21 +38,10 @@ from maintenance_man.models.gradle import (
 from maintenance_man.models.publication import RegistryFact
 from maintenance_man.models.scan import (
     SemverTier,
-    UpdateFinding,
 )
-from tests.conftest import make_gradle_member
-
-_PATCH_SUBRUN = "maintenance_man.process.subprocess.run"
-
-
-def _make_update(pkg: str, latest: str = "2.0.0") -> UpdateFinding:
-    return UpdateFinding(
-        pkg_name=pkg,
-        installed_version="1.0.0",
-        latest_version=latest,
-        semver_tier=SemverTier.MINOR,
-    )
-
+from maintenance_man.process import ProcessError
+from tests.conftest import FakeClock, completed, make_gradle_member, make_update
+from tests.fakes import FakeCommands
 
 _PUB_NOW = datetime(2026, 9, 18, tzinfo=UTC)
 
@@ -101,7 +91,7 @@ def _publication_fixture(
             return None
         return (*result, url)
 
-    context = PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW)
+    context = PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW))
     return module, request, calls, context
 
 
@@ -435,7 +425,7 @@ def test_publication_cache_and_current_policy(tmp_path):
         assert second_calls == []
         assert second.cache_hits == 1
     _, _, expired_calls, expired = _publication_fixture(tmp_path)
-    expired.clock = lambda: _PUB_NOW + timedelta(hours=24)
+    expired.clock = FakeClock(_PUB_NOW + timedelta(hours=24))
     with expired:
         lookup_gradle_publication(request, expired)
         assert len(expired_calls) == 1
@@ -450,7 +440,7 @@ def test_publication_cache_and_current_policy(tmp_path):
 def test_publication_context_logs_a_manager_neutral_label(tmp_path, caplog):
     with (
         caplog.at_level("INFO", logger="maintenance_man.dependency_age"),
-        PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW),
+        PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW)),
     ):
         pass
     assert "Publication lookup " in caplog.text
@@ -539,7 +529,7 @@ def test_plugin_implementation_age_is_part_of_policy(tmp_path):
             url,
         )
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         assert isinstance(
             evaluate_gradle_candidate_age(
                 SimpleNamespace(publication_requests=(request,)), 7, context, _PUB_NOW
@@ -594,7 +584,7 @@ def test_publication_shared_pool_bounds_and_inflight_dedup(tmp_path):
             active -= 1
         return
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         modules = [
             ModuleId(group="org.example", artifact=f"lib{i}", version="2")
             for i in range(12)
@@ -916,7 +906,7 @@ def test_publication_exact_central_timestamp(tmp_path):
         )
         return body, {}, url
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         result = lookup_gradle_publication(
             PublicationRequest(
                 module=module, repositories=("central",), routing_supported=True
@@ -957,7 +947,7 @@ def test_given_invalid_central_timestamp_when_looked_up_then_failure_is_containe
             url,
         )
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         result = lookup_gradle_publication(
             PublicationRequest(
                 module=module, repositories=("central",), routing_supported=True
@@ -1004,7 +994,7 @@ def test_publication_central_timestamp_overflow_withholds(tmp_path):
             url,
         )
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         result = lookup_gradle_publication(
             PublicationRequest(
                 module=module, repositories=("central",), routing_supported=True
@@ -1044,7 +1034,7 @@ def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown):
             return None
         return _pom(modules[0]), {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"}, url
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         context.prefetch(
             request
             for candidate in candidates
@@ -1096,7 +1086,7 @@ def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeyp
     )
     with (
         pytest.raises(KeyboardInterrupt),
-        PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context,
+        PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context,
     ):
         context.prefetch(requests)
         assert started.wait(10), "eight requests did not start"
@@ -1266,7 +1256,7 @@ def test_gradle_scan_age_filter_keeps_unknown_and_filters_known_young(
             )
         return body, {"Last-Modified": date}, url
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         result = age.filter_gradle_updates_by_age(
             [row], project, resolution, 7, context
         )
@@ -1324,7 +1314,7 @@ def test_gradle_group_age_requires_every_member_date(tmp_path, case, kept, dated
             url,
         )
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         result = filter_gradle_updates_by_age([row], project, resolution, 7, context)
     assert bool(result) is kept
     if kept:
@@ -1361,7 +1351,9 @@ def _scan_age_inputs(
             for kind, alias, coordinate in member_specs
         ],
     )
-    update = _make_update("shared", "2").model_copy(update={"gradle_target": target})
+    update = make_update(
+        SemverTier.MINOR, pkg_name="shared", latest_version="2"
+    ).model_copy(update={"gradle_target": target})
     project = ProjectConfig(
         path=tmp_path,
         package_manager="gradle",
@@ -1439,7 +1431,7 @@ def test_gradle_group_age_assesses_known_facts(
         def result(self):
             return self.value
 
-    context = PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW)
+    context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
     outcomes = iter(values)
     monkeypatch.setattr(context, "submit", lambda *_: Future(next(outcomes)))
     with context:
@@ -1473,7 +1465,7 @@ def test_gradle_scan_submits_every_update_before_waiting(tmp_path, monkeypatch):
             _publication_fact(module, repository, datetime(2026, 9, 1, tzinfo=UTC))
         )
 
-    context = PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW)
+    context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
     monkeypatch.setattr(context, "submit", submit)
     with context:
         result = filter_gradle_updates_by_age(
@@ -1494,7 +1486,8 @@ def _pypi_body(name="pkg", version="1.0", uploads=("2025-12-31T00:00:00Z",)):
     ).encode()
 
 
-def _pypi_context(cache, response, clock=lambda: _PUB_NOW):
+def _pypi_context(cache, response, clock=None):
+    clock = clock or FakeClock(_PUB_NOW)
     calls = []
 
     def transport(url, root, suffix, count):
@@ -1514,9 +1507,17 @@ def _no_transport(url, root, suffix, count):
     pytest.fail("no publication lookup expected")
 
 
-@pytest.mark.parametrize("updates, days", [([], 7), ([_make_update("pkg")], 0)])
+@pytest.mark.parametrize(
+    "updates, days",
+    [
+        ([], 7),
+        ([make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="2.0.0")], 0),
+    ],
+)
 def test_registry_age_skips_lookups(tmp_path, updates, days):
-    with PublicationLookupContext(tmp_path, _no_transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(
+        tmp_path, _no_transport, FakeClock(_PUB_NOW)
+    ) as context:
         result = filter_registry_updates_by_age(
             updates, "pypi", tmp_path, days, context
         )
@@ -1534,7 +1535,7 @@ def test_registry_age_skips_lookups(tmp_path, updates, days):
     ],
 )
 def test_registry_age_withholds_young_releases(tmp_path, upload, kept):
-    update = _make_update("pkg", "1.0")
+    update = make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="1.0")
     context, calls = _pypi_context(tmp_path, _pypi_body(uploads=(upload,)))
     with context:
         result = filter_registry_updates_by_age([update], "pypi", tmp_path, 7, context)
@@ -1548,7 +1549,11 @@ def test_registry_age_keeps_unknown_dates(tmp_path, response):
     context, _ = _pypi_context(tmp_path, response)
     with context:
         result = filter_registry_updates_by_age(
-            [_make_update("pkg", "1.0")], "pypi", tmp_path, 7, context
+            [make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="1.0")],
+            "pypi",
+            tmp_path,
+            7,
+            context,
         )
     assert [u.published_date for u in result] == [None]
 
@@ -1557,7 +1562,11 @@ def test_registry_age_propagates_unexpected_errors(tmp_path):
     context, _ = _pypi_context(tmp_path, RuntimeError("bug"))
     with context, pytest.raises(RuntimeError, match="bug"):
         filter_registry_updates_by_age(
-            [_make_update("pkg", "1.0")], "pypi", tmp_path, 7, context
+            [make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="1.0")],
+            "pypi",
+            tmp_path,
+            7,
+            context,
         )
 
 
@@ -1572,14 +1581,19 @@ def test_registry_age_keeps_input_order(tmp_path):
         name = suffix.split("/")[1]
         return _pypi_body(name, "1.0", (uploads[name],)), {}, url
 
-    updates = [_make_update(name, "1.0") for name in ("a", "b", "c")]
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    updates = [
+        make_update(SemverTier.MINOR, pkg_name=name, latest_version="1.0")
+        for name in ("a", "b", "c")
+    ]
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         result = filter_registry_updates_by_age(updates, "pypi", tmp_path, 7, context)
     assert [u.pkg_name for u in result] == ["a", "c"]
 
 
 def test_mvn_age_uses_the_exact_central_pom_and_cache(tmp_path):
-    update = _make_update("org.example:lib", "2.0")
+    update = make_update(
+        SemverTier.MINOR, pkg_name="org.example:lib", latest_version="2.0"
+    )
     first_calls = []
 
     def transport(url, repository, suffix, count):
@@ -1587,7 +1601,7 @@ def test_mvn_age_uses_the_exact_central_pom_and_cache(tmp_path):
         module = ModuleId(group="org.example", artifact="lib", version="2.0")
         return _pom(module), {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"}, url
 
-    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
         result = filter_registry_updates_by_age(
             [update], "central", tmp_path, 7, context
         )
@@ -1601,7 +1615,9 @@ def test_mvn_age_uses_the_exact_central_pom_and_cache(tmp_path):
     assert sorted(path.name for path in tmp_path.iterdir()) == [
         "fb29466986f75a2600e7519a519c1f6e9ee01a1acf330824582b5facbc4e22cf.json"
     ]
-    with PublicationLookupContext(tmp_path, _no_transport, lambda: _PUB_NOW) as again:
+    with PublicationLookupContext(
+        tmp_path, _no_transport, FakeClock(_PUB_NOW)
+    ) as again:
         cached = filter_registry_updates_by_age([update], "central", tmp_path, 7, again)
     assert [u.published_date for u in cached] == [datetime(2026, 9, 1, tzinfo=UTC)]
 
@@ -1631,8 +1647,10 @@ def test_given_gradle_member_when_resolved_then_only_valid_coordinates_map(
 
 @pytest.mark.parametrize("name", ["lib", "a:b:c", ":lib", "org.example:"])
 def test_mvn_age_skips_names_that_are_not_group_artifact(tmp_path, name):
-    update = _make_update(name, "2.0")
-    with PublicationLookupContext(tmp_path, _no_transport, lambda: _PUB_NOW) as context:
+    update = make_update(SemverTier.MINOR, pkg_name=name, latest_version="2.0")
+    with PublicationLookupContext(
+        tmp_path, _no_transport, FakeClock(_PUB_NOW)
+    ) as context:
         result = filter_registry_updates_by_age(
             [update], "central", tmp_path, 7, context
         )
@@ -1642,13 +1660,14 @@ def test_mvn_age_skips_names_that_are_not_group_artifact(tmp_path, name):
 def test_npm_registry_switch_is_seen_by_the_next_scan(tmp_path, monkeypatch):
     _fake_bun(
         monkeypatch,
+        tmp_path,
         "Published: 2024-01-01T00:00:00Z\n",
         "Published: 2026-09-17T00:00:00Z\n",
     )
-    update = _make_update("pkg", "1.0.0")
+    update = make_update(SemverTier.MINOR, pkg_name="pkg", latest_version="1.0.0")
     kept = []
     for _ in range(2):
-        with PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW) as context:
+        with PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW)) as context:
             kept.append(
                 filter_registry_updates_by_age([update], "npm", tmp_path, 7, context)
             )
@@ -1673,9 +1692,12 @@ def test_registry_age_submits_every_update_before_waiting(
         submitted.append(args)
         return Future()
 
-    context = PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW)
+    context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
     monkeypatch.setattr(context, method, submit)
-    updates = [_make_update(f"{prefix}{i}", "1.0") for i in range(expected)]
+    updates = [
+        make_update(SemverTier.MINOR, pkg_name=f"{prefix}{i}", latest_version="1.0")
+        for i in range(expected)
+    ]
     with context:
         result = filter_registry_updates_by_age(updates, source, tmp_path, 7, context)
     assert [u.pkg_name for u in result] == [u.pkg_name for u in updates]
@@ -1712,10 +1734,13 @@ def test_interrupted_registry_batch_cancels_queued_lookups(tmp_path, monkeypatch
         assert release.wait(10), "context cleanup did not release lookups"
 
     monkeypatch.setattr(age, "ThreadPoolExecutor", InterruptingPool)
-    updates = [_make_update(f"pkg{i}", "1.0") for i in range(12)]
+    updates = [
+        make_update(SemverTier.MINOR, pkg_name=f"pkg{i}", latest_version="1.0")
+        for i in range(12)
+    ]
     with (
         pytest.raises(KeyboardInterrupt),
-        PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context,
+        PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context,
     ):
         filter_registry_updates_by_age(updates, "pypi", tmp_path, 7, context)
     assert len(calls) == 8, "queued lookups ran after interruption"
@@ -1768,7 +1793,7 @@ def test_given_pypi_fact_when_reopened_then_literal_cache_path_is_reused(
         "9b296d4647468663160fcfdf13877ac156038d877cb11ab95c5ac04b2cd124c2.json"
     ]
     with PublicationLookupContext(
-        tmp_path, _no_transport, lambda: _PUB_NOW
+        tmp_path, _no_transport, FakeClock(_PUB_NOW)
     ) as cached_context:
         cached = cached_context.submit_registry(
             "pypi", "demo", "2.0", tmp_path
@@ -2018,19 +2043,21 @@ def test_duplicate_registry_lookups_share_one_request(tmp_path):
     assert len(calls) == 1
 
 
-def _fake_bun(monkeypatch, *outputs):
-    calls = []
-    queue = list(outputs)
-
-    def run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        output = queue.pop(0)
+def _fake_bun(monkeypatch, cwd: Path, *outputs) -> FakeCommands:
+    commands = FakeCommands()
+    for output in outputs:
         if isinstance(output, BaseException):
-            raise output
-        return subprocess.CompletedProcess(cmd, 1, output, "warning")
-
-    monkeypatch.setattr(_PATCH_SUBRUN, run)
-    return calls
+            result = ProcessError(f"Could not run bun info in {cwd}: {output}")
+            result.__cause__ = output
+        else:
+            result = completed(returncode=1, stdout=output, stderr="warning")
+        commands.add(
+            ("bun", "info", "pkg@1.0.0"),
+            cwd=cwd,
+            result=result,
+        )
+    monkeypatch.setattr("maintenance_man.dependency_age.run_captured", commands)
+    return commands
 
 
 def test_npm_lookup_runs_bun_info_in_the_project_without_disk_cache(
@@ -2038,16 +2065,19 @@ def test_npm_lookup_runs_bun_info_in_the_project_without_disk_cache(
 ):
     monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
     project, cache = tmp_path / "project", tmp_path / "cache"
-    calls = _fake_bun(monkeypatch, "pkg@1.0.0 | MIT\nPublished: 2024-01-02T03:04:05Z\n")
-    with PublicationLookupContext(cache, clock=lambda: _PUB_NOW) as context:
+    commands = _fake_bun(
+        monkeypatch,
+        project,
+        "pkg@1.0.0 | MIT\nPublished: 2024-01-02T03:04:05Z\n",
+    )
+    with PublicationLookupContext(cache, clock=FakeClock(_PUB_NOW)) as context:
         fact = context.submit_registry("npm", "pkg", "1.0.0", project).result()
         assert context.requests == 1
     assert fact.timestamp == datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
-    ((cmd, kwargs),) = calls
-    assert cmd == ["bun", "info", "pkg@1.0.0"]
-    assert kwargs["cwd"] == project
-    assert kwargs["timeout"] == 30
-    assert "VIRTUAL_ENV" not in kwargs["env"]
+    ((cmd, cwd, kwargs),) = commands.calls
+    assert cmd == ("bun", "info", "pkg@1.0.0")
+    assert cwd == project
+    assert kwargs == {"timeout": 30, "label": "bun info", "ok_codes": None}
     assert not cache.exists() or not list(cache.iterdir())
 
 
@@ -2079,8 +2109,8 @@ def test_npm_lookup_runs_bun_info_in_the_project_without_disk_cache(
     ],
 )
 def test_npm_dates_and_failures(tmp_path, monkeypatch, output, expected):
-    _fake_bun(monkeypatch, output)
-    with PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW) as context:
+    _fake_bun(monkeypatch, tmp_path, output)
+    with PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW)) as context:
         result = context.submit_registry("npm", "pkg", "1.0.0", tmp_path).result()
     if isinstance(expected, datetime):
         assert result.timestamp == expected
@@ -2101,19 +2131,20 @@ def test_npm_ignores_a_planted_cache_file_and_reruns_each_context(
             checked_at=_PUB_NOW,
         ).model_dump_json()
     )
-    calls = _fake_bun(
+    commands = _fake_bun(
         monkeypatch,
+        tmp_path,
         "Published: 2024-01-01T00:00:00Z\n",
         "Published: 2026-09-17T00:00:00Z\n",
     )
     dates = []
     for _ in range(2):
-        with PublicationLookupContext(tmp_path, clock=lambda: _PUB_NOW) as context:
+        with PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW)) as context:
             first = context.submit_registry("npm", "pkg", "1.0.0", tmp_path)
             again = context.submit_registry("npm", "pkg", "1.0.0", tmp_path)
             dates.append(first.result().timestamp)
             assert again is first
-    assert len(calls) == 2
+    assert len(commands.calls) == 2
     assert dates == [
         datetime(2024, 1, 1, tzinfo=UTC),
         datetime(2026, 9, 17, tzinfo=UTC),

@@ -4,37 +4,23 @@ from unittest.mock import MagicMock
 import pytest
 
 from maintenance_man import cli
-from maintenance_man.cli import ExitCode, app
+from maintenance_man.cli import ExitCode
 from maintenance_man.config import load_config
 from maintenance_man.vcs import RevisionError
+from tests.conftest import configure_fake_vcs, run_mm, write_config
 from tests.fake_vcs import FakeJjState
-
-
-def _install_fake_services(monkeypatch: pytest.MonkeyPatch) -> FakeJjState:
-    state = FakeJjState()
-    seeded: set[Path] = set()
-    for project in load_config().projects.values():
-        path = project.path.resolve()
-        if path not in seeded:
-            state.seed_repository(path, files={"dep.txt": "version=1\n"})
-            seeded.add(path)
-    services = state.services()
-    monkeypatch.setattr(cli, "make_vcs_services", lambda: services)
-    return state
 
 
 class TestSyncCommand:
     def test_syncs_all_projects_by_default(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        state = _install_fake_services(monkeypatch)
+        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync"])
-
-        assert exc_info.value.code == ExitCode.OK
+        assert run_mm("sync") == ExitCode.OK
         assert [call.path for call in state.attempts if call.method == "fetch"] == [
             project.path.resolve()
             for _, project in sorted(load_config().projects.items())
@@ -43,14 +29,12 @@ class TestSyncCommand:
     def test_syncs_named_projects_only(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        state = _install_fake_services(monkeypatch)
+        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable", "clean"])
-
-        assert exc_info.value.code == ExitCode.OK
+        assert run_mm("sync", "vulnerable", "clean") == ExitCode.OK
         projects = load_config().projects
         assert [call.path for call in state.attempts if call.method == "fetch"] == [
             projects["vulnerable"].path.resolve(),
@@ -60,32 +44,28 @@ class TestSyncCommand:
     def test_exits_nonzero_on_typed_failure(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        state = _install_fake_services(monkeypatch)
+        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
         path = load_config().projects["vulnerable"].path
         state.fail("fetch", error=RevisionError("fetch failed"), path=path)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable"])
-
-        assert exc_info.value.code == ExitCode.SYNC_FAILED
+        assert run_mm("sync", "vulnerable") == ExitCode.SYNC_FAILED
         assert "fetch failed" in capsys.readouterr().out
 
     def test_continues_after_one_failure(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        state = _install_fake_services(monkeypatch)
+        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
         path = load_config().projects["vulnerable"].path
         state.fail("fetch", error=RevisionError("fetch failed"), path=path)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable", "clean"])
-
-        assert exc_info.value.code == ExitCode.SYNC_FAILED
+        assert run_mm("sync", "vulnerable", "clean") == ExitCode.SYNC_FAILED
         projects = load_config().projects
         assert [call.path for call in state.attempts if call.method == "fetch"] == [
             projects["vulnerable"].path.resolve(),
@@ -95,6 +75,7 @@ class TestSyncCommand:
     def test_composes_once_without_extra_vcs_context(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         state = FakeJjState()
@@ -103,10 +84,7 @@ class TestSyncCommand:
         factory = MagicMock(return_value=state.services())
         monkeypatch.setattr(cli, "make_vcs_services", factory)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable"])
-
-        assert exc_info.value.code == ExitCode.OK
+        assert run_mm("sync", "vulnerable") == ExitCode.OK
         factory.assert_called_once_with()
         assert not any(
             call.method in {"revision_bookmarks", "change_id"}
@@ -116,15 +94,13 @@ class TestSyncCommand:
     def test_reports_successful_action(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        _install_fake_services(monkeypatch)
+        configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable"])
-
-        assert exc_info.value.code == ExitCode.OK
+        assert run_mm("sync", "vulnerable") == ExitCode.OK
         assert "vulnerable — already up to date" in capsys.readouterr().out
 
     def test_no_configured_projects(
@@ -133,16 +109,11 @@ class TestSyncCommand:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         mm_home.mkdir(parents=True, exist_ok=True)
-        (mm_home / "config.toml").write_text(
-            "[defaults]\nmin_version_age_days = 7\n", encoding="utf-8"
-        )
+        write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
         factory = MagicMock()
         monkeypatch.setattr(cli, "make_vcs_services", factory)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync"])
-
-        assert exc_info.value.code == ExitCode.OK
+        assert run_mm("sync") == ExitCode.OK
         factory.assert_not_called()
 
     def test_skips_nonexistent_path(
@@ -162,12 +133,9 @@ path = "{missing_path}"
 package_manager = "uv"
 test_unit = "uv run pytest"
 """
-        (mm_home / "config.toml").write_text(config_text, encoding="utf-8")
+        write_config(mm_home, config_text)
         state = FakeJjState()
         monkeypatch.setattr(cli, "make_vcs_services", state.services)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync"])
-
-        assert exc_info.value.code == ExitCode.SYNC_FAILED
+        assert run_mm("sync") == ExitCode.SYNC_FAILED
         assert state.attempts == []

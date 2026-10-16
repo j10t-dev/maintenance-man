@@ -19,6 +19,7 @@ from maintenance_man.gradle import (
     GRADLE_INVENTORY_MARKER_RELPATH,
     GRADLE_INVENTORY_RELPATH,
 )
+from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
     GradleMember,
@@ -32,6 +33,7 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
+from maintenance_man.process import ToolNotFoundError
 from maintenance_man.storage import save_scan_results
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor
@@ -49,7 +51,7 @@ class FakeClock:
 
 
 def completed(
-    argv: tuple[str, ...] = (),
+    argv: str | list[str] | tuple[str, ...] = (),
     *,
     stdout: str = "",
     stderr: str = "",
@@ -68,16 +70,16 @@ def make_config(**overrides: Any) -> MmConfig:
     return MmConfig.model_validate({"projects": {}} | overrides)
 
 
-def write_config(home: Path, text: str) -> Path:
+def write_config(home: Path, text: str, *, filename: str = "config.toml") -> Path:
     home.mkdir(parents=True, exist_ok=True)
-    path = home / "config.toml"
+    path = home / filename
     path.write_text(text, encoding="utf-8")
     return path
 
 
 def run_mm(*argv: str) -> int:
     try:
-        result = app(list(argv), exit_on_error=False)
+        result = app(list(argv))
     except SystemExit as exc:
         return int(exc.code or 0)
     assert result is None
@@ -100,7 +102,7 @@ def configure_fake_vcs(
     text = config_path.read_text(encoding="utf-8")
     for source, target in replacements.items():
         text = text.replace(str(source), str(target))
-    config_path.write_text(text, encoding="utf-8")
+    write_config(home, text)
     paths_by_name = {
         name: replacements[project.path]
         for name, project in configured.projects.items()
@@ -173,7 +175,7 @@ def fixture_runner(root, args, *, label):
         (root / "gradle/libs.versions.toml").read_bytes()
     ).hexdigest()
     (owned / "report.json").write_text(json.dumps(value))
-    return subprocess.CompletedProcess(args, 0, "", "")
+    return completed(tuple(args))
 
 
 def make_vuln(**overrides: Any) -> VulnFinding:
@@ -190,12 +192,17 @@ def make_vuln(**overrides: Any) -> VulnFinding:
     return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
-def make_update(**overrides: Any) -> UpdateFinding:
+def make_update(tier: SemverTier = SemverTier.PATCH, **overrides: Any) -> UpdateFinding:
+    name, installed, latest = {
+        SemverTier.PATCH: ("pkg-a", "1.0.0", "1.0.1"),
+        SemverTier.MINOR: ("pkg-b", "1.0.0", "1.1.0"),
+        SemverTier.MAJOR: ("pkg-c", "1.0.0", "2.0.0"),
+    }.get(tier, ("pkg-x", "1.0.0", "2.0.0"))
     defaults = {
-        "pkg_name": "pkg-a",
-        "installed_version": "1.0.0",
-        "latest_version": "1.0.1",
-        "semver_tier": SemverTier.PATCH,
+        "pkg_name": name,
+        "installed_version": installed,
+        "latest_version": latest,
+        "semver_tier": tier,
     }
     return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
@@ -211,6 +218,52 @@ def make_scan_result(
         vulnerabilities=vulns if vulns is not None else [make_vuln()],
         updates=updates if updates is not None else [make_update()],
     )
+
+
+def make_activity(
+    *, success: bool, commit_id: str | None
+) -> dict[str, ProjectActivity]:
+    return {
+        "app": ProjectActivity(
+            last_deploy=ActivityEvent(
+                timestamp=datetime(2026, 3, 20, tzinfo=UTC),
+                success=success,
+                branch="main",
+                commit_id=commit_id,
+            )
+        )
+    }
+
+
+def missing_tool(tool: str) -> Callable[[str, str], Path]:
+    def require(name: str, hint: str) -> Path:
+        if name == tool:
+            msg = f"{name} is not installed or not on PATH. {hint}"
+            raise ToolNotFoundError(msg)
+        return Path("/usr/bin") / name
+
+    return require
+
+
+def seed_project(
+    tmp_path: Path,
+    name: str,
+    scan: ScanResult,
+    *,
+    test_unit: str | None = "pytest",
+) -> tuple[FakeJjState, ProjectConfig]:
+    project = make_project(tmp_path / name, test_unit=test_unit)
+    state = FakeJjState()
+    state.seed_repository(project.path, files={"dep.txt": "version=1\n"})
+    state.register_files(
+        project.path,
+        "mm-fixture-some-pkg.txt",
+        "mm-fixture-pkg-a.txt",
+        "mm-fixture-pkg-b.txt",
+    )
+    scan.project = name
+    save_scan_results(name, scan)
+    return state, project
 
 
 @pytest.fixture(autouse=True)
@@ -278,7 +331,7 @@ path = "{clean_path}"
 package_manager = "uv"
 test_unit = "uv run pytest"
 """
-    (mm_home / "config.toml").write_text(config_text)
+    write_config(mm_home, config_text)
     return mm_home
 
 
@@ -291,24 +344,63 @@ def scan_results_dir(mm_home: Path) -> Path:
     return d
 
 
-@pytest.fixture()
-def mock_update_cli_deps(
-    mm_home_with_projects: Path,
+@dataclasses.dataclass(frozen=True, slots=True)
+class CliDeps:
+    vcs_state: FakeJjState
+    scan_result: ScanResult
+    project_paths: dict[str, Path]
+    save_scan: Callable[[], None]
+
+
+def cli_deps(
+    flow: Workflow,
+    mm_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> dict[str, object]:
-    """Provide real storage and one shared fake repository graph to update CLI."""
-    scan_result = make_scan_result()
-    vcs_state, project_paths = configure_fake_vcs(
-        mm_home_with_projects, tmp_path, monkeypatch
-    )
-    for project_path in set(project_paths.values()):
-        vcs_state.register_files(
-            project_path,
+) -> CliDeps:
+    if flow is Workflow.UPDATE:
+        scan_result = make_scan_result()
+        fixture_files = (
             "mm-fixture-some-pkg.txt",
             "mm-fixture-pkg-a.txt",
             "mm-fixture-pkg-b.txt",
             "mm-fixture-pkg-c.txt",
+        )
+        outcomes = {
+            "some-pkg": (True, None),
+            "pkg-a": (True, None),
+            "pkg-b": (True, None),
+            "pkg-c": (True, None),
+        }
+        processor_path = "maintenance_man.services.update.process_findings"
+    else:
+        scan_result = make_scan_result(
+            vulns=[
+                make_vuln(
+                    update_status=UpdateStatus.FAILED,
+                    flow=Workflow.RESOLVE,
+                    failed_phase="unit",
+                ),
+            ],
+            updates=[
+                make_update(
+                    update_status=UpdateStatus.FAILED,
+                    flow=Workflow.RESOLVE,
+                    failed_phase="unit",
+                ),
+            ],
+        )
+        fixture_files = ("mm-fixture-some-pkg.txt", "mm-fixture-pkg-a.txt")
+        outcomes = {"some-pkg": (True, None), "pkg-a": (True, None)}
+        processor_path = "maintenance_man.services.resolve.process_findings"
+
+    vcs_state, project_paths = configure_fake_vcs(mm_home, tmp_path, monkeypatch)
+    for project_path in set(project_paths.values()):
+        vcs_state.register_files(project_path, *fixture_files)
+
+    if flow is Workflow.RESOLVE:
+        vcs_state.repository(project_paths["vulnerable"]).set_bookmark(
+            bookmark="mm/resolve-dependencies", revision="@-"
         )
 
     def save_scan() -> None:
@@ -321,22 +413,17 @@ def mock_update_cli_deps(
         project_scan = deepcopy(scan_result)
         project_scan.project = project_name
         save_scan_results(project_name, project_scan)
-    processor = FakeFindingProcessor(
-        {
-            "some-pkg": (True, None),
-            "pkg-a": (True, None),
-            "pkg-b": (True, None),
-            "pkg-c": (True, None),
-        }
-    )
-    monkeypatch.setattr("maintenance_man.services.update.process_findings", processor)
-    return {
-        "vcs_state": vcs_state,
-        "services": vcs_state.services(),
-        "scan_result": scan_result,
-        "save_scan": save_scan,
-        "project_paths": project_paths,
-    }
+    monkeypatch.setattr(processor_path, FakeFindingProcessor(outcomes))
+    return CliDeps(vcs_state, scan_result, project_paths, save_scan)
+
+
+@pytest.fixture()
+def mock_update_cli_deps(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> CliDeps:
+    return cli_deps(Workflow.UPDATE, mm_home_with_projects, tmp_path, monkeypatch)
 
 
 @pytest.fixture()
@@ -344,63 +431,8 @@ def mock_resolve_cli_deps(
     mm_home_with_projects: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> dict[str, object]:
-    """Provide real storage and one shared fake repository graph to resolve CLI."""
-    scan_result = make_scan_result(
-        vulns=[
-            make_vuln(
-                update_status=UpdateStatus.FAILED,
-                flow=Workflow.RESOLVE,
-                failed_phase="unit",
-            ),
-        ],
-        updates=[
-            make_update(
-                update_status=UpdateStatus.FAILED,
-                flow=Workflow.RESOLVE,
-                failed_phase="unit",
-            ),
-        ],
-    )
-    vcs_state, project_paths = configure_fake_vcs(
-        mm_home_with_projects, tmp_path, monkeypatch
-    )
-    for project_path in set(project_paths.values()):
-        vcs_state.register_files(
-            project_path,
-            "mm-fixture-some-pkg.txt",
-            "mm-fixture-pkg-a.txt",
-        )
-    vcs_state.repository(project_paths["vulnerable"]).set_bookmark(
-        bookmark="mm/resolve-dependencies", revision="@-"
-    )
-    fixture: dict[str, object] = {}
-
-    def save_scan() -> None:
-        save_scan_results(
-            "vulnerable",
-            fixture["scan_result"],  # ty:ignore[invalid-argument-type]
-        )
-
-    fixture.update(
-        {
-            "vcs_state": vcs_state,
-            "services": vcs_state.services(),
-            "scan_result": scan_result,
-            "save_scan": save_scan,
-            "project_paths": project_paths,
-        }
-    )
-    save_scan()
-    for project_name in project_paths:
-        if project_name == "vulnerable":
-            continue
-        project_scan = scan_result.model_copy(deep=True)
-        project_scan.project = project_name
-        save_scan_results(project_name, project_scan)
-    processor = FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)})
-    monkeypatch.setattr("maintenance_man.services.resolve.process_findings", processor)
-    return fixture
+) -> CliDeps:
+    return cli_deps(Workflow.RESOLVE, mm_home_with_projects, tmp_path, monkeypatch)
 
 
 def make_gradle_member(**overrides: Any) -> GradleMember:
@@ -454,10 +486,11 @@ def mm_home_with_gradle(
     mm_home_with_projects: Path, gradle_project: ProjectConfig
 ) -> Path:
     config_path = mm_home_with_projects / "config.toml"
-    config_path.write_text(
+    write_config(
+        mm_home_with_projects,
         config_path.read_text()
         + f'\n[projects.android]\npath = "{gradle_project.path}"\n'
-        f'package_manager = "gradle"\ntest_unit = "./gradlew testDebugUnitTest"\n'
+        f'package_manager = "gradle"\ntest_unit = "./gradlew testDebugUnitTest"\n',
     )
     return mm_home_with_projects
 

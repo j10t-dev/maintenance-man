@@ -4,7 +4,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from maintenance_man.github import CodeHostError
-from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     BlockersStillFailing,
     FindingPassed,
@@ -21,30 +20,17 @@ from maintenance_man.services import WorkflowError
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import RevisionError
-from tests.conftest import make_project, make_scan_result, make_update, make_vuln
+from tests.conftest import (
+    make_project,
+    make_scan_result,
+    make_update,
+    make_vuln,
+    seed_project,
+)
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor, RecordingEmit
 
 _BOOKMARK = "mm/resolve-dependencies"
-
-
-def _seed_project(
-    tmp_path: Path,
-    scan,
-    *,
-    name: str = "api",
-) -> tuple[FakeJjState, ProjectConfig]:
-    project = make_project(tmp_path / name, test_unit="pytest")
-    state = FakeJjState()
-    state.seed_repository(project.path, files={"dep.txt": "version=1\n"})
-    state.register_files(
-        project.path,
-        "mm-fixture-some-pkg.txt",
-        "mm-fixture-pkg-a.txt",
-    )
-    scan.project = name
-    save_scan_results(name, scan)
-    return state, project
 
 
 class TestResolveCandidates:
@@ -77,7 +63,7 @@ class TestResolveCandidates:
             ],
         )
 
-        state, project = _seed_project(tmp_path, scan)
+        state, project = seed_project(tmp_path, "api", scan)
         saved_before = load_scan_results("api")
 
         with pytest.raises(resolve_service.flows.FlowConflictError):
@@ -107,7 +93,7 @@ class TestResolveCandidates:
             ],
         )
 
-        state, project = _seed_project(tmp_path, scan)
+        state, project = seed_project(tmp_path, "api", scan)
         processed: list[tuple[str, ...]] = []
         processor = FakeFindingProcessor({"pkg-a": (True, None)})
 
@@ -151,7 +137,7 @@ class TestResolveCandidates:
                 ),
             ],
         )
-        state, project = _seed_project(tmp_path, scan)
+        state, project = seed_project(tmp_path, "api", scan)
         state.services().repository(project.path).set_bookmark(
             bookmark=_BOOKMARK, revision="main"
         )
@@ -195,7 +181,7 @@ class TestResolveCandidates:
                 ),
             ],
         )
-        state, project = _seed_project(tmp_path, scan)
+        state, project = seed_project(tmp_path, "api", scan)
         state.services().repository(project.path).set_bookmark(
             bookmark=_BOOKMARK, revision="main"
         )
@@ -222,7 +208,7 @@ def test_fresh_resolve_submits_and_removes_completed_findings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result()
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
@@ -255,7 +241,7 @@ def test_fresh_resolve_submits_and_removes_completed_findings(
 def test_failed_candidate_pauses_without_submitting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state, project = _seed_project(tmp_path, make_scan_result())
+    state, project = seed_project(tmp_path, "api", make_scan_result())
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
@@ -297,7 +283,7 @@ def test_blocked_finding_is_saved_and_reported(
         ],
         updates=[],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
@@ -329,7 +315,7 @@ def test_blocked_finding_is_saved_and_reported(
 def test_host_failure_after_push_emits_submit_failure_and_keeps_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state, project = _seed_project(tmp_path, make_scan_result())
+    state, project = seed_project(tmp_path, "api", make_scan_result())
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
@@ -369,7 +355,7 @@ def test_continue_failing_retest_persists_phase_and_reports_blockers(
         ],
         updates=[],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     state.services().repository(project.path).set_bookmark(
         bookmark=_BOOKMARK, revision="main"
     )
@@ -410,7 +396,7 @@ def test_continue_passing_retest_marks_blocker_passed_then_submits(
         ],
         updates=[make_update(pkg_name="pkg-a")],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     state.services().repository(project.path).set_bookmark(
         bookmark=_BOOKMARK, revision="main"
     )
@@ -458,7 +444,7 @@ def test_missing_resume_bookmark_raises_workflow_error(
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.RESOLVE)],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(resolve_service, "process_findings", FakeFindingProcessor({}))
 
     with pytest.raises(
@@ -483,7 +469,7 @@ def test_paused_resolve_requires_continue(tmp_path: Path) -> None:
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     state.services().repository(project.path).set_bookmark(
         bookmark=_BOOKMARK, revision="main"
     )
@@ -506,7 +492,7 @@ def test_continue_wraps_repository_inspection_error(tmp_path: Path) -> None:
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     state.services().repository(project.path).set_bookmark(
         bookmark=_BOOKMARK, revision="main"
     )
@@ -531,7 +517,7 @@ def test_continue_refuses_dirty_current_change(tmp_path: Path) -> None:
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     state.services().repository(project.path).set_bookmark(
         bookmark=_BOOKMARK, revision="main"
     )
@@ -554,7 +540,7 @@ def test_continue_refuses_dirty_current_change(tmp_path: Path) -> None:
 
 
 def test_prepare_failure_emits_then_raises_aborted(tmp_path: Path) -> None:
-    state, project = _seed_project(tmp_path, make_scan_result())
+    state, project = seed_project(tmp_path, "api", make_scan_result())
     state.fail(
         "create_bookmark",
         error=RevisionError("cannot create"),
@@ -578,7 +564,7 @@ def test_prepare_failure_emits_then_raises_aborted(tmp_path: Path) -> None:
 
 
 def test_pruning_failure_is_chained_as_workflow_error(tmp_path: Path) -> None:
-    state, project = _seed_project(tmp_path, make_scan_result())
+    state, project = seed_project(tmp_path, "api", make_scan_result())
     state.fail("fetch", error=RevisionError("cannot fetch"), path=project.path)
 
     with pytest.raises(WorkflowError) as raised:
@@ -608,7 +594,7 @@ def test_bookmark_move_failure_saves_before_refusal(
         ],
         updates=[],
     )
-    state, project = _seed_project(tmp_path, scan)
+    state, project = seed_project(tmp_path, "api", scan)
     state.services().repository(project.path).set_bookmark(
         bookmark=_BOOKMARK, revision="main"
     )
