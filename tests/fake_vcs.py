@@ -903,7 +903,7 @@ class FakeJj:
 
     def _guard(self, bookmark: str, expected: ExpectedRevisions) -> None:
         if bookmark not in tuple(WORKFLOW_BOOKMARKS.values()):
-            msg = "Unexpected managed Gradle bookmark"
+            msg = "Unexpected managed bookmark"
             raise RevisionError(msg)
         data, _ = self._data()
         if data.bookmarks.get("main", ()) != (expected.base,) or data.bookmarks.get(

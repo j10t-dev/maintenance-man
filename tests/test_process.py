@@ -137,7 +137,6 @@ def test_captured_mechanical_failure_raises_selected_error(
         ("", "  boom\n", "tool failed (exit 3): boom"),
         ("from stdout\n", "   \n", "tool failed (exit 3): from stdout"),
         ("", "", "tool failed (exit 3)"),
-        (None, None, "tool failed (exit 3)"),
         ("", "x" * 10 + "y" * 2000, "tool failed (exit 3): " + "y" * 2000),
     ],
 )

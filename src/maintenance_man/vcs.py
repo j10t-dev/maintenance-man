@@ -18,11 +18,10 @@ from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.process import run_captured
 
 JJ_INSTALL_HINT = "Install it from https://jj-vcs.github.io/jj/"
-GH_INSTALL_HINT = "Install it from https://cli.github.com/"
 
 
 class RevisionError(Exception):
-    """A jj or gh command could not run, or a revision could not be resolved."""
+    """A jj command could not run, or a revision could not be resolved."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,39 +112,27 @@ def assert_safe_workspace_path(path: Path) -> Path:
     return target
 
 
-def _guarded_tip(source_bookmark: str, expected_base: str, expected_tip: str) -> str:
-    if source_bookmark not in tuple(WORKFLOW_BOOKMARKS.values()):
-        msg = "Unexpected managed Gradle bookmark"
-        raise RevisionError(msg)
-    if not all(
-        re.fullmatch(r"[0-9a-f]{40,64}", value)
-        for value in (expected_base, expected_tip)
-    ):
-        msg = "Invalid expected revision identity"
-        raise RevisionError(msg)
-    base = f"exactly(exactly(main, 1) & {expected_base}, 1)"
-    tip = f"exactly(exactly({source_bookmark}, 1) & {expected_tip}, 1)"
-    return f"exactly(({base})::({tip}) & ({tip}), 1)"
-
-
 _COMMIT_ID = re.compile(r"[0-9a-f]{40,64}")
 
 
-def _checked_jj(
-    path: Path, arguments: list[str], *, timeout: int = 30
-) -> subprocess.CompletedProcess[str]:
-    command = ["jj", *arguments]
-    return run_captured(
-        command,
-        path,
-        timeout=timeout,
-        label=shlex.join(command),
-        error=RevisionError,
-    )
+def _guarded_tip(source_bookmark: str, expected: ExpectedRevisions) -> str:
+    if source_bookmark not in tuple(WORKFLOW_BOOKMARKS.values()):
+        msg = "Unexpected managed bookmark"
+        raise RevisionError(msg)
+    if not all(_COMMIT_ID.fullmatch(value) for value in (expected.base, expected.tip)):
+        msg = "Invalid expected revision identity"
+        raise RevisionError(msg)
+    base = f"exactly(exactly(main, 1) & {expected.base}, 1)"
+    tip = f"exactly(exactly({source_bookmark}, 1) & {expected.tip}, 1)"
+    return f"exactly(({base})::({tip}) & ({tip}), 1)"
+
+
+def _lines(stdout: str) -> list[str]:
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
 
 
 def _one_line(output: str, *, subject: str) -> str:
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    lines = _lines(output)
     if len(lines) != 1:
         msg = f"{subject} must resolve to exactly one value, got {len(lines)}"
         raise RevisionError(msg)
@@ -173,9 +160,16 @@ class JjRepository:
     def _run(
         self, arguments: list[str], *, timeout: int = 30
     ) -> subprocess.CompletedProcess[str]:
-        return _checked_jj(self.path, arguments, timeout=timeout)
+        command = ["jj", *arguments]
+        return run_captured(
+            command,
+            self.path,
+            timeout=timeout,
+            label=shlex.join(command),
+            error=RevisionError,
+        )
 
-    def _bookmark_listing(self, bookmark: str) -> tuple[str, ...]:
+    def _list_bookmarks(self, *names: str) -> tuple[str, ...]:
         result = self._run(
             [
                 "--ignore-working-copy",
@@ -185,37 +179,23 @@ class JjRepository:
                 "list",
                 "-T",
                 'if(remote == "origin" || !present, "", name ++ "\\n")',
-                bookmark,
+                *names,
             ]
         )
-        names = tuple(
-            line.strip() for line in result.stdout.splitlines() if line.strip()
-        )
-        if any(name != bookmark for name in names):
-            msg = f"Unexpected bookmark listing for {bookmark}"
+        listed = tuple(_lines(result.stdout))
+        if names and any(name not in names for name in listed):
+            msg = f"Unexpected bookmark listing for {', '.join(names)}"
             raise RevisionError(msg)
-        return names
+        return listed
 
     def bookmark_exists(self, *, bookmark: str) -> bool:
-        return bool(self._bookmark_listing(bookmark))
+        return bool(self._list_bookmarks(bookmark))
 
     def local_bookmarks(self) -> frozenset[str]:
-        result = self._run(
-            [
-                "--ignore-working-copy",
-                "--color",
-                "never",
-                "bookmark",
-                "list",
-                "-T",
-                'if(remote == "origin" || !present, "", name ++ "\\n")',
-            ]
-        )
-        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        return frozenset(names)
+        return frozenset(self._list_bookmarks())
 
     def bookmark_conflicted(self, *, bookmark: str) -> bool:
-        names = self._bookmark_listing(bookmark)
+        names = self._list_bookmarks(bookmark)
         if not names:
             msg = f"Cannot inspect bookmark conflict for {bookmark}"
             raise RevisionError(msg)
@@ -297,7 +277,7 @@ class JjRepository:
                 'commit_id ++ "\\n"',
             ]
         )
-        values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        values = _lines(result.stdout)
         if values not in ([], [descendant_id]):
             msg = "Unexpected ancestry result"
             raise RevisionError(msg)
@@ -319,11 +299,7 @@ class JjRepository:
                 ),
             ]
         )
-        return tuple(
-            dict.fromkeys(
-                line.strip() for line in result.stdout.splitlines() if line.strip()
-            )
-        )
+        return tuple(dict.fromkeys(_lines(result.stdout)))
 
     def change_id(self, *, revision: str = "@") -> str:
         result = self._run(
@@ -380,7 +356,7 @@ class JjRepository:
     ) -> None:
         selector = bookmark
         if expected is not None:
-            selector = _guarded_tip(bookmark, expected.base, expected.tip)
+            selector = _guarded_tip(bookmark, expected)
         self._run(["bookmark", "set", "main", "-r", selector])
         if expected is not None and (
             self.resolve_revision(revision="main") != expected.tip
@@ -392,7 +368,7 @@ class JjRepository:
     def reset_verified_bookmark(
         self, *, bookmark: str, expected: ExpectedRevisions
     ) -> None:
-        guarded = _guarded_tip(bookmark, expected.base, expected.tip)
+        guarded = _guarded_tip(bookmark, expected)
         base = f"exactly({expected.base} & ::({guarded}), 1)"
         self._run(["bookmark", "set", bookmark, "--allow-backwards", "-r", base])
         if self.resolve_revision(revision=bookmark) != expected.base:
@@ -411,7 +387,7 @@ class JjRepository:
         if expected is None:
             selector = ["--bookmark", bookmark]
         else:
-            guarded = _guarded_tip(bookmark, expected.base, expected.tip)
+            guarded = _guarded_tip(bookmark, expected)
             push_name = f'templates.git_push_bookmark="\\"{bookmark}\\""'
             selector = ["--change", guarded, "--config", push_name]
         self._run(["git", "push", *selector, "--remote", "origin"], timeout=120)
@@ -424,7 +400,7 @@ class JjRepository:
 
     def workspace_names(self) -> frozenset[str]:
         result = self._run(["workspace", "list", "-T", 'name ++ "\\n"'])
-        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        names = _lines(result.stdout)
         if len(names) != len(set(names)):
             msg = "Unexpected duplicate workspace listing"
             raise RevisionError(msg)
@@ -482,7 +458,7 @@ def _temporary_workspace(
 ) -> Iterator[Repository]:
     resolved = repository.resolve_revision(revision=revision)
     try:
-        container = Path(tempfile.mkdtemp(prefix="mm-gradle-proof-"))
+        container = Path(tempfile.mkdtemp(prefix="mm-proof-"))
     except OSError as exc:
         msg = f"Cannot allocate proof workspace: {exc}"
         raise RevisionError(msg) from exc

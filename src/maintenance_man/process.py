@@ -31,6 +31,15 @@ def _where(cwd: str | Path | None) -> str:
     return f" in {cwd}" if cwd is not None else ""
 
 
+def rejected_status_message(
+    label: str, completed: subprocess.CompletedProcess[str]
+) -> str:
+    """Describe a rejected process status with a bounded diagnostic."""
+    detail = completed.stderr.strip() or completed.stdout.strip()
+    message = f"{label} failed (exit {completed.returncode})"
+    return f"{message}: {detail[-_DIAGNOSTIC_CHARS:]}" if detail else message
+
+
 def run_captured(
     cmd: Sequence[str],
     cwd: str | Path | None,
@@ -61,9 +70,7 @@ def run_captured(
         msg = f"Could not run {label}{_where(cwd)}: {exc}"
         raise error(msg) from exc
     if ok_codes is not None and completed.returncode not in ok_codes:
-        detail = (completed.stderr or "").strip() or (completed.stdout or "").strip()
-        message = f"{label} failed (exit {completed.returncode})"
-        raise error(f"{message}: {detail[-_DIAGNOSTIC_CHARS:]}" if detail else message)
+        raise error(rejected_status_message(label, completed))
     return completed
 
 

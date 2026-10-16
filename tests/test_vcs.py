@@ -165,7 +165,7 @@ class TestJjRepositoryBoundary:
         failure = OSError("allocation denied")
 
         def fail_allocate(*, prefix: str):
-            assert prefix == "mm-gradle-proof-"
+            assert prefix == "mm-proof-"
             raise failure
 
         monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
@@ -187,7 +187,7 @@ class TestJjRepositoryBoundary:
         failure = OSError("marker denied")
 
         def allocate(*, prefix: str) -> str:
-            assert prefix == "mm-gradle-proof-"
+            assert prefix == "mm-proof-"
             container.mkdir()
             return str(container)
 
@@ -419,7 +419,7 @@ def test_proof_body_stays_primary_with_both_cleanup_diagnostics(
     original_remove = vcs.shutil.rmtree
 
     def fail_proof_remove(path: Path):
-        if path.name.startswith("mm-gradle-proof-"):
+        if path.name.startswith("mm-proof-"):
             msg = "remove denied"
             raise OSError(msg)
         return original_remove(path)

@@ -1275,6 +1275,14 @@ def test_refresh_inspection_failure_has_no_mutation(tmp_path: Path) -> None:
     state = FakeJjState()
     path = tmp_path / "source"
     repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    base = repo.resolve_revision(revision="main")
+    tip = state.seed_commit(
+        path,
+        parent=base,
+        files={"dep.txt": "version=2\n"},
+        description="advance main",
+    )
+    state.seed_bookmark(path, bookmark="main", targets=(tip,))
     state.clear_calls()
     state.fail(
         "working_copy_state", error=RevisionError("inspection failed"), path=path
@@ -1796,7 +1804,7 @@ def temporary_workspace_case(
     container = tmp_path / "allocated-proof"
 
     def allocate(*, prefix: str) -> str:
-        assert prefix == "mm-gradle-proof-"
+        assert prefix == "mm-proof-"
         container.mkdir()
         return str(container)
 

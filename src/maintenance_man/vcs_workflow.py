@@ -6,19 +6,17 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from maintenance_man import paths
-from maintenance_man.github import CodeHost, GitHubCodeHost
+from maintenance_man import vcs
+from maintenance_man.github import GH_INSTALL_HINT, CodeHost, GitHubCodeHost
 from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.paths import sanitise_project_name
 from maintenance_man.process import require_tool
 from maintenance_man.vcs import (
-    GH_INSTALL_HINT,
     JJ_INSTALL_HINT,
     ExpectedRevisions,
     JjRepository,
     Repository,
     RevisionError,
-    assert_safe_workspace_path,
 )
 
 
@@ -51,9 +49,9 @@ def ensure_main_bookmark(*, repo: Repository) -> None:
 
 
 def refresh_working_copy_from_main(*, repo: Repository) -> None:
-    state = repo.working_copy_state()
     if repo.is_ancestor(ancestor="main", descendant="@"):
         return
+    state = repo.working_copy_state()
     if not state.has_changes and not state.description and not state.bookmarks:
         repo.rebase_working_copy(revision="main")
         return
@@ -126,36 +124,25 @@ def current_label(*, repo: Repository) -> str:
         parent = repo.revision_bookmarks(revision="@-")
         if parent:
             return parent[0]
-        change = repo.change_id(revision="@")
-        if change:
-            return f"@ {change}"
+        return f"@ {repo.change_id(revision='@')}"
     except RevisionError:
         return "unknown"
-    return "unknown"
 
 
 def _workspace_name(project: str) -> str:
     return f"mm-{sanitise_project_name(project)}"
 
 
-def _workspace_path(project: str) -> Path:
+def _safe_workspace_path(project: str) -> Path:
     try:
-        return paths.project_file(paths.workspaces_dir(), project)
-    except (OSError, ValueError) as exc:
-        msg = f"Cannot compute workspace path: {exc}"
-        raise RevisionError(msg) from exc
-
-
-def _checked_workspace_path(path: Path) -> Path:
-    try:
-        return assert_safe_workspace_path(path)
+        return vcs.assert_safe_workspace_path(vcs.workspace_path_for_project(project))
     except (OSError, ValueError) as exc:
         msg = f"Cannot inspect workspace path: {exc}"
         raise RevisionError(msg) from exc
 
 
 def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
-    workspace_path = _workspace_path(project)
+    workspace_path = _safe_workspace_path(project)
     try:
         workspace_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -170,19 +157,13 @@ def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
 def remove_workspace(*, repo: Repository, project: str) -> None:
     names = repo.workspace_names()
     workspace_name = _workspace_name(project)
-    workspace_path = _checked_workspace_path(_workspace_path(project))
+    workspace_path = _safe_workspace_path(project)
     if workspace_name in names:
         repo.forget_workspace(name=workspace_name)
     try:
-        workspace_path.lstat()
+        shutil.rmtree(workspace_path)
     except FileNotFoundError:
         return
-    except OSError as exc:
-        msg = f"Cannot inspect workspace path: {exc}"
-        raise RevisionError(msg) from exc
-    workspace_path = _checked_workspace_path(workspace_path)
-    try:
-        shutil.rmtree(workspace_path)
     except OSError as exc:
         msg = f"Cannot remove workspace path {workspace_path}: {exc}"
         raise RevisionError(msg) from exc

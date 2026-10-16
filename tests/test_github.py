@@ -156,14 +156,26 @@ def test_create_pr_normalizes_existing_pr_message(
     )
 
 
-def test_create_pr_rejects_failed_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        ("permission denied", "gh pr create failed (exit 2): permission denied"),
+        ("x" * 500 + "y" * 2000, "gh pr create failed (exit 2): " + "y" * 2000),
+    ],
+)
+def test_given_failed_pr_creation_when_create_pr_runs_then_shared_message_is_raised(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    expected: str,
 ) -> None:
     monkeypatch.setattr(
         github,
         "run_captured",
-        lambda *_args, **_kwargs: _completed(returncode=2, stderr="permission denied"),
+        lambda *_args, **_kwargs: _completed(returncode=2, stderr=stderr),
     )
 
-    with pytest.raises(CodeHostError, match="permission denied"):
+    with pytest.raises(CodeHostError) as caught:
         GitHubCodeHost(tmp_path).create_pr(bookmark="mm/update-dependencies")
+
+    assert str(caught.value) == expected

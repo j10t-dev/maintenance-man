@@ -16,6 +16,7 @@ from maintenance_man.models.scan import (
 from maintenance_man.storage import (
     NoScanResultsError,
     atomic_write_text,
+    load_activity,
     load_scan_results,
     record_activity,
     save_scan_results,
@@ -117,6 +118,53 @@ def test_record_activity_replaces_symlink_and_leaves_target(tmp_path):
     record_activity(path, "demo", "build", success=True, branch="main")
     assert not path.is_symlink()
     assert outside.read_text() == "{}"
+
+
+def test_given_bug_when_recording_then_record_activity_propagates_programming_errors(
+    tmp_path, monkeypatch
+):
+    def fail_load(_path: Path):
+        msg = "bug"
+        raise TypeError(msg)
+
+    monkeypatch.setattr(storage, "load_activity", fail_load)
+
+    with pytest.raises(TypeError, match="bug"):
+        record_activity(
+            tmp_path / "activity.json",
+            "demo",
+            "build",
+            success=True,
+            branch="main",
+        )
+
+
+def test_given_bad_json_when_loading_then_load_activity_returns_empty_on_invalid_json(
+    tmp_path,
+):
+    path = tmp_path / "activity.json"
+    path.write_text("{", encoding="utf-8")
+
+    assert load_activity(path) == {}
+
+
+def test_given_invalid_shape_when_activity_is_loaded_then_type_error_propagates(
+    tmp_path,
+):
+    path = tmp_path / "activity.json"
+    path.write_text('{"x": 1}', encoding="utf-8")
+
+    with pytest.raises(TypeError):
+        load_activity(path)
+
+
+def test_given_invalid_fields_when_activity_is_loaded_then_empty_data_is_returned(
+    tmp_path,
+):
+    path = tmp_path / "activity.json"
+    path.write_text('{"x": {"last_build": {"timestamp": "invalid"}}}', encoding="utf-8")
+
+    assert load_activity(path) == {}
 
 
 # -- save_scan_results --

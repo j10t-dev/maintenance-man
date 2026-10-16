@@ -71,11 +71,11 @@ def save_scan_results(project_name: str, scan_result: ScanResult) -> None:
 
 
 def load_activity(path: Path) -> dict[str, ProjectActivity]:
-    """Load activity data from JSON. Returns empty dict on any error."""
+    """Load activity data, returning empty data for I/O or validation failures."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         return {k: ProjectActivity(**v) for k, v in raw.items()}
-    except Exception:
+    except OSError, ValueError:
         return {}
 
 
@@ -88,7 +88,7 @@ def record_activity(
     branch: str,
     commit_id: str | None = None,
 ) -> None:
-    """Record a build/deploy event. Fire-and-forget — never raises."""
+    """Record an event, ignoring persistence and data-validation failures."""
     try:
         activity = load_activity(path)
         proj = activity.get(project, ProjectActivity())
@@ -106,5 +106,5 @@ def record_activity(
         serialised = {k: v.model_dump(mode="json") for k, v in activity.items()}
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(path, json.dumps(serialised, indent=2))
-    except Exception:
+    except OSError, ValueError:
         pass

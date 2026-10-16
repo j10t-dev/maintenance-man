@@ -4,7 +4,9 @@ import shlex
 from pathlib import Path
 from typing import Literal, Protocol
 
-from maintenance_man.process import run_captured
+from maintenance_man.process import rejected_status_message, run_captured
+
+GH_INSTALL_HINT = "Install it from https://cli.github.com/"
 
 
 class CodeHostError(Exception):
@@ -69,6 +71,4 @@ class GitHubCodeHost:
             return completed.stdout.strip()
         if "already exists" in completed.stderr.lower():
             return f"PR already exists for {bookmark}"
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        message = f"gh pr create failed (exit {completed.returncode})"
-        raise CodeHostError(f"{message}: {detail}" if detail else message)
+        raise CodeHostError(rejected_status_message("gh pr create", completed))
