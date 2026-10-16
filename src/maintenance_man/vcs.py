@@ -514,11 +514,10 @@ def _temporary_workspace(
         registered = True
         proof = bind(root)
         proof.new_change(revision=resolved)
-        try:
-            yield proof
-        except BaseException as exc:
-            body_error = exc
-            raise
+        yield proof
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
         diagnostics = _cleanup_proof_workspace(
             repository,

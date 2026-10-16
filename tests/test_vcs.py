@@ -6,9 +6,39 @@ import pytest
 from maintenance_man import vcs
 from maintenance_man.gradle import GradleError
 from maintenance_man.gradle_updates import gradle_evidence_workspace
+from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import VcsServices
 from tests.conftest import make_project
 from tests.fake_vcs import FakeJjState
+
+
+@pytest.mark.parametrize("failing_step", ["add_workspace", "new_change"])
+def test_proof_setup_error_survives_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_step: str
+) -> None:
+    state = FakeJjState()
+    repo = state.seed_repository(tmp_path / "source", files={"dep.txt": "1"})
+    container = tmp_path / "allocated-proof"
+    original = RevisionError("setup failed")
+    state.fail(failing_step, error=original)
+
+    def allocate(*, prefix: str) -> str:
+        container.mkdir()
+        return str(container)
+
+    def remove_failed(path: Path) -> None:
+        message = "busy"
+        raise OSError(message)
+
+    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
+    monkeypatch.setattr(vcs.shutil, "rmtree", remove_failed)
+    with (
+        pytest.raises(RevisionError) as caught,
+        vcs._temporary_workspace(repo, revision="main", bind=state.repository),
+    ):
+        pytest.fail("setup must not reach the body")
+    assert caught.value is original
+    assert any("busy" in note for note in caught.value.__notes__)
 
 
 def _completed(
