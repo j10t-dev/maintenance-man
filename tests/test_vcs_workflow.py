@@ -16,7 +16,7 @@ from maintenance_man.vcs_workflow import (
     remove_workspace,
     sync_main,
 )
-from tests.conftest import MANAGED, RepositoryCase
+from tests.conftest import MANAGED, RepositoryCase, _real_case
 from tests.fake_vcs import FakeCodeHost
 
 
@@ -304,7 +304,7 @@ def test_sync_post_push_failure_prevents_refresh(
         )
 
 
-def test_sync_refuses_divergent_main_without_refresh(
+def test_given_local_and_remote_main_diverge_when_syncing_then_repository_is_preserved(
     repository_case: RepositoryCase,
 ) -> None:
     c = repository_case
@@ -338,17 +338,41 @@ def test_sync_refuses_divergent_main_without_refresh(
         )
 
 
-def test_sync_refuses_preexisting_conflicted_main_without_refresh(
+@pytest.mark.integration
+def test_given_descendant_main_when_syncing_then_unconflicted_bookmark_reaches_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c = _real_case(tmp_path, monkeypatch)
+    base = c.repo.resolve_revision(revision="main")
+    c.repo.new_change(revision=base)
+    c.write_file("dep.txt", "descendant\n")
+    c.describe("descendant")
+    descendant = c.repo.resolve_revision(revision="@")
+    c.conflict_bookmark("main", base, descendant)
+    push_attempted = RevisionError("push attempted")
+    _fail_repository_method(monkeypatch, c, "push_bookmark", push_attempted)
+
+    assert c.repo.bookmark_conflicted(bookmark="main") is False
+    with pytest.raises(RevisionError) as caught:
+        sync_main(repo=c.repo)
+    assert caught.value is push_attempted
+
+
+def test_given_sibling_main_targets_when_syncing_then_conflict_is_refused(
     repository_case: RepositoryCase,
 ) -> None:
     c = repository_case
     repo = c.repo
     base = repo.resolve_revision(revision="main")
     repo.new_change(revision=base)
-    c.write_file("dep.txt", "sibling\n")
-    c.describe("sibling")
-    sibling = repo.resolve_revision(revision="@")
-    c.conflict_bookmark("main", base, sibling)
+    c.write_file("dep.txt", "left sibling\n")
+    c.describe("left sibling")
+    left = repo.resolve_revision(revision="@")
+    repo.new_change(revision=base)
+    c.write_file("dep.txt", "right sibling\n")
+    c.describe("right sibling")
+    right = repo.resolve_revision(revision="@")
+    c.conflict_bookmark("main", left, right)
 
     with pytest.raises(RevisionError, match="conflicted"):
         sync_main(repo=repo)

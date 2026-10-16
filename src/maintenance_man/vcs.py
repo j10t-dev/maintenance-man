@@ -195,11 +195,26 @@ class JjRepository:
         return frozenset(self._list_bookmarks())
 
     def bookmark_conflicted(self, *, bookmark: str) -> bool:
-        names = self._list_bookmarks(bookmark)
-        if not names:
+        result = self._run(
+            [
+                "--ignore-working-copy",
+                "--color",
+                "never",
+                "bookmark",
+                "list",
+                "-T",
+                'if(!remote && present, conflict ++ "\\n", "")',
+                bookmark,
+            ]
+        )
+        states = _lines(result.stdout)
+        if not states:
             msg = f"Cannot inspect bookmark conflict for {bookmark}"
             raise RevisionError(msg)
-        return len(names) > 1
+        if states not in (["false"], ["true"]):
+            msg = f"Unexpected bookmark conflict state for {bookmark}"
+            raise RevisionError(msg)
+        return states == ["true"]
 
     def resolve_revision(self, *, revision: str, read_only: bool = False) -> str:
         prefix = ["--ignore-working-copy", "--color", "never"] if read_only else []

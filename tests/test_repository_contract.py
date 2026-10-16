@@ -41,6 +41,17 @@ def test_given_missing_main_when_resolved_then_revision_error_is_raised(
         repository_case.repo.resolve_revision(revision="main")
 
 
+def test_given_missing_bookmark_when_inspecting_conflict_then_revision_error_is_raised(
+    repository_case: RepositoryCase,
+) -> None:
+    repository_case.repo.delete_bookmark(bookmark="main")
+
+    with pytest.raises(
+        RevisionError, match="Cannot inspect bookmark conflict for main"
+    ):
+        repository_case.repo.bookmark_conflicted(bookmark="main")
+
+
 def test_given_amended_main_when_resolved_then_commit_identity_changes(
     repository_case: RepositoryCase,
 ) -> None:
@@ -339,7 +350,7 @@ def test_guarded_operations_accept_unchanged_revisions(
 
 @pytest.mark.parametrize("operation", ["promote", "reset", "push"])
 @pytest.mark.parametrize("mutation", ["base", "tip", "base-conflict", "tip-conflict"])
-def test_guarded_operations_reject_moved_or_conflicted_revisions(
+def test_given_moved_or_conflicted_revisions_when_guarding_then_operation_is_refused(
     repository_case: RepositoryCase, operation: str, mutation: str
 ):
     c = repository_case
@@ -351,6 +362,7 @@ def test_guarded_operations_reject_moved_or_conflicted_revisions(
     c.repo.set_bookmark(bookmark=MANAGED, revision=tip)
     c.repo.new_change(revision="main")
     c.write_file("dep.txt", "sibling\n")
+    c.describe("sibling")
     sibling = c.repo.resolve_revision(revision="@")
     expected = ExpectedRevisions(base=base, tip=tip)
     if mutation == "base":
@@ -358,7 +370,7 @@ def test_guarded_operations_reject_moved_or_conflicted_revisions(
     elif mutation == "tip":
         c.force_bookmark(MANAGED, base)
     elif mutation == "base-conflict":
-        c.conflict_bookmark("main", base, sibling)
+        c.conflict_bookmark("main", tip, sibling)
     else:
         c.conflict_bookmark(MANAGED, tip, sibling)
     candidates = {base, tip, sibling}
@@ -476,15 +488,21 @@ def test_push_rejects_existing_untracked_remote_without_remote_effect(
 
 
 @pytest.mark.parametrize("operation", ["promote", "reset", "push"])
-def test_guarded_postcheck_race_retains_completed_effect(
+def test_given_guarded_effect_race_when_postchecking_then_completed_effect_is_retained(
     repository_case: RepositoryCase,
     operation: str,
 ):
     c = repository_case
-    base = c.repo.resolve_revision(revision="main")
+    base_parent = c.repo.resolve_revision(revision="main")
+    c.repo.new_change(revision=base_parent)
+    c.write_file("dep.txt", "base\n")
+    c.describe("base")
+    base = c.repo.resolve_revision(revision="@")
+    c.repo.set_bookmark(bookmark="main", revision=base)
+    c.repo.new_change(revision=base)
     tip = c.commit_file("dep.txt", "tip\n", "tip")
     c.repo.set_bookmark(bookmark=MANAGED, revision=tip)
-    c.repo.new_change(revision=base)
+    c.repo.new_change(revision=base_parent)
     c.write_file("dep.txt", "sibling\n")
     c.describe("sibling")
     sibling = c.repo.resolve_revision(revision="@")
@@ -492,7 +510,9 @@ def test_guarded_postcheck_race_retains_completed_effect(
     changed_bookmark = "main" if operation in {"promote", "push"} else MANAGED
     completed_target = tip if operation == "promote" else base
     if operation == "push":
-        c.after_operation(operation, lambda: c.force_bookmark("main", sibling))
+        c.after_operation(
+            operation, lambda: c.force_bookmark(changed_bookmark, sibling)
+        )
     else:
         c.after_operation(
             operation,
