@@ -76,7 +76,8 @@ def scan_one(
 
 
 def scan_all(cfg: MmConfig, *, vcs: VcsServices, emit: Emit) -> ScanSummary:
-    summary = ScanSummary(False, False)
+    results: list[ScanResult] = []
+    had_error = False
     for name, project in cfg.projects.items():
         if not project.path.exists():
             emit(ProjectSkipped(name, SkipReason.PATH_MISSING, str(project.path)))
@@ -91,14 +92,14 @@ def scan_all(cfg: MmConfig, *, vcs: VcsServices, emit: Emit) -> ScanSummary:
             )
         except SCAN_ERRORS as exc:
             emit(OperationFailed(Operation.SCAN, name, str(exc)))
-            summary = ScanSummary(summary.has_vulns, summary.has_updates, True)
+            had_error = True
             continue
-        summary = ScanSummary(
-            summary.has_vulns or result.has_actionable_vulns,
-            summary.has_updates or result.has_updates,
-            summary.had_error,
-        )
-    return summary
+        results.append(result)
+    return ScanSummary(
+        any(result.has_actionable_vulns for result in results),
+        any(result.has_updates for result in results),
+        had_error,
+    )
 
 
 def sync_projects(

@@ -44,6 +44,109 @@ class DeployResult:
     deploy_status: Literal["pass", "fail", "skip", "unchanged", "blocked"]
 
 
+def deploy_project(
+    name: str,
+    project: ProjectConfig,
+    *,
+    healthcheck_url: str | None,
+    build: bool,
+    check: bool,
+    force: bool,
+    vcs: VcsServices,
+    emit: Emit,
+) -> DeployResult:
+    if not project.deployable:
+        emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
+        return DeployResult(name, "skip", "skip")
+    if not project.deploy_command:
+        msg = (
+            f"No deploy_command configured for {name}. "
+            f"Add deploy_command to [projects.{name}] in ~/.mm/config.toml."
+        )
+        raise WorkflowError(msg)
+
+    decision, current_id = should_deploy(
+        name,
+        project.path,
+        load_activity(paths.activity_path()),
+        force=force,
+        vcs=vcs,
+    )
+    if decision is GateDecision.SKIP_UNCHANGED:
+        emit(ProjectSkipped(name, SkipReason.UNCHANGED))
+        return DeployResult(name, "skip", "unchanged")
+    if decision is GateDecision.SKIP_BLOCKED:
+        msg = (
+            f"Could not resolve main revision for {name}; refusing to deploy "
+            "unverified state (use --force to override)."
+        )
+        raise WorkflowError(msg)
+
+    result = _run_steps(
+        name,
+        project,
+        current_id,
+        build=build,
+        healthcheck_url=healthcheck_url if check else None,
+        vcs=vcs,
+        emit=emit,
+    )
+    if result.deploy_status == "pass" and check and not healthcheck_url:
+        emit(HealthcheckUnconfigured())
+    return result
+
+
+def deploy_all(
+    cfg: MmConfig,
+    *,
+    check: bool,
+    force: bool,
+    vcs: VcsServices,
+    emit: Emit,
+) -> tuple[DeployResult, ...]:
+    activity = load_activity(paths.activity_path())
+    results: list[DeployResult] = []
+    healthcheck_url = cfg.defaults.healthcheck_url if check else None
+
+    for name, project in sorted(cfg.projects.items()):
+        if not project.deployable:
+            emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
+            continue
+        if not project.deploy_command:
+            continue
+        if not project.path.exists():
+            emit(ProjectSkipped(name, SkipReason.PATH_MISSING, str(project.path)))
+            results.append(DeployResult(name, "skip", "fail"))
+            continue
+
+        decision, current_id = should_deploy(
+            name, project.path, activity, force=force, vcs=vcs
+        )
+        if decision is GateDecision.SKIP_UNCHANGED:
+            emit(ProjectSkipped(name, SkipReason.UNCHANGED))
+            results.append(DeployResult(name, "skip", "unchanged"))
+            continue
+        if decision is GateDecision.SKIP_BLOCKED:
+            emit(ProjectSkipped(name, SkipReason.BLOCKED))
+            results.append(DeployResult(name, "skip", "blocked"))
+            continue
+
+        emit(ProjectStarted(name))
+        results.append(
+            _run_steps(
+                name,
+                project,
+                current_id,
+                build=True,
+                healthcheck_url=healthcheck_url,
+                vcs=vcs,
+                emit=emit,
+            )
+        )
+
+    return tuple(results)
+
+
 def should_deploy(
     name: str,
     project_path: Path,
@@ -167,106 +270,3 @@ def _run_steps(
         emit(HealthChecked(name, result.is_up, result.error))
 
     return DeployResult(name, build_status, "pass")
-
-
-def deploy_project(
-    name: str,
-    project: ProjectConfig,
-    *,
-    healthcheck_url: str | None,
-    build: bool,
-    check: bool,
-    force: bool,
-    vcs: VcsServices,
-    emit: Emit,
-) -> DeployResult:
-    if not project.deployable:
-        emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
-        return DeployResult(name, "skip", "skip")
-    if not project.deploy_command:
-        msg = (
-            f"No deploy_command configured for {name}. "
-            f"Add deploy_command to [projects.{name}] in ~/.mm/config.toml."
-        )
-        raise WorkflowError(msg)
-
-    decision, current_id = should_deploy(
-        name,
-        project.path,
-        load_activity(paths.activity_path()),
-        force=force,
-        vcs=vcs,
-    )
-    if decision is GateDecision.SKIP_UNCHANGED:
-        emit(ProjectSkipped(name, SkipReason.UNCHANGED))
-        return DeployResult(name, "skip", "unchanged")
-    if decision is GateDecision.SKIP_BLOCKED:
-        msg = (
-            f"Could not resolve main revision for {name}; refusing to deploy "
-            "unverified state (use --force to override)."
-        )
-        raise WorkflowError(msg)
-
-    result = _run_steps(
-        name,
-        project,
-        current_id,
-        build=build,
-        healthcheck_url=healthcheck_url if check else None,
-        vcs=vcs,
-        emit=emit,
-    )
-    if result.deploy_status == "pass" and check and not healthcheck_url:
-        emit(HealthcheckUnconfigured())
-    return result
-
-
-def deploy_all(
-    cfg: MmConfig,
-    *,
-    check: bool,
-    force: bool,
-    vcs: VcsServices,
-    emit: Emit,
-) -> tuple[DeployResult, ...]:
-    activity = load_activity(paths.activity_path())
-    results: list[DeployResult] = []
-    healthcheck_url = cfg.defaults.healthcheck_url if check else None
-
-    for name, project in sorted(cfg.projects.items()):
-        if not project.deployable:
-            emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
-            continue
-        if not project.deploy_command:
-            continue
-        if not project.path.exists():
-            emit(ProjectSkipped(name, SkipReason.PATH_MISSING, str(project.path)))
-            results.append(DeployResult(name, "skip", "fail"))
-            continue
-
-        decision, current_id = should_deploy(
-            name, project.path, activity, force=force, vcs=vcs
-        )
-        if decision is GateDecision.SKIP_UNCHANGED:
-            emit(ProjectSkipped(name, SkipReason.UNCHANGED))
-            results.append(DeployResult(name, "skip", "unchanged"))
-            continue
-        if decision is GateDecision.SKIP_BLOCKED:
-            emit(ProjectSkipped(name, SkipReason.BLOCKED))
-            results.append(DeployResult(name, "skip", "blocked"))
-            continue
-
-        emit(ProjectStarted(name))
-        results.append(
-            _run_steps(
-                name,
-                project,
-                current_id,
-                build=True,
-                healthcheck_url=healthcheck_url,
-                vcs=vcs,
-                emit=emit,
-            )
-        )
-
-    return tuple(results)

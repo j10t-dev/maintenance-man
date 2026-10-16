@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Emit,
@@ -7,12 +9,65 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import ScanResult, UpdateStatus, Workflow
 from maintenance_man.services import WorkflowError
-from maintenance_man.storage import NoScanResultsError, load_scan_results
-from maintenance_man.updater import Finding
+from maintenance_man.storage import (
+    NoScanResultsError,
+    load_scan_results,
+    save_scan_results,
+)
+from maintenance_man.updater import (
+    Finding,
+    consolidate_vulns,
+    remove_completed_findings,
+    sort_updates_by_risk,
+)
 
 
 class FlowConflictError(WorkflowError):
     """Scan-result state belongs to another workflow."""
+
+
+def load_validated_scan(
+    project: str,
+    project_config: ProjectConfig,
+    workflow: Workflow,
+    *,
+    emit: Emit,
+) -> ScanResult | None:
+    try:
+        scan_result = load_scan_results(project)
+    except NoScanResultsError:
+        emit(ProjectSkipped(project, SkipReason.NO_SCAN_RESULTS))
+        return None
+
+    _assert_supported_in_progress_state(scan_result, project)
+    _assert_no_conflicting_flow(scan_result, workflow, project)
+
+    if not scan_result.has_actionable_vulns and not scan_result.updates:
+        emit(ProjectSkipped(project, SkipReason.NOTHING_TO_DO, workflow.value))
+        return None
+    if not project_config.test_phases:
+        emit(MissingTestConfig(project))
+    return scan_result
+
+
+def ordered_findings(
+    scan_result: ScanResult, keep: Callable[[Finding], bool]
+) -> list[Finding]:
+    """Return consolidated vulns then risk-ordered updates, retaining source refs."""
+    vulns = [vuln for vuln in scan_result.vulnerabilities if keep(vuln)]
+    updates = [update for update in scan_result.updates if keep(update)]
+    return [*consolidate_vulns(vulns), *sort_updates_by_risk(updates)]
+
+
+def complete_ready_findings(
+    scan_result: ScanResult, name: str, *, flow: Workflow
+) -> None:
+    """Complete and remove a flow's ready findings, then persist the mutated scan."""
+    for finding in scan_result.findings:
+        if finding.update_status is UpdateStatus.READY and finding.flow is flow:
+            finding.update_status = UpdateStatus.COMPLETED
+    remove_completed_findings(scan_result)
+    save_scan_results(name, scan_result)
 
 
 def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:
@@ -59,27 +114,3 @@ def _assert_no_conflicting_flow(
             "abandon that flow first."
         )
         raise FlowConflictError(msg)
-
-
-def load_validated_scan(
-    project: str,
-    project_config: ProjectConfig,
-    workflow: Workflow,
-    *,
-    emit: Emit,
-) -> ScanResult | None:
-    try:
-        scan_result = load_scan_results(project)
-    except NoScanResultsError:
-        emit(ProjectSkipped(project, SkipReason.NO_SCAN_RESULTS))
-        return None
-
-    _assert_supported_in_progress_state(scan_result, project)
-    _assert_no_conflicting_flow(scan_result, workflow, project)
-
-    if not scan_result.has_actionable_vulns and not scan_result.updates:
-        emit(ProjectSkipped(project, SkipReason.NOTHING_TO_DO, workflow.value))
-        return None
-    if not project_config.test_phases:
-        emit(MissingTestConfig(project))
-    return scan_result

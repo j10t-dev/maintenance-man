@@ -48,7 +48,9 @@ def _seed_project(
 
 
 class TestResolveCandidates:
-    def test_candidates_exclude_other_flow_progress(self) -> None:
+    def test_given_other_flow_when_resolve_runs_then_scan_is_rejected_unchanged(
+        self, tmp_path: Path
+    ) -> None:
         scan = make_scan_result(
             vulns=[
                 make_vuln(pkg_name="pkg-a", vuln_id="CVE-1"),
@@ -75,15 +77,24 @@ class TestResolveCandidates:
             ],
         )
 
-        candidates = resolve_service._ordered_resolve_candidates(scan)
+        state, project = _seed_project(tmp_path, scan)
+        saved_before = load_scan_results("api")
 
-        assert {finding.pkg_name for finding in candidates} == {
-            "pkg-a",
-            "pkg-b",
-            "pkg-e",
-        }
+        with pytest.raises(resolve_service.flows.FlowConflictError):
+            resolve_service.resolve_project(
+                "api",
+                project,
+                minimum_age_days=7,
+                continue_=False,
+                vcs=state.services(),
+                emit=RecordingEmit(),
+            )
 
-    def test_candidates_include_update_owned_test_failures(self) -> None:
+        assert load_scan_results("api") == saved_before
+
+    def test_given_claimable_failure_when_resolve_runs_then_it_is_completed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         scan = make_scan_result(
             vulns=[],
             updates=[
@@ -96,67 +107,115 @@ class TestResolveCandidates:
             ],
         )
 
-        assert [
-            finding.pkg_name
-            for finding in resolve_service._ordered_resolve_candidates(scan)
-        ] == ["pkg-a"]
+        state, project = _seed_project(tmp_path, scan)
+        processed: list[tuple[str, ...]] = []
+        processor = FakeFindingProcessor({"pkg-a": (True, None)})
 
-    def test_failed_findings_only_include_resolve_failures(self) -> None:
+        def process(findings, project_config, **kwargs):
+            processed.append(tuple(finding.pkg_name for finding in findings))
+            return processor(findings, project_config, **kwargs)
+
+        monkeypatch.setattr(resolve_service, "process_findings", process)
+
+        outcome = resolve_service.resolve_project(
+            "api",
+            project,
+            minimum_age_days=7,
+            continue_=False,
+            vcs=state.services(),
+            emit=RecordingEmit(),
+        )
+
+        assert outcome is Outcome.SUCCEEDED
+        assert processed == [("pkg-a",)]
+        assert load_scan_results("api").findings == ()
+
+    def test_given_mixed_failures_when_continuing_then_only_resolve_failure_is_retested(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scan = make_scan_result(
+            vulns=[
+                make_vuln(
+                    pkg_name="some-pkg",
+                    update_status=UpdateStatus.FAILED,
+                    flow=Workflow.RESOLVE,
+                    failed_phase="apply",
+                )
+            ],
+            updates=[
+                make_update(
+                    pkg_name="pkg-a",
+                    update_status=UpdateStatus.FAILED,
+                    flow=Workflow.UPDATE,
+                    failed_phase="unit",
+                ),
+            ],
+        )
+        state, project = _seed_project(tmp_path, scan)
+        state.services().repository(project.path).set_bookmark(
+            bookmark=_BOOKMARK, revision="main"
+        )
+        monkeypatch.setattr(
+            resolve_service, "run_test_phases", lambda *_args, **_kwargs: None
+        )
+        processed: list[tuple[str, ...]] = []
+        processor = FakeFindingProcessor({"pkg-a": (True, None)})
+
+        def process(findings, project_config, **kwargs):
+            processed.append(tuple(finding.pkg_name for finding in findings))
+            return processor(findings, project_config, **kwargs)
+
+        monkeypatch.setattr(resolve_service, "process_findings", process)
+        emit = RecordingEmit()
+
+        outcome = resolve_service.resolve_project(
+            "api",
+            project,
+            minimum_age_days=7,
+            continue_=True,
+            vcs=state.services(),
+            emit=emit,
+        )
+
+        assert outcome is Outcome.SUCCEEDED
+        assert emit.of_type(FindingPassed) == [FindingPassed("some-pkg", False)]
+        assert processed == [("pkg-a",)]
+        assert load_scan_results("api").findings == ()
+
+    def test_given_ready_finding_when_resolve_runs_then_it_is_submitted_and_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         scan = make_scan_result(
             vulns=[],
             updates=[
                 make_update(
-                    pkg_name="keep",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.RESOLVE,
-                ),
-                make_update(
-                    pkg_name="skip-flow",
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.UPDATE,
-                ),
-                make_update(
-                    pkg_name="skip-status",
+                    pkg_name="pkg-a",
                     update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                ),
-                make_update(pkg_name="skip-none"),
-            ],
-        )
-
-        assert [
-            finding.pkg_name
-            for finding in resolve_service._ordered_failed_findings(scan)
-        ] == ["keep"]
-
-    def test_ready_findings_only_include_requested_flow(self) -> None:
-        scan = make_scan_result(
-            vulns=[],
-            updates=[
-                make_update(
-                    pkg_name="keep",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                ),
-                make_update(
-                    pkg_name="skip-update-ready",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.UPDATE,
-                ),
-                make_update(
-                    pkg_name="skip-failed",
-                    update_status=UpdateStatus.FAILED,
                     flow=Workflow.RESOLVE,
                 ),
             ],
         )
+        state, project = _seed_project(tmp_path, scan)
+        state.services().repository(project.path).set_bookmark(
+            bookmark=_BOOKMARK, revision="main"
+        )
+        monkeypatch.setattr(
+            resolve_service, "process_findings", FakeFindingProcessor({})
+        )
+        emit = RecordingEmit()
 
-        assert [
-            finding.pkg_name
-            for finding in resolve_service._ordered_ready_findings(
-                scan, flow=Workflow.RESOLVE
-            )
-        ] == ["keep"]
+        outcome = resolve_service.resolve_project(
+            "api",
+            project,
+            minimum_age_days=7,
+            continue_=False,
+            vcs=state.services(),
+            emit=emit,
+        )
+
+        assert outcome is Outcome.SUCCEEDED
+        assert emit.events[-1] == PullRequestOutput("PR #1")
+        assert load_scan_results("api").findings == ()
 
 
 def test_fresh_resolve_submits_and_removes_completed_findings(

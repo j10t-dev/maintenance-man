@@ -30,15 +30,9 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
-from maintenance_man.services import WorkflowError
-from maintenance_man.services.flows import FlowConflictError, load_validated_scan
-from maintenance_man.storage import save_scan_results
-from maintenance_man.updater import (
-    consolidate_vulns,
-    process_findings,
-    remove_completed_findings,
-    sort_updates_by_risk,
-)
+from maintenance_man.services import WorkflowError, flows
+from maintenance_man.services.flows import FlowConflictError
+from maintenance_man.updater import Finding, process_findings
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import (
     VcsServices,
@@ -86,169 +80,6 @@ class BatchUpdate:
         return Outcome.FAILED if failed else Outcome.SUCCEEDED
 
 
-def resolve_update_targets(
-    cfg: MmConfig,
-    names: Sequence[str],
-    *,
-    negate: bool,
-) -> tuple[Literal["single", "batch"], list[str]]:
-    ordered = config_module.validate_project_names(cfg, names)
-    if negate:
-        excluded = set(ordered)
-        return "batch", [name for name in sorted(cfg.projects) if name not in excluded]
-    if not ordered:
-        return "batch", sorted(cfg.projects)
-    if len(ordered) == 1:
-        return "single", ordered
-    return "batch", ordered
-
-
-def _has_update_progress(scan_result: ScanResult) -> bool:
-    return any(
-        finding.update_status in (UpdateStatus.READY, UpdateStatus.FAILED)
-        and finding.flow is Workflow.UPDATE
-        for finding in scan_result.findings
-    )
-
-
-def _has_update_failures(scan_result: ScanResult) -> bool:
-    return any(
-        finding.update_status is UpdateStatus.FAILED and finding.flow is Workflow.UPDATE
-        for finding in scan_result.findings
-    )
-
-
-def _enter_update_workspace(
-    project: str,
-    project_config: ProjectConfig,
-    scan_result: ScanResult,
-    *,
-    vcs: VcsServices,
-) -> Path:
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    repo = vcs.repository(project_config.path)
-    remove_workspace(repo=repo, project=project)
-
-    if _has_update_progress(scan_result):
-        if not repo.bookmark_exists(bookmark=bookmark):
-            msg = (
-                f"update bookmark '{bookmark}' is missing but in-progress "
-                "state exists — rescan required"
-            )
-            raise UpdateSetupError(msg)
-        workspace_revision = bookmark
-    else:
-        prune_stale_bookmarks(repo=repo, host=vcs.code_host(project_config.path))
-        ensure_main_bookmark(repo=repo)
-        if repo.bookmark_exists(bookmark=bookmark):
-            repo.delete_bookmark(bookmark=bookmark)
-        repo.create_bookmark(bookmark=bookmark, revision="main")
-        workspace_revision = "main"
-
-    try:
-        workspace_path = create_workspace(
-            repo=repo, project=project, revision=workspace_revision
-        )
-        vcs.repository(workspace_path).new_change(revision=bookmark)
-    except RevisionError:
-        remove_workspace(repo=repo, project=project)
-        raise
-    return workspace_path
-
-
-def _selectable_vulns(vulns: list[VulnFinding]) -> list[VulnFinding]:
-    return [
-        vuln
-        for vuln in vulns
-        if vuln.update_status is None
-        or (vuln.update_status is UpdateStatus.FAILED and vuln.flow is Workflow.UPDATE)
-    ]
-
-
-def _selectable_updates(updates: list[UpdateFinding]) -> list[UpdateFinding]:
-    return [
-        update
-        for update in updates
-        if update.update_status is None
-        or (
-            update.update_status is UpdateStatus.FAILED
-            and update.flow is Workflow.UPDATE
-        )
-    ]
-
-
-def _finalise(
-    project_path: Path,
-    scan_result: ScanResult,
-    name: str,
-    *,
-    vcs: VcsServices,
-    emit: Emit,
-) -> bool:
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    repo = vcs.repository(project_path)
-    try:
-        repo.promote_bookmark_to_main(bookmark=bookmark)
-    except RevisionError as exc:
-        emit(OperationFailed(Operation.PROMOTE, name, str(exc)))
-        return False
-    try:
-        refresh_working_copy_from_main(repo=repo)
-    except RevisionError as exc:
-        emit(OperationFailed(Operation.REFRESH, name, str(exc)))
-        return False
-
-    for finding in scan_result.findings:
-        if (
-            finding.update_status is UpdateStatus.READY
-            and finding.flow is Workflow.UPDATE
-        ):
-            finding.update_status = UpdateStatus.COMPLETED
-    remove_completed_findings(scan_result)
-    save_scan_results(name, scan_result)
-    emit(Promoted(bookmark))
-    return True
-
-
-def _process_selected(
-    scan_result: ScanResult,
-    work_config: ProjectConfig,
-    *,
-    choose: FindingChooser | None,
-    vcs: VcsServices,
-    emit: Emit,
-) -> tuple[UpdateResult, ...]:
-    selectable_vulns = _selectable_vulns(
-        [vuln for vuln in scan_result.vulnerabilities if vuln.actionable]
-    )
-    selectable_updates = _selectable_updates(scan_result.updates)
-    if choose is not None and (selectable_vulns or selectable_updates):
-        selected_vulns, selected_updates = choose(selectable_vulns, selectable_updates)
-    else:
-        selected_vulns, selected_updates = selectable_vulns, selectable_updates
-
-    emit(ProcessingStarted(len(selected_vulns), len(selected_updates)))
-    findings = [
-        *consolidate_vulns(selected_vulns),
-        *sort_updates_by_risk(selected_updates),
-    ]
-    results = (
-        process_findings(
-            findings,
-            work_config,
-            flow=Workflow.UPDATE,
-            scan_result=scan_result,
-            vcs=vcs,
-            emit=emit,
-        )
-        if findings
-        else []
-    )
-    result_tuple = tuple(results)
-    emit(FindingsProcessed(result_tuple))
-    return result_tuple
-
-
 def update_project(
     name: str,
     project: ProjectConfig,
@@ -271,13 +102,11 @@ def update_project(
         )
         return ProjectUpdate(name, UpdateRoute.GRADLE, outcome, ())
 
-    scan_result = load_validated_scan(name, project, Workflow.UPDATE, emit=emit)
+    scan_result = flows.load_validated_scan(name, project, Workflow.UPDATE, emit=emit)
     if scan_result is None:
         return ProjectUpdate(name, UpdateRoute.FINDINGS, Outcome.SUCCEEDED, ())
     try:
         workspace = _enter_update_workspace(name, project, scan_result, vcs=vcs)
-    except UpdateSetupError:
-        raise
     except (RevisionError, CodeHostError) as exc:
         raise UpdateSetupError(str(exc)) from exc
 
@@ -295,7 +124,7 @@ def update_project(
         )
         if (
             not any(not result.passed for result in results)
-            and not _has_update_failures(scan_result)
+            and not _has_update_state(scan_result, (UpdateStatus.FAILED,))
             and not scan_result.blocked_findings
         ):
             finalised = _finalise(project.path, scan_result, name, vcs=vcs, emit=emit)
@@ -353,3 +182,147 @@ def update_projects(
         else:
             projects.append(result)
     return BatchUpdate(tuple(projects), had_errors)
+
+
+def resolve_update_targets(
+    cfg: MmConfig,
+    names: Sequence[str],
+    *,
+    negate: bool,
+) -> tuple[Literal["single", "batch"], list[str]]:
+    ordered = config_module.validate_project_names(cfg, names)
+    if negate:
+        excluded = set(ordered)
+        return "batch", [name for name in sorted(cfg.projects) if name not in excluded]
+    if not ordered:
+        return "batch", sorted(cfg.projects)
+    if len(ordered) == 1:
+        return "single", ordered
+    return "batch", ordered
+
+
+def _has_update_state(
+    scan_result: ScanResult, statuses: tuple[UpdateStatus, ...]
+) -> bool:
+    return any(
+        finding.update_status in statuses and finding.flow is Workflow.UPDATE
+        for finding in scan_result.findings
+    )
+
+
+def _enter_update_workspace(
+    project: str,
+    project_config: ProjectConfig,
+    scan_result: ScanResult,
+    *,
+    vcs: VcsServices,
+) -> Path:
+    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
+    repo = vcs.repository(project_config.path)
+    remove_workspace(repo=repo, project=project)
+
+    if _has_update_state(scan_result, (UpdateStatus.READY, UpdateStatus.FAILED)):
+        if not repo.bookmark_exists(bookmark=bookmark):
+            msg = (
+                f"update bookmark '{bookmark}' is missing but in-progress "
+                "state exists — rescan required"
+            )
+            raise UpdateSetupError(msg)
+        workspace_revision = bookmark
+    else:
+        prune_stale_bookmarks(repo=repo, host=vcs.code_host(project_config.path))
+        ensure_main_bookmark(repo=repo)
+        if repo.bookmark_exists(bookmark=bookmark):
+            repo.delete_bookmark(bookmark=bookmark)
+        repo.create_bookmark(bookmark=bookmark, revision="main")
+        workspace_revision = "main"
+
+    try:
+        workspace_path = create_workspace(
+            repo=repo, project=project, revision=workspace_revision
+        )
+        vcs.repository(workspace_path).new_change(revision=bookmark)
+    except RevisionError:
+        remove_workspace(repo=repo, project=project)
+        raise
+    return workspace_path
+
+
+def _is_selectable(finding: Finding) -> bool:
+    return (not isinstance(finding, VulnFinding) or finding.actionable) and (
+        finding.update_status is None
+        or (
+            finding.update_status is UpdateStatus.FAILED
+            and finding.flow is Workflow.UPDATE
+        )
+    )
+
+
+def _finalise(
+    project_path: Path,
+    scan_result: ScanResult,
+    name: str,
+    *,
+    vcs: VcsServices,
+    emit: Emit,
+) -> bool:
+    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
+    repo = vcs.repository(project_path)
+    try:
+        repo.promote_bookmark_to_main(bookmark=bookmark)
+    except RevisionError as exc:
+        emit(OperationFailed(Operation.PROMOTE, name, str(exc)))
+        return False
+    try:
+        refresh_working_copy_from_main(repo=repo)
+    except RevisionError as exc:
+        emit(OperationFailed(Operation.REFRESH, name, str(exc)))
+        return False
+
+    flows.complete_ready_findings(scan_result, name, flow=Workflow.UPDATE)
+    emit(Promoted(bookmark))
+    return True
+
+
+def _process_selected(
+    scan_result: ScanResult,
+    work_config: ProjectConfig,
+    *,
+    choose: FindingChooser | None,
+    vcs: VcsServices,
+    emit: Emit,
+) -> tuple[UpdateResult, ...]:
+    selectable_vulns = [
+        vuln for vuln in scan_result.vulnerabilities if _is_selectable(vuln)
+    ]
+    selectable_updates = [
+        update for update in scan_result.updates if _is_selectable(update)
+    ]
+    if choose is not None and (selectable_vulns or selectable_updates):
+        selected_vulns, selected_updates = choose(selectable_vulns, selectable_updates)
+    else:
+        selected_vulns, selected_updates = selectable_vulns, selectable_updates
+
+    emit(ProcessingStarted(len(selected_vulns), len(selected_updates)))
+    selected = scan_result.model_copy(
+        update={
+            "vulnerabilities": selected_vulns,
+            "updates": selected_updates,
+        }
+    )
+    findings = flows.ordered_findings(selected, lambda _finding: True)
+    results = (
+        process_findings(
+            findings,
+            work_config,
+            flow=Workflow.UPDATE,
+            scan_result=scan_result,
+            vcs=vcs,
+            emit=emit,
+        )
+        if findings
+        else []
+    )
+    result_tuple = tuple(results)
+    emit(FindingsProcessed(result_tuple))
+    return result_tuple
