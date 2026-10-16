@@ -880,7 +880,8 @@ def test_publication_exact_central_timestamp(tmp_path):
     import json
 
     module = ModuleId(group="org.example", artifact="lib", version="2.0")
-    timestamp = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000)
+    first_timestamp = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000)
+    latest_timestamp = int(datetime(2026, 9, 3, tzinfo=UTC).timestamp() * 1000)
     calls = []
 
     def transport(url, repository, suffix, count):
@@ -897,8 +898,15 @@ def test_publication_exact_central_timestamp(tmp_path):
                                 "g": "org.example",
                                 "a": "lib",
                                 "v": "2.0",
-                                "timestamp": timestamp,
-                            }
+                                "timestamp": first_timestamp,
+                                "Extra": 1,
+                            },
+                            {
+                                "g": "org.example",
+                                "a": "lib",
+                                "v": "2.0",
+                                "timestamp": latest_timestamp,
+                            },
                         ]
                     }
                 }
@@ -914,8 +922,49 @@ def test_publication_exact_central_timestamp(tmp_path):
             context,
         )
         assert result.facts[0].method == "central_timestamp"
-        assert result.timestamp == datetime(2026, 9, 1, tzinfo=UTC)
+        assert result.timestamp == datetime(2026, 9, 3, tzinfo=UTC)
         assert len(calls) == 2
+
+
+@pytest.mark.parametrize("timestamp", [True, "1", 0])
+def test_given_invalid_central_timestamp_when_looked_up_then_failure_is_contained(
+    tmp_path, timestamp
+):
+    module = ModuleId(group="org.example", artifact="lib", version="2.0")
+
+    def transport(url, repository, suffix, count):
+        count()
+        if suffix:
+            return _pom(module), {}, url
+        return (
+            json.dumps(
+                {
+                    "response": {
+                        "docs": [
+                            {
+                                "g": "org.example",
+                                "a": "lib",
+                                "v": "2.0",
+                                "timestamp": timestamp,
+                            }
+                        ]
+                    }
+                }
+            ).encode(),
+            {},
+            url,
+        )
+
+    with PublicationLookupContext(tmp_path, transport, lambda: _PUB_NOW) as context:
+        result = lookup_gradle_publication(
+            PublicationRequest(
+                module=module, repositories=("central",), routing_supported=True
+            ),
+            context,
+        )
+
+    assert isinstance(result, AgeBlock)
+    assert "invalid Central timestamp" in result.reason
 
 
 def test_publication_central_timestamp_overflow_withholds(tmp_path):
@@ -1650,11 +1699,16 @@ def _registry_path(cache, registry, package, version):
 
 
 def test_pypi_lookup_uses_exact_url_and_earliest_upload(tmp_path):
-    body = _pypi_body(
-        name="requests",
-        version="2.31.0",
-        uploads=("2025-12-31T10:00:00Z", "2025-12-30T08:00:00Z"),
-    )
+    body = json.dumps(
+        {
+            "info": {"name": "requests", "version": "2.31.0", "Extra": 1},
+            "urls": [
+                {"upload_time_iso_8601": "2026-09-03T00:00:00Z", "Extra": 1},
+                {"upload_time_iso_8601": "2026-09-01T00:00:00Z"},
+            ],
+            "Extra": 1,
+        }
+    ).encode()
     context, calls = _pypi_context(tmp_path, body)
     with context:
         fact = context.submit_registry("pypi", "requests", "2.31.0", tmp_path).result()
@@ -1669,7 +1723,7 @@ def test_pypi_lookup_uses_exact_url_and_earliest_upload(tmp_path):
         registry="pypi",
         package="requests",
         version="2.31.0",
-        timestamp=datetime(2025, 12, 30, 8, tzinfo=UTC),
+        timestamp=datetime(2026, 9, 1, tzinfo=UTC),
         checked_at=_PUB_NOW,
     )
     assert _registry_path(tmp_path, "pypi", "requests", "2.31.0").is_file()
@@ -1721,6 +1775,7 @@ def test_pypi_absent_release_is_unknown(tmp_path):
         (_pypi_body(version="2.0"), "PyPI identity mismatch"),
         (_pypi_body(version="not a version"), "publication lookup failed"),
         (_pypi_body(uploads=()), "PyPI upload time missing"),
+        (_pypi_body(uploads=(None, None)), "PyPI upload time missing"),
         (_pypi_body(uploads=("2026-09-19T00:00:00Z",)), "future publication timestamp"),
         (_pypi_body(uploads=(1,)), "invalid registry timestamp"),
         (_pypi_body(uploads=("soon",)), "publication lookup failed"),

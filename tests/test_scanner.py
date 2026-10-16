@@ -29,9 +29,11 @@ from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
     ScanResult,
+    SecretFinding,
     SemverTier,
     Severity,
     UpdateFinding,
+    VulnFinding,
 )
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.package_managers import PACKAGE_MANAGERS
@@ -150,6 +152,34 @@ def test_scanner_execution_failure_is_a_scan_error(
     monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
     with pytest.raises(ScanError, match=match):
         scan(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"Class": "secret", "Target": None, "Secrets": []},
+        {"Class": "secret", "Target": "src/settings.env", "Secrets": 42},
+        {
+            "Class": "secret",
+            "Target": "src/settings.env",
+            "Secrets": [{"RuleID": False}],
+        },
+    ],
+    ids=["null-target", "non-list-secrets", "non-string-rule-id"],
+)
+def test_given_malformed_consumed_secret_fields_when_scanned_then_scan_error(
+    tmp_path, monkeypatch, result
+):
+    monkeypatch.setattr(scanner, "require_tool", lambda *args: None)
+    monkeypatch.setattr(
+        "maintenance_man.process.subprocess.run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 0, json.dumps({"Results": [result]}), ""
+        ),
+    )
+
+    with pytest.raises(ScanError, match="Trivy"):
+        scanner._run_trivy_scan(tmp_path, scan_secrets=True)
 
 
 def test_stale_comparison_context_is_a_gradle_error(gradle_project, monkeypatch):
@@ -447,11 +477,11 @@ class TestUvNativeScan:
                     "Results": [
                         {
                             "Class": "secret",
-                            "Target": "creds/example.json",
+                            "Target": "src/settings.env",
                             "Secrets": [
                                 {
-                                    "RuleID": "secret-rule",
-                                    "Title": "Example secret",
+                                    "RuleID": "key",
+                                    "Title": "Token",
                                     "Severity": "HIGH",
                                 }
                             ],
@@ -474,8 +504,14 @@ class TestUvNativeScan:
             result = scan_project("test-proj", project)
 
         assert result.vulnerabilities == []
-        assert len(result.secrets) == 1
-        assert result.secrets[0].file == "creds/example.json"
+        assert result.secrets == [
+            SecretFinding(
+                file="src/settings.env",
+                rule_id="key",
+                title="Token",
+                severity=Severity.HIGH,
+            )
+        ]
         assert run.call_args_list[0].args[0] == ["uv", "audit", "--locked"]
         assert run.call_args_list[1].args[0][4:6] == ["--scanners", "secret"]
 
@@ -1274,6 +1310,8 @@ def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
     "result",
     [
         {"Class": False},
+        {"Class": None, "Target": "x", "Secrets": []},
+        {"Class": False, "Target": "x", "Secrets": []},
         {"Class": "lang-pkgs", "Vulnerabilities": ""},
         {"Class": "lang-pkgs", "Vulnerabilities": {}},
         {"Class": "lang-pkgs", "Vulnerabilities": [None]},
@@ -1293,7 +1331,26 @@ def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
         {"Results": []},
         {"Results": [{"Class": "lang-pkgs"}]},
         {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": None}]},
-        {"Results": [{"Class": "os-pkgs", "Vulnerabilities": [{"PkgName": 3}]}]},
+        {
+            "Results": [
+                {
+                    "Class": "os-pkgs",
+                    "Target": None,
+                    "Secrets": 42,
+                    "Vulnerabilities": [{"PkgName": 3}],
+                }
+            ]
+        },
+        {
+            "Results": [
+                {
+                    "Class": "secret",
+                    "Target": None,
+                    "Secrets": 42,
+                    "Vulnerabilities": None,
+                }
+            ]
+        },
     ],
 )
 def test_gradle_trivy_absent_optional_or_null_vulnerabilities_is_clean(payload):
@@ -1321,6 +1378,71 @@ def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semanti
     assert findings[0].severity == Severity.UNKNOWN
     assert findings[0].published_date is None
     assert findings[0].fixed_version is None
+
+
+@pytest.mark.parametrize("extra_fields", [{}, {"Extra": 1}])
+def test_given_vendor_fields_when_trivy_parsed_then_finding_unchanged(
+    extra_fields,
+):
+    from maintenance_man.scanner import _parse_gradle_trivy_output
+
+    row = {
+        "VulnerabilityID": "CVE-example",
+        "PkgName": "org.example:library",
+        "InstalledVersion": "1",
+        **extra_fields,
+    }
+
+    findings = _parse_gradle_trivy_output(
+        json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
+    )
+
+    assert findings == [
+        VulnFinding(
+            vuln_id="CVE-example",
+            pkg_name="org.example:library",
+            installed_version="1",
+            severity=Severity.UNKNOWN,
+            title="",
+            description="",
+            status="unknown",
+        )
+    ]
+
+
+def test_given_language_metadata_when_trivy_parsed_then_vulnerability_retained():
+    from maintenance_man.scanner import _parse_gradle_trivy_output
+
+    payload = {
+        "Results": [
+            {
+                "Class": "lang-pkgs",
+                "Target": None,
+                "Secrets": 42,
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": "CVE-example",
+                        "PkgName": "org.example:library",
+                        "InstalledVersion": "1",
+                    }
+                ],
+            }
+        ]
+    }
+
+    findings = _parse_gradle_trivy_output(json.dumps(payload))
+
+    assert findings == [
+        VulnFinding(
+            vuln_id="CVE-example",
+            pkg_name="org.example:library",
+            installed_version="1",
+            severity=Severity.UNKNOWN,
+            title="",
+            description="",
+            status="unknown",
+        )
+    ]
 
 
 def test_scan_gradle_incomplete_resolution_raises_before_binding_or_trivy(

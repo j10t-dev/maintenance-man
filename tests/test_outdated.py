@@ -281,6 +281,28 @@ class TestUvOutdated:
         with pytest.raises(OutdatedCheckError, match="Unexpected uv output"):
             uv_outdated(ProjectConfig(path=tmp_path, package_manager="uv"))
 
+    def test_given_empty_latest_version_when_uv_outdated_runs_then_row_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: {"a"}
+        )
+        monkeypatch.setattr(
+            "maintenance_man.process.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                cmd,
+                0,
+                '[{"name":"a","version":"1.0","latest_version":"","Extra":1}]'
+                if cmd[1] == "pip"
+                else "",
+                "",
+            ),
+        )
+
+        updates = uv_outdated(ProjectConfig(path=tmp_path, package_manager="uv"))
+
+        assert updates == []
+
     def test_excludes_transitive_deps(self, tmp_path):
         """uv_outdated should only return direct dependencies from pyproject.toml."""
         pyproject = tmp_path / "pyproject.toml"

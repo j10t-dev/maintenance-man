@@ -1,15 +1,23 @@
 import contextlib
 import hashlib
-import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeGuard, assert_never
+from typing import Annotated, Literal, assert_never
 
-from pydantic import ValidationError
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    StrictStr,
+    ValidationError,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+)
 
 from maintenance_man import paths
 from maintenance_man.clock import Clock, utc_now
@@ -193,78 +201,111 @@ def scan_gradle(
         return findings, outcome
 
 
-def _is_trivy_object(value: object) -> TypeGuard[dict[str, object]]:
-    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
-
-
-def _validate_gradle_trivy_vulnerability(
-    row: object, label: str, *, consumed: bool
-) -> None:
-    if not _is_trivy_object(row):
-        msg = f"Malformed {label}: expected an object"
-        raise ScanError(msg)
-    if not consumed:
-        return
-    for field in ("VulnerabilityID", "PkgName", "InstalledVersion"):
-        if not isinstance(row.get(field), str) or not row[field]:
-            msg = f"Malformed {label}.{field}: expected a nonempty string"
-            raise ScanError(msg)
-    for field in ("Severity", "Title", "Description", "Status"):
-        if field in row and not isinstance(row[field], str):
-            msg = f"Malformed {label}.{field}: expected a string"
-            raise ScanError(msg)
-    for field in ("FixedVersion", "PrimaryURL", "PublishedDate"):
-        if field in row and row[field] is not None and not isinstance(row[field], str):
-            msg = f"Malformed {label}.{field}: expected a string or null"
-            raise ScanError(msg)
-
-
-def _validate_gradle_trivy_result(result: object, index: int) -> dict[str, object]:
-    label = f"Trivy SBOM Results[{index}]"
-    if not _is_trivy_object(result):
-        msg = f"Malformed {label}: expected an object"
-        raise ScanError(msg)
-    if "Class" in result and not isinstance(result["Class"], str):
-        msg = f"Malformed {label}.Class: expected a string"
-        raise ScanError(msg)
-    vulnerabilities = result.get("Vulnerabilities")
-    if vulnerabilities is None:
-        return result
-    if not isinstance(vulnerabilities, list):
-        msg = f"Malformed {label}.Vulnerabilities: expected an array"
-        raise ScanError(msg)
-    for row_index, row in enumerate(vulnerabilities):
-        _validate_gradle_trivy_vulnerability(
-            row,
-            f"{label}.Vulnerabilities[{row_index}]",
-            consumed=result.get("Class") == "lang-pkgs",
-        )
-    return result
-
-
 def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
-    """Validate consumed SBOM response fields before using the common parser."""
+    """Parse consumed SBOM response fields and return vulnerability findings."""
+    response = _parse_trivy_response(payload, "Trivy SBOM", consume_secrets=False)
     try:
-        output: object = json.loads(payload)
-    except json.JSONDecodeError as e:
-        msg = f"Failed to parse Trivy SBOM output: {e}"
-        raise ScanError(msg) from e
-    if not _is_trivy_object(output):
-        msg = "Malformed Trivy SBOM output: expected an object"
-        raise ScanError(msg)
-    results = output.get("Results", [])
-    if not isinstance(results, list):
-        msg = "Malformed Trivy SBOM Results: expected an array"
-        raise ScanError(msg)
-    validated_results = [
-        _validate_gradle_trivy_result(result, index)
-        for index, result in enumerate(results)
-    ]
-    try:
-        return _parse_vulns(validated_results)
+        return _parse_vulns(response.results)
     except ValidationError as e:
         msg = f"Malformed Trivy SBOM vulnerability fields: {e}"
         raise ScanError(msg) from e
+
+
+def _parse_trivy_response(
+    payload: str, label: str, *, consume_secrets: bool
+) -> _TrivyResponse:
+    try:
+        return _TrivyResponse.model_validate_json(
+            payload, context={"consume_secrets": consume_secrets}
+        )
+    except ValidationError as e:
+        msg = f"Malformed {label} output: {e}"
+        raise ScanError(msg) from e
+
+
+_NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
+
+
+class _TrivyVulnerability(BaseModel):
+    vulnerability_id: _NonEmptyString = Field(alias="VulnerabilityID")
+    pkg_name: _NonEmptyString = Field(alias="PkgName")
+    installed_version: _NonEmptyString = Field(alias="InstalledVersion")
+    severity: StrictStr = Field("UNKNOWN", alias="Severity")
+    title: StrictStr = Field("", alias="Title")
+    description: StrictStr = Field("", alias="Description")
+    status: StrictStr = Field("unknown", alias="Status")
+    fixed_version: StrictStr | None = Field(None, alias="FixedVersion")
+    primary_url: StrictStr | None = Field(None, alias="PrimaryURL")
+    published_date: StrictStr | None = Field(None, alias="PublishedDate")
+
+
+class _TrivySecret(BaseModel):
+    rule_id: StrictStr = Field("", alias="RuleID")
+    title: StrictStr = Field("", alias="Title")
+    severity: Severity = Field(Severity.UNKNOWN, alias="Severity")
+
+
+class _TrivyLanguageResult(BaseModel):
+    class_: Literal["lang-pkgs"] = Field(alias="Class")
+    vulnerabilities: list[_TrivyVulnerability] | None = Field(
+        None, alias="Vulnerabilities"
+    )
+
+
+class _TrivyNonLanguageResult(BaseModel):
+    class_: StrictStr = Field("", alias="Class")
+    vulnerabilities: list[dict[str, JsonValue]] | None = Field(
+        None, alias="Vulnerabilities"
+    )
+    target: StrictStr = Field("", alias="Target")
+    secrets: list[_TrivySecret] | None = Field(None, alias="Secrets")
+
+    @field_validator("class_")
+    @classmethod
+    def reject_language_class(cls, value: str) -> str:
+        if value == "lang-pkgs":
+            msg = "language package results must use the language result schema"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("target", mode="wrap")
+    @classmethod
+    def decode_consumed_secret_target(
+        cls,
+        value: object,
+        handler: ValidatorFunctionWrapHandler,
+        info: ValidationInfo,
+    ) -> str:
+        if (
+            info.data.get("class_") == "secret"
+            and info.context is not None
+            and info.context["consume_secrets"]
+        ):
+            return handler(value)
+        return ""
+
+    @field_validator("secrets", mode="wrap")
+    @classmethod
+    def decode_consumed_secrets(
+        cls,
+        value: object,
+        handler: ValidatorFunctionWrapHandler,
+        info: ValidationInfo,
+    ) -> list[_TrivySecret] | None:
+        if (
+            info.data.get("class_") == "secret"
+            and info.context is not None
+            and info.context["consume_secrets"]
+        ):
+            return handler(value)
+        return None
+
+
+type _TrivyResult = _TrivyLanguageResult | _TrivyNonLanguageResult
+
+
+class _TrivyResponse(BaseModel):
+    results: list[_TrivyResult] = Field(default_factory=list, alias="Results")
 
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
@@ -398,63 +439,63 @@ def _run_trivy_scan(
         error=ScanError,
     )
 
+    response = _parse_trivy_response(
+        completed.stdout, "Trivy", consume_secrets=scan_secrets
+    )
     try:
-        trivy_output = json.loads(completed.stdout)
-    except json.JSONDecodeError as e:
-        msg = f"Failed to parse Trivy output: {e}"
+        return _parse_vulns(response.results), _parse_secrets(response.results)
+    except ValidationError as e:
+        msg = f"Malformed Trivy finding fields: {e}"
         raise ScanError(msg) from e
 
-    results = trivy_output.get("Results", [])
-    return _parse_vulns(results), _parse_secrets(results)
 
-
-def _parse_vulns(results: list[dict]) -> list[VulnFinding]:
+def _parse_vulns(results: list[_TrivyResult]) -> list[VulnFinding]:
     """Extract vulnerability findings from Trivy results."""
     findings: list[VulnFinding] = []
     for result in results:
-        if result.get("Class") != "lang-pkgs":
+        if not isinstance(result, _TrivyLanguageResult):
             continue
-        for v in result.get("Vulnerabilities") or []:
-            severity_raw = v.get("Severity", "UNKNOWN").upper()
+        for vulnerability in result.vulnerabilities or []:
+            severity_raw = vulnerability.severity.upper()
             try:
                 severity = Severity(severity_raw)
             except ValueError:
                 severity = Severity.UNKNOWN
 
             published = None
-            if v.get("PublishedDate"):
+            if vulnerability.published_date:
                 with contextlib.suppress(ValueError):
-                    published = datetime.fromisoformat(v["PublishedDate"])
+                    published = datetime.fromisoformat(vulnerability.published_date)
 
             findings.append(
                 VulnFinding(
-                    vuln_id=v["VulnerabilityID"],
-                    pkg_name=v["PkgName"],
-                    installed_version=v["InstalledVersion"],
-                    fixed_version=v.get("FixedVersion"),
+                    vuln_id=vulnerability.vulnerability_id,
+                    pkg_name=vulnerability.pkg_name,
+                    installed_version=vulnerability.installed_version,
+                    fixed_version=vulnerability.fixed_version,
                     severity=severity,
-                    title=v.get("Title", ""),
-                    description=v.get("Description", ""),
-                    status=v.get("Status", "unknown"),
-                    primary_url=v.get("PrimaryURL"),
+                    title=vulnerability.title,
+                    description=vulnerability.description,
+                    status=vulnerability.status,
+                    primary_url=vulnerability.primary_url,
                     published_date=published,
                 )
             )
     return findings
 
 
-def _parse_secrets(results: list[dict]) -> list[SecretFinding]:
+def _parse_secrets(results: list[_TrivyResult]) -> list[SecretFinding]:
     """Extract secret findings from Trivy results."""
     return [
         SecretFinding(
-            file=result.get("Target", ""),
-            rule_id=s.get("RuleID", ""),
-            title=s.get("Title", ""),
-            severity=s.get("Severity", "UNKNOWN"),
+            file=result.target,
+            rule_id=secret.rule_id,
+            title=secret.title,
+            severity=secret.severity,
         )
         for result in results
-        if result.get("Class") == "secret"
-        for s in result.get("Secrets") or []
+        if isinstance(result, _TrivyNonLanguageResult) and result.class_ == "secret"
+        for secret in result.secrets or []
     ]
 
 

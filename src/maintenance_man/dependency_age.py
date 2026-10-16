@@ -14,9 +14,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from typing import Annotated
 
 from packaging.version import Version
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, StrictInt, StrictStr, ValidationError
 
 from maintenance_man.clock import Clock, utc_now
 from maintenance_man.models.config import ProjectConfig
@@ -270,30 +271,44 @@ def _pom_identity(body, module):
 
 
 def _parse_central_timestamp(body, module):
-    data = json.loads(body)
-    docs = data["response"]["docs"]
-    if not isinstance(docs, list) or not docs:
-        msg = "Central timestamp missing"
-        raise PublicationError(msg)
+    try:
+        docs = _CentralResponse.model_validate_json(body).response.docs
+    except ValidationError as e:
+        reason = (
+            "Central timestamp missing"
+            if any(
+                error["loc"] == ("response", "docs") and error["type"] == "too_short"
+                for error in e.errors()
+            )
+            else "invalid Central timestamp"
+        )
+        raise PublicationError(reason) from e
     dates = []
     for doc in docs:
-        if (doc["g"], doc["a"], doc["v"]) != (
+        if (doc.g, doc.a, doc.v) != (
             module.group,
             module.artifact,
             module.version,
         ):
             msg = "Central timestamp identity mismatch"
             raise PublicationError(msg)
-        milliseconds = doc["timestamp"]
-        if (
-            isinstance(milliseconds, bool)
-            or not isinstance(milliseconds, int)
-            or not 0 < milliseconds <= _MAX_EPOCH_MS
-        ):
-            msg = "invalid Central timestamp"
-            raise PublicationError(msg)
-        dates.append(datetime.fromtimestamp(milliseconds / 1000, UTC))
+        dates.append(datetime.fromtimestamp(doc.timestamp / 1000, UTC))
     return max(dates)
+
+
+class _CentralDoc(BaseModel):
+    g: StrictStr
+    a: StrictStr
+    v: StrictStr
+    timestamp: Annotated[StrictInt, Field(gt=0, le=_MAX_EPOCH_MS)]
+
+
+class _CentralDocs(BaseModel):
+    docs: Annotated[list[_CentralDoc], Field(min_length=1)]
+
+
+class _CentralResponse(BaseModel):
+    response: _CentralDocs
 
 
 def _registry_timestamp(value):
@@ -304,33 +319,46 @@ def _registry_timestamp(value):
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _pypi_release(data):
-    """Return (name, version, urls) from a PyPI release document."""
-    info = data.get("info") if isinstance(data, dict) else None
-    urls = data.get("urls") if isinstance(data, dict) else None
-    if (
-        not isinstance(info, dict)
-        or not isinstance(info.get("name"), str)
-        or not isinstance(info.get("version"), str)
-        or not isinstance(urls, list)
-        or not all(isinstance(entry, dict) for entry in urls)
-    ):
-        msg = "unexpected PyPI response shape"
-        raise PublicationError(msg)
-    return info["name"], info["version"], urls
+def _pypi_release(body: bytes) -> _PypiRelease:
+    """Decode one PyPI release document at the registry boundary."""
+    try:
+        return _PypiRelease.model_validate_json(body)
+    except ValidationError as e:
+        errors = e.errors()
+        if any(error["type"] == "json_invalid" for error in errors):
+            msg = "publication lookup failed"
+        elif any(error["loc"][-1:] == ("upload_time_iso_8601",) for error in errors):
+            msg = "invalid registry timestamp"
+        else:
+            msg = "unexpected PyPI response shape"
+        raise PublicationError(msg) from e
+
+
+class _PypiInfo(BaseModel):
+    name: StrictStr
+    version: StrictStr
+
+
+class _PypiUpload(BaseModel):
+    upload_time_iso_8601: StrictStr | None = None
+
+
+class _PypiRelease(BaseModel):
+    info: _PypiInfo
+    urls: list[_PypiUpload]
 
 
 def _pypi_timestamp(body, package, version):
-    name, released, urls = _pypi_release(json.loads(body))
-    if normalise_pkg_name(name) != normalise_pkg_name(package) or Version(
-        released
+    release = _pypi_release(body)
+    if normalise_pkg_name(release.info.name) != normalise_pkg_name(package) or Version(
+        release.info.version
     ) != Version(version):
         msg = "PyPI identity mismatch"
         raise PublicationError(msg)
     uploads = [
-        _registry_timestamp(entry["upload_time_iso_8601"])
-        for entry in urls
-        if entry.get("upload_time_iso_8601") is not None
+        _registry_timestamp(upload.upload_time_iso_8601)
+        for upload in release.urls
+        if upload.upload_time_iso_8601 is not None
     ]
     if not uploads:
         msg = "PyPI upload time missing"

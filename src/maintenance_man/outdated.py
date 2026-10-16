@@ -1,8 +1,7 @@
-import json
 import re
 from pathlib import Path
 
-from pydantic import ValidationError
+from pydantic import BaseModel, StrictStr, TypeAdapter, ValidationError
 
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import UpdateFinding, classify_semver
@@ -47,44 +46,30 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     )
 
     try:
-        entries = json.loads(completed.stdout)
-    except json.JSONDecodeError as e:
-        msg = f"Failed to parse uv output: {e}"
-        raise OutdatedCheckError(msg) from e
-
-    if not isinstance(entries, list) or not all(
-        isinstance(entry, dict)
-        and all(
-            isinstance(entry.get(key), str)
-            for key in ("name", "version", "latest_version")
-        )
-        for entry in entries
-    ):
-        msg = (
-            "Unexpected uv output: expected a list of objects with string "
-            "name, version and latest_version"
-        )
-        raise OutdatedCheckError(msg)
-
-    direct_deps = _get_uv_direct_dep_names(Path(project.path))
-
-    try:
+        entries = TypeAdapter(list[_UvRow]).validate_json(completed.stdout)
+        direct_deps = _get_uv_direct_dep_names(Path(project.path))
         return [
             UpdateFinding(
-                pkg_name=entry["name"],
-                installed_version=entry["version"],
-                latest_version=entry["latest_version"],
-                semver_tier=classify_semver(entry["version"], entry["latest_version"]),
+                pkg_name=entry.name,
+                installed_version=entry.version,
+                latest_version=entry.latest_version,
+                semver_tier=classify_semver(entry.version, entry.latest_version),
             )
             for entry in entries
-            if (cur := entry.get("version"))
-            and (lat := entry.get("latest_version"))
+            if (cur := entry.version)
+            and (lat := entry.latest_version)
             and cur != lat
-            and normalise_pkg_name(entry["name"]) in direct_deps
+            and normalise_pkg_name(entry.name) in direct_deps
         ]
     except ValidationError as e:
         msg = f"Unexpected uv output: {e}"
         raise OutdatedCheckError(msg) from e
+
+
+class _UvRow(BaseModel):
+    name: StrictStr
+    version: StrictStr
+    latest_version: StrictStr
 
 
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
