@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from maintenance_man.cli import ExitCode, app
+from maintenance_man.cli import ExitCode, app, main
 from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
@@ -1254,8 +1254,8 @@ class TestUpdateCliSurface:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         with pytest.raises(SystemExit) as exc_info:
-            app(["update", "vulnerable", "--continue"])
-        assert exc_info.value.code == 1
+            main(["update", "vulnerable", "--continue"])
+        assert exc_info.value.code == ExitCode.ERROR
         captured = capsys.readouterr()
         assert "Unknown option" in (captured.out + captured.err)
 
@@ -1265,8 +1265,8 @@ class TestUpdateCliSurface:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         with pytest.raises(SystemExit) as exc_info:
-            app(["update", "vulnerable", "--worktree"])
-        assert exc_info.value.code == 1
+            main(["update", "vulnerable", "--worktree"])
+        assert exc_info.value.code == ExitCode.ERROR
         captured = capsys.readouterr()
         assert "Unknown option" in (captured.out + captured.err)
 
@@ -1276,9 +1276,9 @@ class TestUpdateCliSurface:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         with pytest.raises(SystemExit) as exc_info:
-            app(["update", "--projects", "vulnerable"])
+            main(["update", "--projects", "vulnerable"])
 
-        assert exc_info.value.code == 1
+        assert exc_info.value.code == ExitCode.ERROR
         captured = capsys.readouterr()
         assert "Unknown option" in (captured.out + captured.err)
 

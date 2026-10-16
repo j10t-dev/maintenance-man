@@ -5,10 +5,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from maintenance_man.cli import (
+    ExitCode,
     _ordered_failed_findings,
     _ordered_ready_findings,
     _ordered_resolve_candidates,
     app,
+    main,
 )
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
@@ -958,9 +960,9 @@ class TestResolveCliSurface:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         with pytest.raises(SystemExit) as exc_info:
-            app(["resolve"])
+            main(["resolve"])
 
-        assert exc_info.value.code == 1
+        assert exc_info.value.code == ExitCode.ERROR
 
     def test_unknown_project_exits_1(
         self,
