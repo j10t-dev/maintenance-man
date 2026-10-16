@@ -743,7 +743,7 @@ class FakeJj:
             sorted(
                 name
                 for name, targets in data.bookmarks.items()
-                if targets == (current.commit_id,)
+                if current.commit_id in targets
             )
         )
         return WorkingCopyState(

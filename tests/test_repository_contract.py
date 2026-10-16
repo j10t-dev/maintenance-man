@@ -526,6 +526,55 @@ def test_given_conflicted_bookmark_when_resolving_then_raises_and_direct_id_reso
         c.repo.resolve_revision(revision=MANAGED)
 
 
+def test_given_conflicted_bookmark_when_inspected_then_topic_survives_refresh(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    original = c.repo.resolve_revision(revision="@")
+    c.repo.new_change(revision="main")
+    c.write_file("dep.txt", "protected local change\n")
+    c.repo.working_copy_state()
+    current = c.repo.resolve_revision(revision="@")
+    change_id = c.repo.change_id()
+    c.conflict_bookmark("topic", current, original)
+
+    state = c.repo.working_copy_state()
+    assert state.bookmarks == ("topic",)
+    assert c.repo.revision_bookmarks(revision="@") == ("topic",)
+
+    refresh_working_copy_from_main(repo=c.repo)
+
+    assert c.repo.revision_bookmarks(revision=current) == ("topic",)
+    with c.repo.temporary_workspace(revision=current) as preserved:
+        assert preserved.change_id(revision="@-") == change_id
+        assert (preserved.path / "dep.txt").read_text(encoding="utf-8") == (
+            "protected local change\n"
+        )
+
+
+def test_given_fake_conflicted_bookmark_when_inspected_then_one_attempt_is_recorded(
+    tmp_path: Path,
+) -> None:
+    state = FakeJjState()
+    path = tmp_path / "fake-repository"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    current = repo.resolve_revision(revision="@")
+    main = repo.resolve_revision(revision="main")
+    sibling = state.seed_commit(
+        path,
+        parent=main,
+        files={"dep.txt": "sibling\n"},
+        description="sibling",
+    )
+    state.seed_bookmark(path, bookmark="topic", targets=(current, sibling))
+    state.clear_calls()
+
+    working_copy = repo.working_copy_state()
+
+    assert working_copy.bookmarks == ("topic",)
+    assert [call.method for call in state.attempts] == ["working_copy_state"]
+
+
 def test_workspace_views_isolate_files_and_share_bookmarks(
     repository_case: RepositoryCase, tmp_path: Path
 ):

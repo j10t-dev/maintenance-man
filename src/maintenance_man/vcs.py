@@ -320,7 +320,9 @@ class JjRepository:
             ]
         )
         return tuple(
-            line.strip() for line in result.stdout.splitlines() if line.strip()
+            dict.fromkeys(
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            )
         )
 
     def change_id(self, *, revision: str = "@") -> str:
