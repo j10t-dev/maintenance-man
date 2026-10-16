@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from maintenance_man.clock import Clock, utc_now
+from maintenance_man.clock import Clock
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
     evaluate_gradle_candidate_age,
@@ -826,7 +826,7 @@ def prepare_gradle_candidates(
     publication: PublicationLookupContext,
     minimum_age_days: int,
     *,
-    clock: Clock = utc_now,
+    clock: Clock,
 ) -> tuple[PreparedCandidate, ...]:
     """Validate proposed catalogue changes and apply the release-age policy."""
     batch = validate_gradle_candidates(project, candidates, resolution)

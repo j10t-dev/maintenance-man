@@ -120,6 +120,17 @@ def make_update(tier: SemverTier = SemverTier.PATCH, **overrides: Any) -> Update
     return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
 
 
+def _scan_result_for(
+    project_config: ProjectConfig, updates: list[UpdateFinding]
+) -> ScanResult:
+    return ScanResult(
+        project="demo",
+        scanned_at=datetime.now(tz=UTC),
+        trivy_target=str(project_config.path),
+        updates=updates,
+    )
+
+
 # -- Fixtures --
 
 
@@ -370,7 +381,6 @@ def test_package_boundary_failure_is_persisted_as_a_failed_apply(
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan_result,
-        project_name="demo",
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -695,6 +705,7 @@ def test_success_commits_and_advances_the_flow_bookmark(
         [update],
         project_config,
         flow=flow,
+        scan_result=_scan_result_for(project_config, [update]),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -725,6 +736,7 @@ def test_already_applied_is_ready_without_a_commit(
         project_config,
         flow=flow,
         on_failure="stop" if flow == Workflow.RESOLVE else "continue",
+        scan_result=_scan_result_for(project_config, [update]),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -747,6 +759,7 @@ def test_update_failure_discards_then_attempts_the_next_finding(
         findings,
         project_config,
         flow=Workflow.UPDATE,
+        scan_result=_scan_result_for(project_config, findings),
         vcs=_services(processor_vcs),
         emit=emit,
     )
@@ -773,6 +786,7 @@ def test_all_successful_findings_commit_without_discard(
         project_config,
         flow=flow,
         on_failure="stop" if flow == Workflow.RESOLVE else "continue",
+        scan_result=_scan_result_for(project_config, findings),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -805,6 +819,7 @@ def test_update_success_failure_success_sequence_continues_after_discard(
         findings,
         project_config,
         flow=Workflow.UPDATE,
+        scan_result=_scan_result_for(project_config, findings),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -838,6 +853,7 @@ def test_resolve_failure_preserves_changes_and_stops(
         project_config,
         flow=Workflow.RESOLVE,
         on_failure="stop",
+        scan_result=_scan_result_for(project_config, findings),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -867,6 +883,7 @@ def test_resolve_success_then_failure_leaves_later_finding_unattempted(
         project_config,
         flow=Workflow.RESOLVE,
         on_failure="stop",
+        scan_result=_scan_result_for(project_config, findings),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -902,7 +919,6 @@ def test_repository_failure_never_saves_ready(
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
-        project_name="demo",
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -939,6 +955,7 @@ def test_apply_failure_discards_and_continues(
         findings,
         project_config,
         flow=Workflow.UPDATE,
+        scan_result=_scan_result_for(project_config, findings),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -955,12 +972,14 @@ def test_no_test_config_skips_tests_and_commits(
     project_config: ProjectConfig,
 ):
     config = project_config.model_copy(update={"test_unit": None})
+    update = make_update()
 
     results = process_findings(
-        [make_update()],
+        [update],
         config,
         flow=flow,
         on_failure="stop" if flow == Workflow.RESOLVE else "continue",
+        scan_result=_scan_result_for(config, [update]),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -979,6 +998,7 @@ def test_empty_findings_have_no_repository_effects(
             [],
             project_config,
             flow=Workflow.UPDATE,
+            scan_result=_scan_result_for(project_config, []),
             vcs=_services(processor_vcs),
             emit=RecordingEmit(),
         )
@@ -1021,7 +1041,6 @@ def test_failed_discard_persists_original_failure_and_stops(
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
-        project_name="demo",
         vcs=_services(processor_vcs),
         emit=emit,
     )
@@ -1075,7 +1094,6 @@ def test_update_statuses_are_persisted_after_each_finding(
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
-        project_name="demo",
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -1107,7 +1125,6 @@ def test_resolve_failure_status_is_persisted_before_stopping(
         flow=Workflow.RESOLVE,
         on_failure="stop",
         scan_result=scan,
-        project_name="demo",
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -1152,7 +1169,6 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
-        project_name="demo",
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )
@@ -1171,12 +1187,14 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
 def test_process_updates_sorts_by_risk(
     processor_vcs: ProcessorDeps, project_config: ProjectConfig
 ):
+    findings = sort_updates_by_risk(
+        [make_update(SemverTier.MAJOR), make_update(SemverTier.PATCH)]
+    )
     results = process_findings(
-        sort_updates_by_risk(
-            [make_update(SemverTier.MAJOR), make_update(SemverTier.PATCH)]
-        ),
+        findings,
         project_config,
         flow=Workflow.UPDATE,
+        scan_result=_scan_result_for(project_config, findings),
         vcs=_services(processor_vcs),
         emit=RecordingEmit(),
     )

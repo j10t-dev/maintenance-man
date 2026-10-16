@@ -204,7 +204,6 @@ def _run_candidates(
         project,
         flow=Workflow.RESOLVE,
         scan_result=scan_result,
-        project_name=name,
         on_failure="stop",
         vcs=vcs,
         emit=emit,

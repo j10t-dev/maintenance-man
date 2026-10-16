@@ -85,7 +85,9 @@ def _use_real_mixed_processor(
 ) -> tuple[MagicMock, MagicMock]:
     from maintenance_man import updater
 
-    save_scan_results("outdated", make_scan_result())
+    scan_result = make_scan_result()
+    scan_result.project = "outdated"
+    save_scan_results(scan_result.project, scan_result)
     project_path = deps["project_paths"]["outdated"]
     state = deps["vcs_state"]
     state.register_files(project_path, "package.json")

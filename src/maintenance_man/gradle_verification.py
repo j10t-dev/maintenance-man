@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from maintenance_man.clock import Clock, utc_now
+from maintenance_man.clock import Clock
 from maintenance_man.gradle import GradleError, file_digest
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
@@ -89,7 +89,7 @@ def initialize_comparison_context(
     resolution: CompleteResolution,
     run_cache_parent: Path,
     *,
-    clock: Clock = utc_now,
+    clock: Clock,
 ) -> ComparisonContext:
     policy = _policy(project)
     if run_cache_parent.is_symlink():

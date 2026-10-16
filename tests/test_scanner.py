@@ -13,6 +13,7 @@ import pytest
 
 from maintenance_man import gradle_resolution as candidates
 from maintenance_man import paths, scanner
+from maintenance_man.clock import utc_now
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GRADLE_INVENTORY_BOM_RELPATH,
@@ -26,8 +27,6 @@ from maintenance_man.gradle_inventory import (
 from maintenance_man.gradle_resolution import GeneratedGradleReport
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
-    GradleMember,
-    GradleUpdateTarget,
     ScanResult,
     SecretFinding,
     SemverTier,
@@ -46,12 +45,14 @@ from maintenance_man.scanner import (
 from maintenance_man.storage import load_scan_results
 from tests.conftest import (
     GRADLE_FIXTURES,
+    FakeClock,
     completed,
     fixture_runner,
     make_update,
     make_vuln,
     ops_with_outdated,
 )
+from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeCommands
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)
@@ -185,7 +186,12 @@ def test_given_malformed_consumed_secret_fields_when_scanned_then_scan_error(
 def test_stale_comparison_context_is_a_gradle_error(gradle_project, monkeypatch):
     monkeypatch.setattr(scanner, "context_inputs_valid", lambda *args: False)
     with pytest.raises(GradleError, match="Comparison context expired"):
-        scanner.capture_gradle_snapshot(gradle_project, MagicMock())
+        scanner.capture_gradle_snapshot(
+            gradle_project,
+            MagicMock(),
+            vcs=FakeJjState().services(),
+            clock=utc_now,
+        )
 
 
 def test_capture_checks_the_context_at_the_injected_time(gradle_project, monkeypatch):
@@ -200,7 +206,9 @@ def test_capture_checks_the_context_at_the_injected_time(gradle_project, monkeyp
 
     monkeypatch.setattr(scanner, "context_inputs_valid", stale)
     with pytest.raises(GradleError, match="Comparison context expired"):
-        scanner.capture_gradle_snapshot(gradle_project, MagicMock(), clock=clock)
+        scanner.capture_gradle_snapshot(
+            gradle_project, MagicMock(), vcs=FakeJjState().services(), clock=clock
+        )
     assert observed == [clock.current]
 
 
@@ -574,97 +582,29 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
     from threading import Barrier, Lock
     from types import SimpleNamespace
 
-    from maintenance_man import scanner
-    from maintenance_man.dependency_age import PublicationLookupContext
-    from maintenance_man.models.gradle import (
-        CompleteResolution,
-        ModuleId,
-        RepositoryDeclaration,
-        ResolutionEdge,
-        ResolutionReport,
-        ResolvedComponent,
-        ScopeId,
-        ScopeResolution,
-    )
+    from maintenance_man import dependency_age, scanner
+    from maintenance_man.models.gradle import ModuleId
+    from tests.test_dependency_age import _scan_age_inputs
 
-    catalogue_path = gradle_project.path / GRADLE_CATALOGUE_RELPATH
-    catalogue_path.write_text(
-        '[versions]\nlib0 = "1.0"\nlib1 = "1.0"\n[libraries]\n'
-        'lib0 = { module = "org.example:lib0", version.ref = "lib0" }\n'
-        'lib1 = { module = "org.example:lib1", version.ref = "lib1" }\n'
-    )
     findings = []
     modules = {}
     for index in range(2):
-        module = ModuleId(group="org.example", artifact=f"lib{index}", version="2.0")
+        module = ModuleId(group="org.example", artifact=f"lib{index}", version="2")
         modules[module.artifact] = module
-        target = GradleUpdateTarget(
-            version_ref=f"lib{index}",
-            target_version="2.0",
-            members=[
-                GradleMember(
-                    kind="library",
-                    alias=f"lib{index}",
-                    coordinate=module.coordinate,
-                    installed_version="1.0",
-                )
-            ],
+        finding, project, resolution = _scan_age_inputs(
+            gradle_project.path,
+            member_specs=(("library", f"lib{index}", module.coordinate),),
+            repository_specs=(("library", "https://dl.google.com/dl/android/maven2"),),
         )
         findings.append(
-            make_update(
-                pkg_name=module.coordinate,
-                installed_version="1.0",
-                latest_version="2.0",
-                gradle_target=target,
+            finding.model_copy(
+                update={
+                    "pkg_name": module.coordinate,
+                    "installed_version": "1",
+                    "latest_version": "2",
+                }
             )
         )
-    scope = ScopeId(
-        project_path=":", domain="project", configuration="runtimeClasspath"
-    )
-    components = (
-        ResolvedComponent(id="root", kind="root", module=None, variants=()),
-        *(
-            ResolvedComponent(
-                id=module.artifact,
-                kind="module",
-                module=ModuleId(
-                    group=module.group, artifact=module.artifact, version="1.0"
-                ),
-                variants=("runtime",),
-            )
-            for module in modules.values()
-        ),
-    )
-    edges = tuple(
-        ResolutionEdge(
-            source="root",
-            target=module.artifact,
-            requested=f"{module.coordinate}:1.0",
-            constraint=False,
-        )
-        for module in modules.values()
-    )
-    resolution = CompleteResolution(
-        report=ResolutionReport(
-            schema_version=1,
-            root_project=str(gradle_project.path),
-            producer_versions={"gradle": "9.0", "cyclonedx": "3.0.0", "report": "1"},
-            catalogue_digest=hashlib.sha256(catalogue_path.read_bytes()).hexdigest(),
-            repositories=(
-                RepositoryDeclaration(
-                    project_path=":",
-                    domain="library",
-                    url="https://dl.google.com/dl/android/maven2",
-                ),
-            ),
-            selected_scopes=(scope,),
-            scopes=(
-                ScopeResolution(
-                    scope=scope, components=components, edges=edges, unresolved=()
-                ),
-            ),
-        )
-    )
     state = SimpleNamespace(
         findings=findings,
         vulns=[],
@@ -673,6 +613,7 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         failure=None,
         overlap=False,
         entered=set(),
+        clock=FakeClock(datetime(2026, 9, 18, tzinfo=UTC)),
     )
     barrier, lock = Barrier(2, timeout=10), Lock()
 
@@ -687,7 +628,12 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
             if state.failure:
                 raise state.failure
             return None
-        module = modules[artifact]
+        configured_module = modules[artifact]
+        module = ModuleId(
+            group=configured_module.group,
+            artifact=configured_module.artifact,
+            version=suffix.split("/")[-2],
+        )
         body = (
             f"<project><groupId>{module.group}</groupId>"
             f"<artifactId>{module.artifact}</artifactId>"
@@ -700,23 +646,14 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         )
         return body, {"Last-Modified": published}, url
 
-    now = datetime(2026, 9, 18, tzinfo=UTC)
-    monkeypatch.setattr(
-        scanner,
-        "PublicationLookupContext",
-        lambda path: PublicationLookupContext(
-            path, transport=transport, clock=lambda: now
-        ),
-    )
+    monkeypatch.setattr(dependency_age, "_publication_http", transport)
     monkeypatch.setattr(
         scanner, "scan_gradle", lambda project: (state.vulns, resolution)
     )
     monkeypatch.setattr(
         scanner, "discover_gradle_updates", lambda project: state.findings
     )
-    state.project = gradle_project.model_copy(
-        update={"scan_secrets": False, "gradle_repository_routing": "standard-public"}
-    )
+    state.project = project.model_copy(update={"scan_secrets": False})
     return state
 
 
@@ -726,12 +663,17 @@ def test_gradle_scan_opens_publications_in_the_shared_cache(
     opened = []
     factory = scanner.PublicationLookupContext
 
-    def recording(path):
+    def recording(path, *, clock):
         opened.append(path)
-        return factory(path)
+        return factory(path, clock=clock)
 
     monkeypatch.setattr(scanner, "PublicationLookupContext", recording)
-    scan_project("android", scoped_publication_scan.project, 7)
+    scan_project(
+        "android",
+        scoped_publication_scan.project,
+        7,
+        clock=scoped_publication_scan.clock,
+    )
     assert opened == [paths.publications_dir()]
 
 
@@ -741,7 +683,7 @@ def test_gradle_scan_overlaps_groups_and_retains_unknown_publications(
 ):
     state = scoped_publication_scan
     state.unknown, state.overlap, state.failure = True, True, failure
-    result = scan_project("android", state.project, 7)
+    result = scan_project("android", state.project, 7, clock=state.clock)
     assert state.entered == {"lib0", "lib1"}
     assert len(result.updates) == 2
     assert result.updates[0].blocked_reason is None
@@ -759,7 +701,12 @@ def test_gradle_discovery_failure_is_not_swallowed(
 
     monkeypatch.setattr("maintenance_man.scanner.discover_gradle_updates", fail)
     with pytest.raises(GradleError, match="discovery failed"):
-        scan_project("android", scoped_publication_scan.project, 7)
+        scan_project(
+            "android",
+            scoped_publication_scan.project,
+            7,
+            clock=scoped_publication_scan.clock,
+        )
 
 
 def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
@@ -773,7 +720,7 @@ def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
             fixed_version="2.0",
         )
     ]
-    result = scan_project("android", state.project, 7)
+    result = scan_project("android", state.project, 7, clock=state.clock)
     assert [row.pkg_name for row in result.updates] == [
         "org.example:lib0",
         "org.example:lib1",
@@ -787,7 +734,7 @@ def test_gradle_scan_reports_unmapped_update_without_planning_diagnostics(
 ):
     state = scoped_publication_scan
     state.findings.append(make_update(pkg_name="unmapped", gradle_target=None))
-    result = scan_project("android", state.project, 7)
+    result = scan_project("android", state.project, 7, clock=state.clock)
     assert result.updates[-1].blocked_reason is None
     assert result.updates[-1].gradle_block_kind is None
 
@@ -803,7 +750,7 @@ def test_gradle_scan_does_not_run_update_planning(scoped_publication_scan, monke
         lambda *args: pytest.fail("scan must not run native update validation"),
     )
 
-    result = scan_project("android", state.project, 7)
+    result = scan_project("android", state.project, 7, clock=state.clock)
 
     assert len(result.updates) == 2
     assert len(result.vulnerabilities) == 1
@@ -818,11 +765,24 @@ def test_gradle_scan_filters_young_updates_without_hiding_vulnerabilities(
     state.young = True
     state.vulns = [make_vuln(pkg_name="org.example:lib0")]
 
-    result = scan_project("android", state.project, 7)
+    result = scan_project("android", state.project, 7, clock=state.clock)
 
     assert [row.pkg_name for row in result.updates] == ["org.example:lib1"]
     assert [row.pkg_name for row in result.vulnerabilities] == ["org.example:lib0"]
     assert not result.blocked_findings
+
+
+def test_given_supplied_clock_when_scanned_then_old_update_is_returned_and_persisted(
+    scoped_publication_scan,
+):
+    state = scoped_publication_scan
+    state.young = True
+    clock = FakeClock(datetime(2026, 9, 18, tzinfo=UTC))
+
+    result = scan_project("android", state.project, 7, clock=clock)
+
+    assert [row.pkg_name for row in result.updates] == ["org.example:lib1"]
+    assert load_scan_results("android") == result
 
 
 def test_gradle_scan_disabled_age_policy_skips_publication_lookups(
@@ -830,7 +790,7 @@ def test_gradle_scan_disabled_age_policy_skips_publication_lookups(
 ):
     state = scoped_publication_scan
 
-    result = scan_project("android", state.project, 0)
+    result = scan_project("android", state.project, 0, clock=state.clock)
 
     assert len(result.updates) == 2
     assert not state.entered
@@ -1667,9 +1627,9 @@ def test_non_gradle_scan_filters_through_one_publication_context(
     opened, filtered = [], []
     real = scanner.PublicationLookupContext
 
-    def factory(path):
+    def factory(path, *, clock):
         opened.append(path)
-        return real(path)
+        return real(path, clock=clock)
 
     def fake_filter(
         updates, publication_source, project_path, *, min_age_days, context

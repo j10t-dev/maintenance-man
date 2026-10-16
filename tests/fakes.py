@@ -71,13 +71,11 @@ class FakeFindingProcessor:
         *,
         flow: Workflow,
         on_failure: str = "continue",
-        scan_result: ScanResult | None = None,
-        project_name: str = "",
-        vcs: VcsServices | None = None,
+        scan_result: ScanResult,
+        vcs: VcsServices,
         emit: Emit,
     ) -> list[UpdateResult]:
         del emit
-        assert vcs is not None, "FakeFindingProcessor requires explicit VcsServices"
         repo = vcs.repository(project_config.path)
         results: list[UpdateResult] = []
         for finding in findings:
@@ -97,8 +95,7 @@ class FakeFindingProcessor:
                 finding.update_status = UpdateStatus.FAILED
                 finding.failed_phase = failed_phase
             finding.flow = flow
-            if scan_result is not None:
-                save_scan_results(project_name, scan_result)
+            save_scan_results(scan_result.project, scan_result)
             results.append(
                 UpdateResult(
                     pkg_name=finding.pkg_name,

@@ -37,7 +37,7 @@ from maintenance_man.package_managers import (
 from maintenance_man.process import ProcessError, run_captured, run_live
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import Repository, RevisionError
-from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
+from maintenance_man.vcs_workflow import VcsServices
 
 FailureStrategy = Literal["continue", "stop"]
 
@@ -278,9 +278,8 @@ def process_findings(
     *,
     flow: Workflow,
     on_failure: FailureStrategy = "continue",
-    scan_result: ScanResult | None = None,
-    project_name: str = "",
-    vcs: VcsServices | None = None,
+    scan_result: ScanResult,
+    vcs: VcsServices,
     emit: Emit,
 ) -> list[UpdateResult]:
     """Process findings on the current jj change.
@@ -294,8 +293,7 @@ def process_findings(
     """
     results: list[UpdateResult] = []
     project_path = Path(project_config.path)
-    vcs_services = vcs or make_vcs_services()
-    repo = vcs_services.repository(project_path)
+    repo = vcs.repository(project_path)
     for finding in findings:
         kind = _kind(finding)
         emit(
@@ -311,7 +309,7 @@ def process_findings(
         finding.update_status, finding.failed_phase, finding.flow = finding_transition(
             step, flow
         )
-        _persist_status(scan_result, project_name)
+        save_scan_results(scan_result.project, scan_result)
         discarded = _discard(repo, emit) if should_discard(step, on_failure) else None
         results.append(
             UpdateResult(finding.pkg_name, kind, step.passed, step.failed_phase)
@@ -396,15 +394,6 @@ def _discard(repo: Repository, emit: Emit) -> bool:
         emit(FindingStepFailed(FindingStepKind.DISCARD, str(exc)))
         return False
     return True
-
-
-def _persist_status(
-    scan_result: ScanResult | None,
-    project_name: str,
-) -> None:
-    """Save scan results when a scan result is provided."""
-    if scan_result is not None:
-        save_scan_results(project_name, scan_result)
 
 
 def _apply_update(

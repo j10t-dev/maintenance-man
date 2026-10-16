@@ -53,7 +53,7 @@ from maintenance_man.models.scan import (
 from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
 from maintenance_man.process import require_tool, run_captured
 from maintenance_man.storage import save_scan_results
-from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
+from maintenance_man.vcs_workflow import VcsServices
 
 
 class ScanError(Exception):
@@ -64,6 +64,8 @@ def scan_project(
     name: str,
     project: ProjectConfig,
     min_version_age_days: int = 7,
+    *,
+    clock: Clock = utc_now,
 ) -> ScanResult:
     """Run Trivy and outdated checks against a project and return parsed results.
 
@@ -78,27 +80,30 @@ def scan_project(
         msg = f"Project path does not exist: {project_path}"
         raise FileNotFoundError(msg)
     resolution = None
-    if project.package_manager == "gradle":
-        vulns, updates, secrets, resolution = _scan_gradle_project(
-            project, min_version_age_days
-        )
-    else:
-        ops = package_manager_ops(project.package_manager)
-        match ops.vulnerability_source:
-            case "uv-audit":
-                vulns = _run_uv_audit(project_path)
-                secrets = (
-                    scan_secrets(project_path, project.scan_skip_dirs)
-                    if project.scan_secrets
-                    else []
-                )
-            case "trivy":
-                vulns, secrets = _run_trivy_scan(
-                    project_path, project.scan_secrets, project.scan_skip_dirs
-                )
-            case unreachable:
-                assert_never(unreachable)
-        updates = _check_outdated(project, ops, vulns, min_version_age_days)
+    with PublicationLookupContext(paths.publications_dir(), clock=clock) as publication:
+        if project.package_manager == "gradle":
+            vulns, updates, secrets, resolution = _scan_gradle_project(
+                project, min_version_age_days, publication
+            )
+        else:
+            ops = package_manager_ops(project.package_manager)
+            match ops.vulnerability_source:
+                case "uv-audit":
+                    vulns = _run_uv_audit(project_path)
+                    secrets = (
+                        scan_secrets(project_path, project.scan_skip_dirs)
+                        if project.scan_secrets
+                        else []
+                    )
+                case "trivy":
+                    vulns, secrets = _run_trivy_scan(
+                        project_path, project.scan_secrets, project.scan_skip_dirs
+                    )
+                case unreachable:
+                    assert_never(unreachable)
+            updates = _check_outdated(
+                project, ops, vulns, min_version_age_days, publication
+            )
 
     scan_result = ScanResult(
         project=name,
@@ -118,16 +123,17 @@ def scan_project(
 
 
 def _scan_gradle_project(
-    project: ProjectConfig, min_version_age_days: int
+    project: ProjectConfig,
+    min_version_age_days: int,
+    publication: PublicationLookupContext,
 ) -> tuple[
     list[VulnFinding], list[UpdateFinding], list[SecretFinding], CompleteResolution
 ]:
     vulns, resolution = scan_gradle(project)
     updates = discover_gradle_updates(project)
-    with PublicationLookupContext(paths.publications_dir()) as context:
-        updates = filter_gradle_updates_by_age(
-            updates, project, resolution, min_version_age_days, context
-        )
+    updates = filter_gradle_updates_by_age(
+        updates, project, resolution, min_version_age_days, publication
+    )
     secrets = (
         scan_secrets(Path(project.path), project.scan_skip_dirs)
         if project.scan_secrets
@@ -141,17 +147,17 @@ def _check_outdated(
     ops: PackageManagerOps,
     vulns: list[VulnFinding],
     min_version_age_days: int,
+    publication: PublicationLookupContext,
 ) -> list[UpdateFinding]:
     """Run the table's outdated check and return aged, de-duplicated findings."""
     raw_updates = ops.outdated(project)
-    with PublicationLookupContext(paths.publications_dir()) as context:
-        aged_updates = filter_registry_updates_by_age(
-            raw_updates,
-            ops.publication_source,
-            project.path,
-            min_age_days=min_version_age_days,
-            context=context,
-        )
+    aged_updates = filter_registry_updates_by_age(
+        raw_updates,
+        ops.publication_source,
+        project.path,
+        min_age_days=min_version_age_days,
+        context=publication,
+    )
     vuln_pkgs = {v.pkg_name for v in vulns}
     return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
 
@@ -503,10 +509,10 @@ def capture_gradle_snapshot(
     project: ProjectConfig,
     context: ComparisonContext,
     *,
-    vcs: VcsServices | None = None,
-    clock: Clock = utc_now,
+    vcs: VcsServices,
+    clock: Clock,
 ) -> GradleSnapshot | IncompleteResolution:
-    services = vcs or make_vcs_services()
+    services = vcs
     if not context_inputs_valid(context, project, clock()):
         msg = "Comparison context expired or inputs changed; rebuild baseline and tip"
         raise GradleError(msg)

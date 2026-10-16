@@ -18,6 +18,7 @@ from maintenance_man import gradle_resolution as candidates
 from maintenance_man import gradle_updates as updater
 from maintenance_man import gradle_verification as verification
 from maintenance_man import gradle_workflow as workflow_service
+from maintenance_man.clock import utc_now
 from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import GRADLE_INVENTORY_BOM_RELPATH, GradleError
 from maintenance_man.gradle import parse_catalogue as real_parse_catalogue
@@ -386,7 +387,7 @@ def frozen_context(tmp_path, monkeypatch, resolution):
     monkeypatch.setattr(verification, "_run", command)
     project = ProjectConfig(path=project_path, package_manager="gradle")
     context = verification.initialize_comparison_context(
-        project, resolution, tmp_path / "caches"
+        project, resolution, tmp_path / "caches", clock=utc_now
     )
     return project, context, calls
 
@@ -407,7 +408,9 @@ def test_comparison_setup_requires_trivy_and_leaves_no_cache(
 
     monkeypatch.setattr(verification, "require_tool", missing)
     with pytest.raises(ToolNotFoundError, match="trivy"):
-        verification.initialize_comparison_context(project, resolution, parent)
+        verification.initialize_comparison_context(
+            project, resolution, parent, clock=utc_now
+        )
     assert list(parent.iterdir()) == []
 
 
@@ -569,7 +572,9 @@ def test_capture_reads_before_cleanup_and_never_discovers(
         )
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", trivy)
-    result = scanner.capture_gradle_snapshot(project, context, vcs=state.services())
+    result = scanner.capture_gradle_snapshot(
+        project, context, vcs=state.services(), clock=utc_now
+    )
     if expected == "incomplete":
         assert isinstance(result, IncompleteResolution)
         assert result.kind == "incomplete"
@@ -714,7 +719,9 @@ def test_capture_unreadable_bom_is_gradle_error(frozen_context, monkeypatch):
         lambda *args, **kwargs: pytest.fail("Trivy must not run"),
     )
     with pytest.raises(scanner.GradleError, match="cyclonedxBom produced no inventory"):
-        scanner.capture_gradle_snapshot(project, context)
+        scanner.capture_gradle_snapshot(
+            project, context, vcs=FakeJjState().services(), clock=utc_now
+        )
     assert not (root / ".mm-gradle-inventory").exists()
 
 
@@ -781,9 +788,13 @@ def test_capture_checks_resolution_before_nested_inventory_identity(
     )
     if row == "matching":
         with pytest.raises(scanner.GradleError, match="Malformed CycloneDX inventory"):
-            scanner.capture_gradle_snapshot(project, context)
+            scanner.capture_gradle_snapshot(
+                project, context, vcs=FakeJjState().services(), clock=utc_now
+            )
         return
-    result = scanner.capture_gradle_snapshot(project, context)
+    result = scanner.capture_gradle_snapshot(
+        project, context, vcs=FakeJjState().services(), clock=utc_now
+    )
     assert isinstance(result, IncompleteResolution)
     if row == "incomplete":
         assert result is supplied
@@ -2675,7 +2686,7 @@ def test_rebuild_forwards_one_clock_to_every_timed_step(rebuild_evidence, monkey
 
     def capture(project, ctx, *, clock, **kwargs):
         seen.append(("capture", clock))
-        return original_capture(project, ctx)
+        return original_capture(project, ctx, clock=clock, **kwargs)
 
     monkeypatch.setattr(updater, "initialize_comparison_context", context)
     monkeypatch.setattr(updater, "run_gradle_checks", checks)
@@ -3941,9 +3952,13 @@ def test_snapshot_checks_local_project_provenance(
     )
     if variant in {"unknown-path", "wrong-coordinate", "undeclared"}:
         with pytest.raises(scanner.GradleError, match="local project"):
-            scanner.capture_gradle_snapshot(project, context, vcs=state.services())
+            scanner.capture_gradle_snapshot(
+                project, context, vcs=state.services(), clock=utc_now
+            )
     else:
-        result = scanner.capture_gradle_snapshot(project, context, vcs=state.services())
+        result = scanner.capture_gradle_snapshot(
+            project, context, vcs=state.services(), clock=utc_now
+        )
         if variant == "local":
             assert isinstance(result, GradleSnapshot)
             assert result.inventory_modules == (
@@ -4238,7 +4253,9 @@ def test_snapshot_refuses_inventory_missing_a_resolved_module(
         return subprocess.CompletedProcess(command, 0, '{"Results": []}', "")
 
     monkeypatch.setattr("maintenance_man.process.subprocess.run", scan)
-    result = scanner.capture_gradle_snapshot(project, context)
+    result = scanner.capture_gradle_snapshot(
+        project, context, vcs=FakeJjState().services(), clock=utc_now
+    )
     assert isinstance(result, IncompleteResolution)
     assert any("inventory" in reason and "lib" in reason for reason in result.reasons)
     assert scans == []

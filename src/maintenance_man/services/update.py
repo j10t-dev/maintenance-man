@@ -211,7 +211,6 @@ def _finalise(
 
 
 def _process_selected(
-    name: str,
     scan_result: ScanResult,
     work_config: ProjectConfig,
     *,
@@ -239,7 +238,6 @@ def _process_selected(
             work_config,
             flow=Workflow.UPDATE,
             scan_result=scan_result,
-            project_name=name,
             vcs=vcs,
             emit=emit,
         )
@@ -289,7 +287,6 @@ def update_project(
     try:
         emit(ScanReported(scan_result))
         results = _process_selected(
-            name,
             scan_result,
             work_config,
             choose=choose,
