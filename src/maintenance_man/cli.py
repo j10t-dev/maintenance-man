@@ -728,9 +728,10 @@ def deploy(
     """
     cfg = _load_cfg(config)
     vcs = make_vcs_services()
-    renderer = _Renderer(batch=project is None)
+    batch = not project
+    renderer = _Renderer(batch=batch)
 
-    if not project:
+    if batch:
         if check and not cfg.defaults.healthcheck_url:
             renderer(HealthcheckUnconfigured())
         if not cfg.projects:
@@ -752,6 +753,7 @@ def deploy(
         )
         sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
 
+    assert project is not None
     proj_config = _resolve_proj(cfg, project)
     try:
         result = deploy_service.deploy_project(

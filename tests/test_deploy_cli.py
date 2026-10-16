@@ -487,6 +487,21 @@ class TestDeployCheck:
         assert "no healthcheck_url" not in output
 
 
+def test_given_empty_project_name_when_deploy_then_runs_deploy_all_in_batch_mode(
+    mm_home_with_projects: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setattr(deploy_service, "run_deploy", lambda *a, **k: None)
+    monkeypatch.setattr(deploy_service, "run_build", lambda *a, **k: None)
+    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+
+    code = run_mm("deploy", "")
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "Deploy Summary" in out
+    assert "Deploying deployable" not in out
+
+
 class TestMassDeployCommand:
     @pytest.fixture(autouse=True)
     def _gate(self, _deploy_vcs: _DeployVcs) -> None:
