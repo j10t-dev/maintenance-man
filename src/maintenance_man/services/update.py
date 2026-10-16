@@ -136,17 +136,19 @@ def _enter_update_workspace(
                 "state exists — rescan required"
             )
             raise UpdateSetupError(msg)
-        workspace_path = create_workspace(repo=repo, project=project, revision=bookmark)
-        vcs.repository(workspace_path).new_change(revision=bookmark)
-        return workspace_path
+        workspace_revision = bookmark
+    else:
+        prune_stale_bookmarks(repo=repo, host=vcs.code_host(project_config.path))
+        ensure_main_bookmark(repo=repo)
+        if repo.bookmark_exists(bookmark=bookmark):
+            repo.delete_bookmark(bookmark=bookmark)
+        repo.create_bookmark(bookmark=bookmark, revision="main")
+        workspace_revision = "main"
 
-    prune_stale_bookmarks(repo=repo, host=vcs.code_host(project_config.path))
-    ensure_main_bookmark(repo=repo)
-    if repo.bookmark_exists(bookmark=bookmark):
-        repo.delete_bookmark(bookmark=bookmark)
-    repo.create_bookmark(bookmark=bookmark, revision="main")
-    workspace_path = create_workspace(repo=repo, project=project, revision="main")
     try:
+        workspace_path = create_workspace(
+            repo=repo, project=project, revision=workspace_revision
+        )
         vcs.repository(workspace_path).new_change(revision=bookmark)
     except RevisionError:
         remove_workspace(repo=repo, project=project)

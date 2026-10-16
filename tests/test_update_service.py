@@ -137,6 +137,37 @@ def test_update_emits_processing_result_and_promotion_events(
     assert "mm-api" not in repo.workspace_names()
 
 
+def test_resume_new_change_failure_removes_workspace(
+    tmp_path: Path,
+) -> None:
+    scan = make_scan_result(
+        vulns=[],
+        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)],
+    )
+    state, project = _seed_project(tmp_path, "api", scan)
+    repo = state.repository(project.path)
+    repo.create_bookmark(bookmark="mm/update-dependencies", revision="main")
+    workspace = paths.workspaces_dir() / "api"
+    original = RevisionError("stale lock")
+    state.fail("new_change", error=original, path=workspace)
+
+    with pytest.raises(update_service.UpdateSetupError) as caught:
+        update_service.update_project(
+            "api",
+            project,
+            minimum_age_days=7,
+            choose=None,
+            choose_gradle=None,
+            vcs=state.services(),
+            emit=RecordingEmit(),
+        )
+
+    assert caught.value.__cause__ is original
+    assert "mm-api" not in repo.workspace_names()
+    assert not workspace.exists()
+    assert load_scan_results("api").updates[0].update_status is UpdateStatus.READY
+
+
 def test_typed_equal_risk_selection_order_reaches_processor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
