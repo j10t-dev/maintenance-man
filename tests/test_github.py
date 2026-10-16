@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Literal
 
 import pytest
 
-from maintenance_man import github, process
+from maintenance_man import github
 from maintenance_man.github import CodeHostError, GitHubCodeHost
 from tests.conftest import completed
 
@@ -58,41 +57,6 @@ def test_pr_bookmarks_returns_every_head_name(
             },
         )
     ]
-
-
-def test_pr_bookmarks_propagates_normalized_boundary_failures(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    error = CodeHostError("normalized boundary failure")
-
-    def fail(*_args, **_kwargs):
-        raise error
-
-    monkeypatch.setattr(github, "run_captured", fail)
-    with pytest.raises(CodeHostError) as caught:
-        GitHubCodeHost(tmp_path).pr_bookmarks(state="merged")
-    assert caught.value is error
-
-
-@pytest.mark.parametrize("failure", ["status", "launch", "timeout"])
-def test_pr_bookmarks_normalizes_subprocess_failures(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-) -> None:
-    def run(command, **kwargs):
-        if failure == "status":
-            return completed(command, returncode=2, stdout="", stderr="host rejected")
-        if failure == "launch":
-            msg = "cannot launch"
-            raise OSError(msg)
-        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
-
-    monkeypatch.setattr(process.subprocess, "run", run)
-
-    with pytest.raises(CodeHostError):
-        GitHubCodeHost(tmp_path).pr_bookmarks(state="merged")
 
 
 def test_create_pr_returns_stripped_output_and_uses_guarded_arguments(

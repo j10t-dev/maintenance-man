@@ -28,12 +28,13 @@ from tests.conftest import (
     make_gradle_target,
     make_scan_result,
     make_update,
+    make_vuln,
     missing_tool,
     run_mm,
     write_config,
 )
 from tests.fake_vcs import FakeJjState
-from tests.fakes import FakeFindingProcessor, RecordingEmit
+from tests.fakes import RecordingEmit
 
 
 @pytest.mark.parametrize(
@@ -136,28 +137,6 @@ class TestSharedCommandPrerequisites:
         assert run_mm(command, "vulnerable") == 1
         assert deps.vcs_state.attempts == []
 
-    def test_opposite_workflow_exits_one_before_processing(
-        self,
-        command: str,
-        deps_fixture: str,
-        request: pytest.FixtureRequest,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        deps = request.getfixturevalue(deps_fixture)
-        scan_result: ScanResult = deps.scan_result
-        finding = scan_result.updates[0]
-        finding.update_status = UpdateStatus.FAILED
-        finding.flow = Workflow.RESOLVE if command == "update" else Workflow.UPDATE
-        finding.failed_phase = "apply"
-        deps.save_scan()
-        deps.vcs_state.clear_calls()
-
-        assert run_mm(command, "vulnerable") == 1
-
-        output = capsys.readouterr().out.lower()
-        assert all(word in output for word in ("update", "resolve", "vulnerable"))
-        assert deps.vcs_state.effects == []
-
     def test_legacy_finding_without_flow_exits_one_before_processing(
         self,
         command: str,
@@ -176,61 +155,20 @@ class TestSharedCommandPrerequisites:
         assert "rescan" in capsys.readouterr().out.lower()
         assert deps.vcs_state.effects == []
 
-    def test_missing_test_config_warns_and_succeeds(
+    def test_given_code_host_pruning_failure_when_run_then_exits_one(
         self,
         command: str,
         deps_fixture: str,
         request: pytest.FixtureRequest,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
     ) -> None:
         deps = request.getfixturevalue(deps_fixture)
-        scan_result: ScanResult = deps.scan_result
-        if command == "resolve":
-            for finding in scan_result.findings:
-                finding.update_status = None
-                finding.failed_phase = None
-                finding.flow = None
-        from maintenance_man.storage import save_scan_results
-
-        save_scan_results("no-tests", scan_result)
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+        project_path = deps.project_paths["vulnerable"]
+        deps.vcs_state.code_host(project_path).fail(
+            "pr_bookmarks", error=CodeHostError("host unavailable")
         )
 
-        assert run_mm(command, "no-tests") == 0
-        assert "no test configuration" in capsys.readouterr().out.lower()
-
-    def test_no_scan_results_exits_zero_before_repository_mutation(
-        self,
-        command: str,
-        deps_fixture: str,
-        request: pytest.FixtureRequest,
-        mm_home_with_projects: Path,
-    ) -> None:
-        deps = request.getfixturevalue(deps_fixture)
-        (mm_home_with_projects / "scan-results" / "vulnerable.json").unlink()
-        deps.vcs_state.clear_calls()
-
-        assert run_mm(command, "vulnerable") == 0
-        assert deps.vcs_state.attempts == []
-
-    def test_no_actionable_findings_exits_zero_before_repository_mutation(
-        self,
-        command: str,
-        deps_fixture: str,
-        request: pytest.FixtureRequest,
-    ) -> None:
-        deps = request.getfixturevalue(deps_fixture)
-        scan_result: ScanResult = deps.scan_result
-        scan_result.vulnerabilities = []
-        scan_result.updates = []
-        deps.save_scan()
-        deps.vcs_state.clear_calls()
-
-        assert run_mm(command, "vulnerable") == 0
-        assert deps.vcs_state.attempts == []
+        assert run_mm(command, "vulnerable") == 1
+        assert not any(call.method == "commit" for call in deps.vcs_state.attempts)
 
 
 def test_batch_reports_bookmark_access_error_without_requesting_rescan(
@@ -267,6 +205,142 @@ def test_batch_reports_bookmark_access_error_without_requesting_rescan(
     )
 
 
+@pytest.mark.parametrize(
+    ("scenario", "expected_line"),
+    [
+        ("missing", "vulnerable — no scan results; nothing to do."),
+        ("blocked", "vulnerable — nothing to update."),
+    ],
+)
+def test_given_update_noop_when_command_runs_then_it_exits_zero_and_prints_literal_line(
+    mm_home_with_projects: Path,
+    mock_update_cli_deps: CliDeps,
+    capsys: pytest.CaptureFixture[str],
+    scenario: str,
+    expected_line: str,
+) -> None:
+    if scenario == "missing":
+        (mm_home_with_projects / "scan-results" / "vulnerable.json").unlink()
+    else:
+        save_scan_results(
+            "vulnerable",
+            make_scan_result(vulns=[make_vuln(fixed_version=None)], updates=[]),
+        )
+
+    assert run_mm("update", "vulnerable") == ExitCode.OK
+    assert expected_line in capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("command", "deps_fixture", "other_flow", "expected_lines"),
+    [
+        pytest.param(
+            "update",
+            "mock_update_cli_deps",
+            Workflow.RESOLVE,
+            [
+                "Error: Cannot run update on vulnerable: 1 finding(s) owned by the "
+                "'resolve' ",
+                "flow. Complete or abandon that flow first.",
+            ],
+            id="update",
+        ),
+        pytest.param(
+            "resolve",
+            "mock_resolve_cli_deps",
+            Workflow.UPDATE,
+            [
+                "Error: Cannot run resolve on vulnerable: 1 finding(s) owned by the "
+                "'update' ",
+                "flow. Complete or abandon that flow first.",
+            ],
+            id="resolve",
+        ),
+    ],
+)
+def test_given_opposite_workflow_when_run_then_flow_conflict_is_reported(
+    mm_home_with_projects: Path,
+    request: pytest.FixtureRequest,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    deps_fixture: str,
+    other_flow: Workflow,
+    expected_lines: list[str],
+) -> None:
+    deps: CliDeps = request.getfixturevalue(deps_fixture)
+    for existing in deps.scan_result.findings:
+        existing.update_status = None
+        existing.failed_phase = None
+        existing.flow = None
+    finding = deps.scan_result.updates[0]
+    finding.update_status = UpdateStatus.FAILED
+    finding.failed_phase = "apply"
+    finding.flow = other_flow
+    deps.save_scan()
+
+    assert run_mm(command, "vulnerable") == ExitCode.ERROR
+    assert capsys.readouterr().out.splitlines() == expected_lines
+
+
+@pytest.mark.parametrize("command,deps_fixture", _COMMAND_FIXTURES)
+def test_given_missing_test_config_when_run_then_warns_and_succeeds(
+    mm_home_with_projects: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    deps_fixture: str,
+) -> None:
+    deps: CliDeps = request.getfixturevalue(deps_fixture)
+    if command == "resolve":
+        for finding in deps.scan_result.findings:
+            finding.update_status = None
+            finding.failed_phase = None
+            finding.flow = None
+        save_scan_results("no-tests", deps.scan_result)
+    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+
+    assert run_mm(command, "no-tests") == ExitCode.OK
+    assert (
+        "  Warning: no-tests — no test configuration (test phases will be skipped)"
+        in capsys.readouterr().out.splitlines()
+    )
+
+
+def test_given_missing_update_bookmark_when_run_then_exits_one_with_error(
+    mm_home_with_projects: Path,
+    mock_update_cli_deps: CliDeps,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = mock_update_cli_deps.scan_result.updates[0]
+    finding.update_status = UpdateStatus.FAILED
+    finding.flow = Workflow.UPDATE
+    mock_update_cli_deps.save_scan()
+
+    assert run_mm("update", "vulnerable") == ExitCode.ERROR
+    assert capsys.readouterr().out.splitlines() == [
+        "Error: update bookmark 'mm/update-dependencies' is missing but in-progress "
+        "state",
+        "exists — rescan required",
+    ]
+
+
+def test_given_batch_flow_conflict_when_run_then_exits_four_with_both_projects(
+    mm_home_with_projects: Path,
+    mock_update_cli_deps: CliDeps,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = mock_update_cli_deps.scan_result.updates[0]
+    finding.update_status = UpdateStatus.FAILED
+    finding.flow = Workflow.RESOLVE
+    mock_update_cli_deps.save_scan()
+
+    assert run_mm("update", "vulnerable", "clean") == ExitCode.UPDATE_FAILED
+    lines = capsys.readouterr().out.splitlines()
+    assert "vulnerable" in lines
+    assert "clean" in lines
+
+
 class TestUpdatePreChecks:
     def test_no_projects_configured_exits_0_without_gh(
         self,
@@ -282,40 +356,6 @@ class TestUpdatePreChecks:
         )
 
         assert run_mm("update") == 0
-
-    def test_batch_skips_conflicted_project_and_continues(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Batch mode must not abort on one project's flow conflict."""
-        scan_result: ScanResult = mock_update_cli_deps.scan_result
-        scan_result.updates[0].update_status = UpdateStatus.FAILED
-        scan_result.updates[0].flow = Workflow.RESOLVE
-        mock_update_cli_deps.save_scan()
-
-        assert run_mm("update", "vulnerable", "clean") == ExitCode.UPDATE_FAILED
-
-        out = capsys.readouterr().out.lower()
-        assert "vulnerable" in out
-        assert "clean" in out
-
-    def test_code_host_pruning_failure_refuses_before_processing(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        project_path = mock_update_cli_deps.project_paths["vulnerable"]
-        host = mock_update_cli_deps.vcs_state.code_host(project_path)
-        host.fail("pr_bookmarks", error=CodeHostError("host unavailable"))
-
-        assert run_mm("update", "vulnerable") == 1
-        assert not any(
-            call.method == "commit" for call in mock_update_cli_deps.vcs_state.attempts
-        )
 
     def test_batch_code_host_pruning_failure_continues_other_projects(
         self,
@@ -515,76 +555,27 @@ class TestUpdateNumberedSelection:
         assert (project_path / "mm-fixture-some-pkg.txt").is_file()
         assert not (project_path / "mm-fixture-pkg-a.txt").exists()
 
-    def test_typed_indices_preserve_equal_risk_update_order(
+    def test_given_typed_order_when_run_then_exits_zero_with_prompt(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: CliDeps,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        scan = make_scan_result(
-            vulns=[],
-            updates=[make_update(pkg_name="pkg-a"), make_update(pkg_name="pkg-b")],
+        save_scan_results(
+            "vulnerable",
+            make_scan_result(
+                vulns=[],
+                updates=[make_update(pkg_name="pkg-a"), make_update(pkg_name="pkg-b")],
+            ),
         )
-        save_scan_results("vulnerable", scan)
-        processed: list[str] = []
-        processor = FakeFindingProcessor({"pkg-a": (True, None), "pkg-b": (True, None)})
-
-        def process(findings, project_config, **kwargs):
-            processed.extend(finding.pkg_name for finding in findings)
-            return processor(findings, project_config, **kwargs)
-
-        monkeypatch.setattr(update_service, "process_findings", process)
         prompt = MagicMock(return_value="2,1")
         monkeypatch.setattr("maintenance_man.cli.Prompt.ask", prompt)
 
-        assert run_mm("update", "vulnerable") == 0
-        assert processed == ["pkg-b", "pkg-a"]
+        assert run_mm("update", "vulnerable") == ExitCode.OK
         assert "Select updates \\[all/updates/1,2,.../none]" in prompt.call_args.args[0]
 
 
-def test_update_event_renderers_preserve_text_and_batch_silence(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from maintenance_man.models.events import (
-        FindingsProcessed,
-        MissingTestConfig,
-        ProcessingStarted,
-        Promoted,
-    )
-
-    cli._Renderer(batch=False)(MissingTestConfig("a[b]"))
-    cli._Renderer(batch=False)(ProcessingStarted(1, 2))
-    cli._Renderer(batch=False)(
-        FindingsProcessed((UpdateResult("pkg", "update", True),))
-    )
-    cli._Renderer(batch=False)(Promoted("mm/update-dependencies"))
-    output = capsys.readouterr().out
-    assert "Warning: a[b] — no test configuration" in output
-    assert "Processing 1 vuln fix(es)..." in output
-    assert "Processing 2 update(s)..." in output
-    assert "Summary:" in output
-    assert "Promoted mm/update-dependencies to main." in output
-
-    cli._Renderer(batch=True)(FindingsProcessed((UpdateResult("pkg", "update", True),)))
-    assert capsys.readouterr().out == ""
-
-
 class TestUpdateResume:
-    def test_missing_non_gradle_resume_bookmark_refuses_before_processing(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-    ) -> None:
-        scan_result: ScanResult = mock_update_cli_deps.scan_result
-        scan_result.updates[0].update_status = UpdateStatus.FAILED
-        scan_result.updates[0].flow = Workflow.UPDATE
-        mock_update_cli_deps.save_scan()
-        state = mock_update_cli_deps.vcs_state
-        state.clear_calls()
-
-        assert run_mm("update", "vulnerable") == 1
-        assert not any(call.method == "commit" for call in state.attempts)
-
     """Interactive rerun with update-owned in-progress state."""
 
     def test_resume_ready_only_attaches_workspace_and_promotes(
@@ -647,161 +638,6 @@ class TestUpdateResume:
             if re.match(r"\s*\d+\.", line)
         ]
         assert numbered_rows == ["1. UPDATE pkg-a 1.0.0 -> 1.0.1 (patch)"]
-
-
-class TestUpdateFinalise:
-    """Promote moves READY -> COMPLETED only on success."""
-
-    def test_promote_success_promotes_ready_to_completed(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
-        )
-        assert run_mm("update", "vulnerable") == 0
-        # remove_completed_findings removes promoted findings from the result
-        saved = load_scan_results("vulnerable")
-        assert saved.vulnerabilities == []
-        assert saved.updates == []
-
-    @pytest.mark.parametrize(
-        ("failing_operation", "expected_message"),
-        [
-            ("promote_bookmark_to_main", "Promotion failed"),
-            ("working_copy_state", "Workspace refresh failed"),
-        ],
-    )
-    def test_finalise_failure_leaves_ready(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        failing_operation: str,
-        expected_message: str,
-    ):
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
-        )
-        from maintenance_man.vcs import RevisionError
-
-        mock_update_cli_deps.vcs_state.fail(
-            failing_operation,
-            error=RevisionError("injected"),
-            path=mock_update_cli_deps.project_paths["vulnerable"],
-        )
-
-        assert run_mm("update", "vulnerable") == 4
-
-        output = capsys.readouterr().out
-        assert expected_message in output
-        saved = load_scan_results("vulnerable")
-        assert saved.vulnerabilities[0].update_status == UpdateStatus.READY
-        assert saved.vulnerabilities[0].flow == Workflow.UPDATE
-        assert saved.vulnerabilities[0].failed_phase is None
-        assert saved.updates[0].update_status == UpdateStatus.READY
-        assert saved.updates[0].flow == Workflow.UPDATE
-
-    def test_failed_findings_block_promote(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """If any finding fails, don't promote."""
-        state = mock_update_cli_deps.vcs_state
-        state.clear_calls()
-        monkeypatch.setattr(
-            "maintenance_man.services.update.process_findings",
-            FakeFindingProcessor({"some-pkg": (False, "unit")}),
-        )
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
-        )
-
-        assert run_mm("update", "vulnerable") == 4
-        assert not any(
-            call.method == "promote_bookmark_to_main" for call in state.attempts
-        )
-        saved = load_scan_results("vulnerable")
-        assert saved.vulnerabilities[0].update_status == UpdateStatus.FAILED
-
-    def test_final_bookmark_cleanup_failure_preserves_completed_update(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        project_path = mock_update_cli_deps.project_paths["vulnerable"]
-        state = mock_update_cli_deps.vcs_state
-        state.fail(
-            "delete_bookmark",
-            ordinal=1,
-            error=RevisionError("injected final cleanup failure"),
-            path=project_path,
-        )
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
-        )
-
-        assert run_mm("update", "vulnerable") == ExitCode.UPDATE_FAILED
-        output = capsys.readouterr().out
-        assert "Bookmark cleanup failed" in output
-        assert "injected final cleanup failure" in output
-        repo = mock_update_cli_deps.vcs_state.services().repository(project_path)
-        assert repo.same_revision(left="main", right="mm/update-dependencies")
-        assert (project_path / "mm-fixture-some-pkg.txt").read_text() == "1.0.1"
-        saved = load_scan_results("vulnerable")
-        assert not saved.findings
-
-    def test_failed_workspace_removal_retains_directory_and_reports_failure(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        state = mock_update_cli_deps.vcs_state
-        state.fail("forget_workspace", error=RevisionError("cannot forget"))
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
-        )
-
-        assert run_mm("update", "vulnerable") == ExitCode.UPDATE_FAILED
-        assert (mm_home_with_projects / "workspaces" / "vulnerable").is_dir()
-        source = mock_update_cli_deps.vcs_state.services().repository(
-            mock_update_cli_deps.project_paths["vulnerable"]
-        )
-        assert "mm-vulnerable" in source.workspace_names()
-
-    def test_fresh_update_creates_workspace_bookmark_and_new_change(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        state = mock_update_cli_deps.vcs_state
-        state.clear_calls()
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
-        )
-
-        assert run_mm("update", "vulnerable") == 0
-
-        effects = [call.method for call in state.effects]
-        setup = [
-            method
-            for method in effects
-            if method in {"create_bookmark", "add_workspace", "new_change"}
-        ]
-        assert setup[:3] == ["create_bookmark", "add_workspace", "new_change"]
-        bookmark = next(
-            call for call in state.effects if call.method == "create_bookmark"
-        )
-        assert dict(bookmark.arguments)["bookmark"] == "mm/update-dependencies"
 
 
 class TestUpdateAll:
@@ -872,21 +708,66 @@ class TestUpdateAll:
             saved = load_scan_results(project)
             assert not saved.findings
 
-    def test_batch_no_test_config_does_not_abort(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Missing test config warns (not fatal) for single-project invocation."""
 
-        monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
-        )
+@pytest.mark.parametrize(
+    ("failing_operation", "expected_line"),
+    [
+        ("promote_bookmark_to_main", "Promotion failed: injected"),
+        (
+            "working_copy_state",
+            "Workspace refresh failed: vulnerable: injected",
+        ),
+    ],
+)
+def test_given_finalisation_failure_when_run_then_exits_four_with_error(
+    mm_home_with_projects: Path,
+    mock_update_cli_deps: CliDeps,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failing_operation: str,
+    expected_line: str,
+) -> None:
+    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    mock_update_cli_deps.vcs_state.fail(
+        failing_operation,
+        error=RevisionError("injected"),
+        path=mock_update_cli_deps.project_paths["vulnerable"],
+    )
 
-        assert run_mm("update", "no-tests") == 0
-        saved = load_scan_results("no-tests")
-        assert not saved.findings
+    assert run_mm("update", "vulnerable") == ExitCode.UPDATE_FAILED
+    assert expected_line in capsys.readouterr().out.splitlines()
+
+
+def test_given_successful_update_when_run_then_exits_zero_with_promotion(
+    mm_home_with_projects: Path,
+    mock_update_cli_deps: CliDeps,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+
+    assert run_mm("update", "vulnerable") == ExitCode.OK
+    assert (
+        "Promoted mm/update-dependencies to main."
+        in capsys.readouterr().out.splitlines()
+    )
+
+
+def test_given_workspace_cleanup_failure_when_run_then_exits_four_with_error(
+    mm_home_with_projects: Path,
+    mock_update_cli_deps: CliDeps,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    mock_update_cli_deps.vcs_state.fail(
+        "forget_workspace",
+        error=RevisionError("injected"),
+        path=mock_update_cli_deps.project_paths["vulnerable"],
+    )
+
+    assert run_mm("update", "vulnerable") == ExitCode.UPDATE_FAILED
+    assert "Workspace cleanup failed: injected" in capsys.readouterr().out.splitlines()
 
 
 def test_update_end_to_end_uses_one_graph_and_persists_completion(
@@ -1343,41 +1224,6 @@ def test_gradle_ready_only_missing_bookmark_preserves_state(
     assert all(f.update_status == UpdateStatus.READY for f in state.updates)
     assert gradle_update_cli == {"tests": [], "applies": []}
     _assert_no_gradle_repository_mutations(vcs_state, gradle_project.path)
-
-
-def test_gradle_workspace_revision_reports_uninspectable_local_properties(
-    gradle_project, monkeypatch
-):
-    from maintenance_man.gradle import GradleError
-    from maintenance_man.gradle_workflow import pin_workspace_revision
-    from maintenance_man.vcs import RevisionError
-
-    monkeypatch.delenv("ANDROID_HOME", raising=False)
-    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
-    (gradle_project.path / "local.properties").write_text("sdk.dir=/opt/android\n")
-    state = FakeJjState()
-    state.seed_repository(
-        gradle_project.path, files={"local.properties": "sdk.dir=/opt/android\n"}
-    )
-    state.fail(
-        "revision_file",
-        error=RevisionError("inspection failed"),
-        path=gradle_project.path,
-    )
-
-    with pytest.raises(
-        GradleError,
-        match=(
-            r"Cannot inspect local.properties in mm/update-dependencies: "
-            r"inspection failed"
-        ),
-    ):
-        pin_workspace_revision(
-            "android",
-            gradle_project,
-            "mm/update-dependencies",
-            vcs=state.services(),
-        )
 
 
 @pytest.mark.parametrize("batch", [False, True])

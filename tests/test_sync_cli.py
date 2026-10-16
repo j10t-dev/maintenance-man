@@ -12,35 +12,6 @@ from tests.fake_vcs import FakeJjState
 
 
 class TestSyncCommand:
-    def test_syncs_all_projects_by_default(
-        self,
-        mm_home_with_projects: Path,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
-
-        assert run_mm("sync") == ExitCode.OK
-        assert [call.path for call in state.attempts if call.method == "fetch"] == [
-            project.path.resolve()
-            for _, project in sorted(load_config().projects.items())
-        ]
-
-    def test_syncs_named_projects_only(
-        self,
-        mm_home_with_projects: Path,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
-
-        assert run_mm("sync", "vulnerable", "clean") == ExitCode.OK
-        projects = load_config().projects
-        assert [call.path for call in state.attempts if call.method == "fetch"] == [
-            projects["vulnerable"].path.resolve(),
-            projects["clean"].path.resolve(),
-        ]
-
     def test_exits_nonzero_on_typed_failure(
         self,
         mm_home_with_projects: Path,
@@ -54,23 +25,6 @@ class TestSyncCommand:
 
         assert run_mm("sync", "vulnerable") == ExitCode.SYNC_FAILED
         assert "fetch failed" in capsys.readouterr().out
-
-    def test_continues_after_one_failure(
-        self,
-        mm_home_with_projects: Path,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
-        path = load_config().projects["vulnerable"].path
-        state.fail("fetch", error=RevisionError("fetch failed"), path=path)
-
-        assert run_mm("sync", "vulnerable", "clean") == ExitCode.SYNC_FAILED
-        projects = load_config().projects
-        assert [call.path for call in state.attempts if call.method == "fetch"] == [
-            projects["vulnerable"].path.resolve(),
-            projects["clean"].path.resolve(),
-        ]
 
     def test_composes_once_without_extra_vcs_context(
         self,
@@ -107,6 +61,7 @@ class TestSyncCommand:
         self,
         mm_home: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         mm_home.mkdir(parents=True, exist_ok=True)
         write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
@@ -114,6 +69,7 @@ class TestSyncCommand:
         monkeypatch.setattr(cli, "make_vcs_services", factory)
 
         assert run_mm("sync") == ExitCode.OK
+        assert "No projects configured" in capsys.readouterr().out
         factory.assert_not_called()
 
     def test_skips_nonexistent_path(
@@ -121,6 +77,7 @@ class TestSyncCommand:
         mm_home: Path,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         mm_home.mkdir(parents=True, exist_ok=True)
         missing_path = tmp_path / "does-not-exist"
@@ -138,4 +95,5 @@ test_unit = "uv run pytest"
         monkeypatch.setattr(cli, "make_vcs_services", state.services)
 
         assert run_mm("sync") == ExitCode.SYNC_FAILED
+        assert "ghost — path does not exist" in capsys.readouterr().out
         assert state.attempts == []

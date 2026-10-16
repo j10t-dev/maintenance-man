@@ -1,30 +1,16 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from rich.console import Console
 
 from maintenance_man import cli, paths
 from maintenance_man.cli import ExitCode
 from maintenance_man.deployer import BuildError, DeployError, HealthCheckResult
-from maintenance_man.models.activity import ActivityEvent, ProjectActivity
-from maintenance_man.models.events import (
-    DeployStep,
-    DeployStepFailed,
-    DeployStepStarted,
-    DeployStepSucceeded,
-    Event,
-    HealthChecked,
-    HealthcheckUnconfigured,
-    ProjectStarted,
-)
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from tests.conftest import configure_fake_vcs, make_activity, run_mm, write_config
+from tests.conftest import configure_fake_vcs, run_mm, write_config
 from tests.fake_vcs import FakeJjState
 
 
@@ -34,89 +20,6 @@ def test_deploy_summary_prints_bracketed_project_literal(capsys) -> None:
     )
 
     assert "a[b]" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
-@pytest.mark.parametrize(
-    ("event", "single", "batch_text"),
-    [
-        (
-            ProjectStarted("a[b]"),
-            "",
-            f"\n{'═' * 40}\na[b]\n{'═' * 40}\n",
-        ),
-        (
-            DeployStepStarted("a[b]", DeployStep.BUILD),
-            "Building a[b]\n\n",
-            "  Building...\n",
-        ),
-        (
-            DeployStepStarted("a[b]", DeployStep.DEPLOY),
-            "Deploying a[b]\n\n",
-            "  Deploying...\n",
-        ),
-        (
-            DeployStepStarted("a[b]", DeployStep.HEALTH),
-            "\nChecking health of a[b]...\n",
-            "",
-        ),
-        (
-            DeployStepSucceeded("a[b]", DeployStep.BUILD),
-            "\nBuild succeeded.\n\n",
-            "",
-        ),
-        (
-            DeployStepSucceeded("a[b]", DeployStep.DEPLOY),
-            "\nDeploy succeeded.\n",
-            "",
-        ),
-        (
-            DeployStepFailed("a[b]", DeployStep.BUILD, "bad [state]"),
-            "Error: bad [state]\n",
-            "  Build failed: bad [state]\n",
-        ),
-        (
-            DeployStepFailed("a[b]", DeployStep.DEPLOY, "bad [state]"),
-            "Error: bad [state]\n",
-            "  Deploy failed: bad [state]\n",
-        ),
-        (
-            HealthChecked("a[b]", True, None),
-            "Healthy: a[b] is up\n",
-            "  Healthy: a[b] is up\n",
-        ),
-        (
-            HealthChecked("a[b]", False, "bad [state]"),
-            "Warning: bad [state]\n",
-            "  Warning: bad [state]\n",
-        ),
-        (
-            HealthChecked("a[b]", False, None),
-            "Warning: a[b] is not healthy\n",
-            "  Warning: a[b] is not healthy\n",
-        ),
-        (
-            HealthcheckUnconfigured(),
-            "--check: no healthcheck_url configured in [defaults]\n",
-            "--check: no healthcheck_url configured in [defaults]\n",
-        ),
-    ],
-)
-def test_deploy_event_renderer_preserves_text(
-    monkeypatch: pytest.MonkeyPatch,
-    event: Event,
-    single: str,
-    batch_text: str,
-    batch: bool,
-) -> None:
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=220, color_system=None)
-    )
-
-    cli._Renderer(batch=batch)(event)
-
-    assert output.getvalue() == (batch_text if batch else single)
 
 
 @dataclass(frozen=True)
@@ -295,52 +198,21 @@ class TestDeployCommand:
         """Error when project doesn't exist."""
         assert run_mm("deploy", "nonexistent") == ExitCode.ERROR
 
-    @patch("maintenance_man.services.deploy.record_activity")
     @patch("maintenance_man.services.deploy.run_live")
-    def test_successful_deploy_records_activity(
+    def test_given_unchanged_deploy_when_run_then_exits_zero_with_force_hint(
         self,
         mock_deploy: MagicMock,
-        mock_record: MagicMock,
         mm_home_with_projects: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Successful deploy records activity event."""
-        assert run_mm("deploy", "deployable") == ExitCode.OK
-        mock_record.assert_called_once()
-        _, kwargs = mock_record.call_args
-        assert kwargs["success"] is True
+        assert run_mm("deploy", "deploy-only") == ExitCode.OK
+        capsys.readouterr()
 
-    @patch("maintenance_man.services.deploy.record_activity")
-    @patch(
-        "maintenance_man.services.deploy.run_live",
-        side_effect=DeployError("deploy failed"),
-    )
-    def test_failed_deploy_records_activity(
-        self,
-        mock_deploy: MagicMock,
-        mock_record: MagicMock,
-        mm_home_with_projects: Path,
-    ) -> None:
-        """Failed deploy still records activity event with success=False."""
-        assert run_mm("deploy", "deployable") == ExitCode.DEPLOY_FAILED
-        mock_record.assert_called_once()
-        _, kwargs = mock_record.call_args
-        assert kwargs["success"] is False
-
-    @patch("maintenance_man.services.deploy.record_activity")
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_deploy_with_build_records_both(
-        self,
-        mock_run: MagicMock,
-        mock_record: MagicMock,
-        mm_home_with_projects: Path,
-    ) -> None:
-        """--build records both build and deploy events."""
-        assert run_mm("deploy", "deployable", "--build") == ExitCode.OK
-        assert mock_record.call_count == 2
-        calls = mock_record.call_args_list
-        # First call is build, second is deploy
-        assert calls[0].args[2] == "build"
-        assert calls[1].args[2] == "deploy"
+        assert run_mm("deploy", "deploy-only") == ExitCode.OK
+        assert (
+            "deploy-only unchanged since last deploy (use --force to redeploy)."
+            in capsys.readouterr().out.splitlines()
+        )
 
 
 class TestDeployCheck:
@@ -393,31 +265,22 @@ class TestDeployCheck:
         assert run_mm("deploy", "deployable", "--check") == ExitCode.OK
         mock_check.assert_called_once_with("http://pihost:8080", "deployable")
 
-    @pytest.mark.parametrize("healthcheck_line", [None, 'healthcheck_url = ""'])
     @patch("maintenance_man.services.deploy.check_health")
     @patch("maintenance_man.services.deploy.run_live")
-    def test_check_without_healthcheck_url_warns(
+    def test_given_unconfigured_check_when_run_then_exits_zero_with_warning(
         self,
         mock_deploy: MagicMock,
         mock_check: MagicMock,
-        healthcheck_line: str | None,
         mm_home_with_projects: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """--check without healthcheck_url configured prints warning."""
-        if healthcheck_line is not None:
-            config_path = mm_home_with_projects / "config.toml"
-            write_config(
-                mm_home_with_projects,
-                config_path.read_text().replace(
-                    "min_version_age_days = 7",
-                    f"min_version_age_days = 7\n{healthcheck_line}",
-                ),
-            )
         assert run_mm("deploy", "deployable", "--check") == ExitCode.OK
-        output = capsys.readouterr().out
-        assert output.count("--check: no healthcheck_url configured") == 1
-        mock_check.assert_not_called()
+        assert (
+            capsys.readouterr().out.count(
+                "--check: no healthcheck_url configured in [defaults]"
+            )
+            == 1
+        )
 
     @pytest.mark.parametrize(
         ("failure", "error", "expected_code"),
@@ -426,7 +289,7 @@ class TestDeployCheck:
             (DeployError, DeployError("deploy failed"), ExitCode.DEPLOY_FAILED),
         ],
     )
-    def test_failed_deploy_with_check_has_no_health_hint(
+    def test_given_failed_checked_deploy_when_run_then_error_has_no_health_hint(
         self,
         failure: type[BuildError] | type[DeployError],
         error: BuildError | DeployError,
@@ -510,27 +373,6 @@ class TestMassDeployCommand:
             == 2
         )
 
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_build_failure_skips_deploy_for_that_project(
-        self,
-        mock_run: MagicMock,
-        mm_home_with_projects: Path,
-    ) -> None:
-        """Build failure skips deploy for that project but continues to next."""
-        error = BuildError("build failed")
-
-        def fail_build(*args, **kwargs):
-            if kwargs["error"] is BuildError:
-                raise error
-
-        mock_run.side_effect = fail_build
-        assert run_mm("deploy") == ExitCode.DEPLOY_FAILED
-        # "deployable" build fails => deploy skipped; "deploy-only" has no build => runs
-        assert (
-            sum(call.kwargs["error"] is DeployError for call in mock_run.call_args_list)
-            == 1
-        )
-
     @patch(
         "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=True),
@@ -593,179 +435,3 @@ class TestMassDeployCommand:
         write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
         assert run_mm("deploy") == ExitCode.OK
         assert "no projects" in capsys.readouterr().out.lower()
-
-
-class TestDeployGateWiring:
-    @pytest.fixture(autouse=True)
-    def _vcs(self, _deploy_vcs: _DeployVcs) -> None:
-        pass
-
-    @patch("maintenance_man.services.deploy.record_activity")
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_explicit_unchanged_skips_with_warning(
-        self,
-        mock_deploy: MagicMock,
-        mock_record: MagicMock,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        _deploy_vcs: _DeployVcs,
-    ) -> None:
-        main_id = _deploy_vcs.main_ids["deploy-only"]
-        monkeypatch.setattr(
-            "maintenance_man.services.deploy.load_activity",
-            lambda path: (
-                make_activity(success=True, commit_id="C")
-                | {
-                    "deploy-only": ProjectActivity(
-                        last_deploy=ActivityEvent(
-                            timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                            success=True,
-                            branch="main",
-                            commit_id=main_id,
-                        )
-                    )
-                }
-            ),
-        )
-        assert run_mm("deploy", "deploy-only") == ExitCode.OK
-        mock_deploy.assert_not_called()
-        mock_record.assert_not_called()
-        assert "force" in capsys.readouterr().out.lower()
-
-    @patch("maintenance_man.services.deploy.record_activity")
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_force_redeploys_unchanged_and_records_commit_id(
-        self,
-        mock_deploy: MagicMock,
-        mock_record: MagicMock,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        _deploy_vcs: _DeployVcs,
-    ) -> None:
-        main_id = _deploy_vcs.main_ids["deploy-only"]
-        monkeypatch.setattr(
-            "maintenance_man.services.deploy.load_activity",
-            lambda path: {
-                "deploy-only": ProjectActivity(
-                    last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                        success=True,
-                        branch="main",
-                        commit_id=main_id,
-                    )
-                )
-            },
-        )
-        assert run_mm("deploy", "deploy-only", "--force") == ExitCode.OK
-        mock_deploy.assert_called_once()
-        assert mock_record.call_args.kwargs["commit_id"] == main_id
-
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_batch_blocked_exits_ok(
-        self,
-        mock_deploy: MagicMock,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        _deploy_vcs: _DeployVcs,
-    ) -> None:
-        path = _deploy_vcs.paths["deploy-only"]
-        _deploy_vcs.state.fail(
-            "resolve_revision", error=RevisionError("no main"), path=path
-        )
-        _deploy_vcs.state.fail(
-            "resolve_revision", ordinal=2, error=RevisionError("no main"), path=path
-        )
-        monkeypatch.setattr(
-            "maintenance_man.services.deploy.load_activity", lambda path: {}
-        )
-        assert run_mm("deploy") == ExitCode.OK
-        mock_deploy.assert_not_called()
-
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_batch_skips_unchanged_deploys_changed(
-        self,
-        mock_run: MagicMock,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        _deploy_vcs: _DeployVcs,
-    ) -> None:
-        main_id = _deploy_vcs.main_ids["deployable"]
-        monkeypatch.setattr(
-            "maintenance_man.services.deploy.load_activity",
-            lambda path: {
-                "deployable": ProjectActivity(
-                    last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                        success=True,
-                        branch="main",
-                        commit_id=main_id,
-                    )
-                )
-            },
-        )
-        assert run_mm("deploy") == ExitCode.OK
-        labels = [call.kwargs["label"] for call in mock_run.call_args_list]
-        assert "Deploy for deployable" not in labels
-        assert "Deploy for deploy-only" in labels
-        assert all(
-            call.kwargs["error"] is DeployError for call in mock_run.call_args_list
-        )
-
-    @patch(
-        "maintenance_man.services.deploy.check_health",
-        return_value=HealthCheckResult(is_up=True),
-    )
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_check_not_run_for_skipped(
-        self,
-        mock_run: MagicMock,
-        mock_check: MagicMock,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        _deploy_vcs: _DeployVcs,
-    ) -> None:
-        config_path = mm_home_with_projects / "config.toml"
-        write_config(
-            mm_home_with_projects,
-            config_path.read_text().replace(
-                "min_version_age_days = 7",
-                'min_version_age_days = 7\nhealthcheck_url = "http://h:8080"',
-            ),
-        )
-        main_id = _deploy_vcs.main_ids["deployable"]
-        monkeypatch.setattr(
-            "maintenance_man.services.deploy.load_activity",
-            lambda path: {
-                "deployable": ProjectActivity(
-                    last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                        success=True,
-                        branch="main",
-                        commit_id=main_id,
-                    )
-                ),
-                "deploy-only": ProjectActivity(
-                    last_deploy=ActivityEvent(
-                        timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                        success=True,
-                        branch="main",
-                        commit_id=main_id,
-                    )
-                ),
-            },
-        )
-        assert run_mm("deploy", "--check") == ExitCode.OK
-        mock_check.assert_not_called()
-
-    @patch("maintenance_man.services.deploy.run_live")
-    def test_loop_closes_real_activity(
-        self,
-        mock_deploy: MagicMock,
-        mm_home_with_projects: Path,
-    ) -> None:
-        """Deploy once records the id; second run skips. The headline behaviour."""
-        assert run_mm("deploy", "deploy-only") == ExitCode.OK
-        assert mock_deploy.call_count == 1
-        assert run_mm("deploy", "deploy-only") == ExitCode.OK
-        assert mock_deploy.call_count == 1

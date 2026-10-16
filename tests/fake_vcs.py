@@ -1,5 +1,3 @@
-"""Shared in-memory repository adapter used by repository contract tests."""
-
 from __future__ import annotations
 
 import hashlib
@@ -7,7 +5,7 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Literal
 
 from maintenance_man.github import CodeHostError
 from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
@@ -28,20 +26,12 @@ class FakeCall:
     arguments: tuple[tuple[str, object], ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _HostFailure:
-    method: str
-    ordinal: int
-    error: CodeHostError
-    registered_after: int
-
-
 @dataclass(slots=True)
 class _HostData:
     prs: list[tuple[str, Literal["open", "merged", "closed"], str]] = field(
         default_factory=list
     )
-    failures: list[_HostFailure] = field(default_factory=list)
+    failures: list[_Failure[CodeHostError]] = field(default_factory=list)
     ordinals: dict[str, int] = field(default_factory=dict)
     attempts: list[FakeCall] = field(default_factory=list)
     effects: list[FakeCall] = field(default_factory=list)
@@ -51,14 +41,8 @@ class FakeCodeHost:
     def __init__(self, path: Path, *, _data: _HostData | None = None):
         self.path = path.resolve()
         self._data = _data or _HostData()
-
-    @property
-    def attempts(self) -> list[FakeCall]:
-        return self._data.attempts
-
-    @property
-    def effects(self) -> list[FakeCall]:
-        return self._data.effects
+        self.attempts = self._data.attempts
+        self.effects = self._data.effects
 
     def seed_pr(
         self,
@@ -76,13 +60,9 @@ class FakeCodeHost:
         ordinal: int = 1,
         error: CodeHostError,
     ) -> None:
+        registered_after = self._data.ordinals.get(method, 0)
         self._data.failures.append(
-            _HostFailure(
-                method,
-                ordinal,
-                error,
-                self._data.ordinals.get(method, 0),
-            )
+            _Failure(method, ordinal, error, None, registered_after)
         )
 
     def _begin(self, method: str, **arguments: object) -> None:
@@ -156,16 +136,16 @@ class _RepositoryData:
     tracks_main: bool = True
 
 
-@dataclass(frozen=True, slots=True)
-class _Failure:
+@dataclass(slots=True)
+class _Failure[ErrorT: Exception]:
     method: str
     ordinal: int
-    error: RevisionError
+    error: ErrorT
     path: Path | None
     registered_after: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Hook:
     method: str
     ordinal: int
@@ -178,39 +158,34 @@ class _Hook:
 def _tree_id(files: tuple[tuple[str, bytes], ...]) -> str:
     digest = hashlib.sha256()
     for name, content in files:
-        digest.update(name.encode())
-        digest.update(b"\0")
-        digest.update(content)
-        digest.update(b"\0")
+        digest.update(name.encode() + b"\0" + content + b"\0")
     return digest.hexdigest()
 
 
 def _commit(
-    *, change_id: str, parent: str | None, files: dict[str, bytes], description: str
+    change_id: str, parent: str | None, files: dict[str, bytes], description: str
 ) -> _Commit:
     frozen_files = tuple(sorted(files.items()))
     tree = _tree_id(frozen_files)
     digest = hashlib.sha256()
-    digest.update(change_id.encode())
-    digest.update((parent or "root").encode())
-    digest.update(tree.encode())
-    digest.update(description.encode())
+    digest.update(
+        change_id.encode()
+        + (parent or "root").encode()
+        + tree.encode()
+        + description.encode()
+    )
     return _Commit(
         digest.hexdigest(), change_id, parent, frozen_files, description, tree
     )
 
 
 class FakeJjState:
-    """Repository graph and boundary controls shared by path-bound fake views."""
-
-    _owners: ClassVar[dict[Path, FakeJjState]] = {}
-
     def __init__(self) -> None:
         self._repositories: dict[Path, _RepositoryData] = {}
         self._bindings: dict[Path, tuple[Path, str]] = {}
         self._origins: dict[str, _Origin] = {}
         self._sequence = 0
-        self._failures: list[_Failure] = []
+        self._failures: list[_Failure[RevisionError]] = []
         self._hooks: list[_Hook] = []
         self._ordinals: dict[tuple[str, Path], int] = {}
         self._hook_ordinals: dict[tuple[str, str, Path], int] = {}
@@ -231,18 +206,8 @@ class FakeJjState:
             raise AssertionError(msg)
         root.mkdir(parents=True, exist_ok=True)
         encoded = {name: value.encode() for name, value in files.items()}
-        baseline = _commit(
-            change_id=self._identity("change"),
-            parent=None,
-            files=encoded,
-            description=description,
-        )
-        child = _commit(
-            change_id=self._identity("change"),
-            parent=baseline.commit_id,
-            files=encoded,
-            description="",
-        )
+        baseline = _commit(self._identity("change"), None, encoded, description)
+        child = _commit(self._identity("change"), baseline.commit_id, encoded, "")
         origin_key = f"origin:{root}"
         self._origins[origin_key] = _Origin(
             graph={baseline.commit_id: baseline},
@@ -260,19 +225,18 @@ class FakeJjState:
         self._hosts[root] = _HostData()
         self._bind(root, root, "default")
         self._project(data, data.workspaces["default"])
-        return FakeJj(root)
+        return FakeJj(self, root)
 
     def _bind(self, path: Path, root: Path, workspace: str) -> None:
         resolved = path.resolve()
         self._bindings[resolved] = (root, workspace)
-        self._owners[resolved] = self
 
     def repository(self, path: Path) -> FakeJj:
         resolved = path.resolve()
         if resolved not in self._bindings:
             msg = f"unknown fake repository path: {resolved}"
             raise AssertionError(msg)
-        return FakeJj(resolved)
+        return FakeJj(self, resolved)
 
     def code_host(self, path: Path) -> FakeCodeHost:
         resolved = path.resolve()
@@ -307,12 +271,7 @@ class FakeJjState:
         root.mkdir(parents=True, exist_ok=True)
         graph = dict(origin.graph)
         base = graph[main]
-        child = _commit(
-            change_id=self._identity("change"),
-            parent=main,
-            files=dict(base.files),
-            description="",
-        )
+        child = _commit(self._identity("change"), main, dict(base.files), "")
         graph[child.commit_id] = child
         data = _RepositoryData(
             graph=graph,
@@ -326,7 +285,7 @@ class FakeJjState:
         self._repositories[root] = data
         self._bind(root, root, "default")
         self._project(data, data.workspaces["default"])
-        return FakeJj(root)
+        return FakeJj(self, root)
 
     def track_main(self, path: Path, *, enabled: bool) -> None:
         data, _ = self._view(path)
@@ -344,12 +303,8 @@ class FakeJjState:
         if parent not in data.graph:
             msg = f"unknown parent: {parent}"
             raise AssertionError(msg)
-        record = _commit(
-            change_id=self._identity("change"),
-            parent=parent,
-            files={name: value.encode() for name, value in files.items()},
-            description=description,
-        )
+        encoded = {name: value.encode() for name, value in files.items()}
+        record = _commit(self._identity("change"), parent, encoded, description)
         data.graph[record.commit_id] = record
         self._origins[data.origin_key].graph[record.commit_id] = record
         return record.commit_id
@@ -373,12 +328,8 @@ class FakeJjState:
         description: str = "",
     ) -> str:
         data, workspace = self._view(path)
-        record = _commit(
-            change_id=self._identity("change"),
-            parent=parent,
-            files={name: value.encode() for name, value in files.items()},
-            description=description,
-        )
+        encoded = {name: value.encode() for name, value in files.items()}
+        record = _commit(self._identity("change"), parent, encoded, description)
         data.graph[record.commit_id] = record
         self._replace_workspace(data, workspace, current=record.commit_id)
         data.declared_files.update(files)
@@ -398,7 +349,6 @@ class FakeJjState:
             origin.bookmarks.pop(bookmark, None)
 
     def remote_bookmark_targets(self, path: Path, *, bookmark: str) -> tuple[str, ...]:
-        """Inspect an actual-origin bookmark for workflow outcome assertions."""
         data, _ = self._view(path)
         return self._origins[data.origin_key].bookmarks.get(bookmark, ())
 
@@ -421,14 +371,9 @@ class FakeJjState:
         path: Path | None = None,
     ) -> None:
         resolved = path.resolve() if path else None
+        registered_after = self._matching_call_ordinal(method, resolved)
         self._failures.append(
-            _Failure(
-                method,
-                ordinal,
-                error,
-                resolved,
-                self._matching_call_ordinal(method, resolved),
-            )
+            _Failure(method, ordinal, error, resolved, registered_after)
         )
 
     def hook(
@@ -441,15 +386,9 @@ class FakeJjState:
         path: Path | None = None,
     ) -> None:
         resolved = path.resolve() if path else None
+        registered_after = self._matching_hook_ordinal(method, phase, resolved)
         self._hooks.append(
-            _Hook(
-                method,
-                ordinal,
-                phase,
-                action,
-                resolved,
-                self._matching_hook_ordinal(method, phase, resolved),
-            )
+            _Hook(method, ordinal, phase, action, resolved, registered_after)
         )
 
     def clear_calls(self) -> None:
@@ -457,29 +396,16 @@ class FakeJjState:
         self.effects.clear()
         self._ordinals.clear()
         self._hook_ordinals.clear()
-        self._failures = [
-            _Failure(item.method, item.ordinal, item.error, item.path, 0)
-            for item in self._failures
-        ]
-        self._hooks = [
-            _Hook(
-                item.method,
-                item.ordinal,
-                item.phase,
-                item.action,
-                item.path,
-                0,
-            )
-            for item in self._hooks
-        ]
+        for failure in self._failures:
+            failure.registered_after = 0
+        for hook in self._hooks:
+            hook.registered_after = 0
         for host in self._hosts.values():
             host.attempts.clear()
             host.effects.clear()
             host.ordinals.clear()
-            host.failures = [
-                _HostFailure(item.method, item.ordinal, item.error, 0)
-                for item in host.failures
-            ]
+            for failure in host.failures:
+                failure.registered_after = 0
 
     def _matching_call_ordinal(self, method: str, path: Path | None) -> int:
         return sum(
@@ -563,12 +489,7 @@ class FakeJjState:
             target = workspace.path / name
             if target.is_file() and not target.is_symlink():
                 files[name] = target.read_bytes()
-        record = _commit(
-            change_id=current.change_id,
-            parent=current.parent,
-            files=files,
-            description=current.description,
-        )
+        record = _commit(current.change_id, current.parent, files, current.description)
         data.graph[record.commit_id] = record
         self._replace_workspace(data, workspace, current=record.commit_id)
         return record
@@ -622,15 +543,9 @@ class FakeJjState:
 
 
 class FakeJj:
-    """Path-bound Repository implementation backed by FakeJjState."""
-
-    def __init__(self, path: Path):
+    def __init__(self, state: FakeJjState, path: Path):
         resolved = path.resolve()
-        try:
-            self._state = FakeJjState._owners[resolved]
-        except KeyError as exc:
-            msg = f"unknown fake repository path: {resolved}"
-            raise AssertionError(msg) from exc
+        self._state = state
         self._path = resolved
         self._state._view(resolved)
 
@@ -734,11 +649,22 @@ class FakeJj:
 
     def working_copy_state(self) -> WorkingCopyState:
         self._state._begin(self.path, "working_copy_state")
+        current, has_changes, bookmarks = self._working_copy_details()
+        return WorkingCopyState(
+            has_changes=has_changes,
+            description=current.description,
+            bookmarks=bookmarks,
+        )
+
+    def has_changes(self) -> bool:
+        self._state._begin(self.path, "has_changes")
+        _current, has_changes, _bookmarks = self._working_copy_details()
+        return has_changes
+
+    def _working_copy_details(self) -> tuple[_Commit, bool, tuple[str, ...]]:
         current = self._state._snapshot(self.path)
         data, _ = self._data()
-        parent_files = (
-            dict(data.graph[current.parent].files) if current.parent is not None else {}
-        )
+        parent = dict(data.graph[current.parent].files) if current.parent else {}
         bookmarks = tuple(
             sorted(
                 name
@@ -746,18 +672,7 @@ class FakeJj:
                 if current.commit_id in targets
             )
         )
-        return WorkingCopyState(
-            has_changes=dict(current.files) != parent_files,
-            description=current.description,
-            bookmarks=bookmarks,
-        )
-
-    def has_changes(self) -> bool:
-        self._state._begin(self.path, "has_changes")
-        current = self._state._snapshot(self.path)
-        data, _ = self._data()
-        parent = dict(data.graph[current.parent].files) if current.parent else {}
-        return dict(current.files) != parent
+        return current, dict(current.files) != parent, bookmarks
 
     def changed_paths(self, *, revision: str = "@") -> frozenset[str]:
         self._state._begin(self.path, "changed_paths", revision=revision)
@@ -811,12 +726,7 @@ class FakeJj:
         target = self.resolve_revision(revision=revision)
         data, workspace = self._data()
         base = data.graph[target]
-        record = _commit(
-            change_id=self._state._identity("change"),
-            parent=target,
-            files=dict(base.files),
-            description="",
-        )
+        record = _commit(self._state._identity("change"), target, dict(base.files), "")
         data.graph[record.commit_id] = record
         self._state._replace_workspace(data, workspace, current=record.commit_id)
         self._state._project(data, self._state._workspace(data, workspace.name))
@@ -827,16 +737,13 @@ class FakeJj:
         current = self._state._snapshot(self.path)
         data, workspace = self._data()
         finished = _commit(
-            change_id=current.change_id,
-            parent=current.parent,
-            files=dict(current.files),
-            description=message,
+            current.change_id, current.parent, dict(current.files), message
         )
         child = _commit(
-            change_id=self._state._identity("change"),
-            parent=finished.commit_id,
-            files=dict(finished.files),
-            description="",
+            self._state._identity("change"),
+            finished.commit_id,
+            dict(finished.files),
+            "",
         )
         data.graph[finished.commit_id] = finished
         data.graph[child.commit_id] = child
@@ -848,10 +755,7 @@ class FakeJj:
         current = self._state._snapshot(self.path)
         data, workspace = self._data()
         described = _commit(
-            change_id=current.change_id,
-            parent=current.parent,
-            files=dict(current.files),
-            description=message,
+            current.change_id, current.parent, dict(current.files), message
         )
         data.graph[described.commit_id] = described
         self._state._replace_workspace(data, workspace, current=described.commit_id)
@@ -865,10 +769,10 @@ class FakeJj:
         data, workspace = self._data()
         parent = data.graph[current.parent]
         restored = _commit(
-            change_id=current.change_id,
-            parent=current.parent,
-            files=dict(parent.files),
-            description=current.description,
+            current.change_id,
+            current.parent,
+            dict(parent.files),
+            current.description,
         )
         data.graph[restored.commit_id] = restored
         self._state._replace_workspace(data, workspace, current=restored.commit_id)
@@ -890,12 +794,7 @@ class FakeJj:
                 rebased_files[name] = current_files[name]
             else:
                 rebased_files.pop(name, None)
-        rebased = _commit(
-            change_id=current.change_id,
-            parent=target,
-            files=rebased_files,
-            description=current.description,
-        )
+        rebased = _commit(current.change_id, target, rebased_files, current.description)
         data.graph[rebased.commit_id] = rebased
         self._state._replace_workspace(data, workspace, current=rebased.commit_id)
         self._state._project(data, self._state._workspace(data, workspace.name))
@@ -1042,8 +941,9 @@ class FakeJj:
             msg = f"Unknown workspace: {name}"
             raise RevisionError(msg) from exc
         self._state._bindings.pop(workspace.path, None)
-        self._state._owners.pop(workspace.path, None)
         self._state._effect(self.path, "forget_workspace", name=name)
 
     def temporary_workspace(self, *, revision: str):
-        return _temporary_workspace(self, revision=revision, bind=FakeJj)
+        return _temporary_workspace(
+            self, revision=revision, bind=self._state.repository
+        )

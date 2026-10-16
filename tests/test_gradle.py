@@ -38,6 +38,7 @@ from tests.conftest import (
     fixture_runner,
     make_gradle_target,
 )
+from tests.fake_vcs import FakeJjState
 
 
 def _digest(path: Path) -> str:
@@ -1644,3 +1645,38 @@ def test_missing_update_report_is_gradle_error_with_cause(tmp_path):
     ) as caught:
         parse_update_report(tmp_path / "missing.toml")
     assert isinstance(caught.value.__cause__, FileNotFoundError)
+
+
+def test_gradle_workspace_revision_reports_uninspectable_local_properties(
+    gradle_project, monkeypatch
+):
+    from maintenance_man.gradle import GradleError
+    from maintenance_man.gradle_workflow import pin_workspace_revision
+    from maintenance_man.vcs import RevisionError
+
+    monkeypatch.delenv("ANDROID_HOME", raising=False)
+    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
+    (gradle_project.path / "local.properties").write_text("sdk.dir=/opt/android\n")
+    state = FakeJjState()
+    state.seed_repository(
+        gradle_project.path, files={"local.properties": "sdk.dir=/opt/android\n"}
+    )
+    state.fail(
+        "revision_file",
+        error=RevisionError("inspection failed"),
+        path=gradle_project.path,
+    )
+
+    with pytest.raises(
+        GradleError,
+        match=(
+            r"Cannot inspect local.properties in mm/update-dependencies: "
+            r"inspection failed"
+        ),
+    ):
+        pin_workspace_revision(
+            "android",
+            gradle_project,
+            "mm/update-dependencies",
+            vcs=state.services(),
+        )

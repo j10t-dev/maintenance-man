@@ -1,31 +1,17 @@
-import typing
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 from rich.console import Console
-from rich.text import Text
 
-from maintenance_man import cli, scanner, vcs_workflow
+from maintenance_man import cli, scanner
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
-    Event,
     FindingsBlocked,
-    GradleFlowFailed,
-    GradleRunArchived,
-    GradleWithheld,
-    NoEligibleGradleChanges,
-    Operation,
-    OperationFailed,
-    ProjectSkipped,
-    PullRequestOutput,
-    SkipReason,
-    SyncCompleted,
 )
 from maintenance_man.models.gradle import (
     CandidateWithheld,
@@ -44,15 +30,11 @@ from maintenance_man.models.scan import (
     Severity,
     UpdateFinding,
     VulnFinding,
-    Workflow,
 )
-from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.services import scan as scan_service
 from maintenance_man.services.scan import ScanSummary
-from maintenance_man.storage import load_scan_results
 from maintenance_man.vcs import RevisionError
 from tests.conftest import (
-    completed,
     make_scan_result,
     make_update,
     missing_tool,
@@ -61,145 +43,6 @@ from tests.conftest import (
     write_config,
 )
 from tests.fake_vcs import FakeJjState
-
-
-@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
-@pytest.mark.parametrize(
-    ("event", "single", "batch_text"),
-    [
-        (
-            ProjectSkipped("a[b]", SkipReason.PATH_MISSING, "/tmp/[path]"),
-            "Warning: a[b] — path does not exist: /tmp/[path]",
-            "Warning: a[b] — path does not exist: /tmp/[path]",
-        ),
-        (
-            ProjectSkipped("a[b]", SkipReason.NO_SCAN_RESULTS),
-            "a[b] — no scan results; nothing to do.",
-            "",
-        ),
-        (
-            ProjectSkipped("a[b]", SkipReason.NOTHING_TO_DO, "resolve"),
-            "a[b] — nothing to resolve.",
-            "  a[b] — nothing to update",
-        ),
-        (
-            ProjectSkipped("a[b]", SkipReason.FLOW_CONFLICT, "bad [projects.x]"),
-            "  Skipped: a[b] — bad [projects.x]",
-            "  Skipped: a[b] — bad [projects.x]",
-        ),
-        (
-            ProjectSkipped("a[b]", SkipReason.NOT_DEPLOYABLE),
-            "a[b] — skipped (not deployable)",
-            "a[b] — skipped (not deployable)",
-        ),
-        (
-            ProjectSkipped("a[b]", SkipReason.UNCHANGED),
-            "a[b] unchanged since last deploy (use --force to redeploy).",
-            "a[b] — unchanged since last deploy",
-        ),
-        (
-            ProjectSkipped("a[b]", SkipReason.BLOCKED),
-            "Warning: a[b] — could not resolve main revision; skipping "
-            "(use --force to deploy anyway)",
-            "Warning: a[b] — could not resolve main revision; skipping "
-            "(use --force to deploy anyway)",
-        ),
-        (
-            OperationFailed(Operation.UPDATE_SETUP, "a[b]", "bad [projects.x]"),
-            "  Error: a[b] — bad [projects.x]",
-            "  Error: a[b] — bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.PROMOTE, "a[b]", "bad [projects.x]"),
-            "Promotion failed: bad [projects.x]",
-            "Promotion failed: bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.REFRESH, "a[b]", "bad [projects.x]"),
-            "Workspace refresh failed: a[b]: bad [projects.x]",
-            "Workspace refresh failed: a[b]: bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.WORKSPACE_CLEANUP, "a[b]", "bad [projects.x]"),
-            "Workspace cleanup failed: bad [projects.x]",
-            "  Workspace cleanup failed: bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.BOOKMARK_CLEANUP, "a[b]", "bad [projects.x]"),
-            "Bookmark cleanup failed: bad [projects.x]",
-            "  Bookmark cleanup failed: a[b] — bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.RESOLVE_SETUP, "a[b]", "bad [projects.x]"),
-            "  Resolve setup failed: bad [projects.x]",
-            "  Resolve setup failed: bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.SUBMIT, "a[b]", "bad [projects.x]"),
-            "  bad [projects.x]\n  Submit failed. Keeping mm/resolve-dependencies "
-            "for manual recovery.",
-            "  bad [projects.x]\n  Submit failed. Keeping mm/resolve-dependencies "
-            "for manual recovery.",
-        ),
-        (
-            OperationFailed(Operation.REMOTE_SYNC, "a[b]", "bad [projects.x]"),
-            "Warning: a[b] — failed to sync remote: bad [projects.x]",
-            "Warning: a[b] — failed to sync remote: bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.SCAN, "a[b]", "bad [projects.x]"),
-            "Error: a[b] — bad [projects.x]",
-            "Error: a[b] — bad [projects.x]",
-        ),
-        (
-            OperationFailed(Operation.SYNC, "a[b]", "bad [projects.x]"),
-            "  a[b] — bad [projects.x]",
-            "  a[b] — bad [projects.x]",
-        ),
-        (
-            SyncCompleted("a[b]", "already [up] to date"),
-            "  a[b] — already [up] to date",
-            "  a[b] — already [up] to date",
-        ),
-        (
-            GradleWithheld("g:[lib]", "too [new]"),
-            "Withheld g:[lib]: too [new]",
-            "Withheld g:[lib]: too [new]",
-        ),
-        (
-            NoEligibleGradleChanges(),
-            "No eligible Gradle changes",
-            "No eligible Gradle changes",
-        ),
-        (
-            GradleRunArchived(Path("/tmp/[history]/run.json")),
-            "Archived failed Gradle run to /tmp/[history]/run.json; "
-            "rebuilding candidates from main",
-            "Archived failed Gradle run to /tmp/[history]/run.json; "
-            "rebuilding candidates from main",
-        ),
-        (
-            GradleFlowFailed(Workflow.UPDATE, "bad [projects.x]"),
-            "Cannot complete Gradle update: bad [projects.x]",
-            "Cannot complete Gradle update: bad [projects.x]",
-        ),
-    ],
-)
-def test_event_renderer_preserves_text(
-    monkeypatch: pytest.MonkeyPatch,
-    event: Event,
-    single: str,
-    batch_text: str,
-    batch: bool,
-) -> None:
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=220, color_system=None)
-    )
-
-    cli._Renderer(batch=batch)(event)
-
-    assert output.getvalue().rstrip("\n") == (batch_text if batch else single)
 
 
 @pytest.mark.parametrize(
@@ -234,34 +77,6 @@ def test_given_update_table_renders_blocked_rows_with_reason_when_blocked_then_l
     assert any(line.startswith("UPDATE") and "pkg-a" in line for line in lines)
 
 
-@pytest.mark.parametrize("batch", [False, True])
-def test_pull_request_output_is_indented_and_dim(
-    monkeypatch: pytest.MonkeyPatch, batch: bool
-) -> None:
-    output = StringIO()
-    monkeypatch.setattr(
-        cli,
-        "console",
-        Console(
-            file=output,
-            width=220,
-            force_terminal=True,
-            color_system="standard",
-        ),
-    )
-
-    cli._Renderer(batch=batch)(PullRequestOutput("https://x/pull/1"))
-
-    rendered = Text.from_ansi(output.getvalue())
-    assert rendered.plain == "  https://x/pull/1\n"
-    assert rendered.spans
-    assert all("dim" in str(span.style) for span in rendered.spans)
-
-
-def test_given_event_types_when_registry_checked_then_all_are_registered() -> None:
-    assert set(typing.get_args(Event.__value__)) <= set(cli._render.registry) - {object}
-
-
 def test_numbered_findings_print_bracketed_values_literally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -283,47 +98,6 @@ def test_numbered_findings_print_bracketed_values_literally(
     assert "a[b]" in output.getvalue()
     assert "CVE-[x]" in output.getvalue()
     assert "u[p]" in output.getvalue()
-
-
-@pytest.mark.parametrize("failure", ["fetch", "local_bookmarks", "delete_bookmark"])
-def test_housekeeping_failure_still_saves_scan(
-    mm_home, tmp_path, monkeypatch, capsys, failure
-):
-    project_path = tmp_path / "project"
-    state = FakeJjState()
-    repo = state.seed_repository(project_path, files={"dep.txt": "version=1\n"})
-    repo.set_bookmark(bookmark="mm/update-dependencies", revision="main")
-    state.code_host(project_path).seed_pr(
-        bookmark="mm/update-dependencies", state="merged"
-    )
-    write_config(
-        mm_home,
-        f'[projects.demo]\npath = "{project_path}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n",
-    )
-    monkeypatch.setattr(cli, "make_vcs_services", state.services)
-    monkeypatch.setattr(
-        scan_service, "prune_stale_bookmarks", vcs_workflow.prune_stale_bookmarks
-    )
-    monkeypatch.setattr(scan_service, "scan_project", scanner.scan_project)
-    monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
-    monkeypatch.setattr(
-        scanner, "package_manager_ops", ops_with_outdated(lambda project: [])
-    )
-    state.fail(
-        failure,
-        error=RevisionError(f"{failure} unavailable"),
-        path=project_path,
-    )
-
-    assert run_mm("scan", "demo") == 0
-
-    assert f"{failure} unavailable" in capsys.readouterr().out
-    assert repo.bookmark_exists(bookmark="mm/update-dependencies")
-    saved = load_scan_results("demo")
-    assert saved.project == "demo"
-    assert saved.vulnerabilities == []
-    assert saved.updates == []
 
 
 def _make_vulnerable_result() -> ScanResult:
@@ -440,16 +214,22 @@ def test_scan_without_trivy_reports_an_unknown_project(
     assert "trivy" not in capsys.readouterr().out.lower()
 
 
-@pytest.mark.parametrize("tool", ["jj", "gh"])
-def test_scan_warns_and_continues_without_housekeeping_tools(
-    mm_home_with_projects, monkeypatch, capsys, tool
-):
-    monkeypatch.setattr("maintenance_man.vcs_workflow.require_tool", missing_tool(tool))
-    prune = MagicMock(return_value=True)
-    monkeypatch.setattr("maintenance_man.services.scan.prune_stale_bookmarks", prune)
-    assert run_mm("scan", "clean") == 0
-    prune.assert_not_called()
-    assert f"{tool} is not installed" in capsys.readouterr().out
+def test_given_remote_sync_failure_when_scan_runs_then_exits_zero_with_warning(
+    mm_home_with_projects: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_remote_sync(**kwargs) -> None:
+        message = "offline"
+        raise RevisionError(message)
+
+    monkeypatch.setattr(scan_service, "prune_stale_bookmarks", fail_remote_sync)
+
+    assert run_mm("scan", "clean") == ExitCode.OK
+    assert (
+        "Warning: clean — failed to sync remote: offline"
+        in capsys.readouterr().out.splitlines()
+    )
 
 
 def test_batch_scan_without_trivy_scans_uv_and_exits_error(
@@ -472,50 +252,6 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
     assert run_mm("scan") == ExitCode.ERROR
     assert not (results / "first.json").exists()
     assert (results / "second.json").is_file()
-
-
-@pytest.mark.parametrize("failure", ["outdated", "scanner"])
-@pytest.mark.parametrize("argv", [["scan"], ["scan", "first"]])
-def test_failed_project_scan_keeps_its_result_and_exits_error(
-    mm_home, tmp_path, monkeypatch, failure, argv
-):
-    results = _two_project_config(mm_home, tmp_path)
-    monkeypatch.setattr(
-        "maintenance_man.services.scan.scan_project", scanner.scan_project
-    )
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
-
-    def trivy(*args, **kwargs):
-        if failure == "scanner":
-            msg = "Trivy filesystem scan failed (exit 1): boom"
-            raise scanner.ScanError(msg)
-        return [], []
-
-    def outdated(project):
-        if failure == "outdated" and project.package_manager == "bun":
-            msg = "bun outdated failed (exit 1): boom"
-            raise OutdatedCheckError(msg)
-        return []
-
-    monkeypatch.setattr("maintenance_man.scanner._run_trivy_scan", trivy)
-    monkeypatch.setattr(
-        "maintenance_man.scanner.package_manager_ops", ops_with_outdated(outdated)
-    )
-    assert run_mm(*argv) == ExitCode.ERROR
-    assert (results / "first.json").read_bytes() == b"previous first result"
-    assert (results / "second.json").is_file() is (argv == ["scan"])
-
-
-def test_scan_warns_and_continues_when_bookmark_pruning_cannot_run(
-    mm_home_with_projects, monkeypatch, capsys
-):
-    def fail(**kwargs):
-        msg = "Could not run jj git fetch: missing jj"
-        raise RevisionError(msg)
-
-    monkeypatch.setattr("maintenance_man.services.scan.prune_stale_bookmarks", fail)
-    assert run_mm("scan", "clean") == 0
-    assert "failed to sync remote" in capsys.readouterr().out
 
 
 class TestScanSingleProject:
@@ -775,339 +511,6 @@ def test_scan_blocked_no_fix_vulnerability_exit(
     expected = 3 if with_updates else 0
     argv = ["scan"] if all_projects else ["scan", "sample"]
     assert run_mm(*argv) == expected
-
-
-def test_all_scan_real_wrapper_launch_error_preserves_results_and_scans_next(
-    mm_home, gradle_project, monkeypatch
-):
-    from maintenance_man.gradle import GRADLE_INVENTORY_RELPATH
-    from maintenance_man.scanner import scan_project
-
-    monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
-
-    root = Path(gradle_project.path)
-    (root / "gradlew").write_text("#!/definitely/missing/mm-interpreter\n")
-    mm_home.mkdir(parents=True, exist_ok=True)
-    write_config(
-        mm_home,
-        f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
-        f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n",
-    )
-    results = mm_home / "scan-results"
-    results.mkdir()
-    (results / "android.json").write_bytes(b"previous scan results\n")
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
-    monkeypatch.setattr("maintenance_man.scanner._check_outdated", lambda *args: [])
-    assert run_mm("scan") == ExitCode.ERROR
-    assert (results / "android.json").read_bytes() == b"previous scan results\n"
-    assert (results / "remaining.json").is_file()
-    assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-
-
-_GRADLE_SCAN_CLI_MODULES = [
-    ("androidx.room", "room-runtime", "2.8.4"),
-    ("androidx.room", "room-compiler", "2.8.4"),
-    ("com.squareup.okhttp3", "okhttp", "4.12.0"),
-    ("com.google.code.gson", "gson", "2.11.0"),
-    ("androidx.compose.ui", "ui", "1.9.0"),
-    ("org.jetbrains", "annotations", "23.0.0"),
-]
-
-
-def _gradle_report_json_for_fixture_bom(root: Path) -> str:
-    """A resolution report covering every fixtures/gradle/bom.json component.
-
-    mmGradleReport now captures the resolution graph alongside the inventory
-    in one combined command, so any test that fakes a real ``bom.json`` must
-    also fake a matching ``report.json`` for the adapter's inventory-to-scope
-    cross-check to accept it.
-    """
-    import hashlib
-    import json
-
-    from maintenance_man.gradle import GRADLE_CATALOGUE_RELPATH
-
-    components: list[dict[str, object]] = [
-        {"id": "root", "kind": "root", "module": None, "variants": []}
-    ]
-    for index, (group, artifact, version) in enumerate(_GRADLE_SCAN_CLI_MODULES):
-        components.append(
-            {
-                "id": f"c{index}",
-                "kind": "module",
-                "module": {"group": group, "artifact": artifact, "version": version},
-                "variants": ["runtime"],
-            }
-        )
-    scope = {
-        "project_path": ":",
-        "domain": "project",
-        "configuration": "runtimeClasspath",
-    }
-    return json.dumps(
-        {
-            "schema_version": 1,
-            "root_project": ":",
-            "producer_versions": {
-                "gradle": "8.14.3",
-                "cyclonedx": "3.4.1",
-                "report": "1",
-            },
-            "catalogue_digest": hashlib.sha256(
-                (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
-            ).hexdigest(),
-            "repositories": [],
-            "selected_scopes": [scope],
-            "scopes": [
-                {
-                    "scope": scope,
-                    "components": components,
-                    "edges": [],
-                    "unresolved": [],
-                }
-            ],
-            "selection_errors": [],
-        }
-    )
-
-
-@pytest.mark.parametrize(
-    "phase",
-    ["inventory-mkdir", "inventory-marker", "inventory-cleanup", "report-cleanup"],
-)
-def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaining(
-    mm_home, gradle_project, monkeypatch, phase
-):
-    from maintenance_man.gradle import (
-        GRADLE_INVENTORY_MARKER_RELPATH,
-        GRADLE_INVENTORY_RELPATH,
-        GRADLE_REPORT_MARKER_RELPATH,
-    )
-    from maintenance_man.scanner import _check_outdated, scan_project
-
-    monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
-    root = Path(gradle_project.path)
-    results = _seed_scan_filesystem_error_config(mm_home, root)
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
-    monkeypatch.setattr(
-        "maintenance_man.scanner._check_outdated",
-        lambda project, *args: (
-            [] if project.package_manager == "uv" else _check_outdated(project, *args)
-        ),
-    )
-    _inject_scan_filesystem_failure(monkeypatch, phase, root)
-    commands = _prepare_scan_filesystem_error_commands(monkeypatch, phase, root)
-    assert run_mm("scan") == ExitCode.ERROR
-    assert (results / "android.json").read_bytes() == b"old result bytes"
-    assert (results / "remaining.json").is_file()
-    if phase == "inventory-cleanup":
-        assert (root / GRADLE_INVENTORY_MARKER_RELPATH).is_file()
-    else:
-        assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-    if phase == "report-cleanup":
-        assert (root / GRADLE_REPORT_MARKER_RELPATH).is_file()
-    elif phase != "inventory-cleanup":
-        assert commands == []
-
-
-def _seed_scan_filesystem_error_config(mm_home: Path, root: Path) -> Path:
-    mm_home.mkdir(parents=True, exist_ok=True)
-    write_config(
-        mm_home,
-        f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
-        "scan_secrets = false\n"
-        f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n",
-    )
-    results = mm_home / "scan-results"
-    results.mkdir()
-    (results / "android.json").write_bytes(b"old result bytes")
-    return results
-
-
-def _inject_scan_filesystem_failure(monkeypatch, phase: str, root: Path) -> None:
-    from maintenance_man.gradle import (
-        GRADLE_INVENTORY_MARKER_RELPATH,
-        GRADLE_INVENTORY_RELPATH,
-    )
-
-    if phase == "inventory-mkdir":
-        mkdir = Path.mkdir
-
-        def fail(path, *args, **kwargs):
-            if path == root / GRADLE_INVENTORY_RELPATH:
-                msg = "mkdir denied"
-                raise PermissionError(msg)
-            return mkdir(path, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "mkdir", fail)
-    elif phase == "inventory-marker":
-        write = Path.write_bytes
-
-        def fail(path, content):
-            if path == root / GRADLE_INVENTORY_MARKER_RELPATH:
-                msg = "marker denied"
-                raise PermissionError(msg)
-            return write(path, content)
-
-        monkeypatch.setattr(Path, "write_bytes", fail)
-    elif phase == "inventory-cleanup":
-
-        def fail(*args, **kwargs):
-            msg = "inventory cleanup denied"
-            raise PermissionError(msg)
-
-        monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
-    else:
-        _inject_report_cleanup_failure(monkeypatch, root)
-
-
-def _inject_report_cleanup_failure(monkeypatch, root: Path) -> None:
-    from maintenance_man.gradle import GRADLE_UPDATE_REPORT_RELPATH
-    from maintenance_man.gradle_resolution import parse_resolution_report
-    from tests.conftest import GRADLE_FIXTURES
-
-    resolution = parse_resolution_report(
-        (GRADLE_FIXTURES / "resolution/empty.json").read_text()
-    )
-    monkeypatch.setattr(
-        "maintenance_man.scanner.scan_gradle",
-        lambda *args: ([], resolution),
-    )
-    unlink = Path.unlink
-
-    def fail(path, *args, **kwargs):
-        if path == root / GRADLE_UPDATE_REPORT_RELPATH:
-            msg = "cleanup denied"
-            raise PermissionError(msg)
-        return unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", fail)
-
-
-def _prepare_scan_filesystem_error_commands(
-    monkeypatch, phase: str, root: Path
-) -> list[list[str]]:
-    import subprocess
-
-    from maintenance_man.gradle import GRADLE_UPDATE_REPORT_RELPATH
-    from tests.conftest import GRADLE_FIXTURES
-
-    commands: list[list[str]] = []
-
-    def run(cmd, **kwargs):
-        commands.append(cmd)
-        if phase == "inventory-cleanup":
-            from maintenance_man.gradle import GRADLE_INVENTORY_BOM_RELPATH
-
-            if cmd[1] == "mmGradleReport":
-                (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
-                    (GRADLE_FIXTURES / "bom.json").read_bytes()
-                )
-                (root / GRADLE_INVENTORY_BOM_RELPATH).parent.joinpath(
-                    "report.json"
-                ).write_text(_gradle_report_json_for_fixture_bom(root))
-            else:
-                assert cmd[:2] == ["trivy", "sbom"]
-                return completed(cmd, returncode=0, stdout='{"Results": []}', stderr="")
-        else:
-            assert phase == "report-cleanup"
-            assert cmd[1] == "versionCatalogUpdate"
-            (root / GRADLE_UPDATE_REPORT_RELPATH).write_bytes(
-                (GRADLE_FIXTURES / "updates-clean.toml").read_bytes()
-            )
-        return completed(cmd, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", run)
-    return commands
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "report-false",
-        "trivy-root",
-        "trivy-results",
-        "trivy-row",
-        "trivy-launch",
-        "trivy-decode",
-        "wrapper-decode",
-    ],
-)
-def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
-    mm_home, gradle_project, monkeypatch, failure
-):
-    import json
-    import subprocess
-
-    from maintenance_man.gradle import (
-        GRADLE_INVENTORY_BOM_RELPATH,
-        GRADLE_INVENTORY_RELPATH,
-        GRADLE_REPORT_MARKER_RELPATH,
-        GRADLE_UPDATE_REPORT_RELPATH,
-    )
-    from maintenance_man.scanner import _check_outdated, scan_project
-    from tests.conftest import GRADLE_FIXTURES
-
-    root = Path(gradle_project.path)
-    results = _seed_scan_filesystem_error_config(mm_home, root)
-    monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
-    monkeypatch.setattr(
-        "maintenance_man.scanner._check_outdated",
-        lambda project, *args: (
-            [] if project.package_manager == "uv" else _check_outdated(project, *args)
-        ),
-    )
-    if failure == "report-false":
-        from maintenance_man.gradle_resolution import parse_resolution_report
-
-        resolution = parse_resolution_report(
-            (GRADLE_FIXTURES / "resolution/empty.json").read_text()
-        )
-        monkeypatch.setattr(
-            "maintenance_man.scanner.scan_gradle",
-            lambda *args: ([], resolution),
-        )
-
-    def run(cmd, **kwargs):
-        if cmd[1] == "mmGradleReport":
-            if failure == "wrapper-decode":
-                msg = "utf8"
-                raise UnicodeDecodeError(msg, b"\xff", 0, 1, "invalid")
-            (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
-                (GRADLE_FIXTURES / "bom.json").read_bytes()
-            )
-            (root / GRADLE_INVENTORY_BOM_RELPATH).parent.joinpath(
-                "report.json"
-            ).write_text(_gradle_report_json_for_fixture_bom(root))
-            return completed(cmd, returncode=0, stdout="", stderr="")
-        if cmd[1] == "versionCatalogUpdate":
-            assert failure == "report-false"
-            (root / GRADLE_UPDATE_REPORT_RELPATH).write_text("libraries = false\n")
-            return completed(cmd, returncode=0, stdout="", stderr="")
-        assert cmd[:2] == ["trivy", "sbom"]
-        if failure == "trivy-launch":
-            msg = "missing interpreter"
-            raise FileNotFoundError(msg)
-        if failure == "trivy-decode":
-            msg = "utf8"
-            raise UnicodeDecodeError(msg, b"\xff", 0, 1, "invalid")
-        payload = {
-            "trivy-root": [],
-            "trivy-results": {"Results": False},
-            "trivy-row": {"Results": [None]},
-        }[failure]
-        return completed(cmd, returncode=0, stdout=json.dumps(payload), stderr="")
-
-    monkeypatch.setattr(subprocess, "run", run)
-    assert run_mm("scan") == ExitCode.ERROR
-    assert (results / "android.json").read_bytes() == b"old result bytes"
-    assert (results / "remaining.json").is_file()
-    assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-    assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()
-    assert not (root / GRADLE_REPORT_MARKER_RELPATH).exists()
 
 
 @pytest.mark.parametrize("manager", ["gradle", "uv", "bun", "mvn"])

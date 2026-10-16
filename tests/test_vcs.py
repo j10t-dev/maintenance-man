@@ -6,11 +6,130 @@ import pytest
 from maintenance_man import vcs
 from maintenance_man.gradle import GradleError
 from maintenance_man.gradle_updates import gradle_evidence_workspace
-from maintenance_man.vcs import RevisionError
+from maintenance_man.vcs import Repository, RevisionError
 from maintenance_man.vcs_workflow import VcsServices
 from tests.conftest import completed, make_project
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeCommands
+
+
+@pytest.fixture
+def temporary_workspace_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[FakeJjState, Repository, Path]:
+    state = FakeJjState()
+    path = tmp_path / "source"
+    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
+    container = tmp_path / "allocated-proof"
+
+    def allocate(*, prefix: str) -> str:
+        assert prefix == "mm-proof-"
+        container.mkdir()
+        return str(container)
+
+    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
+    return state, repo, container
+
+
+def test_temporary_workspace_registration_failure_removes_owned_container(
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+):
+    state, repo, container = temporary_workspace_case
+    state.fail("add_workspace", error=RevisionError("registration failed"))
+    entered = False
+    with (
+        pytest.raises(RevisionError, match="registration failed"),
+        repo.temporary_workspace(revision="main"),
+    ):
+        entered = True
+    assert entered is False
+    assert not any(call.method == "forget_workspace" for call in state.attempts)
+    assert not container.exists()
+
+
+@pytest.mark.parametrize("mutation", ["replace", "symlink"])
+def test_temporary_workspace_marker_tampering_prevents_deletion(
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path], mutation: str
+):
+    _state, repo, container = temporary_workspace_case
+    with (
+        pytest.raises(RevisionError, match="ownership marker changed"),
+        repo.temporary_workspace(revision="main"),
+    ):
+        marker = container / ".mm-proof-owner"
+        if mutation == "replace":
+            marker.write_text("replacement", encoding="utf-8")
+        else:
+            marker.unlink()
+            marker.symlink_to(container / "replacement")
+    assert container.exists()
+
+
+def test_temporary_workspace_body_error_keeps_cleanup_diagnostics(
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, repo, _container = temporary_workspace_case
+    state.fail("forget_workspace", error=RevisionError("forget failed"))
+
+    def fail_remove(_path: Path) -> None:
+        msg = "remove failed"
+        raise OSError(msg)
+
+    monkeypatch.setattr(vcs.shutil, "rmtree", fail_remove)
+    body_error = RuntimeError("caller")
+    with (
+        pytest.raises(RuntimeError) as caught,
+        repo.temporary_workspace(revision="main"),
+    ):
+        raise body_error
+    assert caught.value is body_error
+    assert caught.value.__notes__ == [
+        "forget workspace failed: forget failed; "
+        "remove proof workspace failed: remove failed"
+    ]
+
+
+def test_temporary_workspace_propagates_unexpected_cleanup_error(
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _state, repo, container = temporary_workspace_case
+    unexpected = TypeError("unexpected cleanup failure")
+
+    def fail_remove(_path: Path) -> None:
+        raise unexpected
+
+    with (
+        pytest.raises(TypeError) as caught,
+        monkeypatch.context() as cleanup_patch,
+    ):
+        cleanup_patch.setattr(vcs.shutil, "rmtree", fail_remove)
+        with repo.temporary_workspace(revision="main"):
+            pass
+    assert caught.value is unexpected
+    vcs.shutil.rmtree(container)
+
+
+def test_temporary_workspace_cleanup_errors_raise_combined_revision_error(
+    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, repo, _container = temporary_workspace_case
+    state.fail("forget_workspace", error=RevisionError("forget failed"))
+
+    def fail_remove(_path: Path) -> None:
+        msg = "remove failed"
+        raise OSError(msg)
+
+    monkeypatch.setattr(vcs.shutil, "rmtree", fail_remove)
+    with (
+        pytest.raises(RevisionError) as caught,
+        repo.temporary_workspace(revision="main"),
+    ):
+        pass
+    assert "forget failed" in str(caught.value)
+    assert "remove failed" in str(caught.value)
 
 
 @pytest.mark.parametrize("failing_step", ["add_workspace", "new_change"])
@@ -84,7 +203,6 @@ def test_given_distinct_revision_ids_when_same_revision_runs_then_it_uses_two_lo
 def test_assert_safe_workspace_path_accepts_direct_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
 ) -> None:
-    monkeypatch.setattr(vcs.paths, "MM_HOME", tmp_path / ".mm")
     root = vcs.paths.workspaces_dir()
     root.mkdir(parents=True)
     child = root / "project"
@@ -98,7 +216,6 @@ def test_assert_safe_workspace_path_accepts_direct_child(
 def test_assert_safe_workspace_path_rejects_unsafe_locations_without_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
 ) -> None:
-    monkeypatch.setattr(vcs.paths, "MM_HOME", tmp_path / ".mm")
     root = vcs.paths.workspaces_dir()
     root.mkdir(parents=True)
     targets = {
@@ -120,7 +237,6 @@ def test_assert_safe_workspace_path_rejects_unsafe_locations_without_removal(
 def test_assert_safe_workspace_path_rejects_final_symlink_and_preserves_sibling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(vcs.paths, "MM_HOME", tmp_path / ".mm")
     root = vcs.paths.workspaces_dir()
     sibling = root / "project-b"
     sibling.mkdir(parents=True)
