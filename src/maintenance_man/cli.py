@@ -1364,13 +1364,23 @@ def _print_update_table(updates: list[UpdateFinding]) -> None:
     if not updates:
         return
     table = Table(show_header=True, **_TABLE_STYLE)
-    table.add_column("", style="bold cyan", width=6, no_wrap=True)
+    table.add_column("", style="bold cyan", width=7, no_wrap=True)
     table.add_column("Package", overflow="fold")
     table.add_column("Installed")
     table.add_column("Latest")
     table.add_column("Tier")
-    table.add_column("Age")
+    table.add_column("Age / reason")
     for item in updates:
+        if item.blocked_reason:
+            table.add_row(
+                "BLOCKED",
+                escape(item.pkg_name),
+                "",
+                "",
+                "",
+                escape(item.blocked_reason),
+            )
+            continue
         age = ""
         if item.published_date:
             days = (datetime.now(UTC) - item.published_date).days

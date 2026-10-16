@@ -201,6 +201,38 @@ def test_event_renderer_preserves_text(
     assert output.getvalue().rstrip("\n") == (batch_text if batch else single)
 
 
+@pytest.mark.parametrize(
+    ("pkg_name", "reason"),
+    [
+        ("org.x:lib", "rich version"),
+        ("org.x:[lib]", "cannot render [catalogue]"),
+    ],
+)
+def test_given_update_table_renders_blocked_rows_with_reason_when_blocked_then_literal(
+    monkeypatch, pkg_name, reason
+):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli, "console", Console(file=output, width=220, color_system=None)
+    )
+    blocked = make_update(
+        pkg_name=pkg_name,
+        installed_version="unknown",
+        latest_version="2.0",
+        blocked_reason=reason,
+    )
+    plain = make_update(pkg_name="pkg-a")
+
+    cli._print_update_table([blocked, plain])
+
+    lines = output.getvalue().splitlines()
+    assert any(
+        line.startswith("BLOCKED") and pkg_name in line and reason in line
+        for line in lines
+    )
+    assert any(line.startswith("UPDATE") and "pkg-a" in line for line in lines)
+
+
 @pytest.mark.parametrize("batch", [False, True])
 def test_pull_request_output_is_indented_and_dim(
     monkeypatch: pytest.MonkeyPatch, batch: bool
@@ -588,7 +620,8 @@ def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
                     "2.3.12"
                 ),
                 gradle_block_kind="age",
-            )
+            ),
+            make_update(pkg_name="pkg-a"),
         ],
     )
 
@@ -597,9 +630,10 @@ def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
 
     assert "clean" not in out
     assert "ksp" in out
+    assert "BLOCKED" in out
+    assert "publication date" in out
     assert "UPDATE" in out
-    assert "Blocked" not in out
-    assert "publication date" not in out
+    assert "pkg-a" in out
 
 
 def test_blocked_update_candidates_still_exit_updates_found():
@@ -625,7 +659,9 @@ def test_blocked_update_candidates_still_exit_updates_found():
     assert _scan_exit_code(ScanSummary.of(result)) == ExitCode.UPDATES_FOUND
 
 
-def test_scan_keeps_update_planning_diagnostics_out_of_standard_rows(monkeypatch):
+def test_given_blocked_scan_when_rendered_then_advisory_and_vuln_diagnostics_hidden(
+    monkeypatch,
+):
     output = StringIO()
     monkeypatch.setattr(
         cli, "console", Console(file=output, width=220, color_system=None)
@@ -652,12 +688,14 @@ def test_scan_keeps_update_planning_diagnostics_out_of_standard_rows(monkeypatch
     for label, package, reason in (
         ("VULN", "some-pkg", "Cannot identify catalogue entry"),
         ("ADV", "unfixed-pkg", "No published fix"),
-        ("UPDATE", "agp", "Publication lookup timed out"),
     ):
         rows = [line for line in lines if package in line]
         assert len(rows) == 1
         assert label in rows[0]
         assert reason not in output.getvalue()
+    blocked = next(line for line in lines if "agp" in line)
+    assert "BLOCKED" in blocked
+    assert "Publication lookup timed out" in blocked
     available = next(line for line in lines if "available" in line)
     assert "UPDATE" in available
     assert "timed out" not in available
