@@ -1,6 +1,6 @@
 import functools
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -443,8 +443,12 @@ app = cyclopts.App(
 )
 
 
-def main() -> None:
-    app()
+def main(argv: Sequence[str] | None = None) -> None:
+    """Usage errors exit with ExitCode.ERROR; cyclopts would exit 2 on its own."""
+    try:
+        app(argv, exit_on_error=False)
+    except cyclopts.CycloptsError:
+        sys.exit(ExitCode.ERROR)
 
 
 @app.command

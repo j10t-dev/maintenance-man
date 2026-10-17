@@ -15,7 +15,7 @@ import pytest
 from rich.console import Console
 
 from maintenance_man import cli, vcs
-from maintenance_man.cli import app
+from maintenance_man.cli import main
 from maintenance_man.config import load_config
 from maintenance_man.gradle import (
     GRADLE_INVENTORY_BOM_RELPATH,
@@ -83,10 +83,9 @@ def write_config(home: Path, text: str, *, filename: str = "config.toml") -> Pat
 
 def run_mm(*argv: str) -> int:
     try:
-        result = app(list(argv))
+        main(list(argv))
     except SystemExit as exc:
         return int(exc.code or 0)
-    assert result is None
     return 0
 
 

@@ -9,7 +9,7 @@ description = "Config-driven CLI for routine software project maintenance"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "cyclopts==4.25.2",
+    "cyclopts==5.2.0",
     "packaging==26.3",
     "pydantic==2.13.5",
     "rich==15.0.0",
@@ -23,7 +23,7 @@ dev = [
     "import-linter==2.15",
     "pytest==9.1.1",
     "ruff==0.15.20",
-    "ty>=0.0.34",
+    "ty==0.0.84",
 ]
 
 [tool.ruff]

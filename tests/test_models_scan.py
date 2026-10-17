@@ -117,7 +117,7 @@ class TestVulnFinding:
                 vuln_id="CVE-2025-00001",
                 pkg_name="pkg",
                 installed_version="1.0",
-                severity="BOGUS",  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+                severity="BOGUS",  # type: ignore[arg-type]
                 title="t",
                 description="d",
                 status="fixed",
