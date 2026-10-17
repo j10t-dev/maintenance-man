@@ -25,14 +25,6 @@ def workspaces_dir() -> Path:
     return mm_home() / "workspaces"
 
 
-def gradle_runs_dir() -> Path:
-    return mm_home() / "gradle-runs"
-
-
-def gradle_contexts_dir() -> Path:
-    return mm_home() / "gradle-contexts"
-
-
 def publications_dir() -> Path:
     return mm_home() / "publications"
 

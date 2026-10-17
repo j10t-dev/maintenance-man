@@ -1,8 +1,5 @@
 import contextlib
-import hashlib
-import logging
 import re
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,16 +29,10 @@ from maintenance_man.gradle import (
 )
 from maintenance_man.gradle_inventory import bind_inventory
 from maintenance_man.gradle_resolution import generate_gradle_report
-from maintenance_man.gradle_verification import TRIVY_INSTALL_HINT, context_inputs_valid
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
-    ComparisonContext,
     CompleteResolution,
-    FindingEvidence,
-    FindingKey,
-    GradleSnapshot,
     IncompleteResolution,
-    ModuleId,
 )
 from maintenance_man.models.scan import (
     ScanResult,
@@ -53,7 +44,8 @@ from maintenance_man.models.scan import (
 from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
 from maintenance_man.process import require_tool, run_captured
 from maintenance_man.storage import save_scan_results
-from maintenance_man.vcs_workflow import VcsServices
+
+TRIVY_INSTALL_HINT = "Install it from https://trivy.dev/"
 
 
 class ScanError(Exception):
@@ -485,104 +477,3 @@ def _parse_secrets(results: list[_TrivyResult]) -> list[SecretFinding]:
         if isinstance(result, _TrivyNonLanguageResult) and result.class_ == "secret"
         for secret in result.secrets or []
     ]
-
-
-def capture_gradle_snapshot(
-    project: ProjectConfig,
-    context: ComparisonContext,
-    *,
-    vcs: VcsServices,
-    clock: Clock,
-) -> GradleSnapshot | IncompleteResolution:
-    services = vcs
-    if not context_inputs_valid(context, project, clock()):
-        msg = "Comparison context expired or inputs changed; rebuild baseline and tip"
-        raise GradleError(msg)
-    with generate_gradle_report(project) as generated:
-        resolution = generated.resolution
-        if isinstance(resolution, IncompleteResolution):
-            return resolution
-        report = resolution.report
-        if (
-            set(report.selected_scopes) != set(context.selected_scopes)
-            or report.producer_versions != context.producer_versions
-        ):
-            return IncompleteResolution(
-                report=report, reasons=("selected scopes or producer versions changed",)
-            )
-        coverage = bind_inventory(generated.inventory, report)
-        if coverage.errors:
-            return IncompleteResolution(report=report, reasons=coverage.errors)
-        modules, scopes = coverage.modules, coverage.scopes
-        inventory = generated.inventory_bytes
-        bom = generated.bom_path
-        binary = next(
-            key.removeprefix("binary:")
-            for key in context.loaded_input_digests
-            if key.startswith("binary:")
-        )
-        trivy_started = time.monotonic()
-        completed = run_captured(
-            [binary, *context.scanner_flags, str(bom)],
-            project.path,
-            timeout=300,
-            label="Trivy snapshot",
-            error=ScanError,
-        )
-        logging.getLogger(__name__).info(
-            "Gradle Trivy snapshot %.3fs", time.monotonic() - trivy_started
-        )
-        rows = _parse_gradle_trivy_output(completed.stdout)
-        grouped: dict[FindingKey, list[VulnFinding]] = {}
-        for row in rows:
-            group, separator, artifact = row.pkg_name.partition(":")
-            module = ModuleId(
-                group=group, artifact=artifact, version=row.installed_version
-            )
-            if not separator or module not in scopes or module not in modules:
-                return IncompleteResolution(
-                    report=report,
-                    reasons=(
-                        f"finding has no exact inventory/graph scope: "
-                        f"{row.pkg_name} {row.installed_version}",
-                    ),
-                )
-            for scope in scopes[module]:
-                key = FindingKey(
-                    advisory_id=row.vuln_id, coordinate=row.pkg_name, scope=scope
-                )
-                grouped.setdefault(key, []).append(row)
-        findings = tuple(
-            FindingEvidence(
-                key=key,
-                affected_versions=frozenset(row.installed_version for row in evidence),
-                severity=max(
-                    (row.severity for row in evidence),
-                    key=lambda severity: severity.rank,
-                ),
-                has_unknown=any(row.severity == Severity.UNKNOWN for row in evidence),
-                rows=tuple(evidence),
-            )
-            for key, evidence in sorted(
-                grouped.items(),
-                key=lambda item: (
-                    item[0].advisory_id,
-                    item[0].coordinate,
-                    item[0].scope.project_path,
-                    item[0].scope.domain,
-                    item[0].scope.configuration,
-                ),
-            )
-        )
-    # Generated report/BOM cleanup must precede the jj source-tree snapshot.
-    if not context_inputs_valid(context, project, clock()):
-        msg = "Comparison inputs changed during capture"
-        raise GradleError(msg)
-    return GradleSnapshot(
-        tree_id=services.repository(Path(project.path)).tree_id(),
-        resolution=resolution,
-        context_identity=context.identity,
-        findings=findings,
-        inventory_digest=hashlib.sha256(inventory).hexdigest(),
-        inventory_modules=modules,
-    )

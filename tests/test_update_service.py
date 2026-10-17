@@ -50,9 +50,7 @@ def test_update_processes_in_managed_workspace(tmp_path: Path, monkeypatch) -> N
     result = update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=None,
-        choose_gradle=None,
         vcs=state.services(),
         emit=RecordingEmit(),
     )
@@ -85,9 +83,7 @@ def test_update_emits_processing_result_and_promotion_events(
     result = update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=pick_findings("pkg-b"),
-        choose_gradle=None,
         vcs=state.services(),
         emit=emit,
     )
@@ -95,7 +91,6 @@ def test_update_emits_processing_result_and_promotion_events(
     expected_result = UpdateResult("pkg-b", "update", True)
     assert result == update_service.ProjectUpdate(
         "api",
-        update_service.UpdateRoute.FINDINGS,
         Outcome.SUCCEEDED,
         (expected_result,),
     )
@@ -133,9 +128,7 @@ def test_update_reports_blocked_findings_in_the_project_result(
     result = update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=pick_findings("pkg-a"),
-        choose_gradle=None,
         vcs=state.services(),
         emit=emit,
     )
@@ -164,9 +157,7 @@ def test_resume_new_change_failure_removes_workspace(
         update_service.update_project(
             "api",
             project,
-            minimum_age_days=7,
             choose=None,
-            choose_gradle=None,
             vcs=state.services(),
             emit=RecordingEmit(),
         )
@@ -194,9 +185,7 @@ def test_typed_equal_risk_selection_order_reaches_processor(
     result = update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=pick_findings("pkg-b", "pkg-a"),
-        choose_gradle=None,
         vcs=state.services(),
         emit=RecordingEmit(),
     )
@@ -211,9 +200,7 @@ def test_update_no_scan_results_is_a_success(tmp_path: Path) -> None:
     result = update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=None,
-        choose_gradle=None,
         vcs=FakeJjState().services(),
         emit=emit,
     )
@@ -233,9 +220,7 @@ def test_update_nothing_actionable_is_a_success(tmp_path: Path) -> None:
     result = update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=None,
-        choose_gradle=None,
         vcs=state.services(),
         emit=emit,
     )
@@ -270,9 +255,7 @@ def test_missing_test_config_is_reported_before_workspace_setup(
     update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=None,
-        choose_gradle=None,
         vcs=state.services(),
         emit=emit,
     )
@@ -296,9 +279,7 @@ def test_update_rejects_findings_owned_by_resolve(tmp_path: Path) -> None:
         update_service.update_project(
             "api",
             project,
-            minimum_age_days=7,
             choose=None,
-            choose_gradle=None,
             vcs=state.services(),
             emit=RecordingEmit(),
         )
@@ -318,9 +299,7 @@ def test_missing_progress_bookmark_requires_rescan(tmp_path: Path) -> None:
         update_service.update_project(
             "api",
             project,
-            minimum_age_days=7,
             choose=None,
-            choose_gradle=None,
             vcs=state.services(),
             emit=RecordingEmit(),
         )
@@ -337,9 +316,7 @@ def test_workspace_revision_error_is_wrapped_with_cause(tmp_path: Path) -> None:
         update_service.update_project(
             "api",
             project,
-            minimum_age_days=7,
             choose=None,
-            choose_gradle=None,
             vcs=state.services(),
             emit=RecordingEmit(),
         )
@@ -375,9 +352,7 @@ def test_finalisation_failures_emit_operation_and_fail(
     result = update_service.update_project(
         "api",
         project,
-        minimum_age_days=7,
         choose=None,
-        choose_gradle=None,
         vcs=state.services(),
         emit=emit,
     )
@@ -424,9 +399,7 @@ def test_existing_update_failure_blocks_single_and_batch_success(
     single = update_service.update_project(
         "single",
         projects["single"],
-        minimum_age_days=7,
         choose=None,
-        choose_gradle=None,
         vcs=state.services(),
         emit=RecordingEmit(),
     )
@@ -448,7 +421,7 @@ def test_existing_update_failure_blocks_single_and_batch_success(
         )
 
 
-def test_batch_reports_success_conflict_missing_path_and_gradle(
+def test_batch_reports_success_conflict_and_missing_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = FakeJjState()
@@ -456,9 +429,8 @@ def test_batch_reports_success_conflict_missing_path_and_gradle(
         "a": make_project(tmp_path / "a", test_unit="pytest"),
         "b": make_project(tmp_path / "b", test_unit="pytest"),
         "c": make_project(tmp_path / "missing", test_unit="pytest"),
-        "g": make_project(tmp_path / "g", package_manager="gradle"),
     }
-    for name in ("a", "b", "g"):
+    for name in ("a", "b"):
         state.seed_repository(projects[name].path, files={"dep.txt": "version=1\n"})
     state.register_files(projects["a"].path, "mm-fixture-pkg-a.txt")
     passing = make_scan_result(vulns=[], updates=[make_update()])
@@ -475,29 +447,22 @@ def test_batch_reports_success_conflict_missing_path_and_gradle(
         "process_findings",
         FakeFindingProcessor({"pkg-a": (True, None)}),
     )
-    monkeypatch.setattr(
-        update_service.gradle_workflow,
-        "run_gradle_flow",
-        lambda *args, **kwargs: Outcome.SUCCEEDED,
-    )
     emit = RecordingEmit()
 
     result = update_service.update_projects(
         make_config(projects=projects),
-        ["a", "b", "c", "g"],
+        ["a", "b", "c"],
         vcs=state.services(),
         emit=emit,
     )
 
     assert result.had_errors is True
-    assert [project.project for project in result.projects] == ["a", "g"]
-    assert result.projects[-1].route is update_service.UpdateRoute.GRADLE
+    assert [project.project for project in result.projects] == ["a"]
     assert ProjectStarted("a") in emit.events
     assert ProjectStarted("b") in emit.events
-    assert ProjectStarted("g") in emit.events
     missing = ProjectSkipped("c", SkipReason.PATH_MISSING, str(projects["c"].path))
     assert missing in emit.events
-    assert emit.events.index(missing) < emit.events.index(ProjectStarted("g"))
+    assert emit.events.index(ProjectStarted("b")) < emit.events.index(missing)
     assert not any(
         isinstance(event, ProjectStarted) and event.project == "c"
         for event in emit.events
@@ -510,3 +475,58 @@ def test_batch_reports_success_conflict_missing_path_and_gradle(
         and "owned by the 'resolve' flow" in event.detail
         for event in emit.events
     )
+
+
+@pytest.mark.parametrize(
+    "android_home, tracked, inspection_error, refusal",
+    [
+        (None, False, None, "is not a tracked regular file"),
+        (None, True, None, None),
+        ("/opt/android", False, None, None),
+        (None, True, RevisionError("inspection failed"), "inspection failed"),
+    ],
+)
+def test_given_local_properties_when_update_starts_then_untracked_sdk_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    android_home: str | None,
+    tracked: bool,
+    inspection_error: RevisionError | None,
+    refusal: str | None,
+) -> None:
+    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
+    if android_home:
+        monkeypatch.setenv("ANDROID_HOME", android_home)
+    else:
+        monkeypatch.delenv("ANDROID_HOME", raising=False)
+    project = make_project(tmp_path / "api", test_unit="pytest")
+    files = {"dep.txt": "version=1\n"} | (
+        {"local.properties": "sdk.dir=/x\n"} if tracked else {}
+    )
+    state = FakeJjState()
+    state.seed_repository(project.path, files=files)
+    state.register_files(project.path, "mm-fixture-pkg-a.txt")
+    (project.path / "local.properties").write_text("sdk.dir=/x\n")
+    if inspection_error is not None:
+        state.fail("revision_file", error=inspection_error, path=project.path)
+    scan = make_scan_result(vulns=[], updates=[make_update()])
+    scan.project = "api"
+    save_scan_results("api", scan)
+    monkeypatch.setattr(
+        update_service,
+        "process_findings",
+        FakeFindingProcessor({"pkg-a": (True, None)}),
+    )
+    state.clear_calls()
+
+    if refusal is not None:
+        with pytest.raises(update_service.UpdateSetupError, match=refusal):
+            update_service.update_project(
+                "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
+            )
+        assert state.effects == []
+    else:
+        result = update_service.update_project(
+            "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
+        )
+        assert result.outcome is Outcome.SUCCEEDED

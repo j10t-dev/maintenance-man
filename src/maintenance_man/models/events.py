@@ -1,10 +1,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
 
-from maintenance_man.models.gradle import GradleRun
-from maintenance_man.models.scan import ScanResult, UpdateResult, Workflow
+from maintenance_man.models.scan import ScanResult, UpdateResult
 
 
 class Outcome(StrEnum):
@@ -29,8 +27,6 @@ class Operation(StrEnum):
     WORKSPACE_CLEANUP = "workspace_cleanup"
     BOOKMARK_CLEANUP = "bookmark_cleanup"
     RESOLVE_SETUP = "resolve_setup"
-    SUBMIT = "submit"
-    REMOTE_SYNC = "remote_sync"
     SCAN = "scan"
     SYNC = "sync"
 
@@ -95,7 +91,7 @@ class FindingsProcessed:
 
 @dataclass(frozen=True, slots=True)
 class Promoted:
-    """The managed update bookmark has been promoted to local main."""
+    """A workflow bookmark has been promoted to local main."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,11 +102,6 @@ class ResolvePaused:
 @dataclass(frozen=True, slots=True)
 class FindingsBlocked:
     findings: tuple[tuple[str, str], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class SubmissionBlocked:
-    project: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,39 +183,6 @@ class FindingFailed:
     target: str
 
 
-@dataclass(frozen=True, slots=True)
-class PullRequestOutput:
-    text: str
-
-
-@dataclass(frozen=True, slots=True)
-class GradleWithheld:
-    label: str
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class NoEligibleGradleChanges:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class GradleRunArchived:
-    path: Path
-
-
-@dataclass(frozen=True, slots=True)
-class GradleFlowFailed:
-    flow: Workflow
-    error: str
-
-
-@dataclass(frozen=True, slots=True)
-class GradleRunReported:
-    scan: ScanResult
-    run: GradleRun
-
-
 type Event = (
     ProjectStarted
     | ProjectSkipped
@@ -236,7 +194,6 @@ type Event = (
     | Promoted
     | ResolvePaused
     | FindingsBlocked
-    | SubmissionBlocked
     | BlockersStillFailing
     | SyncCompleted
     | DeployStepStarted
@@ -249,11 +206,5 @@ type Event = (
     | FindingStepFailed
     | FindingPassed
     | FindingFailed
-    | PullRequestOutput
-    | GradleWithheld
-    | NoEligibleGradleChanges
-    | GradleRunArchived
-    | GradleFlowFailed
-    | GradleRunReported
 )
 type Emit = Callable[[Event], None]

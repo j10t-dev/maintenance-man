@@ -1,9 +1,7 @@
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-from maintenance_man.github import CodeHostError
 from maintenance_man.models.events import (
     BlockersStillFailing,
     FindingPassed,
@@ -11,9 +9,8 @@ from maintenance_man.models.events import (
     Operation,
     OperationFailed,
     Outcome,
-    PullRequestOutput,
+    Promoted,
     ResolvePaused,
-    SubmissionBlocked,
 )
 from maintenance_man.models.scan import UpdateStatus, Workflow
 from maintenance_man.services import WorkflowError
@@ -23,9 +20,22 @@ from maintenance_man.vcs import RevisionError
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor, RecordingEmit
 from tests.support.findings import make_scan_result, make_update, make_vuln
-from tests.support.projects import make_project, seed_project
+from tests.support.projects import seed_project
 
 _BOOKMARK = "mm/resolve-dependencies"
+
+
+def _record_tip_at_promotion(state: FakeJjState, path: Path) -> list[str]:
+    tips: list[str] = []
+    state.hook(
+        "promote_bookmark_to_main",
+        phase="before",
+        action=lambda: tips.append(
+            state.repository(path).resolve_revision(revision=_BOOKMARK)
+        ),
+        path=path,
+    )
+    return tips
 
 
 class TestResolveCandidates:
@@ -65,7 +75,6 @@ class TestResolveCandidates:
             resolve_service.resolve_project(
                 "api",
                 project,
-                minimum_age_days=7,
                 continue_=False,
                 vcs=state.services(),
                 emit=RecordingEmit(),
@@ -101,7 +110,6 @@ class TestResolveCandidates:
         outcome = resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=False,
             vcs=state.services(),
             emit=RecordingEmit(),
@@ -152,7 +160,6 @@ class TestResolveCandidates:
         outcome = resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=True,
             vcs=state.services(),
             emit=emit,
@@ -165,7 +172,7 @@ class TestResolveCandidates:
         assert processed == [("pkg-a",)]
         assert load_scan_results("api").findings == ()
 
-    def test_given_ready_finding_when_resolve_runs_then_it_is_submitted_and_removed(
+    def test_given_ready_finding_when_resolve_runs_then_it_is_promoted_and_removed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         scan = make_scan_result(
@@ -179,9 +186,12 @@ class TestResolveCandidates:
             ],
         )
         state, project = seed_project(tmp_path, "api", scan)
-        state.services().repository(project.path).set_bookmark(
-            bookmark=_BOOKMARK, revision="main"
-        )
+        state.register_files(project.path, "mm-fixture-pkg-a.txt")
+        (project.path / "mm-fixture-pkg-a.txt").write_text("1.0.1", encoding="utf-8")
+        repo = state.services().repository(project.path)
+        repo.commit(message="fixture: update pkg-a")
+        repo.set_bookmark(bookmark=_BOOKMARK, revision="@-")
+        resolve_tip = repo.resolve_revision(revision=_BOOKMARK)
         monkeypatch.setattr(
             resolve_service, "process_findings", FakeFindingProcessor({})
         )
@@ -190,18 +200,19 @@ class TestResolveCandidates:
         outcome = resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=False,
             vcs=state.services(),
             emit=emit,
         )
 
         assert outcome is Outcome.SUCCEEDED
-        assert emit.events[-1] == PullRequestOutput("PR #1")
+        assert emit.events[-1] == Promoted()
         assert load_scan_results("api").findings == ()
+        assert repo.same_revision(left="main", right=resolve_tip)
+        assert not repo.bookmark_exists(bookmark=_BOOKMARK)
 
 
-def test_fresh_resolve_submits_and_removes_completed_findings(
+def test_fresh_resolve_promotes_and_removes_completed_findings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result()
@@ -211,19 +222,19 @@ def test_fresh_resolve_submits_and_removes_completed_findings(
         "process_findings",
         FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)}),
     )
+    resolve_tips = _record_tip_at_promotion(state, project.path)
     emit = RecordingEmit()
 
     outcome = resolve_service.resolve_project(
         "api",
         project,
-        minimum_age_days=7,
         continue_=False,
         vcs=state.services(),
         emit=emit,
     )
 
     assert outcome is Outcome.SUCCEEDED
-    assert emit.events[-1] == PullRequestOutput("PR #1")
+    assert emit.events[-1] == Promoted()
     assert load_scan_results("api").findings == ()
     created = [call for call in state.effects if call.method == "create_bookmark"]
     assert len(created) == 1
@@ -231,11 +242,12 @@ def test_fresh_resolve_submits_and_removes_completed_findings(
         "bookmark": _BOOKMARK,
         "revision": "main",
     }
-    host = state.code_host(project.path)
-    assert sum(call.method == "create_pr" for call in host.attempts) == 1
+    repo = state.services().repository(project.path)
+    assert repo.same_revision(left="main", right=resolve_tips[0])
+    assert not repo.bookmark_exists(bookmark=_BOOKMARK)
 
 
-def test_failed_candidate_pauses_without_submitting(
+def test_failed_candidate_pauses_without_promoting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state, project = seed_project(tmp_path, "api", make_scan_result())
@@ -249,7 +261,6 @@ def test_failed_candidate_pauses_without_submitting(
     outcome = resolve_service.resolve_project(
         "api",
         project,
-        minimum_age_days=7,
         continue_=False,
         vcs=state.services(),
         emit=emit,
@@ -260,9 +271,8 @@ def test_failed_candidate_pauses_without_submitting(
     saved = load_scan_results("api")
     assert saved.vulnerabilities[0].update_status is UpdateStatus.FAILED
     assert saved.vulnerabilities[0].failed_phase == "unit"
-    assert not any(
-        call.method == "create_pr" for call in state.code_host(project.path).attempts
-    )
+    assert not any(call.method == "push_bookmark" for call in state.attempts)
+    assert Promoted() not in emit.events
 
 
 def test_blocked_finding_is_saved_and_reported(
@@ -291,25 +301,58 @@ def test_blocked_finding_is_saved_and_reported(
     outcome = resolve_service.resolve_project(
         "api",
         project,
-        minimum_age_days=7,
         continue_=False,
         vcs=state.services(),
         emit=emit,
     )
 
     assert outcome is Outcome.FAILED
-    assert emit.events[-2:] == [
-        FindingsBlocked((("blocked", "No published fix"),)),
-        SubmissionBlocked("api"),
-    ]
+    assert emit.events[-1:] == [FindingsBlocked((("blocked", "No published fix"),))]
     assert [finding.pkg_name for finding in load_scan_results("api").findings] == [
         "some-pkg",
         "blocked",
     ]
-    assert not any(call.method == "create_pr" for call in state.effects)
+    assert not any(call.method == "push_bookmark" for call in state.attempts)
 
 
-def test_host_failure_after_push_emits_submit_failure_and_keeps_ready(
+def test_given_row_blocked_during_run_when_resolve_completes_then_it_is_reported_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = make_scan_result(
+        vulns=[
+            make_vuln(pkg_name="some-pkg"),
+            make_vuln(pkg_name="drifted", vuln_id="CVE-drifted"),
+        ],
+        updates=[],
+    )
+    state, project = seed_project(tmp_path, "api", scan)
+    passing = FakeFindingProcessor({"some-pkg": (True, None)})
+
+    def process_and_block_drifted(findings, *args, scan_result, emit, **kwargs):
+        drifted = next(row for row in findings if row.pkg_name == "drifted")
+        drifted.blocked_reason = "catalogue drifted"
+        emit(FindingsBlocked((("drifted", "catalogue drifted"),)))
+        ready = [row for row in findings if row is not drifted]
+        return passing(ready, *args, scan_result=scan_result, emit=emit, **kwargs)
+
+    monkeypatch.setattr(resolve_service, "process_findings", process_and_block_drifted)
+    emit = RecordingEmit()
+
+    outcome = resolve_service.resolve_project(
+        "api",
+        project,
+        continue_=False,
+        vcs=state.services(),
+        emit=emit,
+    )
+
+    assert outcome is Outcome.SUCCEEDED
+    assert emit.of_type(FindingsBlocked) == [
+        FindingsBlocked((("drifted", "catalogue drifted"),))
+    ]
+
+
+def test_given_promotion_failure_when_resolve_completes_then_ready_and_bookmark_remain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state, project = seed_project(tmp_path, "api", make_scan_result())
@@ -318,25 +361,30 @@ def test_host_failure_after_push_emits_submit_failure_and_keeps_ready(
         "process_findings",
         FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)}),
     )
-    state.code_host(project.path).fail("create_pr", error=CodeHostError("denied"))
+    state.fail(
+        "promote_bookmark_to_main", error=RevisionError("denied"), path=project.path
+    )
     emit = RecordingEmit()
 
     outcome = resolve_service.resolve_project(
         "api",
         project,
-        minimum_age_days=7,
         continue_=False,
         vcs=state.services(),
         emit=emit,
     )
 
     assert outcome is Outcome.FAILED
-    assert emit.events[-1] == OperationFailed(Operation.SUBMIT, "api", "denied")
+    assert emit.events[-1] == OperationFailed(
+        Operation.PROMOTE,
+        "api",
+        f"denied · rebase with jj rebase -b {_BOOKMARK} -d main, then rerun",
+    )
     assert all(
         finding.update_status is UpdateStatus.READY
         for finding in load_scan_results("api").findings
     )
-    assert state.remote_bookmark_targets(project.path, bookmark=_BOOKMARK)
+    assert state.services().repository(project.path).bookmark_exists(bookmark=_BOOKMARK)
 
 
 def test_continue_failing_retest_persists_phase_and_reports_blockers(
@@ -364,7 +412,6 @@ def test_continue_failing_retest_persists_phase_and_reports_blockers(
     outcome = resolve_service.resolve_project(
         "api",
         project,
-        minimum_age_days=7,
         continue_=True,
         vcs=state.services(),
         emit=emit,
@@ -380,7 +427,7 @@ def test_continue_failing_retest_persists_phase_and_reports_blockers(
     )
 
 
-def test_continue_passing_retest_marks_blocker_passed_then_submits(
+def test_continue_passing_retest_marks_blocker_passed_then_promotes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result(
@@ -416,12 +463,12 @@ def test_continue_passing_retest_marks_blocker_passed_then_submits(
         return processor(findings, project_config, **kwargs)
 
     monkeypatch.setattr(resolve_service, "process_findings", process)
+    resolve_tips = _record_tip_at_promotion(state, project.path)
     emit = RecordingEmit()
 
     outcome = resolve_service.resolve_project(
         "api",
         project,
-        minimum_age_days=7,
         continue_=True,
         vcs=state.services(),
         emit=emit,
@@ -430,8 +477,11 @@ def test_continue_passing_retest_marks_blocker_passed_then_submits(
     assert outcome is Outcome.SUCCEEDED
     assert FindingPassed("some-pkg", False, "1.0.0", "1.0.1") in emit.events
     assert processed == [("pkg-a",)]
-    assert emit.events[-1] == PullRequestOutput("PR #1")
+    assert emit.events[-1] == Promoted()
     assert load_scan_results("api").findings == ()
+    repo = state.services().repository(project.path)
+    assert repo.same_revision(left="main", right=resolve_tips[0])
+    assert not repo.bookmark_exists(bookmark=_BOOKMARK)
 
 
 def test_missing_resume_bookmark_raises_workflow_error(
@@ -454,7 +504,6 @@ def test_missing_resume_bookmark_raises_workflow_error(
         resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=False,
             vcs=state.services(),
             emit=RecordingEmit(),
@@ -475,7 +524,6 @@ def test_paused_resolve_requires_continue(tmp_path: Path) -> None:
         resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=False,
             vcs=state.services(),
             emit=RecordingEmit(),
@@ -499,7 +547,6 @@ def test_continue_wraps_repository_inspection_error(tmp_path: Path) -> None:
         resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=True,
             vcs=state.services(),
             emit=RecordingEmit(),
@@ -524,7 +571,6 @@ def test_continue_refuses_dirty_current_change(tmp_path: Path) -> None:
         resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=True,
             vcs=state.services(),
             emit=RecordingEmit(),
@@ -549,7 +595,6 @@ def test_prepare_failure_emits_then_raises_aborted(tmp_path: Path) -> None:
         resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=False,
             vcs=state.services(),
             emit=emit,
@@ -558,24 +603,6 @@ def test_prepare_failure_emits_then_raises_aborted(tmp_path: Path) -> None:
     assert emit.events[-1] == OperationFailed(
         Operation.RESOLVE_SETUP, "api", "cannot create"
     )
-
-
-def test_pruning_failure_is_chained_as_workflow_error(tmp_path: Path) -> None:
-    state, project = seed_project(tmp_path, "api", make_scan_result())
-    state.fail("fetch", error=RevisionError("cannot fetch"), path=project.path)
-
-    with pytest.raises(WorkflowError) as raised:
-        resolve_service.resolve_project(
-            "api",
-            project,
-            minimum_age_days=7,
-            continue_=False,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
-
-    assert str(raised.value) == "cannot fetch"
-    assert isinstance(raised.value.__cause__, RevisionError)
 
 
 def test_bookmark_move_failure_saves_before_refusal(
@@ -617,7 +644,6 @@ def test_bookmark_move_failure_saves_before_refusal(
         resolve_service.resolve_project(
             "api",
             project,
-            minimum_age_days=7,
             continue_=True,
             vcs=state.services(),
             emit=RecordingEmit(),
@@ -630,36 +656,3 @@ def test_bookmark_move_failure_saves_before_refusal(
     saved = load_scan_results("api").vulnerabilities[0]
     assert saved.update_status is UpdateStatus.FAILED
     assert saved.failed_phase == "unit"
-
-
-@pytest.mark.parametrize("continue_", [False, True])
-def test_gradle_project_routes_to_gradle_resolve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, continue_: bool
-) -> None:
-    project = make_project(tmp_path, package_manager="gradle")
-    state = FakeJjState()
-    state.seed_repository(project.path, files={"settings.gradle": ""})
-    run = MagicMock(return_value=Outcome.FAILED)
-    monkeypatch.setattr(resolve_service.gradle_workflow, "run_gradle_flow", run)
-    emit = RecordingEmit()
-
-    outcome = resolve_service.resolve_project(
-        "android",
-        project,
-        minimum_age_days=9,
-        continue_=continue_,
-        vcs=state.services(),
-        emit=emit,
-    )
-
-    assert outcome is Outcome.FAILED
-    run.assert_called_once_with(
-        "android",
-        project,
-        Workflow.RESOLVE,
-        minimum_age_days=9,
-        continue_=continue_,
-        choose=None,
-        vcs=state.services(),
-        emit=emit,
-    )

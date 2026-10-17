@@ -7,13 +7,10 @@ from enum import StrEnum
 from pathlib import Path
 
 from maintenance_man import vcs
-from maintenance_man.github import GH_INSTALL_HINT, CodeHost, GitHubCodeHost
-from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.paths import sanitise_project_name
 from maintenance_man.process import require_tool
 from maintenance_man.vcs import (
     JJ_INSTALL_HINT,
-    ExpectedRevisions,
     JjRepository,
     Repository,
     RevisionError,
@@ -21,14 +18,12 @@ from maintenance_man.vcs import (
 
 
 def require_vcs_tools() -> None:
-    require_tool("gh", GH_INSTALL_HINT)
     require_tool("jj", JJ_INSTALL_HINT)
 
 
 @dataclass(frozen=True, slots=True)
 class VcsServices:
     repository: Callable[[Path], Repository]
-    code_host: Callable[[Path], CodeHost]
 
 
 class SyncAction(StrEnum):
@@ -38,7 +33,7 @@ class SyncAction(StrEnum):
 
 
 def make_vcs_services() -> VcsServices:
-    return VcsServices(repository=JjRepository, code_host=GitHubCodeHost)
+    return VcsServices(repository=JjRepository)
 
 
 def ensure_main_bookmark(*, repo: Repository) -> None:
@@ -88,32 +83,6 @@ def sync_main(*, repo: Repository) -> SyncAction:
 
     msg = "local main and origin/main have diverged; resolve manually before syncing"
     raise RevisionError(msg)
-
-
-def prune_stale_bookmarks(*, repo: Repository, host: CodeHost) -> None:
-    repo.fetch()
-    merged = host.pr_bookmarks(state="merged")
-    closed = host.pr_bookmarks(state="closed")
-    local = repo.local_bookmarks()
-    managed_prefixes = tuple(WORKFLOW_BOOKMARKS.values())
-    stale = {
-        bookmark
-        for bookmark in merged | closed
-        if bookmark.startswith(managed_prefixes)
-    }
-    for bookmark in sorted(local & stale):
-        repo.delete_bookmark(bookmark=bookmark)
-
-
-def push_bookmark_and_create_pr(
-    *,
-    repo: Repository,
-    host: CodeHost,
-    bookmark: str,
-    expected: ExpectedRevisions | None = None,
-) -> str:
-    repo.push_bookmark(bookmark=bookmark, expected=expected)
-    return host.create_pr(bookmark=bookmark)
 
 
 def current_label(*, repo: Repository) -> str:

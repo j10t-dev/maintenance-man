@@ -5,7 +5,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from maintenance_man.config import ordered_unique_project_names
-from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
@@ -23,12 +22,7 @@ from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import ScanError, scan_project
 from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import (
-    VcsServices,
-    prune_stale_bookmarks,
-    require_vcs_tools,
-    sync_main,
-)
+from maintenance_man.vcs_workflow import VcsServices, sync_main
 
 SCAN_ERRORS = (
     ScanError,
@@ -59,24 +53,15 @@ def scan_one(
     project: ProjectConfig,
     *,
     minimum_age_days: int,
-    vcs: VcsServices,
     emit: Emit,
 ) -> ScanResult:
-    try:
-        require_vcs_tools()
-        prune_stale_bookmarks(
-            repo=vcs.repository(project.path), host=vcs.code_host(project.path)
-        )
-    except (ToolNotFoundError, RevisionError, CodeHostError) as exc:
-        emit(OperationFailed(Operation.REMOTE_SYNC, name, str(exc)))
-
     started = time.monotonic()
     result = scan_project(name, project, minimum_age_days)
     emit(ScanReported(result, time.monotonic() - started))
     return result
 
 
-def scan_all(cfg: MmConfig, *, vcs: VcsServices, emit: Emit) -> ScanSummary:
+def scan_all(cfg: MmConfig, *, emit: Emit) -> ScanSummary:
     results: list[ScanResult] = []
     clean: list[str] = []
     had_error = False
@@ -89,7 +74,6 @@ def scan_all(cfg: MmConfig, *, vcs: VcsServices, emit: Emit) -> ScanSummary:
                 name,
                 project,
                 minimum_age_days=cfg.defaults.min_version_age_days,
-                vcs=vcs,
                 emit=emit,
             )
         except SCAN_ERRORS as exc:

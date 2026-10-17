@@ -295,9 +295,6 @@ def test_given_one_clean_project_when_batch_scanned_then_notice_names_only_it(
         f'[projects.second]\npath = "{tmp_path / "second"}"\npackage_manager = "uv"\n',
     )
     monkeypatch.setattr(
-        "maintenance_man.services.scan.prune_stale_bookmarks", lambda **kwargs: None
-    )
-    monkeypatch.setattr(
         "maintenance_man.services.scan.scan_project",
         lambda name, project, days: _scanned_result(
             project=name, updates=[make_update()] if name == "second" else []

@@ -4,32 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man.gradle_updates import gradle_evidence_workspace
-from maintenance_man.vcs import ExpectedRevisions, RevisionError
-from maintenance_man.vcs_workflow import VcsServices, refresh_working_copy_from_main
+from maintenance_man.vcs import RevisionError
+from maintenance_man.vcs_workflow import refresh_working_copy_from_main
 from tests.fake_vcs import FakeJjState
-from tests.support.projects import make_project
 from tests.support.repository import (
     MANAGED,
     RepositoryCase,
-    assert_origin_baseline_only,
-    bookmark_state,
-    bookmark_targets,
-    real_repository_case,
-    run_jj,
 )
-
-_GUARDED = {
-    "promote": lambda repo, bookmark, expected: repo.promote_bookmark_to_main(
-        bookmark=bookmark, expected=expected
-    ),
-    "reset": lambda repo, bookmark, expected: repo.reset_verified_bookmark(
-        bookmark=bookmark, expected=expected
-    ),
-    "push": lambda repo, bookmark, expected: repo.push_bookmark(
-        bookmark=bookmark, expected=expected
-    ),
-}
 
 
 def test_given_missing_main_when_resolved_then_revision_error_is_raised(
@@ -130,17 +111,6 @@ def test_read_only_file_inspection_does_not_snapshot(repository_case: Repository
     assert c.repo.tree_id() != tree_before
 
 
-def test_changed_paths_reports_add_edit_and_delete(repository_case: RepositoryCase):
-    c = repository_case
-    c.commit_file("gone.txt", "remove me\n", "add removable file")
-    for filename in ("new.txt", "dep.txt", "gone.txt"):
-        c.register_file(filename)
-    c.write_file("new.txt", "new\n")
-    c.write_file("dep.txt", "version=2\n")
-    (c.repo.path / "gone.txt").unlink()
-    assert c.repo.changed_paths() == frozenset({"new.txt", "dep.txt", "gone.txt"})
-
-
 def test_discard_restores_the_parent_tree(repository_case: RepositoryCase) -> None:
     c = repository_case
     c.write_file("dep.txt", "dirty\n")
@@ -150,33 +120,6 @@ def test_discard_restores_the_parent_tree(repository_case: RepositoryCase) -> No
 
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=1\n"
     assert c.repo.has_changes() is False
-
-
-@pytest.mark.parametrize("error_type", [RuntimeError, RevisionError])
-def test_proof_preserves_body_exception(
-    repository_case: RepositoryCase, error_type: type[BaseException]
-):
-    c = repository_case
-    project = make_project(c.repo.path)
-    original = error_type("proof body failed")
-
-    def no_host(path: Path):
-        msg = f"unexpected host for {path}"
-        raise AssertionError(msg)
-
-    services = VcsServices(repository=c.bind, code_host=no_host)
-    before_names = c.repo.workspace_names()
-    proof_path = None
-    with (
-        pytest.raises(error_type) as caught,
-        gradle_evidence_workspace(project, "main", vcs=services) as proof,
-    ):
-        proof_path = proof.path
-        assert proof.path != project.path
-        raise original
-    assert caught.value is original
-    assert c.repo.workspace_names() == before_names
-    assert proof_path is not None and not proof_path.exists()
 
 
 def test_given_conflicted_bookmark_when_resolving_then_raises_and_direct_id_resolves(
@@ -217,11 +160,11 @@ def test_given_conflicted_bookmark_when_inspected_then_topic_survives_refresh(
     refresh_working_copy_from_main(repo=c.repo)
 
     assert c.repo.revision_bookmarks(revision=current) == ("topic",)
-    with c.repo.temporary_workspace(revision=current) as preserved:
-        assert preserved.change_id(revision="@-") == change_id
-        assert (preserved.path / "dep.txt").read_text(encoding="utf-8") == (
-            "protected local change\n"
-        )
+    c.repo.new_change(revision=current)
+    assert c.repo.change_id(revision="@-") == change_id
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == (
+        "protected local change\n"
+    )
 
 
 def test_given_fake_conflicted_bookmark_when_inspected_then_one_attempt_is_recorded(
@@ -272,7 +215,6 @@ def test_promote_then_rebase_empty_source_child_projects_updated_files(
     repository_case: RepositoryCase, tmp_path: Path
 ):
     c = repository_case
-    base = c.repo.resolve_revision(revision="main")
     source_change = c.repo.change_id()
     update_path = tmp_path / "promotion-workspace"
     c.repo.add_workspace(name="promotion", path=update_path, revision="main")
@@ -284,10 +226,7 @@ def test_promote_then_rebase_empty_source_child_projects_updated_files(
     tip = update.resolve_revision(revision="@-")
     update.set_bookmark(bookmark=MANAGED, revision=tip)
 
-    c.repo.promote_bookmark_to_main(
-        bookmark=MANAGED,
-        expected=ExpectedRevisions(base=base, tip=tip),
-    )
+    c.repo.promote_bookmark_to_main(bookmark=MANAGED)
     c.repo.rebase_working_copy(revision="main")
 
     assert c.repo.change_id() == source_change
@@ -309,145 +248,6 @@ def test_rebase_preserves_change_and_new_change_preserves_old_commit(
     c.repo.new_change(revision="main")
     assert c.repo.resolve_revision(revision=old) == old
     assert c.repo.change_id() != change_before
-
-
-@pytest.mark.parametrize("error", [RuntimeError("caller"), RevisionError("caller")])
-def test_temporary_workspace_preserves_body_exception_identity_and_cleans_up(
-    repository_case: RepositoryCase, error: Exception
-):
-    before = repository_case.repo.workspace_names()
-    with (
-        pytest.raises(type(error)) as caught,
-        repository_case.repo.temporary_workspace(revision="main") as proof,
-    ):
-        container = proof.path.parent
-        raise error
-    assert caught.value is error
-    assert not container.exists()
-    assert repository_case.repo.workspace_names() == before
-
-
-@pytest.mark.parametrize("operation", ["promote", "reset", "push"])
-def test_guarded_operations_accept_unchanged_revisions(
-    repository_case: RepositoryCase, operation: str
-):
-    c = repository_case
-    base = c.repo.resolve_revision(revision="main")
-    c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "version=2\n")
-    c.describe("upgrade dependency")
-    tip = c.repo.resolve_revision(revision="@")
-    c.repo.set_bookmark(bookmark=MANAGED, revision=tip)
-    expected = ExpectedRevisions(base=base, tip=tip)
-    _GUARDED[operation](c.repo, MANAGED, expected)
-    if operation == "promote":
-        assert c.repo.resolve_revision(revision="main") == tip
-    elif operation == "reset":
-        assert c.repo.resolve_revision(revision=MANAGED) == base
-    else:
-        assert c.origin_peer.remote_bookmark_targets(MANAGED) == (tip,)
-
-
-@pytest.mark.parametrize("operation", ["promote", "reset", "push"])
-@pytest.mark.parametrize("mutation", ["base", "tip", "base-conflict", "tip-conflict"])
-def test_given_moved_or_conflicted_revisions_when_guarding_then_operation_is_refused(
-    repository_case: RepositoryCase, operation: str, mutation: str
-):
-    c = repository_case
-    base = c.repo.resolve_revision(revision="main")
-    c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "version=2\n")
-    c.describe("upgrade dependency")
-    tip = c.repo.resolve_revision(revision="@")
-    c.repo.set_bookmark(bookmark=MANAGED, revision=tip)
-    c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "sibling\n")
-    c.describe("sibling")
-    sibling = c.repo.resolve_revision(revision="@")
-    expected = ExpectedRevisions(base=base, tip=tip)
-    if mutation == "base":
-        c.force_bookmark("main", sibling)
-    elif mutation == "tip":
-        c.force_bookmark(MANAGED, base)
-    elif mutation == "base-conflict":
-        c.conflict_bookmark("main", tip, sibling)
-    else:
-        c.conflict_bookmark(MANAGED, tip, sibling)
-    candidates = {base, tip, sibling}
-    before_targets = {
-        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
-        for bookmark in ("main", MANAGED)
-    }
-    if mutation == "base-conflict":
-        assert c.repo.bookmark_conflicted(bookmark="main") is True
-    else:
-        assert c.repo.resolve_revision(revision="main") == (
-            sibling if mutation == "base" else base
-        )
-    if mutation == "tip-conflict":
-        assert c.repo.bookmark_conflicted(bookmark=MANAGED) is True
-    else:
-        assert c.repo.resolve_revision(revision=MANAGED) == (
-            base if mutation == "tip" else tip
-        )
-    assert_origin_baseline_only(c, base=base)
-    push_effects: list[str] = []
-    if operation == "push":
-        c.after_push(lambda: push_effects.append("pushed"))
-    with pytest.raises(RevisionError):
-        _GUARDED[operation](c.repo, MANAGED, expected)
-    assert {
-        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
-        for bookmark in ("main", MANAGED)
-    } == before_targets
-    assert_origin_baseline_only(c, base=base)
-    assert push_effects == []
-
-
-@pytest.mark.parametrize("operation", ["promote", "reset", "push"])
-def test_guarded_operations_reject_unmanaged_bookmark(
-    repository_case: RepositoryCase, operation: str
-):
-    base = repository_case.repo.resolve_revision(revision="main")
-    expected = ExpectedRevisions(base=base, tip=base)
-    with pytest.raises(RevisionError, match="Unexpected managed"):
-        _GUARDED[operation](repository_case.repo, "feature/unmanaged", expected)
-
-
-@pytest.mark.parametrize("operation", ["promote", "reset", "push"])
-def test_guarded_operations_reject_sibling_base_and_tip(
-    repository_case: RepositoryCase, operation: str
-):
-    c = repository_case
-    root = c.repo.resolve_revision(revision="main")
-    tip = c.commit_file("dep.txt", "tip\n", "tip")
-    c.repo.new_change(revision=root)
-    c.write_file("dep.txt", "sibling\n")
-    c.describe("sibling")
-    sibling = c.repo.resolve_revision(revision="@")
-    c.force_bookmark("main", tip)
-    c.force_bookmark(MANAGED, sibling)
-    expected = ExpectedRevisions(base=tip, tip=sibling)
-    candidates = {root, tip, sibling}
-    before_targets = {
-        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
-        for bookmark in ("main", MANAGED)
-    }
-    assert c.repo.resolve_revision(revision="main") == tip
-    assert c.repo.resolve_revision(revision=MANAGED) == sibling
-    assert_origin_baseline_only(c, base=root)
-    push_effects: list[str] = []
-    if operation == "push":
-        c.after_push(lambda: push_effects.append("pushed"))
-
-    with pytest.raises(RevisionError):
-        _GUARDED[operation](c.repo, MANAGED, expected)
-    assert {
-        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
-        for bookmark in ("main", MANAGED)
-    } == before_targets
-    assert_origin_baseline_only(c, base=root)
-    assert push_effects == []
 
 
 def test_initial_push_tracks_main_for_later_peer_advance(
@@ -485,67 +285,3 @@ def test_push_rejects_existing_untracked_remote_without_remote_effect(
     c.origin_peer.repo.fetch(main_only=True)
     assert c.origin_peer.repo.resolve_revision(revision="main") == base
     assert push_effects == []
-
-
-@pytest.mark.parametrize("operation", ["promote", "reset", "push"])
-def test_given_guarded_effect_race_when_postchecking_then_completed_effect_is_retained(
-    repository_case: RepositoryCase,
-    operation: str,
-):
-    c = repository_case
-    base_parent = c.repo.resolve_revision(revision="main")
-    c.repo.new_change(revision=base_parent)
-    c.write_file("dep.txt", "base\n")
-    c.describe("base")
-    base = c.repo.resolve_revision(revision="@")
-    c.repo.set_bookmark(bookmark="main", revision=base)
-    c.repo.new_change(revision=base)
-    tip = c.commit_file("dep.txt", "tip\n", "tip")
-    c.repo.set_bookmark(bookmark=MANAGED, revision=tip)
-    c.repo.new_change(revision=base_parent)
-    c.write_file("dep.txt", "sibling\n")
-    c.describe("sibling")
-    sibling = c.repo.resolve_revision(revision="@")
-    expected = ExpectedRevisions(base=base, tip=tip)
-    changed_bookmark = "main" if operation in {"promote", "push"} else MANAGED
-    completed_target = tip if operation == "promote" else base
-    if operation == "push":
-        c.after_operation(
-            operation, lambda: c.force_bookmark(changed_bookmark, sibling)
-        )
-    else:
-        c.after_operation(
-            operation,
-            lambda: c.conflict_bookmark(changed_bookmark, completed_target, sibling),
-        )
-
-    with pytest.raises(RevisionError):
-        _GUARDED[operation](c.repo, MANAGED, expected)
-
-    if operation in {"promote", "reset"}:
-        assert c.repo.bookmark_conflicted(bookmark=changed_bookmark) is True
-        assert bookmark_targets(
-            c.repo, bookmark=changed_bookmark, candidates={base, tip, sibling}
-        ) == frozenset({completed_target, sibling})
-    else:
-        assert c.repo.resolve_revision(revision="main") == sibling
-        assert c.origin_peer.remote_bookmark_targets(MANAGED) == (tip,)
-
-
-@pytest.mark.integration
-def test_guarded_change_push_names_only_the_managed_bookmark(tmp_path: Path):
-    c = real_repository_case(tmp_path)
-    base = c.repo.resolve_revision(revision="main")
-    c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "version=2\n")
-    c.describe("upgrade dependency")
-    tip = c.repo.resolve_revision(revision="@")
-    c.repo.set_bookmark(bookmark=MANAGED, revision=tip)
-    c.repo.set_bookmark(bookmark="unrelated", revision=tip)
-    expected = ExpectedRevisions(base=base, tip=tip)
-    c.repo.push_bookmark(bookmark=MANAGED, expected=expected)
-    c.repo.push_bookmark(bookmark=MANAGED, expected=expected)
-    fetched = run_jj(c.repo.path, "git", "fetch", "--remote", "origin")
-    assert fetched.returncode == 0, fetched.stderr
-    assert run_jj(c.repo.path, "log", "-r", f"{MANAGED}@origin").returncode == 0
-    assert run_jj(c.repo.path, "log", "-r", "unrelated@origin").returncode != 0

@@ -3,21 +3,17 @@ from pathlib import Path
 import pytest
 
 from maintenance_man import paths
-from maintenance_man.github import CodeHostError
-from maintenance_man.vcs import ExpectedRevisions, RevisionError
+from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import (
     SyncAction,
     create_workspace,
     current_label,
     ensure_main_bookmark,
-    prune_stale_bookmarks,
-    push_bookmark_and_create_pr,
     refresh_working_copy_from_main,
     remove_workspace,
     sync_main,
 )
-from tests.fake_vcs import FakeCodeHost
-from tests.support.repository import MANAGED, RepositoryCase, real_repository_case
+from tests.support.repository import RepositoryCase, real_repository_case
 
 
 def _fail_repository_method(
@@ -439,10 +435,8 @@ def test_refresh_protected_change_starts_new_child_and_preserves_old_content(
     )
     assert c.repo.revision_file(revision=old, filename="dep.txt").is_regular is True
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
-    with c.repo.temporary_workspace(revision=old) as preserved:
-        assert (preserved.path / "dep.txt").read_text(
-            encoding="utf-8"
-        ) == expected_old_content
+    c.repo.new_change(revision=old)
+    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == expected_old_content
 
 
 def test_refresh_inspection_failure_has_no_mutation(
@@ -485,154 +479,6 @@ def test_refresh_relationship_or_rebase_failure_has_no_completed_mutation(
     assert caught.value is failure
     assert c.repo.resolve_revision(revision="@") == before
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=1\n"
-
-
-@pytest.mark.parametrize("failed_listing", ["merged", "closed", "local"])
-def test_prune_finishes_all_listings_before_deletion(
-    repository_case: RepositoryCase,
-    monkeypatch: pytest.MonkeyPatch,
-    failed_listing: str,
-) -> None:
-    c = repository_case
-    repo = c.repo
-    base = repo.resolve_revision(revision="main")
-    repo.set_bookmark(bookmark=MANAGED, revision=base)
-    host = FakeCodeHost(repo.path)
-    host.seed_pr(bookmark=MANAGED, state="merged")
-    if failed_listing == "merged":
-        host.fail("pr_bookmarks", ordinal=1, error=CodeHostError("merged failed"))
-    elif failed_listing == "closed":
-        host.fail("pr_bookmarks", ordinal=2, error=CodeHostError("closed failed"))
-    else:
-        _fail_repository_method(
-            monkeypatch, c, "local_bookmarks", RevisionError("local failed")
-        )
-
-    with pytest.raises((CodeHostError, RevisionError)):
-        prune_stale_bookmarks(repo=repo, host=host)
-    assert repo.bookmark_exists(bookmark=MANAGED) is True
-
-
-def test_prune_fetch_failure_stops_before_host_or_deletion(
-    repository_case: RepositoryCase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    c = repository_case
-    host = FakeCodeHost(c.repo.path)
-    failure = RevisionError("fetch failed")
-    _fail_repository_method(monkeypatch, c, "fetch", failure)
-
-    with pytest.raises(RevisionError) as caught:
-        prune_stale_bookmarks(repo=c.repo, host=host)
-
-    assert caught.value is failure
-    assert host.attempts == []
-
-
-def test_prune_deletes_sorted_managed_intersection_and_stops_on_failure(
-    repository_case: RepositoryCase,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    c = repository_case
-    repo = c.repo
-    base = repo.resolve_revision(revision="main")
-    stale = [
-        "mm/resolve-dependencies-b",
-        "mm/update-dependencies-a",
-        "mm/update-dependencies-c",
-    ]
-    for bookmark in [*stale, "feature/unrelated"]:
-        repo.set_bookmark(bookmark=bookmark, revision=base)
-    host = FakeCodeHost(repo.path)
-    for bookmark in stale:
-        host.seed_pr(bookmark=bookmark, state="closed")
-    host.seed_pr(bookmark="feature/unrelated", state="closed")
-    original = type(repo).delete_bookmark
-    calls = 0
-
-    def fail_second(repository, *, bookmark: str):
-        nonlocal calls
-        if repository.path == repo.path:
-            calls += 1
-            if calls == 2:
-                message = "delete failed"
-                raise RevisionError(message)
-        return original(repository, bookmark=bookmark)
-
-    monkeypatch.setattr(type(repo), "delete_bookmark", fail_second)
-
-    with pytest.raises(RevisionError, match="delete failed"):
-        prune_stale_bookmarks(repo=repo, host=host)
-
-    ordered = sorted(stale)
-    assert repo.bookmark_exists(bookmark=ordered[0]) is False
-    assert repo.bookmark_exists(bookmark=ordered[1]) is True
-    assert repo.bookmark_exists(bookmark=ordered[2]) is True
-    assert repo.bookmark_exists(bookmark="feature/unrelated") is True
-    assert calls == 2
-
-
-def _submission_case(c: RepositoryCase):
-    repo = c.repo
-    base = repo.resolve_revision(revision="main")
-    tip = c.commit_file("dep.txt", "version=2\n", "update")
-    repo.set_bookmark(bookmark=MANAGED, revision=tip)
-    return repo, FakeCodeHost(repo.path), ExpectedRevisions(base, tip)
-
-
-def test_submission_push_failure_never_calls_host(
-    repository_case: RepositoryCase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo, host, expected = _submission_case(repository_case)
-    _fail_repository_method(
-        monkeypatch, repository_case, "push_bookmark", RevisionError("push failed")
-    )
-
-    with pytest.raises(RevisionError, match="push failed"):
-        push_bookmark_and_create_pr(
-            repo=repo, host=host, bookmark=MANAGED, expected=expected
-        )
-    assert host.attempts == []
-
-
-def test_submission_postcheck_failure_retains_push_and_never_calls_host(
-    repository_case: RepositoryCase,
-) -> None:
-    c = repository_case
-    repo, host, expected = _submission_case(c)
-    c.after_push(lambda: c.force_bookmark("main", expected.tip))
-
-    with pytest.raises(RevisionError, match="changed"):
-        push_bookmark_and_create_pr(
-            repo=repo, host=host, bookmark=MANAGED, expected=expected
-        )
-    assert c.origin_peer.remote_bookmark_targets(MANAGED) == (expected.tip,)
-    assert host.attempts == []
-
-
-def test_submission_host_failure_retains_push_and_retry_succeeds(
-    repository_case: RepositoryCase,
-) -> None:
-    c = repository_case
-    repo, host, expected = _submission_case(c)
-    host.fail("create_pr", error=CodeHostError("host unavailable"))
-
-    with pytest.raises(CodeHostError, match="host unavailable"):
-        push_bookmark_and_create_pr(
-            repo=repo, host=host, bookmark=MANAGED, expected=expected
-        )
-    assert c.origin_peer.remote_bookmark_targets(MANAGED) == (expected.tip,)
-    assert (
-        push_bookmark_and_create_pr(
-            repo=repo, host=host, bookmark=MANAGED, expected=expected
-        )
-        == "PR #1"
-    )
-    assert (
-        push_bookmark_and_create_pr(
-            repo=repo, host=host, bookmark=MANAGED, expected=expected
-        )
-        == f"PR already exists for {MANAGED}"
-    )
 
 
 def test_workspace_policy_creates_and_removes_registered_path(

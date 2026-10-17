@@ -17,7 +17,6 @@ from maintenance_man.gradle import (
 )
 from maintenance_man.gradle_resolution import (
     attach_gradle_publications,
-    collect_gradle_resolution,
     exact_fix_candidate,
     generate_gradle_report,
     parse_resolution_report,
@@ -131,9 +130,6 @@ def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):
             assert generated.bom_path.is_file()
             assert isinstance(generated.resolution, CompleteResolution)
         assert not (tmp_path / ".mm-gradle-inventory").exists()
-        result = collect_gradle_resolution(project)
-    assert isinstance(result, CompleteResolution)
-    assert result.report.scopes[0].components[0].kind == "root"
 
 
 def test_captured_inventory_bytes_and_models_survive_cleanup(tmp_path):

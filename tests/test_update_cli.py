@@ -1,5 +1,4 @@
 import re
-import subprocess
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -8,11 +7,8 @@ import pytest
 
 from maintenance_man import cli
 from maintenance_man.cli import ExitCode
-from maintenance_man.github import CodeHostError
 from maintenance_man.models.events import Operation, OperationFailed, Outcome
 from maintenance_man.models.scan import (
-    GradleMember,
-    GradleUpdateTarget,
     ScanResult,
     UpdateResult,
     UpdateStatus,
@@ -26,7 +22,6 @@ from tests.fake_vcs import FakeJjState
 from tests.fakes import RecordingEmit
 from tests.support.cli import CliDeps, run_mm
 from tests.support.findings import (
-    make_gradle_target,
     make_scan_result,
     make_update,
     make_vuln,
@@ -149,19 +144,17 @@ _COMMAND_FIXTURES = [
 
 @pytest.mark.parametrize("command,deps_fixture", _COMMAND_FIXTURES)
 class TestSharedCommandPrerequisites:
-    @pytest.mark.parametrize("tool", ["gh", "jj"])
     def test_missing_tool_exits_one(
         self,
         command: str,
         deps_fixture: str,
         request: pytest.FixtureRequest,
         monkeypatch: pytest.MonkeyPatch,
-        tool: str,
     ) -> None:
         deps = request.getfixturevalue(deps_fixture)
         deps.vcs_state.clear_calls()
         monkeypatch.setattr(
-            "maintenance_man.vcs_workflow.require_tool", missing_tool(tool)
+            "maintenance_man.vcs_workflow.require_tool", missing_tool("jj")
         )
 
         assert run_mm(command, "vulnerable") == 1
@@ -186,21 +179,6 @@ class TestSharedCommandPrerequisites:
         assert captured.out == ""
         assert "rescan" in captured.err.lower()
         assert deps.vcs_state.effects == []
-
-    def test_given_code_host_pruning_failure_when_run_then_exits_one(
-        self,
-        command: str,
-        deps_fixture: str,
-        request: pytest.FixtureRequest,
-    ) -> None:
-        deps = request.getfixturevalue(deps_fixture)
-        project_path = deps.project_paths["vulnerable"]
-        deps.vcs_state.code_host(project_path).fail(
-            "pr_bookmarks", error=CodeHostError("host unavailable")
-        )
-
-        assert run_mm(command, "vulnerable") == 1
-        assert not any(call.method == "commit" for call in deps.vcs_state.attempts)
 
 
 def test_batch_reports_bookmark_access_error_without_requesting_rescan(
@@ -376,7 +354,7 @@ def test_given_batch_flow_conflict_when_run_then_exits_four_with_both_projects(
 
 
 class TestUpdatePreChecks:
-    def test_no_projects_configured_exits_0_without_gh(
+    def test_no_projects_configured_exits_0_without_jj(
         self,
         mm_home: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -386,23 +364,10 @@ class TestUpdatePreChecks:
 
         monkeypatch.setattr(
             "maintenance_man.vcs_workflow.require_tool",
-            missing_tool("gh"),
+            missing_tool("jj"),
         )
 
         assert run_mm("update") == 0
-
-    def test_batch_code_host_pruning_failure_continues_other_projects(
-        self,
-        mm_home_with_projects: Path,
-        mock_update_cli_deps: CliDeps,
-    ) -> None:
-        vulnerable = mock_update_cli_deps.project_paths["vulnerable"]
-        host = mock_update_cli_deps.vcs_state.code_host(vulnerable)
-        host.fail("pr_bookmarks", error=CodeHostError("host unavailable"))
-
-        assert run_mm("update", "vulnerable", "clean") == ExitCode.UPDATE_FAILED
-        clean = load_scan_results("clean")
-        assert not clean.findings
 
 
 class TestUpdateNoOp:
@@ -935,22 +900,22 @@ def test_update_end_to_end_uses_one_graph_and_persists_completion(
     assert [finding.pkg_name for finding in saved.findings] == ["unrelated"]
     effects = [call.method for call in state.effects]
     assert any(call.method == "working_copy_state" for call in state.attempts)
+    assert effects.index("forget_workspace") < effects.index("promote_bookmark_to_main")
     assert effects.index("promote_bookmark_to_main") < effects.index(
         "rebase_working_copy"
     )
-    assert effects.index("rebase_working_copy") < effects.index("forget_workspace")
-    assert effects.index("forget_workspace") < effects.index("delete_bookmark")
+    assert effects.index("rebase_working_copy") < effects.index("delete_bookmark")
 
 
 class TestUpdateTargetSelection:
-    def test_excluding_all_projects_exits_0_without_gh(
+    def test_excluding_all_projects_exits_0_without_jj(
         self,
         mm_home_with_projects: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
             "maintenance_man.vcs_workflow.require_tool",
-            missing_tool("gh"),
+            missing_tool("jj"),
         )
 
         assert (
@@ -1110,7 +1075,6 @@ class TestUpdateTargetSelection:
                 update_service.UpdateSetupError("setup failed"),
                 update_service.ProjectUpdate(
                     "clean",
-                    update_service.UpdateRoute.FINDINGS,
                     Outcome.SUCCEEDED,
                     (UpdateResult(pkg_name="pkg-a", kind="update", passed=True),),
                 ),
@@ -1136,14 +1100,12 @@ def test_given_batch_with_blocked_findings_when_updated_then_totals_sum_them(
         side_effect=[
             update_service.ProjectUpdate(
                 "vulnerable",
-                update_service.UpdateRoute.FINDINGS,
                 Outcome.FAILED,
                 (passed,),
                 blocked=1,
             ),
             update_service.ProjectUpdate(
                 "clean",
-                update_service.UpdateRoute.FINDINGS,
                 Outcome.FAILED,
                 (),
                 blocked=2,
@@ -1205,102 +1167,6 @@ class TestUpdateCliSurface:
         assert "Unknown option" in (captured.out + captured.err)
 
 
-@pytest.fixture()
-def gradle_update_cli(
-    mock_update_cli_deps, mm_home_with_gradle, gradle_project, monkeypatch
-):
-    """Update-CLI boundaries plus Gradle spies. Returns a mutable spy record."""
-    monkeypatch.setattr(
-        "maintenance_man.gradle_workflow.load_scan_results",
-        lambda *args: mock_update_cli_deps.scan_result,
-    )
-    mock_update_cli_deps.vcs_state.seed_repository(
-        gradle_project.path,
-        files={
-            "gradlew": (gradle_project.path / "gradlew").read_text(),
-            "gradle/libs.versions.toml": (
-                gradle_project.path / "gradle/libs.versions.toml"
-            ).read_text(),
-        },
-    )
-    spies: dict[str, list] = {"tests": [], "applies": []}
-    monkeypatch.setattr(
-        "maintenance_man.updater.run_test_phases",
-        lambda cfg, path: spies["tests"].append(1),
-    )
-    monkeypatch.setattr(
-        "maintenance_man.gradle_updates.apply_gradle_update",
-        lambda project, target: spies["applies"].append(target) or None,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.gradle_updates.validate_gradle_target",
-        lambda project, target: None,
-    )
-    # `mm update <one project>` is the interactive single-project path, so every
-    # test here must answer the selection prompt; individual tests override this.
-    monkeypatch.setattr("maintenance_man.output.prompt", lambda *a, **k: "all")
-    return spies
-
-
-_GRADLE_REPOSITORY_MUTATIONS = {
-    "add_workspace",
-    "commit",
-    "create_bookmark",
-    "delete_bookmark",
-    "discard",
-    "forget_workspace",
-    "new_change",
-    "promote_bookmark_to_main",
-    "push_bookmark",
-    "rebase_working_copy",
-    "reset_verified_bookmark",
-    "set_bookmark",
-}
-
-
-def _assert_no_gradle_repository_mutations(state: FakeJjState, path: Path) -> None:
-    attempts = [call for call in state.attempts if call.path == path.resolve()]
-    effects = [call for call in state.effects if call.path == path.resolve()]
-    assert not ({call.method for call in attempts} & _GRADLE_REPOSITORY_MUTATIONS)
-    assert not ({call.method for call in effects} & _GRADLE_REPOSITORY_MUTATIONS)
-
-
-def _gradle_scan_state(mock_update_cli_deps: CliDeps) -> ScanResult:
-    """A room reference group and a ksp plugin group; eligibility is set by dates."""
-    ksp_target = GradleUpdateTarget(
-        version_ref="ksp",
-        members=[
-            GradleMember(
-                kind="plugin",
-                alias="ksp",
-                coordinate="com.google.devtools.ksp",
-                installed_version="2.3.10",
-            )
-        ],
-        target_version="2.3.12",
-    )
-    scan_result = make_scan_result(
-        vulns=[],
-        updates=[
-            make_update(
-                pkg_name="room",
-                installed_version="2.8.4",
-                latest_version="2.8.5",
-                gradle_target=make_gradle_target(),
-            ),
-            make_update(
-                pkg_name="ksp",
-                installed_version="2.3.10",
-                latest_version="2.3.12",
-                gradle_target=ksp_target,
-            ),
-        ],
-    )
-    mock_update_cli_deps.scan_result.vulnerabilities = scan_result.vulnerabilities
-    mock_update_cli_deps.scan_result.updates = scan_result.updates
-    return mock_update_cli_deps.scan_result
-
-
 def test_given_mixed_results_when_totals_printed_then_stderr_counts_each_state(capsys):
     cli._print_result_totals(
         [
@@ -1315,93 +1181,3 @@ def test_given_mixed_results_when_totals_printed_then_stderr_counts_each_state(c
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "1 passed · 1 failed\n"
-
-
-@pytest.mark.parametrize("batch", [False, True])
-def test_gradle_ready_with_unresolved_block_never_finalizes(
-    gradle_update_cli,
-    mock_update_cli_deps,
-    monkeypatch,
-    mm_home_with_gradle,
-    gradle_project,
-    batch,
-):
-    from maintenance_man.models.scan import Severity, VulnFinding
-
-    state = _gradle_scan_state(mock_update_cli_deps)
-    for finding in state.updates:
-        finding.update_status = UpdateStatus.READY
-        finding.flow = Workflow.UPDATE
-    state.vulnerabilities.append(
-        VulnFinding(
-            vuln_id="CVE-blocked",
-            pkg_name="unmapped",
-            installed_version="1",
-            fixed_version=None,
-            severity=Severity.HIGH,
-            title="No fix",
-            description="No published fix",
-            status="affected",
-            blocked_reason="no fixed version",
-            gradle_block_kind="mapping",
-        )
-    )
-    write_config(
-        mm_home_with_gradle,
-        f'[projects.android]\npath = "{gradle_project.path}"\n'
-        'package_manager = "gradle"\n',
-    )
-    args = ["update"] if batch else ["update", "android"]
-    vcs_state = mock_update_cli_deps.vcs_state
-    vcs_state.clear_calls()
-    assert run_mm(*args) == 4
-    assert all(f.update_status == UpdateStatus.READY for f in state.updates)
-    assert gradle_update_cli == {"tests": [], "applies": []}
-    _assert_no_gradle_repository_mutations(vcs_state, gradle_project.path)
-
-
-def test_gradle_ready_only_missing_bookmark_preserves_state(
-    gradle_update_cli, mock_update_cli_deps, monkeypatch, gradle_project
-):
-    state = _gradle_scan_state(mock_update_cli_deps)
-    for finding in state.updates:
-        finding.update_status = UpdateStatus.READY
-        finding.flow = Workflow.UPDATE
-    vcs_state = mock_update_cli_deps.vcs_state
-    vcs_state.clear_calls()
-    assert run_mm("update", "android") == 4
-    assert all(f.update_status == UpdateStatus.READY for f in state.updates)
-    assert gradle_update_cli == {"tests": [], "applies": []}
-    _assert_no_gradle_repository_mutations(vcs_state, gradle_project.path)
-
-
-@pytest.mark.parametrize("batch", [False, True])
-@pytest.mark.parametrize("status", [UpdateStatus.FAILED, UpdateStatus.READY])
-def test_gradle_legacy_update_history_is_preserved_without_effects(
-    gradle_update_cli,
-    mock_update_cli_deps,
-    monkeypatch,
-    gradle_project,
-    batch,
-    status,
-):
-
-    scan = _gradle_scan_state(mock_update_cli_deps)
-    for row in scan.updates:
-        row.update_status = status
-        row.flow = Workflow.UPDATE
-        row.failed_phase = "unit"
-    before = scan.model_dump_json()
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("legacy history cannot authorize commands")
-
-    monkeypatch.setattr(subprocess, "run", forbidden)
-    monkeypatch.setattr("maintenance_man.gradle.run_logged", forbidden)
-    vcs_state = mock_update_cli_deps.vcs_state
-    vcs_state.clear_calls()
-    exit_code = run_mm("update") if batch else run_mm("update", "android")
-    assert exit_code == ExitCode.UPDATE_FAILED
-    assert scan.model_dump_json() == before
-    assert gradle_update_cli == {"tests": [], "applies": []}
-    _assert_no_gradle_repository_mutations(vcs_state, gradle_project.path)

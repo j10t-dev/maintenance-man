@@ -3,8 +3,6 @@ from pathlib import Path
 import pytest
 
 from maintenance_man import paths, vcs
-from maintenance_man.gradle import GradleError
-from maintenance_man.gradle_updates import gradle_run_path
 
 
 @pytest.fixture()
@@ -27,8 +25,6 @@ def test_tests_run_under_an_isolated_home(tmp_path):
         ("scan_results_dir", "scan-results"),
         ("activity_path", "activity.json"),
         ("workspaces_dir", "workspaces"),
-        ("gradle_runs_dir", "gradle-runs"),
-        ("gradle_contexts_dir", "gradle-contexts"),
         ("publications_dir", "publications"),
     ],
 )
@@ -65,9 +61,3 @@ def test_project_file_rejects(tmp_path, project, suffix):
 def test_workspace_path_rejects_degenerate_names(home, project):
     with pytest.raises(ValueError):
         vcs.workspace_path_for_project(project)
-
-
-def test_gradle_run_path(home):
-    assert gradle_run_path("demo") == home / "gradle-runs" / "demo.json"
-    with pytest.raises(GradleError, match="Invalid Gradle run path"):
-        gradle_run_path("")

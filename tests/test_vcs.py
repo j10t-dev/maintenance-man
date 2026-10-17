@@ -1,165 +1,12 @@
+import shlex
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from maintenance_man import vcs
-from maintenance_man.gradle import GradleError
-from maintenance_man.gradle_updates import gradle_evidence_workspace
-from maintenance_man.vcs import Repository, RevisionError
-from maintenance_man.vcs_workflow import VcsServices
-from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeCommands
 from tests.support.process import completed
-from tests.support.projects import make_project
-
-
-@pytest.fixture
-def temporary_workspace_case(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[FakeJjState, Repository, Path]:
-    state = FakeJjState()
-    path = tmp_path / "source"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    container = tmp_path / "allocated-proof"
-
-    def allocate(*, prefix: str) -> str:
-        assert prefix == "mm-proof-"
-        container.mkdir()
-        return str(container)
-
-    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
-    return state, repo, container
-
-
-def test_temporary_workspace_registration_failure_removes_owned_container(
-    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
-):
-    state, repo, container = temporary_workspace_case
-    state.fail("add_workspace", error=RevisionError("registration failed"))
-    entered = False
-    with (
-        pytest.raises(RevisionError, match="registration failed"),
-        repo.temporary_workspace(revision="main"),
-    ):
-        entered = True
-    assert entered is False
-    assert not any(call.method == "forget_workspace" for call in state.attempts)
-    assert not container.exists()
-
-
-@pytest.mark.parametrize("mutation", ["replace", "symlink"])
-def test_temporary_workspace_marker_tampering_prevents_deletion(
-    temporary_workspace_case: tuple[FakeJjState, Repository, Path], mutation: str
-):
-    _state, repo, container = temporary_workspace_case
-    with (
-        pytest.raises(RevisionError, match="ownership marker changed"),
-        repo.temporary_workspace(revision="main"),
-    ):
-        marker = container / ".mm-proof-owner"
-        if mutation == "replace":
-            marker.write_text("replacement", encoding="utf-8")
-        else:
-            marker.unlink()
-            marker.symlink_to(container / "replacement")
-    assert container.exists()
-
-
-def test_temporary_workspace_body_error_keeps_cleanup_diagnostics(
-    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
-    monkeypatch: pytest.MonkeyPatch,
-):
-    state, repo, _container = temporary_workspace_case
-    state.fail("forget_workspace", error=RevisionError("forget failed"))
-
-    def fail_remove(_path: Path) -> None:
-        msg = "remove failed"
-        raise OSError(msg)
-
-    monkeypatch.setattr(vcs.shutil, "rmtree", fail_remove)
-    body_error = RuntimeError("caller")
-    with (
-        pytest.raises(RuntimeError) as caught,
-        repo.temporary_workspace(revision="main"),
-    ):
-        raise body_error
-    assert caught.value is body_error
-    assert caught.value.__notes__ == [
-        "forget workspace failed: forget failed; "
-        "remove proof workspace failed: remove failed"
-    ]
-
-
-def test_temporary_workspace_propagates_unexpected_cleanup_error(
-    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
-    monkeypatch: pytest.MonkeyPatch,
-):
-    _state, repo, container = temporary_workspace_case
-    unexpected = TypeError("unexpected cleanup failure")
-
-    def fail_remove(_path: Path) -> None:
-        raise unexpected
-
-    with (
-        pytest.raises(TypeError) as caught,
-        monkeypatch.context() as cleanup_patch,
-    ):
-        cleanup_patch.setattr(vcs.shutil, "rmtree", fail_remove)
-        with repo.temporary_workspace(revision="main"):
-            pass
-    assert caught.value is unexpected
-    vcs.shutil.rmtree(container)
-
-
-def test_temporary_workspace_cleanup_errors_raise_combined_revision_error(
-    temporary_workspace_case: tuple[FakeJjState, Repository, Path],
-    monkeypatch: pytest.MonkeyPatch,
-):
-    state, repo, _container = temporary_workspace_case
-    state.fail("forget_workspace", error=RevisionError("forget failed"))
-
-    def fail_remove(_path: Path) -> None:
-        msg = "remove failed"
-        raise OSError(msg)
-
-    monkeypatch.setattr(vcs.shutil, "rmtree", fail_remove)
-    with (
-        pytest.raises(RevisionError) as caught,
-        repo.temporary_workspace(revision="main"),
-    ):
-        pass
-    assert "forget failed" in str(caught.value)
-    assert "remove failed" in str(caught.value)
-
-
-@pytest.mark.parametrize("failing_step", ["add_workspace", "new_change"])
-def test_proof_setup_error_survives_cleanup_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_step: str
-) -> None:
-    state = FakeJjState()
-    repo = state.seed_repository(tmp_path / "source", files={"dep.txt": "1"})
-    container = tmp_path / "allocated-proof"
-    original = RevisionError("setup failed")
-    state.fail(failing_step, error=original)
-
-    def allocate(*, prefix: str) -> str:
-        container.mkdir()
-        return str(container)
-
-    def remove_failed(path: Path) -> None:
-        message = "busy"
-        raise OSError(message)
-
-    monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
-    monkeypatch.setattr(vcs.shutil, "rmtree", remove_failed)
-    with (
-        pytest.raises(RevisionError) as caught,
-        vcs._temporary_workspace(repo, revision="main", bind=state.repository),
-    ):
-        pytest.fail("setup must not reach the body")
-    assert caught.value is original
-    assert any("busy" in note for note in caught.value.__notes__)
 
 
 def test_given_distinct_revision_ids_when_same_revision_runs_then_it_uses_two_log_calls(
@@ -316,13 +163,14 @@ class TestJjRepositoryBoundary:
                 "list",
                 "-T",
                 'if(remote == "origin" || !present, "", name ++ "\\n")',
+                "main",
             ),
             cwd=tmp_path,
             result=error,
         )
         monkeypatch.setattr(vcs, "run_captured", commands)
         with pytest.raises(vcs.RevisionError, match="Could not run jj") as caught:
-            vcs.JjRepository(tmp_path).local_bookmarks()
+            vcs.JjRepository(tmp_path).bookmark_exists(bookmark="main")
         assert caught.value.__cause__ is failure
         ((actual_argv, cwd, kwargs),) = commands.calls
         assert actual_argv == (
@@ -334,67 +182,14 @@ class TestJjRepositoryBoundary:
             "list",
             "-T",
             'if(remote == "origin" || !present, "", name ++ "\\n")',
+            "main",
         )
         assert cwd == tmp_path
         assert kwargs == {
             "timeout": 30,
-            "label": (
-                "jj --ignore-working-copy --color never bookmark list -T "
-                '\'if(remote == "origin" || !present, "", name ++ "\\n")\''
-            ),
+            "label": shlex.join(actual_argv),
             "error": vcs.RevisionError,
         }
-
-    def test_temporary_workspace_normalizes_allocation_failure(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        repo = vcs.JjRepository(tmp_path)
-        failure = OSError("allocation denied")
-
-        def fail_allocate(*, prefix: str):
-            assert prefix == "mm-proof-"
-            raise failure
-
-        monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
-        monkeypatch.setattr(vcs.tempfile, "mkdtemp", fail_allocate)
-        with (
-            pytest.raises(
-                vcs.RevisionError, match="allocate proof workspace"
-            ) as caught,
-            repo.temporary_workspace(revision="main"),
-        ):
-            pytest.fail("allocation failure must prevent entry")
-        assert caught.value.__cause__ is failure
-
-    def test_temporary_workspace_marker_failure_removes_allocated_container(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        repo = vcs.JjRepository(tmp_path)
-        container = tmp_path / "proof-container"
-        failure = OSError("marker denied")
-
-        def allocate(*, prefix: str) -> str:
-            assert prefix == "mm-proof-"
-            container.mkdir()
-            return str(container)
-
-        original_write_text = Path.write_text
-
-        def fail_marker(path: Path, data: str, **kwargs):
-            if path.name == ".mm-proof-owner":
-                raise failure
-            return original_write_text(path, data, **kwargs)
-
-        monkeypatch.setattr(repo, "resolve_revision", lambda **kwargs: "a" * 40)
-        monkeypatch.setattr(vcs.tempfile, "mkdtemp", allocate)
-        monkeypatch.setattr(Path, "write_text", fail_marker)
-        with (
-            pytest.raises(vcs.RevisionError, match="mark proof workspace") as caught,
-            repo.temporary_workspace(revision="main"),
-        ):
-            pytest.fail("marker failure must prevent entry")
-        assert caught.value.__cause__ is failure
-        assert not container.exists()
 
     @pytest.mark.parametrize(
         ("stdout", "message"),
@@ -576,78 +371,3 @@ class TestJjRepositoryBoundary:
         monkeypatch.setattr(repo, "_run", run)
         repo.fetch(main_only=main_only)
         assert calls == [(arguments, 120)]
-
-    @pytest.mark.parametrize(
-        "expected",
-        [
-            vcs.ExpectedRevisions(base="base", tip="b" * 40),
-            vcs.ExpectedRevisions(base="a" * 40, tip="tip"),
-        ],
-    )
-    def test_guarded_mutation_rejects_invalid_revision_identity(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        expected: vcs.ExpectedRevisions,
-    ):
-        repo = vcs.JjRepository(tmp_path)
-        monkeypatch.setattr(
-            repo,
-            "_run",
-            lambda *args, **kwargs: pytest.fail("invalid guard reached mutation"),
-        )
-        with pytest.raises(vcs.RevisionError, match="Invalid expected revision"):
-            repo.promote_bookmark_to_main(
-                bookmark="mm/update-dependencies", expected=expected
-            )
-
-
-@pytest.mark.parametrize("phase", ["setup", "cleanup"])
-def test_proof_translates_workspace_lifecycle_errors(tmp_path: Path, phase: str):
-    state = FakeJjState()
-    repo = state.seed_repository(tmp_path / "repo", files={"dep.txt": "one\n"})
-    state.fail(
-        "add_workspace" if phase == "setup" else "forget_workspace",
-        error=vcs.RevisionError(f"{phase} denied"),
-        path=repo.path,
-    )
-    services = VcsServices(repository=state.repository, code_host=state.code_host)
-    message = "create" if phase == "setup" else "clean up"
-    with (
-        pytest.raises(GradleError, match=message) as caught,
-        gradle_evidence_workspace(make_project(repo.path), "main", vcs=services),
-    ):
-        pass
-    assert isinstance(caught.value.__cause__, vcs.RevisionError)
-
-
-def test_proof_body_stays_primary_with_both_cleanup_diagnostics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    state = FakeJjState()
-    repo = state.seed_repository(tmp_path / "repo", files={"dep.txt": "one\n"})
-    state.fail(
-        "forget_workspace",
-        error=vcs.RevisionError("forget denied"),
-        path=repo.path,
-    )
-    original_remove = vcs.shutil.rmtree
-
-    def fail_proof_remove(path: Path):
-        if path.name.startswith("mm-proof-"):
-            msg = "remove denied"
-            raise OSError(msg)
-        return original_remove(path)
-
-    monkeypatch.setattr(vcs.shutil, "rmtree", fail_proof_remove)
-    services = VcsServices(repository=state.repository, code_host=state.code_host)
-    original = RuntimeError("body failed")
-    with (
-        pytest.raises(RuntimeError) as caught,
-        gradle_evidence_workspace(make_project(repo.path), "main", vcs=services),
-    ):
-        raise original
-    assert caught.value is original
-    notes = "\n".join(caught.value.__notes__)
-    assert "forget workspace failed: forget denied" in notes
-    assert "remove proof workspace failed: remove denied" in notes

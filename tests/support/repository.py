@@ -36,12 +36,10 @@ class RepositoryCase:
     write_file: Callable[[str, str | None], None]
     commit_file: Callable[[str, str, str], str]
     describe: Callable[[str], None]
-    force_bookmark: Callable[[str, str], None]
     conflict_bookmark: Callable[[str, str, str], None]
     origin_peer: OriginPeer
     track_main: Callable[[bool], None]
     after_push: Callable[[Callable[[], None]], None]
-    after_operation: Callable[[str, Callable[[], None]], None]
     attempts: list[FakeCall] | None
     commands: list[tuple[str, ...]] | None
 
@@ -51,10 +49,10 @@ def real_repository_case(
 ) -> RepositoryCase:
     """Create isolated jj checkouts and an origin, with optional operation hooks."""
     repo, origin_git = _initialize_real_repository(tmp_path)
-    pending_after_operation: list[tuple[str, Callable[[], None]]] = []
+    pending_after_push: list[Callable[[], None]] = []
     commands: list[tuple[str, ...]] = []
     _install_real_postcheck_interceptor(
-        repo.path, monkeypatch, pending_after_operation, commands
+        repo.path, monkeypatch, pending_after_push, commands
     )
     repo.push_bookmark(bookmark="main")
     origin_peer = _initialize_real_peer(tmp_path, origin_git)
@@ -68,11 +66,8 @@ def real_repository_case(
         assert result.returncode == 0, result.stderr
 
     def after_push(action: Callable[[], None]) -> None:
-        after_operation("push", action)
-
-    def after_operation(operation: str, action: Callable[[], None]) -> None:
-        assert not pending_after_operation, "only one pending operation is supported"
-        pending_after_operation.append((operation, action))
+        assert not pending_after_push, "only one pending push action is supported"
+        pending_after_push.append(action)
 
     return RepositoryCase(
         repo=repo,
@@ -81,12 +76,10 @@ def real_repository_case(
         write_file=partial(_write_repository_file, repo),
         commit_file=partial(_commit_repository_file, repo, register_file),
         describe=partial(_describe_real_repository, repo),
-        force_bookmark=partial(_force_real_bookmark, repo),
         conflict_bookmark=partial(_conflict_real_bookmark, repo),
         origin_peer=origin_peer,
         track_main=track_main,
         after_push=after_push,
-        after_operation=after_operation,
         attempts=None,
         commands=commands,
     )
@@ -119,7 +112,6 @@ def fake_repository_case(tmp_path: Path) -> RepositoryCase:
         write_file=partial(_write_repository_file, repo),
         commit_file=partial(_commit_repository_file, repo, register_file),
         describe=describe,
-        force_bookmark=partial(_seed_fake_bookmark, state, path),
         conflict_bookmark=partial(_seed_fake_bookmark, state, path),
         origin_peer=OriginPeer(
             peer_repo,
@@ -135,51 +127,9 @@ def fake_repository_case(tmp_path: Path) -> RepositoryCase:
         ),
         track_main=partial(_track_fake_main, state, path),
         after_push=partial(_install_fake_after_push, state, path),
-        after_operation=partial(_install_fake_after_operation, state, path),
         attempts=state.attempts,
         commands=None,
     )
-
-
-def bookmark_targets(
-    repo: Repository, *, bookmark: str, candidates: set[str]
-) -> frozenset[str]:
-    """Inspect which candidate revisions carry the named bookmark."""
-    observed = {
-        revision: repo.revision_bookmarks(revision=revision) for revision in candidates
-    }
-    return frozenset(
-        revision for revision, names in observed.items() if bookmark in names
-    )
-
-
-def bookmark_state(
-    repo: Repository, *, bookmark: str, candidates: set[str]
-) -> tuple[bool, frozenset[str], str | None]:
-    """Capture conflict status, targets and the resolved revision for one bookmark."""
-    conflicted = repo.bookmark_conflicted(bookmark=bookmark)
-    return (
-        conflicted,
-        bookmark_targets(repo, bookmark=bookmark, candidates=candidates),
-        None if conflicted else repo.resolve_revision(revision=bookmark),
-    )
-
-
-def assert_origin_baseline_only(c: RepositoryCase, *, base: str) -> None:
-    """Assert that the origin still has its baseline and no managed push."""
-    c.origin_peer.repo.fetch(main_only=False)
-    assert c.origin_peer.repo.resolve_revision(revision="main") == base
-    if isinstance(c.repo, vcs.JjRepository):
-        missing = run_jj(
-            c.origin_peer.repo.path,
-            "log",
-            "-r",
-            f"{MANAGED}@origin",
-            "--no-graph",
-            "-T",
-            'commit_id ++ "\\n"',
-        )
-        assert missing.returncode != 0
 
 
 def run_jj(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -215,7 +165,7 @@ def _initialize_real_repository(tmp_path: Path) -> tuple[vcs.JjRepository, Path]
 def _install_real_postcheck_interceptor(
     path: Path,
     monkeypatch: pytest.MonkeyPatch | None,
-    pending_after_operation: list[tuple[str, Callable[[], None]]],
+    pending_after_push: list[Callable[[], None]],
     commands: list[tuple[str, ...]],
 ) -> None:
     if monkeypatch is None:
@@ -225,19 +175,9 @@ def _install_real_postcheck_interceptor(
     def intercept_push(command, cwd, **kwargs):
         commands.append(tuple(command))
         completed = captured_run(command, cwd, **kwargs)
-        arguments = list(command)
-        operation = None
-        if arguments[1:4] == ["bookmark", "set", "main"]:
-            operation = "promote"
-        elif arguments[1:4] == ["bookmark", "set", MANAGED]:
-            operation = "reset"
-        elif arguments[1:3] == ["git", "push"]:
-            operation = "push"
-        if pending_after_operation and Path(cwd).resolve() == path.resolve():
-            expected, action = pending_after_operation[0]
-            if operation == expected:
-                pending_after_operation.pop(0)
-                action()
+        is_push = list(command)[1:3] == ["git", "push"]
+        if is_push and pending_after_push and Path(cwd).resolve() == path.resolve():
+            pending_after_push.pop(0)()
         return completed
 
     monkeypatch.setattr(vcs, "run_captured", intercept_push)
@@ -324,19 +264,6 @@ def _describe_real_repository(repository: Repository, message: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def _force_real_bookmark(repository: Repository, bookmark: str, revision: str) -> None:
-    result = run_jj(
-        repository.path,
-        "bookmark",
-        "set",
-        bookmark,
-        "-r",
-        revision,
-        "--allow-backwards",
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def _conflict_real_bookmark(
     repository: Repository, bookmark: str, left: str, right: str
 ) -> None:
@@ -391,14 +318,3 @@ def _install_fake_after_push(
         action=action,
         path=path,
     )
-
-
-def _install_fake_after_operation(
-    state: FakeJjState, path: Path, operation: str, action: Callable[[], None]
-) -> None:
-    methods = {
-        "promote": "promote_bookmark_to_main",
-        "reset": "reset_verified_bookmark",
-        "push": "push_bookmark",
-    }
-    state.hook(methods[operation], phase="postcheck", action=action, path=path)

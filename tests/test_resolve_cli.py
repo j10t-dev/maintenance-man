@@ -10,12 +10,9 @@ from maintenance_man.models.scan import (
     Workflow,
 )
 from maintenance_man.storage import load_scan_results
-from maintenance_man.vcs import RevisionError
 from tests.fakes import FakeFindingProcessor
 from tests.support.cli import CliDeps, run_mm
 from tests.support.findings import (
-    make_gradle_target,
-    make_scan_result,
     make_update,
     make_vuln,
 )
@@ -39,7 +36,7 @@ def mock_resolve_fresh(mock_resolve_cli_deps: CliDeps) -> CliDeps:
 
 
 class TestResolveFlow:
-    def test_existing_ready_resolve_progress_preserves_bookmark_and_submits(
+    def test_existing_ready_resolve_progress_promotes_without_reapplying(
         self,
         mm_home_with_projects: Path,
         mock_resolve_cli_deps: CliDeps,
@@ -55,16 +52,16 @@ class TestResolveFlow:
         ]
         mock_resolve_cli_deps.save_scan()
         state = mock_resolve_cli_deps.vcs_state
+        repo = state.repository(mock_resolve_cli_deps.project_paths["vulnerable"])
+        resolve_tip = repo.resolve_revision(revision=_RESOLVE_BOOKMARK)
         state.clear_calls()
 
         assert run_mm("resolve", "vulnerable") == 0
         assert not any(
-            call.method in {"delete_bookmark", "create_bookmark", "new_change"}
-            for call in state.effects
+            call.method in {"create_bookmark", "new_change"} for call in state.effects
         )
-        assert state.code_host(
-            mock_resolve_cli_deps.project_paths["vulnerable"]
-        ).effects
+        assert repo.resolve_revision(revision="main") == resolve_tip
+        assert not any(call.method == "push_bookmark" for call in state.attempts)
 
 
 def test_given_failed_resolve_when_run_then_exits_four_with_continuation(
@@ -95,29 +92,6 @@ def test_given_paused_resolve_when_run_then_exits_one_with_instruction(
     assert captured.err.splitlines() == [
         "error: resolve already paused for vulnerable — rerun with --continue"
     ]
-
-
-class TestResolveSubmit:
-    def test_push_failure_never_calls_host_and_retains_ready_state(
-        self,
-        mm_home_with_projects: Path,
-        mock_resolve_fresh: CliDeps,
-    ) -> None:
-        path = mock_resolve_fresh.project_paths["vulnerable"]
-        state = mock_resolve_fresh.vcs_state
-        state.fail(
-            "push_bookmark",
-            error=RevisionError("push rejected"),
-            path=path,
-        )
-        host = state.code_host(path)
-
-        assert run_mm("resolve", "vulnerable") == ExitCode.UPDATE_FAILED
-        assert not any(call.method == "create_pr" for call in host.attempts)
-        saved = load_scan_results("vulnerable")
-        assert all(
-            finding.update_status == UpdateStatus.READY for finding in saved.findings
-        )
 
 
 class TestResolveContinue:
@@ -241,9 +215,7 @@ class TestResolveContinue:
         assert not any(call.method == "commit" for call in state.attempts)
         moved = next(call for call in state.effects if call.method == "set_bookmark")
         assert dict(moved.arguments)["revision"] == "@-"
-        assert state.remote_bookmark_targets(path, bookmark=_RESOLVE_BOOKMARK) == (
-            manual_tip,
-        )
+        assert repo.resolve_revision(revision="main") == manual_tip
         saved = load_scan_results("vulnerable")
         assert not saved.findings
 
@@ -319,10 +291,10 @@ class TestResolveContinue:
 
         assert run_mm("resolve", "vulnerable", "--continue") == 0
         mock_tests.assert_not_called()
-        host = mock_resolve_cli_deps.vcs_state.code_host(
-            mock_resolve_cli_deps.project_paths["vulnerable"]
+        assert not any(
+            call.method == "push_bookmark"
+            for call in mock_resolve_cli_deps.vcs_state.attempts
         )
-        assert sum(call.method == "create_pr" for call in host.attempts) == 1
 
 
 class TestResolveCliSurface:
@@ -339,93 +311,3 @@ class TestResolveCliSurface:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert run_mm("resolve", "missing") == 1
-
-
-@pytest.mark.parametrize("continue_", [False, True])
-@pytest.mark.parametrize("status", [UpdateStatus.FAILED, UpdateStatus.READY])
-@pytest.mark.parametrize(
-    "target_shape", ["valid", "missing", "empty", "mixed-history", "cross-kind"]
-)
-def test_gradle_legacy_resolve_history_never_authorizes_effects(
-    mm_home_with_gradle,
-    monkeypatch,
-    continue_,
-    status,
-    target_shape,
-):
-    """Even a manually repaired catalogue cannot replace a revision-bound ledger."""
-    import subprocess
-
-    target = make_gradle_target()
-    if target_shape == "missing":
-        target = None
-    elif target_shape == "empty":
-        target.members = []
-    elif target_shape == "mixed-history":
-        target.members[1].installed_version = "9.9.9"
-    updates = [
-        make_update(
-            pkg_name="room",
-            installed_version="2.8.4",
-            latest_version="2.8.5",
-            gradle_target=target,
-            update_status=status,
-            failed_phase="unit",
-            flow=Workflow.RESOLVE,
-        )
-    ]
-    vulns = (
-        [
-            make_vuln(
-                pkg_name="androidx.room:room-runtime",
-                installed_version="2.8.4",
-                fixed_version=None,
-                gradle_target=make_gradle_target(),
-                update_status=status,
-                failed_phase="unit",
-                flow=Workflow.RESOLVE,
-            )
-        ]
-        if target_shape == "cross-kind"
-        else []
-    )
-    scan = make_scan_result(vulns=vulns, updates=updates)
-    results = mm_home_with_gradle / "scan-results" / "android.json"
-    results.parent.mkdir(exist_ok=True)
-    results.write_text(scan.model_dump_json())
-    before = results.read_bytes()
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("legacy history must not run commands or alter bookmarks")
-
-    monkeypatch.setattr(subprocess, "run", forbidden)
-    monkeypatch.setattr("maintenance_man.gradle.run_logged", forbidden)
-    args = ["resolve", "android"] + (["--continue"] if continue_ else [])
-    assert run_mm(*args) == 4
-    assert results.read_bytes() == before
-    assert not (mm_home_with_gradle / "gradle-runs" / "android.json").exists()
-
-
-@pytest.mark.parametrize("owned", [False, True])
-def test_gradle_continuation_without_ledger_preserves_interrupted_outputs(
-    mm_home_with_gradle,
-    gradle_project,
-    monkeypatch,
-    owned,
-):
-    import subprocess
-
-    report = gradle_project.path / "gradle/libs.versions.updates.toml"
-    report.write_bytes(b"preserved output")
-    marker = gradle_project.path / "gradle/.mm-owned-report"
-    if owned:
-        marker.write_bytes(b"")
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("no ledger")
-
-    monkeypatch.setattr(subprocess, "run", forbidden)
-    monkeypatch.setattr("maintenance_man.gradle.run_logged", forbidden)
-    assert run_mm("resolve", "android", "--continue") == 4
-    assert report.read_bytes() == b"preserved output"
-    assert marker.exists() is owned

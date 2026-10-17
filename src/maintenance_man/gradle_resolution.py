@@ -196,13 +196,6 @@ def generate_gradle_report(
         )
 
 
-def collect_gradle_resolution(project: ProjectConfig) -> ResolutionOutcome:
-    # Digest validation binds this report to the source file. No graph is
-    # reconstructed from TOML.
-    with generate_gradle_report(project) as generated:
-        return generated.resolution
-
-
 EXACT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 BRANCH = re.compile(r"^(\d+)\.(\d+)(?:\D|$)")
 

@@ -1,11 +1,17 @@
+from pathlib import Path
+
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Emit,
     MissingTestConfig,
+    Operation,
+    OperationFailed,
     ProjectSkipped,
+    Promoted,
     SkipReason,
 )
 from maintenance_man.models.scan import (
+    WORKFLOW_BOOKMARKS,
     ScanResult,
     UpdateFinding,
     UpdateStatus,
@@ -24,6 +30,8 @@ from maintenance_man.updater import (
     remove_completed_findings,
     sort_updates_by_risk,
 )
+from maintenance_man.vcs import RevisionError
+from maintenance_man.vcs_workflow import VcsServices, refresh_working_copy_from_main
 
 
 class FlowConflictError(WorkflowError):
@@ -70,6 +78,50 @@ def complete_ready_findings(
             finding.update_status = UpdateStatus.COMPLETED
     remove_completed_findings(scan_result)
     save_scan_results(name, scan_result)
+
+
+def finalise_local_changes(
+    project_path: Path,
+    scan_result: ScanResult,
+    name: str,
+    flow: Workflow,
+    *,
+    vcs: VcsServices,
+    emit: Emit,
+) -> bool:
+    """Promote the flow's bookmark to local main, then complete its READY findings.
+
+    Each failure is emitted as OperationFailed and returns False. A promotion or
+    refresh failure leaves the READY findings and the bookmark for a later retry;
+    a bookmark-cleanup failure after completion is reported and the next run
+    recreates the bookmark.
+    """
+    bookmark = WORKFLOW_BOOKMARKS[flow]
+    repo = vcs.repository(project_path)
+    try:
+        repo.promote_bookmark_to_main(bookmark=bookmark)
+    except RevisionError as exc:
+        emit(
+            OperationFailed(
+                Operation.PROMOTE,
+                name,
+                f"{exc} · rebase with jj rebase -b {bookmark} -d main, then rerun",
+            )
+        )
+        return False
+    try:
+        refresh_working_copy_from_main(repo=repo)
+    except RevisionError as exc:
+        emit(OperationFailed(Operation.REFRESH, name, str(exc)))
+        return False
+    complete_ready_findings(scan_result, name, flow=flow)
+    emit(Promoted())
+    try:
+        repo.delete_bookmark(bookmark=bookmark)
+    except RevisionError as exc:
+        emit(OperationFailed(Operation.BOOKMARK_CLEANUP, name, str(exc)))
+        return False
+    return True
 
 
 def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:

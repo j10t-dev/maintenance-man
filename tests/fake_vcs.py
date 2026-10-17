@@ -7,14 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from maintenance_man.github import CodeHostError
-from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.vcs import (
-    ExpectedRevisions,
     RevisionError,
     RevisionFile,
     WorkingCopyState,
-    _temporary_workspace,
 )
 from maintenance_man.vcs_workflow import VcsServices
 
@@ -24,82 +20,6 @@ class FakeCall:
     path: Path
     method: str
     arguments: tuple[tuple[str, object], ...]
-
-
-@dataclass(slots=True)
-class _HostData:
-    prs: list[tuple[str, Literal["open", "merged", "closed"], str]] = field(
-        default_factory=list
-    )
-    failures: list[_Failure[CodeHostError]] = field(default_factory=list)
-    ordinals: dict[str, int] = field(default_factory=dict)
-    attempts: list[FakeCall] = field(default_factory=list)
-    effects: list[FakeCall] = field(default_factory=list)
-
-
-class FakeCodeHost:
-    def __init__(self, path: Path, *, _data: _HostData | None = None):
-        self.path = path.resolve()
-        self._data = _data or _HostData()
-        self.attempts = self._data.attempts
-        self.effects = self._data.effects
-
-    def seed_pr(
-        self,
-        *,
-        bookmark: str,
-        state: Literal["open", "merged", "closed"],
-        message: str = "PR #1",
-    ) -> None:
-        self._data.prs.append((bookmark, state, message))
-
-    def fail(
-        self,
-        method: str,
-        *,
-        ordinal: int = 1,
-        error: CodeHostError,
-    ) -> None:
-        registered_after = self._data.ordinals.get(method, 0)
-        self._data.failures.append(
-            _Failure(method, ordinal, error, None, registered_after)
-        )
-
-    def _begin(self, method: str, **arguments: object) -> None:
-        self._data.attempts.append(
-            FakeCall(self.path, method, tuple(arguments.items()))
-        )
-        ordinal = self._data.ordinals.get(method, 0) + 1
-        self._data.ordinals[method] = ordinal
-        for failure in self._data.failures:
-            if (
-                failure.method == method
-                and ordinal == failure.registered_after + failure.ordinal
-            ):
-                raise failure.error
-
-    def pr_bookmarks(self, *, state: Literal["merged", "closed"]) -> frozenset[str]:
-        self._begin("pr_bookmarks", state=state)
-        return frozenset(
-            bookmark
-            for bookmark, observed_state, _message in self._data.prs
-            if observed_state == state
-        )
-
-    def create_pr(self, *, bookmark: str) -> str:
-        self._begin("create_pr", bookmark=bookmark)
-        for existing, state, message in reversed(self._data.prs):
-            if existing == bookmark and state == "open":
-                return (
-                    message
-                    if message != "PR #1"
-                    else f"PR already exists for {bookmark}"
-                )
-        self._data.prs.append((bookmark, "open", "PR #1"))
-        self._data.effects.append(
-            FakeCall(self.path, "create_pr", (("bookmark", bookmark),))
-        )
-        return "PR #1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +111,6 @@ class FakeJjState:
         self._hook_ordinals: dict[tuple[str, str, Path], int] = {}
         self.attempts: list[FakeCall] = []
         self.effects: list[FakeCall] = []
-        self._hosts: dict[Path, _HostData] = {}
 
     def _identity(self, label: str) -> str:
         self._sequence += 1
@@ -222,7 +141,6 @@ class FakeJjState:
             origin_key=origin_key,
         )
         self._repositories[root] = data
-        self._hosts[root] = _HostData()
         self._bind(root, root, "default")
         self._project(data, data.workspaces["default"])
         return FakeJj(self, root)
@@ -238,18 +156,8 @@ class FakeJjState:
             raise AssertionError(msg)
         return FakeJj(self, resolved)
 
-    def code_host(self, path: Path) -> FakeCodeHost:
-        resolved = path.resolve()
-        try:
-            root, _workspace = self._bindings[resolved]
-            data = self._hosts[root]
-        except KeyError as exc:
-            msg = f"unknown fake repository path: {resolved}"
-            raise AssertionError(msg) from exc
-        return FakeCodeHost(resolved, _data=data)
-
     def services(self) -> VcsServices:
-        return VcsServices(repository=self.repository, code_host=self.code_host)
+        return VcsServices(repository=self.repository)
 
     def register_files(self, path: Path, *filenames: str) -> None:
         data, _ = self._view(path)
@@ -400,12 +308,6 @@ class FakeJjState:
             failure.registered_after = 0
         for hook in self._hooks:
             hook.registered_after = 0
-        for host in self._hosts.values():
-            host.attempts.clear()
-            host.effects.clear()
-            host.ordinals.clear()
-            for failure in host.failures:
-                failure.registered_after = 0
 
     def _matching_call_ordinal(self, method: str, path: Path | None) -> int:
         return sum(
@@ -561,11 +463,6 @@ class FakeJj:
         data, _ = self._data()
         return bool(data.bookmarks.get(bookmark, ()))
 
-    def local_bookmarks(self) -> frozenset[str]:
-        self._state._begin(self.path, "local_bookmarks")
-        data, _ = self._data()
-        return frozenset(name for name, targets in data.bookmarks.items() if targets)
-
     def bookmark_conflicted(self, *, bookmark: str) -> bool:
         self._state._begin(self.path, "bookmark_conflicted", bookmark=bookmark)
         data, _ = self._data()
@@ -673,19 +570,6 @@ class FakeJj:
             )
         )
         return current, dict(current.files) != parent, bookmarks
-
-    def changed_paths(self, *, revision: str = "@") -> frozenset[str]:
-        self._state._begin(self.path, "changed_paths", revision=revision)
-        commit_id = self.resolve_revision(revision=revision)
-        data, _ = self._data()
-        record = data.graph[commit_id]
-        parent = dict(data.graph[record.parent].files) if record.parent else {}
-        current = dict(record.files)
-        return frozenset(
-            name
-            for name in parent.keys() | current.keys()
-            if parent.get(name) != current.get(name)
-        )
 
     def create_bookmark(self, *, bookmark: str, revision: str) -> None:
         self._state._begin(
@@ -800,54 +684,13 @@ class FakeJj:
         self._state._project(data, self._state._workspace(data, workspace.name))
         self._state._effect(self.path, "rebase_working_copy", revision=revision)
 
-    def _guard(self, bookmark: str, expected: ExpectedRevisions) -> None:
-        if bookmark not in tuple(WORKFLOW_BOOKMARKS.values()):
-            msg = "Unexpected managed bookmark"
-            raise RevisionError(msg)
-        data, _ = self._data()
-        if data.bookmarks.get("main", ()) != (expected.base,) or data.bookmarks.get(
-            bookmark, ()
-        ) != (expected.tip,):
-            msg = "Guarded revisions changed"
-            raise RevisionError(msg)
-        if not self._state._is_ancestor(data, expected.base, expected.tip):
-            msg = "Guarded tip is not descended from its base"
-            raise RevisionError(msg)
-
-    def promote_bookmark_to_main(
-        self, *, bookmark: str, expected: ExpectedRevisions | None = None
-    ) -> None:
+    def promote_bookmark_to_main(self, *, bookmark: str) -> None:
         method = "promote_bookmark_to_main"
-        self._state._begin(self.path, method, bookmark=bookmark, expected=expected)
+        self._state._begin(self.path, method, bookmark=bookmark)
         data, _ = self._data()
-        if expected is None:
-            target = self.resolve_revision(revision=bookmark)
-        else:
-            self._guard(bookmark, expected)
-            target = expected.tip
-        data.bookmarks["main"] = (target,)
-        self._state._effect(self.path, method, bookmark=bookmark, expected=expected)
+        data.bookmarks["main"] = (self.resolve_revision(revision=bookmark),)
+        self._state._effect(self.path, method, bookmark=bookmark)
         self._state._run_hooks(self.path, method, "postcheck")
-        if expected is not None and (
-            data.bookmarks.get("main") != (expected.tip,)
-            or data.bookmarks.get(bookmark) != (expected.tip,)
-        ):
-            msg = "Local revisions changed during promotion"
-            raise RevisionError(msg)
-
-    def reset_verified_bookmark(
-        self, *, bookmark: str, expected: ExpectedRevisions
-    ) -> None:
-        method = "reset_verified_bookmark"
-        self._state._begin(self.path, method, bookmark=bookmark, expected=expected)
-        self._guard(bookmark, expected)
-        data, _ = self._data()
-        data.bookmarks[bookmark] = (expected.base,)
-        self._state._effect(self.path, method, bookmark=bookmark, expected=expected)
-        self._state._run_hooks(self.path, method, "postcheck")
-        if data.bookmarks.get(bookmark) != (expected.base,):
-            msg = "Local revisions changed during reset"
-            raise RevisionError(msg)
 
     def fetch(self, *, main_only: bool = False) -> None:
         self._state._begin(self.path, "fetch", main_only=main_only)
@@ -876,11 +719,9 @@ class FakeJj:
                 data.bookmarks[name] = tuple(dict.fromkeys((*local, *remote)))
         self._state._effect(self.path, "fetch", main_only=main_only)
 
-    def push_bookmark(
-        self, *, bookmark: str, expected: ExpectedRevisions | None = None
-    ) -> None:
+    def push_bookmark(self, *, bookmark: str) -> None:
         method = "push_bookmark"
-        self._state._begin(self.path, method, bookmark=bookmark, expected=expected)
+        self._state._begin(self.path, method, bookmark=bookmark)
         data, _ = self._data()
         origin = self._state._origins[data.origin_key]
         if (
@@ -890,24 +731,14 @@ class FakeJj:
         ):
             msg = "Non-tracking remote bookmark main@origin exists"
             raise RevisionError(msg)
-        if expected is not None:
-            self._guard(bookmark, expected)
-            target = expected.tip
-        else:
-            target = self.resolve_revision(revision=bookmark)
+        target = self.resolve_revision(revision=bookmark)
         origin.graph.update(data.graph)
         origin.bookmarks[bookmark] = (target,)
         data.tracking[bookmark] = (target,)
         if bookmark == "main":
             data.tracks_main = True
-        self._state._effect(self.path, method, bookmark=bookmark, expected=expected)
+        self._state._effect(self.path, method, bookmark=bookmark)
         self._state._run_hooks(self.path, method, "postcheck")
-        if expected is not None and (
-            data.bookmarks.get("main") != (expected.base,)
-            or data.bookmarks.get(bookmark) != (expected.tip,)
-        ):
-            msg = "Local revisions changed during submission"
-            raise RevisionError(msg)
 
     def workspace_names(self) -> frozenset[str]:
         self._state._begin(self.path, "workspace_names")
@@ -942,8 +773,3 @@ class FakeJj:
             raise RevisionError(msg) from exc
         self._state._bindings.pop(workspace.path, None)
         self._state._effect(self.path, "forget_workspace", name=name)
-
-    def temporary_workspace(self, *, revision: str):
-        return _temporary_workspace(
-            self, revision=revision, bind=self._state.repository
-        )

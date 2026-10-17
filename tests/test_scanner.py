@@ -12,7 +12,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from maintenance_man import dependency_age, paths, scanner
-from maintenance_man.clock import utc_now
 from maintenance_man.config import load_config
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
@@ -54,7 +53,6 @@ from maintenance_man.scanner import (
 from maintenance_man.services import scan as scan_service
 from maintenance_man.storage import load_scan_results
 from maintenance_man.uv_dependencies import normalise_pkg_name
-from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeCommands, RecordingEmit
 from tests.support.clock import FakeClock
 from tests.support.findings import make_update, make_vuln
@@ -84,12 +82,6 @@ def test_given_package_name_when_normalised_then_pep_503_name_is_returned(
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
-
-
-def _batch_scan_dependencies(root: Path) -> tuple[FakeJjState, RecordingEmit]:
-    state = FakeJjState()
-    state.seed_repository(root, files={})
-    return state, RecordingEmit()
 
 
 def _quiet_uv_scan(monkeypatch):
@@ -236,34 +228,6 @@ def test_given_malformed_consumed_secret_fields_when_scanned_then_scan_error(
 
     with pytest.raises(ScanError, match="Trivy"):
         scanner._run_trivy_scan(tmp_path, scanners="vuln,secret")
-
-
-def test_stale_comparison_context_is_a_gradle_error(gradle_project, monkeypatch):
-    monkeypatch.setattr(scanner, "context_inputs_valid", lambda *args: False)
-    with pytest.raises(GradleError, match="Comparison context expired"):
-        scanner.capture_gradle_snapshot(
-            gradle_project,
-            MagicMock(),
-            vcs=FakeJjState().services(),
-            clock=utc_now,
-        )
-
-
-def test_capture_checks_the_context_at_the_injected_time(gradle_project, monkeypatch):
-
-    clock = FakeClock(datetime(2032, 2, 3, 4, 5, 6, tzinfo=UTC))
-    observed = []
-
-    def stale(context, project, now):
-        observed.append(now)
-        return False
-
-    monkeypatch.setattr(scanner, "context_inputs_valid", stale)
-    with pytest.raises(GradleError, match="Comparison context expired"):
-        scanner.capture_gradle_snapshot(
-            gradle_project, MagicMock(), vcs=FakeJjState().services(), clock=clock
-        )
-    assert observed == [clock.current]
 
 
 class TestUvAuditParsing:
@@ -1439,9 +1403,6 @@ def test_given_vulnerable_update_when_scanned_then_only_clean_is_looked_up_and_s
 
 def _scan_service_failure_setup(mm_home: Path, root: Path, monkeypatch):
     monkeypatch.setattr("maintenance_man.services.scan.scan_project", scan_project)
-    monkeypatch.setattr(
-        "maintenance_man.services.scan.prune_stale_bookmarks", lambda **kwargs: None
-    )
     mm_home.mkdir(parents=True, exist_ok=True)
     write_config(
         mm_home,
@@ -1462,8 +1423,7 @@ def _scan_service_failure_setup(mm_home: Path, root: Path, monkeypatch):
             [] if project.package_manager == "uv" else check_outdated(project, *args)
         ),
     )
-    state, emit = _batch_scan_dependencies(root)
-    return results, state, emit
+    return results, RecordingEmit()
 
 
 def _write_gradle_capture(root: Path) -> None:
@@ -1606,10 +1566,10 @@ def test_given_gradle_scan_failure_when_scanning_all_then_next_project_is_saved(
     expected_commands,
 ):
     root = Path(gradle_project.path)
-    results, state, emit = _scan_service_failure_setup(mm_home, root, monkeypatch)
+    results, emit = _scan_service_failure_setup(mm_home, root, monkeypatch)
     commands = _inject_scan_service_failure(monkeypatch, root, failure)
 
-    summary = scan_service.scan_all(load_config(), vcs=state.services(), emit=emit)
+    summary = scan_service.scan_all(load_config(), emit=emit)
 
     assert summary.had_error is True
     assert [

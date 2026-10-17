@@ -38,14 +38,9 @@ from maintenance_man.models.events import (
     FindingsProcessed,
     FindingStarted,
     FindingStepFailed,
-    GradleFlowFailed,
-    GradleRunArchived,
-    GradleRunReported,
-    GradleWithheld,
     HealthChecked,
     HealthcheckUnconfigured,
     MissingTestConfig,
-    NoEligibleGradleChanges,
     Operation,
     OperationFailed,
     Outcome,
@@ -53,28 +48,18 @@ from maintenance_man.models.events import (
     ProjectSkipped,
     ProjectStarted,
     Promoted,
-    PullRequestOutput,
     ResolvePaused,
     ScanReported,
     SkipReason,
-    SubmissionBlocked,
     SyncCompleted,
     TestCommandStarted,
 )
-from maintenance_man.models.gradle import (
-    FailedAttempt,
-    GradleCandidate,
-    GradleRun,
-    WithheldAttempt,
-)
 from maintenance_man.models.scan import (
-    WORKFLOW_BOOKMARKS,
     ScanResult,
     SecretFinding,
     UpdateFinding,
     UpdateResult,
     VulnFinding,
-    Workflow,
     highest_fix_version,
     sort_vulns_by_severity,
 )
@@ -188,11 +173,7 @@ class _Renderer:
             )
             return
         words = _OPERATION_WORDS[event.operation]
-        if event.operation is Operation.SUBMIT:
-            bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-            words = f"{words} · keeping {bookmark} for manual recovery"
-        kind = "warning" if event.operation in _WARNING_OPERATIONS else "error"
-        output.diagnostic(kind, f"{event.project} · {words} · {event.error}")
+        output.diagnostic("error", f"{event.project} · {words} · {event.error}")
 
     @__call__.register
     def _render_scan_reported(self, event: ScanReported) -> None:
@@ -242,14 +223,6 @@ class _Renderer:
             output.heading(self.project)
         for package, reason in event.findings:
             output.outcome(self.project, "resolve", "blocked", package, reason=reason)
-
-    @__call__.register
-    def _render_submission_blocked(self, event: SubmissionBlocked) -> None:
-        output.diagnostic(
-            "warning",
-            f"{event.project} · blocked findings remain · "
-            "rescan or resolve them manually",
-        )
 
     @__call__.register
     def _render_blockers_still_failing(self, event: BlockersStillFailing) -> None:
@@ -351,45 +324,6 @@ class _Renderer:
     def _render_healthcheck_unconfigured(self, event: HealthcheckUnconfigured) -> None:
         output.notice("--check: no healthcheck_url configured in [defaults]")
 
-    @__call__.register
-    def _render_pull_request_output(self, event: PullRequestOutput) -> None:
-        if self.project:
-            output.heading(self.project)
-        output.outcome(
-            self.project, "resolve", "passed", "pull request", reason=event.text
-        )
-
-    @__call__.register
-    def _render_gradle_withheld(self, event: GradleWithheld) -> None:
-        output.outcome(
-            self.project, self.flow, "blocked", event.label, reason=event.reason
-        )
-
-    @__call__.register
-    def _render_no_eligible_gradle_changes(
-        self, event: NoEligibleGradleChanges
-    ) -> None:
-        output.notice(f"No eligible Gradle changes in {self.project}")
-
-    @__call__.register
-    def _render_gradle_run_archived(self, event: GradleRunArchived) -> None:
-        output.diagnostic(
-            "warning",
-            f"archived failed Gradle run to {event.path} · "
-            "rebuilding candidates from main",
-        )
-
-    @__call__.register
-    def _render_gradle_flow_failed(self, event: GradleFlowFailed) -> None:
-        output.diagnostic(
-            "error", f"cannot complete Gradle {event.flow.value} · {event.error}"
-        )
-
-    @__call__.register
-    def _render_gradle_run_reported(self, event: GradleRunReported) -> None:
-        _print_scan_result(event.scan)
-        _print_gradle_run_summary(event.run)
-
 
 _DEPLOY_SKIPS: dict[SkipReason, tuple[output.Status, str]] = {
     SkipReason.NOT_DEPLOYABLE: ("skipped", "not deployable"),
@@ -419,12 +353,9 @@ _OPERATION_WORDS: dict[Operation, str] = {
     Operation.WORKSPACE_CLEANUP: "workspace cleanup",
     Operation.BOOKMARK_CLEANUP: "bookmark cleanup",
     Operation.RESOLVE_SETUP: "resolve setup",
-    Operation.SUBMIT: "submit failed",
-    Operation.REMOTE_SYNC: "failed to sync remote",
     Operation.SCAN: "scan",
     Operation.SYNC: "sync",
 }
-_WARNING_OPERATIONS = {Operation.SUBMIT, Operation.REMOTE_SYNC}
 _LOCAL_MAIN = "local main"
 
 
@@ -487,23 +418,18 @@ def scan(
         _notice_no_projects(config)
         return
 
-    vcs = make_vcs_services()
-
     if project:
         proj_config = _resolve_proj(cfg, project)
         result = scan_service.scan_one(
             project,
             proj_config,
             minimum_age_days=cfg.defaults.min_version_age_days,
-            vcs=vcs,
             emit=_Renderer(batch=False, project=project, flow="scan"),
         )
         sys.exit(_scan_exit_code(ScanSummary.of(result)))
 
     started = time.monotonic()
-    summary = scan_service.scan_all(
-        cfg, vcs=vcs, emit=_Renderer(batch=True, flow="scan")
-    )
+    summary = scan_service.scan_all(cfg, emit=_Renderer(batch=True, flow="scan"))
     if summary.clean:
         elapsed = time.monotonic() - started
         output.notice(
@@ -563,9 +489,7 @@ def update(
         result = update_service.update_project(
             name,
             proj_config,
-            minimum_age_days=cfg.defaults.min_version_age_days,
             choose=_choose_findings,
-            choose_gradle=_choose_gradle_candidates,
             vcs=vcs,
             emit=_Renderer(batch=False, project=name),
         )
@@ -582,9 +506,7 @@ def update(
     blocked = sum(project.blocked for project in batch.projects)
     if results or blocked:
         _print_result_totals(results, blocked)
-    elif not any(
-        project.route is update_service.UpdateRoute.GRADLE for project in batch.projects
-    ):
+    else:
         output.notice("No projects had actionable findings")
     sys.exit(ExitCode.UPDATE_FAILED if batch.outcome is Outcome.FAILED else ExitCode.OK)
 
@@ -1197,36 +1119,6 @@ def _choose_findings(
     return _selected_findings(selection, numbered, selectable_vulns, selectable_updates)
 
 
-def _choose_gradle_candidates(
-    candidates: tuple[GradleCandidate, ...],
-) -> tuple[GradleCandidate, ...]:
-    output.choices(
-        [
-            (
-                f"{candidate.target.display_name} → {candidate.target.target_version}",
-                " · ".join(
-                    f"{member.alias}: {member.coordinate} "
-                    f"{member.installed_version} → {candidate.target.target_version}"
-                    for member in candidate.target.members
-                ),
-            )
-            for candidate in candidates
-        ]
-    )
-    selection = _prompt_selection(
-        "Select all, none, vulns, updates, or comma-separated numbers",
-        len(candidates),
-    )
-    if selection == "all":
-        return candidates
-    if selection == "none":
-        return ()
-    if selection in {"vulns", "updates"}:
-        origin = "security" if selection == "vulns" else "ordinary"
-        return tuple(item for item in candidates if origin in item.origins)
-    return tuple(item for index, item in enumerate(candidates, 1) if index in selection)
-
-
 @app.command
 @_command
 def resolve(
@@ -1239,8 +1131,9 @@ def resolve(
 
     Applies each failed finding on ``mm/resolve-dependencies``, runs tests, and
     stops on the first failure so the operator can debug manually. Rerun with
-    ``--continue`` after committing a manual fix to re-test and advance. Submits
-    a PR once all candidates reach READY.
+    ``--continue`` after committing a manual fix to re-test and advance. Promotes
+    the resolve bookmark to local main once all candidates reach READY. Takes
+    over pending update work when it exists.
 
     Parameters
     ----------
@@ -1256,59 +1149,16 @@ def resolve(
     output.reset_invocation_output(verbose=verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
-    minimum_age_days = cfg.defaults.min_version_age_days
     vcs_workflow.require_vcs_tools()
     vcs = make_vcs_services()
     outcome = resolve_service.resolve_project(
         project,
         proj_config,
-        minimum_age_days=minimum_age_days,
         continue_=continue_,
         vcs=vcs,
         emit=_Renderer(batch=False, project=project, flow="resolve"),
     )
     sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)
-
-
-def _print_gradle_run_summary(run: GradleRun) -> None:
-    counts = {
-        state: sum(attempt.state == state for attempt in run.attempts)
-        for state in ("ready", "completed", "failed", "applying")
-    }
-    withheld: dict[tuple[str, str, str, str], str] = {}
-    for block in run.selection_blocks:
-        if block.group_key is not None:
-            key = ("target", block.group_key, "", block.reason)
-            label = block.group_key
-        else:
-            key = ("package", block.coordinate, block.installed_version, block.reason)
-            label = f"{block.coordinate}@{block.installed_version}"
-        withheld[key] = label
-    for attempt in run.attempts:
-        if isinstance(attempt, WithheldAttempt):
-            target = attempt.candidate.target
-            key = ("target", target.group_key, "", attempt.reason)
-            withheld[key] = f"{target.display_name} -> {target.target_version}"
-    for (_kind, _identity, _version, reason), label in sorted(withheld.items()):
-        output.outcome(run.project, run.flow.value, "blocked", label, reason=reason)
-    for attempt in run.attempts:
-        if isinstance(attempt, FailedAttempt):
-            target = attempt.candidate.target
-            output.outcome(
-                run.project,
-                run.flow.value,
-                "failed",
-                f"{target.display_name} -> {target.target_version}",
-                reason=attempt.reason,
-            )
-    output.summary(
-        {
-            "verified": counts["ready"] + counts["completed"],
-            "withheld": len(withheld),
-            "failed": counts["failed"] + counts["applying"],
-            "residual advisories": len(run.accepted_snapshot.findings),
-        }
-    )
 
 
 type _FindingRows = tuple[list[list[str | Text]], list[list[str]]]

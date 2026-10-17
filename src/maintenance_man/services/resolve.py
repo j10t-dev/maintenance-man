@@ -1,7 +1,5 @@
 from pathlib import Path
 
-from maintenance_man import gradle_workflow
-from maintenance_man.github import CodeHostError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     BlockersStillFailing,
@@ -11,9 +9,7 @@ from maintenance_man.models.events import (
     Operation,
     OperationFailed,
     Outcome,
-    PullRequestOutput,
     ResolvePaused,
-    SubmissionBlocked,
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
@@ -30,35 +26,17 @@ from maintenance_man.updater import (
     run_test_phases,
 )
 from maintenance_man.vcs import Repository, RevisionError
-from maintenance_man.vcs_workflow import (
-    VcsServices,
-    ensure_main_bookmark,
-    prune_stale_bookmarks,
-    push_bookmark_and_create_pr,
-)
+from maintenance_man.vcs_workflow import VcsServices, ensure_main_bookmark
 
 
 def resolve_project(
     name: str,
     project: ProjectConfig,
     *,
-    minimum_age_days: int,
     continue_: bool,
     vcs: VcsServices,
     emit: Emit,
 ) -> Outcome:
-    if project.package_manager == "gradle":
-        return gradle_workflow.run_gradle_flow(
-            name,
-            project,
-            Workflow.RESOLVE,
-            minimum_age_days=minimum_age_days,
-            continue_=continue_,
-            choose=None,
-            vcs=vcs,
-            emit=emit,
-        )
-
     scan_result = flows.load_validated_scan(name, project, Workflow.RESOLVE, emit=emit)
     if scan_result is None:
         return Outcome.SUCCEEDED
@@ -68,9 +46,8 @@ def resolve_project(
     candidates = _select_resolve_candidates(scan_result)
     repo = vcs.repository(project.path)
     try:
-        prune_stale_bookmarks(repo=repo, host=vcs.code_host(project.path))
         ensure_main_bookmark(repo=repo)
-    except (RevisionError, CodeHostError) as exc:
+    except RevisionError as exc:
         raise WorkflowError(str(exc)) from exc
     if any(_is_failed_resolve_finding(finding) for finding in scan_result.findings):
         msg = f"resolve already paused for {name} — rerun with --continue"
@@ -163,32 +140,6 @@ def _prepare_resolve_bookmark(
     return True
 
 
-def _submit(
-    name: str,
-    project_path: Path,
-    scan_result: ScanResult,
-    *,
-    vcs: VcsServices,
-    emit: Emit,
-) -> Outcome:
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    try:
-        output = push_bookmark_and_create_pr(
-            repo=vcs.repository(project_path),
-            host=vcs.code_host(project_path),
-            bookmark=bookmark,
-        )
-    except (RevisionError, CodeHostError) as exc:
-        save_scan_results(name, scan_result)
-        emit(OperationFailed(Operation.SUBMIT, name, str(exc)))
-        return Outcome.FAILED
-    if output:
-        emit(PullRequestOutput(output))
-
-    flows.complete_ready_findings(scan_result, name, flow=Workflow.RESOLVE)
-    return Outcome.SUCCEEDED
-
-
 def _run_candidates(
     name: str,
     project: ProjectConfig,
@@ -226,12 +177,17 @@ def _run_candidates(
                 )
             )
         )
-        emit(SubmissionBlocked(name))
         save_scan_results(name, scan_result)
         return Outcome.FAILED
     if not has_ready_findings:
         return Outcome.SUCCEEDED
-    return _submit(name, project.path, scan_result, vcs=vcs, emit=emit)
+    return (
+        Outcome.SUCCEEDED
+        if flows.finalise_local_changes(
+            project.path, scan_result, name, Workflow.RESOLVE, vcs=vcs, emit=emit
+        )
+        else Outcome.FAILED
+    )
 
 
 def _check_resumable(repo: Repository, bookmark: str) -> None:

@@ -1,7 +1,6 @@
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,31 +11,23 @@ from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     FindingsBlocked,
 )
-from maintenance_man.models.gradle import (
-    CandidateWithheld,
-    CompleteResolution,
-    FailedAttempt,
-    GradleCandidate,
-    GradleSnapshot,
-    ResolutionReport,
-    WithheldAttempt,
-)
 from maintenance_man.models.scan import (
-    GradleMember,
-    GradleUpdateTarget,
     ScanResult,
     SemverTier,
     Severity,
     UpdateFinding,
     VulnFinding,
-    Workflow,
 )
 from maintenance_man.services import scan as scan_service
 from maintenance_man.services.scan import ScanSummary
-from maintenance_man.vcs import RevisionError
-from tests.fake_vcs import FakeJjState
 from tests.support.cli import TerminalStream, run_mm
-from tests.support.findings import make_gradle_target, make_scan_result, make_update
+from tests.support.findings import (
+    make_gradle_member,
+    make_gradle_target,
+    make_scan_result,
+    make_update,
+    make_vuln,
+)
 from tests.support.package_managers import ops_with_outdated
 from tests.support.process import missing_tool
 from tests.support.projects import write_config
@@ -99,27 +90,6 @@ def test_numbered_findings_print_bracketed_values_literally(
     assert "u[p]" in captured.err
 
 
-def test_gradle_candidates_print_one_row_each_and_reprompt_after_invalid_selection(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    candidate = GradleCandidate(
-        target=make_gradle_target(), origins=frozenset({"ordinary"})
-    )
-    replies = iter(["9", "1"])
-    monkeypatch.setattr(
-        "maintenance_man.output.prompt", lambda *args, **kwargs: next(replies)
-    )
-
-    assert cli._choose_gradle_candidates((candidate,)) == (candidate,)
-
-    lines = capsys.readouterr().err.splitlines()
-    assert lines[0].startswith("    1  room")
-    assert lines[-1] == "error: Invalid selection: 9"
-    listing = " ".join(line.strip() for line in lines[:-1])
-    for alias in ("room-runtime", "room-compiler", "room-testing"):
-        assert f"{alias}: androidx.room:{alias} 2.8.4 → 2.8.5" in listing
-
-
 def _make_vulnerable_result() -> ScanResult:
     return ScanResult(
         project="vulnerable",
@@ -167,9 +137,6 @@ def _make_updates_only_result() -> ScanResult:
 @pytest.fixture(autouse=True)
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
-    monkeypatch.setattr(
-        "maintenance_man.services.scan.prune_stale_bookmarks", lambda **kwargs: None
-    )
 
     def _fake_scan(
         name: str,
@@ -218,9 +185,6 @@ def test_given_two_clean_projects_when_batch_scanned_then_one_notice_names_both(
 ) -> None:
     _two_project_config(mm_home, tmp_path)
     monkeypatch.setattr(
-        "maintenance_man.services.scan.prune_stale_bookmarks", lambda **kwargs: None
-    )
-    monkeypatch.setattr(
         "maintenance_man.services.scan.scan_project",
         lambda name, project, days: ScanResult(
             project=name,
@@ -241,9 +205,6 @@ def test_given_two_clean_projects_when_batch_scanned_then_one_notice_names_both(
 def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys):
     mm_home.mkdir(parents=True)
     write_config(mm_home, "")
-    monkeypatch.setattr(
-        "maintenance_man.vcs_workflow.require_tool", missing_tool("trivy")
-    )
     monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
     assert run_mm("scan") == 0
     captured = capsys.readouterr()
@@ -257,30 +218,9 @@ def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys
 def test_scan_without_trivy_reports_an_unknown_project(
     mm_home_with_projects, monkeypatch, capsys
 ):
-    monkeypatch.setattr(
-        "maintenance_man.vcs_workflow.require_tool", missing_tool("trivy")
-    )
     monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
     assert run_mm("scan", "nonexistent") == 1
     assert "trivy" not in capsys.readouterr().out.lower()
-
-
-def test_given_remote_sync_failure_when_scan_runs_then_exits_zero_with_warning(
-    mm_home_with_projects: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    def fail_remote_sync(**kwargs) -> None:
-        message = "offline"
-        raise RevisionError(message)
-
-    monkeypatch.setattr(scan_service, "prune_stale_bookmarks", fail_remote_sync)
-
-    assert run_mm("scan", "clean") == ExitCode.OK
-    assert (
-        "warning: clean · failed to sync remote · offline"
-        in capsys.readouterr().err.splitlines()
-    )
 
 
 def test_batch_scan_without_trivy_scans_uv_and_exits_error(
@@ -290,9 +230,6 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
     (results / "first.json").unlink()
     monkeypatch.setattr(
         "maintenance_man.services.scan.scan_project", scanner.scan_project
-    )
-    monkeypatch.setattr(
-        "maintenance_man.vcs_workflow.require_tool", missing_tool("trivy")
     )
     monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
@@ -500,7 +437,7 @@ def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
 
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
-    def _boom(name, proj_config, *, minimum_age_days, vcs, emit):
+    def _boom(name, proj_config, *, minimum_age_days, emit):
         msg = "./gradlew cyclonedxBom failed (exit 1): boom"
         raise GradleError(msg)
 
@@ -514,7 +451,7 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
 ):
     scanned: list[str] = []
 
-    def _scan(name, proj_config, *, minimum_age_days, vcs, emit):
+    def _scan(name, proj_config, *, minimum_age_days, emit):
         scanned.append(name)
         if proj_config.package_manager == "gradle":
             msg = "boom"
@@ -602,15 +539,11 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_pat
         trivy_target="/fixture",
         vulnerabilities=findings,
     )
-    state = FakeJjState()
-    project_path = tmp_path / "project"
-    state.seed_repository(project_path, files={})
     monkeypatch.setattr(scan_service, "scan_project", lambda *args, **kwargs: result)
     scan_service.scan_one(
         "android",
-        ProjectConfig(path=project_path, package_manager=manager),
+        ProjectConfig(path=tmp_path, package_manager=manager),
         minimum_age_days=7,
-        vcs=state.services(),
         emit=cli._Renderer(batch=False, project="android", flow="scan"),
     )
     rendered = stream.getvalue()
@@ -650,140 +583,4 @@ def test_gradle_advisories_keep_installed_versions_separate(capsys):
     assert [(row[2], row[3]) for row in rows] == [
         ("org.example:shared", "1.0"),
         ("org.example:shared", "2.0"),
-    ]
-
-
-def _summary_run(blocks=(), attempts=(), residuals=()):
-    return SimpleNamespace(
-        project="api",
-        flow=Workflow.UPDATE,
-        selection_blocks=tuple(blocks),
-        attempts=tuple(attempts),
-        accepted_snapshot=SimpleNamespace(findings=tuple(residuals)),
-    )
-
-
-def _summary_attempt(state, reference="shared", reason="too young"):
-    target = GradleUpdateTarget(
-        version_ref=reference,
-        target_version="2.0",
-        members=[
-            GradleMember(
-                kind="library",
-                alias="shared",
-                coordinate="g:shared",
-                installed_version="1.0",
-            )
-        ],
-    )
-    candidate = GradleCandidate(target=target, origins=frozenset({"ordinary"}))
-    if state == "withheld":
-        return WithheldAttempt(candidate=candidate, reason=reason)
-    if state == "failed":
-        baseline = GradleSnapshot(
-            tree_id="tree",
-            context_identity="context",
-            inventory_digest="bom",
-            inventory_modules=(),
-            findings=(),
-            resolution=CompleteResolution(
-                report=ResolutionReport(
-                    schema_version=1,
-                    root_project=":",
-                    producer_versions={
-                        "gradle": "9.6.1",
-                        "cyclonedx": "3.4.1",
-                        "report": "1",
-                    },
-                    catalogue_digest="catalogue",
-                    repositories=(),
-                    selected_scopes=(),
-                    scopes=(),
-                )
-            ),
-        )
-        return FailedAttempt(candidate=candidate, reason=reason, baseline=baseline)
-    return SimpleNamespace(
-        state=state, reason=reason, candidate=SimpleNamespace(target=target)
-    )
-
-
-def test_gradle_retry_summary_renders_persisted_selection_blocks(capsys):
-    blocks = [
-        CandidateWithheld(
-            group_key=group,
-            coordinate="g:shared",
-            installed_version="1.0",
-            reason=reason,
-            advisory_ids=frozenset({advisory}),
-        )
-        for group, reason, advisory in (
-            ("ref:first", "too young", "CVE-A"),
-            ("ref:first", "too young", "CVE-B"),
-            ("ref:second", "too young", "CVE-C"),
-            ("ref:first", "unsupported routing", "CVE-D"),
-        )
-    ]
-    # Round-trip selection records to demonstrate the retry needs no preparation output.
-    loaded = [
-        CandidateWithheld.model_validate_json(block.model_dump_json())
-        for block in blocks
-    ]
-    run = _summary_run(loaded, (_summary_attempt("completed"),), (object(),))
-    cli._print_gradle_run_summary(run)
-    captured = capsys.readouterr()
-    assert "1 verified · 3 withheld · 0 failed · 1 residual advisories" in captured.err
-    assert captured.out.splitlines() == [
-        "api\tupdate\tblocked\tref:first\t-\t-\ttoo young",
-        "api\tupdate\tblocked\tref:first\t-\t-\tunsupported routing",
-        "api\tupdate\tblocked\tref:second\t-\t-\ttoo young",
-    ]
-
-
-def test_gradle_summary_keeps_unknown_versions_and_collapses_duplicate_reasons(
-    capsys,
-):
-    blocks = [
-        CandidateWithheld(
-            group_key=None,
-            coordinate="g:unowned",
-            installed_version=version,
-            reason="ambiguous owner",
-            advisory_ids=frozenset({advisory}),
-        )
-        for version, advisory in (("1.0", "CVE-A"), ("1.0", "CVE-B"), ("2.0", "CVE-C"))
-    ]
-    cli._print_gradle_run_summary(_summary_run(blocks))
-    captured = capsys.readouterr()
-    assert "2 withheld" in captured.err
-    assert captured.out.splitlines() == [
-        "api\tupdate\tblocked\tg:unowned@1.0\t-\t-\tambiguous owner",
-        "api\tupdate\tblocked\tg:unowned@2.0\t-\t-\tambiguous owner",
-    ]
-
-
-def test_gradle_summary_deduplicates_selection_and_attempt_but_retains_failures(
-    capsys,
-):
-    block = CandidateWithheld(
-        group_key="ref:shared",
-        coordinate="g:shared",
-        installed_version="1.0",
-        reason="too young",
-    )
-    run = _summary_run(
-        (block,),
-        (
-            _summary_attempt("withheld"),
-            _summary_attempt("failed", "broken", "unit tests failed"),
-            _summary_attempt("applying", "interrupted"),
-            _summary_attempt("ready", "accepted"),
-        ),
-    )
-    cli._print_gradle_run_summary(run)
-    captured = capsys.readouterr()
-    assert "1 verified · 1 withheld · 2 failed · 0 residual advisories" in captured.err
-    assert captured.out.splitlines() == [
-        "api\tupdate\tblocked\tshared -> 2.0\t-\t-\ttoo young",
-        "api\tupdate\tfailed\tbroken -> 2.0\t-\t-\tunit tests failed",
     ]

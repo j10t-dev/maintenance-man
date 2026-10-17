@@ -53,18 +53,12 @@ def test_scan_all_continues_after_failure_and_summarises_results(
             raise ScanError(msg)
         return {"first": first, "third": third}[name]
 
-    monkeypatch.setattr(scan_service, "require_vcs_tools", lambda: None)
-    monkeypatch.setattr(scan_service, "prune_stale_bookmarks", lambda **kwargs: None)
     monkeypatch.setattr(scan_service, "scan_project", fake_scan)
     ticks = iter([1.0, 1.25, 2.0, 3.0, 3.5])
     monkeypatch.setattr(scan_service.time, "monotonic", lambda: next(ticks))
     recorded = RecordingEmit()
 
-    summary = scan_service.scan_all(
-        cfg,
-        vcs=_services(*(project.path for project in projects.values())),
-        emit=recorded,
-    )
+    summary = scan_service.scan_all(cfg, emit=recorded)
 
     assert recorded.events == [
         ScanReported(first, 0.25),
@@ -85,19 +79,13 @@ def test_given_two_clean_projects_when_scanned_in_batch_then_summary_lists_both(
         path.mkdir()
         projects[name] = make_project(path)
     cfg = make_config(projects=projects)
-    monkeypatch.setattr(scan_service, "require_vcs_tools", lambda: None)
-    monkeypatch.setattr(scan_service, "prune_stale_bookmarks", lambda **kwargs: None)
     monkeypatch.setattr(
         scan_service,
         "scan_project",
         lambda name, project, minimum_age_days: make_scan_result(vulns=[], updates=[]),
     )
 
-    summary = scan_service.scan_all(
-        cfg,
-        vcs=_services(*(project.path for project in projects.values())),
-        emit=RecordingEmit(),
-    )
+    summary = scan_service.scan_all(cfg, emit=RecordingEmit())
 
     assert summary.clean == ("a", "b")
 
@@ -107,45 +95,12 @@ def test_scan_all_skips_missing_path_without_error(tmp_path: Path) -> None:
     cfg = make_config(projects={"ghost": make_project(missing)})
     recorded = RecordingEmit()
 
-    summary = scan_service.scan_all(cfg, vcs=_services(), emit=recorded)
+    summary = scan_service.scan_all(cfg, emit=recorded)
 
     assert recorded.events == [
         ProjectSkipped("ghost", SkipReason.PATH_MISSING, str(missing))
     ]
     assert summary == scan_service.ScanSummary(False, False, False)
-
-
-def test_scan_one_reports_remote_sync_failure_then_scans(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = tmp_path / "project"
-    path.mkdir()
-    result = make_scan_result(vulns=[], updates=[])
-    result.project = "demo"
-    monkeypatch.setattr(scan_service, "require_vcs_tools", lambda: None)
-    monkeypatch.setattr(
-        scan_service,
-        "prune_stale_bookmarks",
-        lambda **kwargs: (_ for _ in ()).throw(RevisionError("offline")),
-    )
-    monkeypatch.setattr(scan_service, "scan_project", lambda *args, **kwargs: result)
-    ticks = iter([1.0, 1.5])
-    monkeypatch.setattr(scan_service.time, "monotonic", lambda: next(ticks))
-    recorded = RecordingEmit()
-
-    actual = scan_service.scan_one(
-        "demo",
-        make_project(path),
-        minimum_age_days=7,
-        vcs=_services(path),
-        emit=recorded,
-    )
-
-    assert actual is result
-    assert recorded.events == [
-        OperationFailed(Operation.REMOTE_SYNC, "demo", "offline"),
-        ScanReported(result, 0.5),
-    ]
 
 
 def test_scan_summary_ignores_blocked_vulnerability_without_fix() -> None:

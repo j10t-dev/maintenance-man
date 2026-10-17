@@ -1,6 +1,4 @@
-from datetime import UTC, datetime
 from io import StringIO
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,79 +21,23 @@ from maintenance_man.models.events import (
     FindingStarted,
     FindingStepFailed,
     FindingStepKind,
-    GradleFlowFailed,
-    GradleRunArchived,
-    GradleRunReported,
-    GradleWithheld,
     HealthChecked,
     HealthcheckUnconfigured,
     MissingTestConfig,
-    NoEligibleGradleChanges,
     Operation,
     OperationFailed,
     ProcessingStarted,
     ProjectSkipped,
     ProjectStarted,
     Promoted,
-    PullRequestOutput,
     ResolvePaused,
     ScanReported,
     SkipReason,
-    SubmissionBlocked,
     SyncCompleted,
 )
-from maintenance_man.models.gradle import (
-    ComparisonContext,
-    CompleteResolution,
-    GradleRun,
-    GradleSnapshot,
-    ResolutionReport,
-)
-from maintenance_man.models.scan import ScanResult, UpdateResult, Workflow
+from maintenance_man.models.scan import ScanResult, UpdateResult
 from tests.support.cli import TerminalStream
 from tests.support.findings import make_scan_result, make_update
-
-
-def _make_gradle_run() -> GradleRun:
-    context = ComparisonContext(
-        scanner_version="test",
-        loaded_input_digests={},
-        selected_scopes=(),
-        producer_versions={"gradle": "8", "cyclonedx": "3", "report": "1"},
-        scanner_flags=(),
-        created_at=datetime(2026, 10, 16, tzinfo=UTC),
-        private_cache_path=Path("/tmp/cache"),
-        owner_token="owner",
-    )
-    resolution = CompleteResolution(
-        report=ResolutionReport(
-            schema_version=1,
-            root_project=":",
-            producer_versions={"gradle": "8", "cyclonedx": "3", "report": "1"},
-            catalogue_digest="catalogue",
-            repositories=(),
-            selected_scopes=(),
-            scopes=(),
-        )
-    )
-    snapshot = GradleSnapshot(
-        tree_id="tree",
-        resolution=resolution,
-        context_identity=context.identity,
-        findings=(),
-        inventory_digest="inventory",
-        inventory_modules=(),
-    )
-    return GradleRun(
-        project="a[b]",
-        flow=Workflow.UPDATE,
-        base_commit_id="base",
-        managed_bookmark="mm/update-dependencies",
-        managed_tip_id="tip",
-        context=context,
-        initial_snapshot=snapshot,
-        accepted_snapshot=snapshot,
-    )
 
 
 def _pipe_scan() -> ScanResult:
@@ -119,11 +61,6 @@ _OPERATION_DIAGNOSTICS = {
     Operation.WORKSPACE_CLEANUP: "error: api · workspace cleanup · boom",
     Operation.BOOKMARK_CLEANUP: "error: api · bookmark cleanup · boom",
     Operation.RESOLVE_SETUP: "error: api · resolve setup · boom",
-    Operation.SUBMIT: (
-        "warning: api · submit failed · keeping mm/resolve-dependencies "
-        "for manual recovery · boom"
-    ),
-    Operation.REMOTE_SYNC: "warning: api · failed to sync remote · boom",
     Operation.SCAN: "error: api · scan · boom",
     Operation.SYNC: "error: api · sync · boom",
 }
@@ -224,60 +161,10 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
             "",
         ),
         (
-            SubmissionBlocked("api"),
-            "update",
-            "",
-            "warning: api · blocked findings remain · "
-            "rescan or resolve them manually\n",
-        ),
-        (
             BlockersStillFailing("unit", ("a", "b")),
             "update",
             "",
             "error: unit · still blocking: a, b\n",
-        ),
-        (
-            PullRequestOutput("https://x/pull/1"),
-            "resolve",
-            "api\tresolve\tpassed\tpull request\t-\t-\thttps://x/pull/1\n",
-            "",
-        ),
-        (
-            GradleWithheld("org.x:lib -> 2", "too young"),
-            "update",
-            "api\tupdate\tblocked\torg.x:lib -> 2\t-\t-\ttoo young\n",
-            "",
-        ),
-        (
-            GradleWithheld("org.x:lib -> 2", "too young"),
-            "resolve",
-            "api\tresolve\tblocked\torg.x:lib -> 2\t-\t-\ttoo young\n",
-            "",
-        ),
-        (
-            GradleWithheld("g:[red]lib", "too [new]"),
-            "update",
-            "api\tupdate\tblocked\tg:[red]lib\t-\t-\ttoo [new]\n",
-            "",
-        ),
-        (
-            NoEligibleGradleChanges(),
-            "update",
-            "",
-            "No eligible Gradle changes in api\n",
-        ),
-        (
-            GradleRunArchived(Path("/tmp/run.json")),
-            "update",
-            "",
-            "warning: archived failed Gradle run to /tmp/run.json · "
-            "rebuilding candidates from main\n",
-        ),
-        (
-            GradleFlowFailed(Workflow.UPDATE, "bad"),
-            "update",
-            "",
-            "error: cannot complete Gradle update · bad\n",
         ),
     ],
 )
@@ -398,12 +285,8 @@ def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
         ),
         (Promoted(), "  ✓ passed    local main"),
         (ProcessingStarted(2, 1), "api · 2 vulnerabilities · 1 updates"),
-        (
-            PullRequestOutput("https://x/pull/1"),
-            "api\n  ✓ passed    pull request              https://x/pull/1",
-        ),
     ],
-    ids=["passed", "failed", "blocked", "promoted", "processing", "pull-request"],
+    ids=["passed", "failed", "blocked", "promoted", "processing"],
 )
 def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
     monkeypatch: pytest.MonkeyPatch, event: Event, expected: str
@@ -476,18 +359,11 @@ def test_given_summary_events_when_rendered_then_exact_payloads_are_forwarded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scan = make_scan_result()
-    run = _make_gradle_run()
     print_scan = MagicMock()
-    print_gradle = MagicMock()
     monkeypatch.setattr(cli, "_print_scan_result", print_scan)
-    monkeypatch.setattr(cli, "_print_gradle_run_summary", print_gradle)
 
     cli._Renderer(batch=False, flow="scan")(ScanReported(scan, elapsed_s=1.25))
     print_scan.assert_called_once_with(scan, elapsed_s=1.25)
-    print_scan.reset_mock()
-    cli._Renderer(batch=False)(GradleRunReported(scan, run))
-    print_scan.assert_called_once_with(scan)
-    print_gradle.assert_called_once_with(run)
 
 
 def _blocked_scan() -> ScanResult:

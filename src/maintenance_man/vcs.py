@@ -2,19 +2,13 @@ from __future__ import annotations
 
 import re
 import shlex
-import shutil
 import stat
 import subprocess
-import tempfile
-import uuid
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from maintenance_man import paths
-from maintenance_man.models.scan import WORKFLOW_BOOKMARKS
 from maintenance_man.process import run_captured
 
 JJ_INSTALL_HINT = "Install it from https://jj-vcs.github.io/jj/"
@@ -22,12 +16,6 @@ JJ_INSTALL_HINT = "Install it from https://jj-vcs.github.io/jj/"
 
 class RevisionError(Exception):
     """A jj command could not run, or a revision could not be resolved."""
-
-
-@dataclass(frozen=True, slots=True)
-class ExpectedRevisions:
-    base: str
-    tip: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +36,6 @@ class Repository(Protocol):
     def path(self) -> Path: ...
 
     def bookmark_exists(self, *, bookmark: str) -> bool: ...
-    def local_bookmarks(self) -> frozenset[str]: ...
     def bookmark_conflicted(self, *, bookmark: str) -> bool: ...
     def resolve_revision(self, *, revision: str, read_only: bool = False) -> str: ...
     def revision_file(self, *, revision: str, filename: str) -> RevisionFile: ...
@@ -59,7 +46,6 @@ class Repository(Protocol):
     def change_id(self, *, revision: str = "@") -> str: ...
     def working_copy_state(self) -> WorkingCopyState: ...
     def has_changes(self) -> bool: ...
-    def changed_paths(self, *, revision: str = "@") -> frozenset[str]: ...
     def create_bookmark(self, *, bookmark: str, revision: str) -> None: ...
     def set_bookmark(self, *, bookmark: str, revision: str) -> None: ...
     def delete_bookmark(self, *, bookmark: str) -> None: ...
@@ -67,22 +53,12 @@ class Repository(Protocol):
     def commit(self, *, message: str) -> None: ...
     def discard(self) -> None: ...
     def rebase_working_copy(self, *, revision: str) -> None: ...
-    def promote_bookmark_to_main(
-        self, *, bookmark: str, expected: ExpectedRevisions | None = None
-    ) -> None: ...
-    def reset_verified_bookmark(
-        self, *, bookmark: str, expected: ExpectedRevisions
-    ) -> None: ...
+    def promote_bookmark_to_main(self, *, bookmark: str) -> None: ...
     def fetch(self, *, main_only: bool = False) -> None: ...
-    def push_bookmark(
-        self, *, bookmark: str, expected: ExpectedRevisions | None = None
-    ) -> None: ...
+    def push_bookmark(self, *, bookmark: str) -> None: ...
     def workspace_names(self) -> frozenset[str]: ...
     def add_workspace(self, *, name: str, path: Path, revision: str) -> None: ...
     def forget_workspace(self, *, name: str) -> None: ...
-    def temporary_workspace(
-        self, *, revision: str
-    ) -> AbstractContextManager[Repository]: ...
 
 
 def workspace_path_for_project(project: str) -> Path:
@@ -113,18 +89,6 @@ def assert_safe_workspace_path(path: Path) -> Path:
 
 
 _COMMIT_ID = re.compile(r"[0-9a-f]{40,64}")
-
-
-def _guarded_tip(source_bookmark: str, expected: ExpectedRevisions) -> str:
-    if source_bookmark not in tuple(WORKFLOW_BOOKMARKS.values()):
-        msg = "Unexpected managed bookmark"
-        raise RevisionError(msg)
-    if not all(_COMMIT_ID.fullmatch(value) for value in (expected.base, expected.tip)):
-        msg = "Invalid expected revision identity"
-        raise RevisionError(msg)
-    base = f"exactly(exactly(main, 1) & {expected.base}, 1)"
-    tip = f"exactly(exactly({source_bookmark}, 1) & {expected.tip}, 1)"
-    return f"exactly(({base})::({tip}) & ({tip}), 1)"
 
 
 def _lines(stdout: str) -> list[str]:
@@ -169,7 +133,7 @@ class JjRepository:
             error=RevisionError,
         )
 
-    def _list_bookmarks(self, *names: str) -> tuple[str, ...]:
+    def bookmark_exists(self, *, bookmark: str) -> bool:
         result = self._run(
             [
                 "--ignore-working-copy",
@@ -179,20 +143,14 @@ class JjRepository:
                 "list",
                 "-T",
                 'if(remote == "origin" || !present, "", name ++ "\\n")',
-                *names,
+                bookmark,
             ]
         )
-        listed = tuple(_lines(result.stdout))
-        if names and any(name not in names for name in listed):
-            msg = f"Unexpected bookmark listing for {', '.join(names)}"
+        listed = _lines(result.stdout)
+        if any(name != bookmark for name in listed):
+            msg = f"Unexpected bookmark listing for {bookmark}"
             raise RevisionError(msg)
-        return listed
-
-    def bookmark_exists(self, *, bookmark: str) -> bool:
-        return bool(self._list_bookmarks(bookmark))
-
-    def local_bookmarks(self) -> frozenset[str]:
-        return frozenset(self._list_bookmarks())
+        return bool(listed)
 
     def bookmark_conflicted(self, *, bookmark: str) -> bool:
         result = self._run(
@@ -341,10 +299,6 @@ class JjRepository:
     def has_changes(self) -> bool:
         return bool(self._run(["diff", "--summary"]).stdout.strip())
 
-    def changed_paths(self, *, revision: str = "@") -> frozenset[str]:
-        result = self._run(["diff", "-r", revision, "--name-only"])
-        return frozenset(line for line in result.stdout.splitlines() if line)
-
     def create_bookmark(self, *, bookmark: str, revision: str) -> None:
         self._run(["bookmark", "create", bookmark, "-r", revision])
 
@@ -366,29 +320,8 @@ class JjRepository:
     def rebase_working_copy(self, *, revision: str) -> None:
         self._run(["rebase", "-r", "@", "-d", revision])
 
-    def promote_bookmark_to_main(
-        self, *, bookmark: str, expected: ExpectedRevisions | None = None
-    ) -> None:
-        selector = bookmark
-        if expected is not None:
-            selector = _guarded_tip(bookmark, expected)
-        self._run(["bookmark", "set", "main", "-r", selector])
-        if expected is not None and (
-            self.resolve_revision(revision="main") != expected.tip
-            or self.resolve_revision(revision=bookmark) != expected.tip
-        ):
-            msg = "Local revisions changed during promotion"
-            raise RevisionError(msg)
-
-    def reset_verified_bookmark(
-        self, *, bookmark: str, expected: ExpectedRevisions
-    ) -> None:
-        guarded = _guarded_tip(bookmark, expected)
-        base = f"exactly({expected.base} & ::({guarded}), 1)"
-        self._run(["bookmark", "set", bookmark, "--allow-backwards", "-r", base])
-        if self.resolve_revision(revision=bookmark) != expected.base:
-            msg = "Local revisions changed during reset"
-            raise RevisionError(msg)
+    def promote_bookmark_to_main(self, *, bookmark: str) -> None:
+        self._run(["bookmark", "set", "main", "-r", bookmark])
 
     def fetch(self, *, main_only: bool = False) -> None:
         arguments = ["git", "fetch", "--remote", "origin"]
@@ -396,22 +329,10 @@ class JjRepository:
             arguments.extend(["--branch", "main"])
         self._run(arguments, timeout=120)
 
-    def push_bookmark(
-        self, *, bookmark: str, expected: ExpectedRevisions | None = None
-    ) -> None:
-        if expected is None:
-            selector = ["--bookmark", bookmark]
-        else:
-            guarded = _guarded_tip(bookmark, expected)
-            push_name = f'templates.git_push_bookmark="\\"{bookmark}\\""'
-            selector = ["--change", guarded, "--config", push_name]
-        self._run(["git", "push", *selector, "--remote", "origin"], timeout=120)
-        if expected is not None and (
-            self.resolve_revision(revision="main") != expected.base
-            or self.resolve_revision(revision=bookmark) != expected.tip
-        ):
-            msg = "Local revisions changed during submission"
-            raise RevisionError(msg)
+    def push_bookmark(self, *, bookmark: str) -> None:
+        self._run(
+            ["git", "push", "--bookmark", bookmark, "--remote", "origin"], timeout=120
+        )
 
     def workspace_names(self) -> frozenset[str]:
         result = self._run(["workspace", "list", "-T", 'name ++ "\\n"'])
@@ -426,97 +347,3 @@ class JjRepository:
 
     def forget_workspace(self, *, name: str) -> None:
         self._run(["workspace", "forget", name])
-
-    def temporary_workspace(
-        self, *, revision: str
-    ) -> AbstractContextManager[Repository]:
-        return _temporary_workspace(self, revision=revision, bind=JjRepository)
-
-
-def _cleanup_proof_workspace(
-    repository: Repository,
-    *,
-    name: str,
-    container: Path,
-    marker: Path,
-    owner_token: str,
-    registered: bool,
-) -> list[str]:
-    diagnostics: list[str] = []
-    if registered:
-        try:
-            repository.forget_workspace(name=name)
-        except RevisionError as exc:
-            diagnostics.append(f"forget workspace failed: {exc}")
-    try:
-        owned = (
-            not container.is_symlink()
-            and not marker.is_symlink()
-            and marker.is_file()
-            and marker.read_text(encoding="utf-8") == owner_token
-        )
-        if owned:
-            shutil.rmtree(container)
-        elif container.exists() or container.is_symlink():
-            diagnostics.append("proof workspace ownership marker changed")
-    except (OSError, UnicodeError) as exc:
-        diagnostics.append(f"remove proof workspace failed: {exc}")
-    return diagnostics
-
-
-@contextmanager
-def _temporary_workspace(
-    repository: Repository,
-    *,
-    revision: str,
-    bind: Callable[[Path], Repository],
-) -> Iterator[Repository]:
-    resolved = repository.resolve_revision(revision=revision)
-    try:
-        container = Path(tempfile.mkdtemp(prefix="mm-proof-"))
-    except OSError as exc:
-        msg = f"Cannot allocate proof workspace: {exc}"
-        raise RevisionError(msg) from exc
-    token = uuid.uuid4().hex
-    marker = container / ".mm-proof-owner"
-    name = f"mm-proof-{token}"
-    root = container / "workspace"
-    try:
-        marker.write_text(token, encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        cleanup = ""
-        try:
-            if not container.is_symlink():
-                shutil.rmtree(container)
-            else:
-                cleanup = "; allocated path became a symlink and was not removed"
-        except OSError as cleanup_exc:
-            cleanup = f"; cleanup failed: {cleanup_exc}"
-        msg = f"Cannot mark proof workspace: {exc}{cleanup}"
-        raise RevisionError(msg) from exc
-    registered = False
-    body_error: BaseException | None = None
-    try:
-        repository.add_workspace(name=name, path=root, revision=resolved)
-        registered = True
-        proof = bind(root)
-        proof.new_change(revision=resolved)
-        yield proof
-    except BaseException as exc:
-        body_error = exc
-        raise
-    finally:
-        diagnostics = _cleanup_proof_workspace(
-            repository,
-            name=name,
-            container=container,
-            marker=marker,
-            owner_token=token,
-            registered=registered,
-        )
-        if diagnostics:
-            detail = "; ".join(diagnostics)
-            if body_error is not None:
-                body_error.add_note(detail)
-            else:
-                raise RevisionError(detail)

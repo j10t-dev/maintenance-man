@@ -1,12 +1,13 @@
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
 from maintenance_man import config as config_module
-from maintenance_man import gradle_workflow
-from maintenance_man.github import CodeHostError
+from maintenance_man.gradle import (
+    GRADLE_LOCAL_PROPERTIES_RELPATH,
+    workspace_environment_reason,
+)
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
     Emit,
@@ -17,7 +18,6 @@ from maintenance_man.models.events import (
     ProcessingStarted,
     ProjectSkipped,
     ProjectStarted,
-    Promoted,
     ScanReported,
     SkipReason,
 )
@@ -33,24 +33,17 @@ from maintenance_man.models.scan import (
 from maintenance_man.services import WorkflowError, flows
 from maintenance_man.services.flows import FlowConflictError
 from maintenance_man.updater import Finding, process_findings
-from maintenance_man.vcs import RevisionError
+from maintenance_man.vcs import Repository, RevisionError, workspace_path_for_project
 from maintenance_man.vcs_workflow import (
     VcsServices,
     create_workspace,
     ensure_main_bookmark,
-    prune_stale_bookmarks,
-    refresh_working_copy_from_main,
     remove_workspace,
 )
 
 
 class UpdateSetupError(WorkflowError):
     """An update workspace could not be prepared safely."""
-
-
-class UpdateRoute(StrEnum):
-    FINDINGS = "findings"
-    GRADLE = "gradle"
 
 
 type FindingChooser = Callable[
@@ -62,7 +55,6 @@ type FindingChooser = Callable[
 @dataclass(frozen=True, slots=True)
 class ProjectUpdate:
     project: str
-    route: UpdateRoute
     outcome: Outcome
     results: tuple[UpdateResult, ...]
     blocked: int = 0
@@ -85,35 +77,22 @@ def update_project(
     name: str,
     project: ProjectConfig,
     *,
-    minimum_age_days: int,
     choose: FindingChooser | None,
-    choose_gradle: gradle_workflow.GradleChooser | None,
     vcs: VcsServices,
     emit: Emit,
 ) -> ProjectUpdate:
-    if project.package_manager == "gradle":
-        outcome = gradle_workflow.run_gradle_flow(
-            name,
-            project,
-            Workflow.UPDATE,
-            minimum_age_days=minimum_age_days,
-            choose=choose_gradle,
-            emit=emit,
-            vcs=vcs,
-        )
-        return ProjectUpdate(name, UpdateRoute.GRADLE, outcome, ())
-
     scan_result = flows.load_validated_scan(name, project, Workflow.UPDATE, emit=emit)
     if scan_result is None:
-        return ProjectUpdate(name, UpdateRoute.FINDINGS, Outcome.SUCCEEDED, ())
+        return ProjectUpdate(name, Outcome.SUCCEEDED, ())
     try:
         workspace = _enter_update_workspace(name, project, scan_result, vcs=vcs)
-    except (RevisionError, CodeHostError) as exc:
+    except RevisionError as exc:
         raise UpdateSetupError(str(exc)) from exc
 
     work_config = project.model_copy(update={"path": workspace})
-    finalised = False
     results: tuple[UpdateResult, ...] = ()
+    may_finalise = False
+    cleaned = True
     try:
         emit(ScanReported(scan_result))
         results = _process_selected(
@@ -123,32 +102,24 @@ def update_project(
             vcs=vcs,
             emit=emit,
         )
-        if (
+        may_finalise = (
             not any(not result.passed for result in results)
             and not _has_update_state(scan_result, (UpdateStatus.FAILED,))
             and not scan_result.blocked_findings
-        ):
-            finalised = _finalise(project.path, scan_result, name, vcs=vcs, emit=emit)
+        )
     finally:
         try:
             remove_workspace(repo=vcs.repository(project.path), project=name)
         except RevisionError as exc:
             emit(OperationFailed(Operation.WORKSPACE_CLEANUP, name, str(exc)))
-            finalised = False
+            cleaned = False
 
-    if finalised:
-        try:
-            vcs.repository(project.path).delete_bookmark(
-                bookmark=WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-            )
-        except RevisionError as exc:
-            emit(OperationFailed(Operation.BOOKMARK_CLEANUP, name, str(exc)))
-            finalised = False
-    outcome = Outcome.SUCCEEDED if finalised else Outcome.FAILED
+    finalised = may_finalise and flows.finalise_local_changes(
+        project.path, scan_result, name, Workflow.UPDATE, vcs=vcs, emit=emit
+    )
     return ProjectUpdate(
         name,
-        UpdateRoute.FINDINGS,
-        outcome,
+        Outcome.SUCCEEDED if cleaned and finalised else Outcome.FAILED,
         results,
         blocked=len(scan_result.blocked_findings),
     )
@@ -174,9 +145,7 @@ def update_projects(
             result = update_project(
                 name,
                 project,
-                minimum_age_days=cfg.defaults.min_version_age_days,
                 choose=None,
-                choose_gradle=None,
                 vcs=vcs,
                 emit=emit,
             )
@@ -236,9 +205,10 @@ def _enter_update_workspace(
             )
             raise UpdateSetupError(msg)
         workspace_revision = bookmark
+        _require_sdk_in_workspace(project, project_config, repo, workspace_revision)
     else:
-        prune_stale_bookmarks(repo=repo, host=vcs.code_host(project_config.path))
         ensure_main_bookmark(repo=repo)
+        _require_sdk_in_workspace(project, project_config, repo, "main")
         if repo.bookmark_exists(bookmark=bookmark):
             repo.delete_bookmark(bookmark=bookmark)
         repo.create_bookmark(bookmark=bookmark, revision="main")
@@ -255,6 +225,22 @@ def _enter_update_workspace(
     return workspace_path
 
 
+def _require_sdk_in_workspace(
+    name: str, project: ProjectConfig, repo: Repository, revision: str
+) -> None:
+    """Refuse a workspace checkout that would lack its local.properties."""
+    reason = workspace_environment_reason(
+        project.path, workspace_path_for_project(name)
+    )
+    if reason is None:
+        return
+    inspected = repo.revision_file(
+        revision=revision, filename=GRADLE_LOCAL_PROPERTIES_RELPATH
+    )
+    if not inspected.is_regular:
+        raise UpdateSetupError(reason)
+
+
 def _is_selectable(finding: Finding) -> bool:
     return (not isinstance(finding, VulnFinding) or finding.actionable) and (
         finding.update_status is None
@@ -263,32 +249,6 @@ def _is_selectable(finding: Finding) -> bool:
             and finding.flow is Workflow.UPDATE
         )
     )
-
-
-def _finalise(
-    project_path: Path,
-    scan_result: ScanResult,
-    name: str,
-    *,
-    vcs: VcsServices,
-    emit: Emit,
-) -> bool:
-    bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    repo = vcs.repository(project_path)
-    try:
-        repo.promote_bookmark_to_main(bookmark=bookmark)
-    except RevisionError as exc:
-        emit(OperationFailed(Operation.PROMOTE, name, str(exc)))
-        return False
-    try:
-        refresh_working_copy_from_main(repo=repo)
-    except RevisionError as exc:
-        emit(OperationFailed(Operation.REFRESH, name, str(exc)))
-        return False
-
-    flows.complete_ready_findings(scan_result, name, flow=Workflow.UPDATE)
-    emit(Promoted())
-    return True
 
 
 def _process_selected(
