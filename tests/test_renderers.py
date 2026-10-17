@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.text import Text
 
 from maintenance_man import cli
+from maintenance_man import output as maintenance_output
 from maintenance_man.models import events
 from maintenance_man.models.events import (
     BlockersStillFailing,
@@ -15,6 +16,7 @@ from maintenance_man.models.events import (
     DeployStepFailed,
     DeployStepStarted,
     DeployStepSucceeded,
+    Event,
     FindingFailed,
     FindingPassed,
     FindingsBlocked,
@@ -108,9 +110,6 @@ def output(monkeypatch):
     monkeypatch.setattr(
         cli, "_print_gradle_run_summary", lambda *args: cli.console.print("GRADLE")
     )
-    monkeypatch.setattr(
-        cli, "_print_update_summary", lambda *args: cli.console.print("SUMMARY")
-    )
     return buffer
 
 
@@ -119,74 +118,8 @@ def output(monkeypatch):
     "event, expected",
     [
         (
-            FindingStarted("vuln", "pkg[a]", "1.0", "1.1", "CVE-1"),
-            "\n  VULN pkg[a] 1.0 -> 1.1 (CVE-1)\n",
-        ),
-        (
-            FindingStarted("update", "pkg", "1.0", "2.0", "major"),
-            "\n  UPDATE pkg 1.0 -> 2.0 (major)\n",
-        ),
-        (events.TestCommandStarted("uv run pytest"), "  $ uv run pytest\n"),
-        (
-            FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, "boom"),
-            "  FAIL Package manager command failed: boom\n",
-        ),
-        (
-            FindingStepFailed(FindingStepKind.TEST, "unit failed"),
-            "  FAIL unit failed\n",
-        ),
-        (FindingPassed("pkg", False), "  PASS pkg\n"),
-        (FindingPassed("pkg", True), "  PASS pkg (already applied)\n"),
-        (FindingFailed("pkg", "unit"), "  FAIL pkg — unit failed\n"),
-        (ProjectStarted("a[b]"), ("", f"\n{'═' * 40}\na[b]\n{'═' * 40}\n")),
-        (
             ProjectSkipped("a[b]", SkipReason.PATH_MISSING, "/tmp/[x]"),
             "Warning: a[b] — path does not exist: /tmp/[x]\n",
-        ),
-        (
-            OperationFailed(Operation.SCAN, "a[b]", "bad [state]"),
-            "Error: a[b] — bad [state]\n",
-        ),
-        (ScanReported(make_scan_result()), ""),
-        (
-            MissingTestConfig("a[b]"),
-            "  Warning: a[b] — no test configuration (test phases will be skipped)\n",
-        ),
-        (ProcessingStarted(1, 0), "\nProcessing 1 vuln fix(es)...\n"),
-        (ProcessingStarted(0, 1), "\nProcessing 1 update(s)...\n"),
-        (
-            ProcessingStarted(1, 2),
-            "\nProcessing 1 vuln fix(es)...\n\nProcessing 2 update(s)...\n",
-        ),
-        (ProcessingStarted(0, 0), ""),
-        (
-            FindingsProcessed((UpdateResult("pkg", "update", True),)),
-            ("SUMMARY\n", ""),
-        ),
-        (
-            Promoted("mm/update-dependencies"),
-            "Promoted mm/update-dependencies to main.\n",
-        ),
-        (
-            ResolvePaused("a[b]"),
-            "  Resolve paused. Continue with mm resolve a[b] --continue.\n",
-        ),
-        (
-            FindingsBlocked((("pkg[one]", "reason[two]"),)),
-            "  BLOCKED pkg[one] — reason[two]\n",
-        ),
-        (
-            FindingsBlocked((("pkg-one", "reason-one"), ("pkg-two", "reason-two"))),
-            "  BLOCKED pkg-one — reason-one\n  BLOCKED pkg-two — reason-two\n",
-        ),
-        (
-            SubmissionBlocked("a[b]"),
-            "  Not submitting: blocked findings remain. "
-            "Rescan or resolve them manually.\n",
-        ),
-        (
-            BlockersStillFailing("unit", ("pkg[one]", "pkg-two")),
-            "  FAIL unit — still blocking: pkg[one], pkg-two\n",
         ),
         (
             SyncCompleted("a[b]", "already [up] to date"),
@@ -244,32 +177,9 @@ def output(monkeypatch):
             HealthcheckUnconfigured(),
             "--check: no healthcheck_url configured in [defaults]\n",
         ),
-        (PullRequestOutput("https://x/pull/[1]"), "  https://x/pull/[1]\n"),
-        (
-            GradleWithheld("g:[lib]", "too [new]"),
-            "Withheld g:[lib]: too [new]\n",
-        ),
-        (NoEligibleGradleChanges(), "No eligible Gradle changes\n"),
-        (
-            GradleRunArchived(Path("/tmp/[run].json")),
-            "Archived failed Gradle run to /tmp/[run].json; "
-            "rebuilding candidates from main\n",
-        ),
-        (
-            GradleFlowFailed(Workflow.UPDATE, "bad [state]"),
-            "Cannot complete Gradle update: bad [state]\n",
-        ),
-        (
-            GradleFlowFailed(Workflow.RESOLVE, "bad [state]"),
-            "Cannot complete Gradle resolve: bad [state]\n",
-        ),
-        (
-            GradleRunReported(make_scan_result(), _make_gradle_run()),
-            "SCAN\nGRADLE\n",
-        ),
     ],
 )
-def test_given_progress_event_when_rendered_in_both_modes_then_expected_text_is_printed(
+def test_given_unconverted_event_when_rendered_in_both_modes_then_text_is_printed(
     output, batch, event, expected
 ):
     cli._Renderer(batch=batch)(event)
@@ -277,26 +187,309 @@ def test_given_progress_event_when_rendered_in_both_modes_then_expected_text_is_
     assert output.getvalue() == rendered
 
 
+def _pipe_scan() -> ScanResult:
+    scan = make_scan_result(
+        updates=[
+            make_update(
+                pkg_name="pkg",
+                installed_version="1.0",
+                latest_version="1.1",
+                blocked_reason="too young",
+            )
+        ]
+    )
+    scan.project = "api"
+    return scan
+
+
+_OPERATION_DIAGNOSTICS = {
+    Operation.UPDATE_SETUP: "error: api · update setup · boom",
+    Operation.REFRESH: "error: api · workspace refresh · boom",
+    Operation.WORKSPACE_CLEANUP: "error: api · workspace cleanup · boom",
+    Operation.BOOKMARK_CLEANUP: "error: api · bookmark cleanup · boom",
+    Operation.RESOLVE_SETUP: "error: api · resolve setup · boom",
+    Operation.SUBMIT: (
+        "warning: api · submit failed · keeping mm/resolve-dependencies "
+        "for manual recovery · boom"
+    ),
+    Operation.REMOTE_SYNC: "warning: api · failed to sync remote · boom",
+    Operation.SCAN: "error: api · scan · boom",
+    Operation.SYNC: "error: api · sync · boom",
+}
+_STEP_WORDS = [
+    (FindingStepKind.PREPARE, "prepare"),
+    (FindingStepKind.PACKAGE_COMMAND, "package command"),
+    (FindingStepKind.TEST, "test"),
+    (FindingStepKind.INSPECT, "inspect"),
+    (FindingStepKind.COMMIT, "commit"),
+    (FindingStepKind.BOOKMARK, "bookmark"),
+    (FindingStepKind.DISCARD, "discard"),
+]
+_RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
+
+
 @pytest.mark.parametrize("batch", [False, True])
-def test_given_pull_request_output_when_rendered_then_it_is_indented_and_dim(
-    monkeypatch: pytest.MonkeyPatch, batch: bool
-) -> None:
-    output = StringIO()
-    monkeypatch.setattr(
-        cli,
-        "console",
-        Console(
-            file=output,
-            width=220,
-            force_terminal=True,
-            color_system="standard",
+@pytest.mark.parametrize(
+    ("event", "flow", "stdout", "stderr"),
+    [
+        (FindingStarted("vuln", "pkg", "1.0", "1.1", "CVE-1"), "update", "", ""),
+        (events.TestCommandStarted("uv run pytest"), "update", "", ""),
+        *[
+            (
+                FindingStepFailed(step, "boom"),
+                "update",
+                "",
+                f"error: {words} · boom\n",
+            )
+            for step, words in _STEP_WORDS
+        ],
+        (
+            FindingPassed("pkg", False, "1.0", "1.1"),
+            "update",
+            "api\tupdate\tpassed\tpkg\t1.0\t1.1\t-\n",
+            "",
         ),
+        (
+            FindingPassed("pkg", True, "1.0", "1.1"),
+            "update",
+            "api\tupdate\tpassed\tpkg\t1.0\t1.1\talready applied\n",
+            "",
+        ),
+        (
+            FindingFailed("pkg", "unit", "1.0", "1.1"),
+            "update",
+            "api\tupdate\tfailed\tpkg\t1.0\t1.1\tunit failed\n",
+            "",
+        ),
+        (
+            FindingFailed("pkg", "apply", "1.0", "1.1"),
+            "update",
+            "api\tupdate\tfailed\tpkg\t1.0\t1.1\tapply failed\n",
+            "",
+        ),
+        (FindingFailed("pkg", "commit", "1.0", "1.1"), "resolve", _RESOLVE_RECORD, ""),
+        (
+            FindingPassed("pkg[red]", False, "1.0", "1.1"),
+            "update",
+            "api\tupdate\tpassed\tpkg[red]\t1.0\t1.1\t-\n",
+            "",
+        ),
+        (
+            Promoted("mm/update-dependencies"),
+            "update",
+            "api\tpromotion\tpassed\tlocal main\t-\t-\t-\n",
+            "",
+        ),
+        (
+            OperationFailed(Operation.PROMOTE, "api", "conflict"),
+            "update",
+            "api\tpromotion\tfailed\tlocal main\t-\t-\tconflict\n",
+            "",
+        ),
+        (ProcessingStarted(2, 1), "update", "", ""),
+        (ProjectStarted("api"), "update", "", ""),
+        (
+            MissingTestConfig("api"),
+            "update",
+            "",
+            "warning: api · no test configuration · test phases skipped\n",
+        ),
+        (
+            ResolvePaused("api"),
+            "update",
+            "",
+            "Resolve paused\nhint: mm resolve api --continue\n",
+        ),
+        (
+            FindingsBlocked((("pkg", "no fix"),)),
+            "update",
+            "api\tresolve\tblocked\tpkg\t-\t-\tno fix\n",
+            "",
+        ),
+        (
+            ScanReported(_pipe_scan()),
+            "update",
+            "api\tupdate\tblocked\tpkg\t1.0\t1.1\ttoo young\n",
+            "",
+        ),
+        (
+            SubmissionBlocked("api"),
+            "update",
+            "",
+            "warning: api · blocked findings remain · "
+            "rescan or resolve them manually\n",
+        ),
+        (
+            BlockersStillFailing("unit", ("a", "b")),
+            "update",
+            "",
+            "error: unit · still blocking: a, b\n",
+        ),
+        (PullRequestOutput("https://x/pull/1"), "update", "", "https://x/pull/1\n"),
+        (
+            GradleWithheld("org.x:lib -> 2", "too young"),
+            "update",
+            "api\tupdate\tblocked\torg.x:lib -> 2\t-\t-\ttoo young\n",
+            "",
+        ),
+        (
+            GradleWithheld("org.x:lib -> 2", "too young"),
+            "resolve",
+            "api\tresolve\tblocked\torg.x:lib -> 2\t-\t-\ttoo young\n",
+            "",
+        ),
+        (
+            GradleWithheld("g:[red]lib", "too [new]"),
+            "update",
+            "api\tupdate\tblocked\tg:[red]lib\t-\t-\ttoo [new]\n",
+            "",
+        ),
+        (
+            NoEligibleGradleChanges(),
+            "update",
+            "",
+            "No eligible Gradle changes in api\n",
+        ),
+        (
+            GradleRunArchived(Path("/tmp/run.json")),
+            "update",
+            "",
+            "warning: archived failed Gradle run to /tmp/run.json · "
+            "rebuilding candidates from main\n",
+        ),
+        (
+            GradleFlowFailed(Workflow.UPDATE, "bad"),
+            "update",
+            "",
+            "error: cannot complete Gradle update · bad\n",
+        ),
+    ],
+)
+def test_given_event_when_rendered_in_pipe_then_records_and_diagnostics_split_by_stream(
+    capsys: pytest.CaptureFixture[str],
+    batch: bool,
+    event: Event,
+    flow: str,
+    stdout: str,
+    stderr: str,
+) -> None:
+    cli._Renderer(batch=batch, project="api", flow=flow)(event)
+
+    captured = capsys.readouterr()
+    assert captured.out == stdout
+    assert captured.err == stderr
+
+
+@pytest.mark.parametrize(
+    "operation", [item for item in Operation if item is not Operation.PROMOTE]
+)
+def test_given_operation_failure_when_rendered_then_diagnostic_goes_to_stderr(
+    capsys: pytest.CaptureFixture[str], operation: Operation
+) -> None:
+    cli._Renderer(batch=False, project="api")(OperationFailed(operation, "api", "boom"))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{_OPERATION_DIAGNOSTICS[operation]}\n"
+
+
+@pytest.mark.parametrize(
+    ("batch", "expected"),
+    [(False, "1 passed · 1 failed\n"), (True, "")],
+    ids=["single", "batch"],
+)
+def test_given_processed_findings_when_rendered_then_only_single_project_prints_totals(
+    capsys: pytest.CaptureFixture[str], batch: bool, expected: str
+) -> None:
+    results = (
+        UpdateResult("a", "update", True),
+        UpdateResult("b", "vuln", False, "unit"),
     )
 
-    cli._Renderer(batch=batch)(PullRequestOutput("https://x/pull/1"))
+    cli._Renderer(batch=batch, project="api")(FindingsProcessed(results))
 
-    rendered = Text.from_ansi(output.getvalue())
-    assert rendered.plain == "  https://x/pull/1\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        (
+            (UpdateResult("a", "update", True), UpdateResult("b", "update", True)),
+            "2 passed\n",
+        ),
+        ((UpdateResult("a", "update", False, "unit"),), "1 failed\n"),
+        ((), ""),
+    ],
+    ids=["passed-only", "failed-only", "none"],
+)
+def test_given_finding_totals_when_rendered_then_zero_counts_are_omitted(
+    capsys: pytest.CaptureFixture[str],
+    results: tuple[UpdateResult, ...],
+    expected: str,
+) -> None:
+    cli._Renderer(batch=False, project="api")(FindingsProcessed(results))
+
+    assert capsys.readouterr().err == expected
+
+
+@pytest.mark.parametrize(
+    ("verbose", "expected"), [(False, ""), (True, "$ uv run pytest\n")]
+)
+def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
+    capsys: pytest.CaptureFixture[str], verbose: bool, expected: str
+) -> None:
+    maintenance_output.set_verbose(verbose)
+
+    renderer = cli._Renderer(batch=False, project="api")
+    renderer(events.TestCommandStarted("uv run pytest"))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            FindingPassed("pkg", False, "1.0", "1.1"),
+            "  ✓ passed   pkg                       1.0 → 1.1",
+        ),
+        (
+            FindingFailed("pkg", "unit", "1.0", "1.1"),
+            "  ✗ failed   pkg                       1.0 → 1.1             unit failed",
+        ),
+        (Promoted("mm/update-dependencies"), "  ✓ passed   local main"),
+        (ProcessingStarted(2, 1), "api · 2 vulnerabilities · 1 updates"),
+    ],
+    ids=["passed", "failed", "promoted", "processing"],
+)
+def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
+    monkeypatch: pytest.MonkeyPatch, event: Event, expected: str
+) -> None:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+
+    cli._Renderer(batch=False, project="api")(event)
+
+    assert Text.from_ansi(stream.getvalue()).plain == f"{expected}\n"
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_given_pull_request_output_when_rendered_then_stderr_text_is_dim(
+    monkeypatch: pytest.MonkeyPatch, batch: bool
+) -> None:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stderr", stream)
+    monkeypatch.setenv("TERM", "xterm")
+
+    cli._Renderer(batch=batch)(PullRequestOutput("https://x/pull/[1]"))
+
+    rendered = Text.from_ansi(stream.getvalue())
+    assert rendered.plain == "https://x/pull/[1]\n"
     assert rendered.spans
     assert all("dim" in str(span.style) for span in rendered.spans)
 
@@ -305,20 +498,15 @@ def test_given_summary_events_when_rendered_then_exact_payloads_are_forwarded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scan = make_scan_result()
-    results = (UpdateResult("pkg", "update", True),)
     run = _make_gradle_run()
     print_scan = MagicMock()
-    print_updates = MagicMock()
     print_gradle = MagicMock()
     monkeypatch.setattr(cli, "_print_scan_result", print_scan)
-    monkeypatch.setattr(cli, "_print_update_summary", print_updates)
     monkeypatch.setattr(cli, "_print_gradle_run_summary", print_gradle)
 
     cli._Renderer(batch=False, flow="scan")(ScanReported(scan, elapsed_s=1.25))
     print_scan.assert_called_once_with(scan, elapsed_s=1.25)
     print_scan.reset_mock()
-    cli._Renderer(batch=False)(FindingsProcessed(results))
-    print_updates.assert_called_once_with(list(results))
     cli._Renderer(batch=False)(GradleRunReported(scan, run))
     print_scan.assert_called_once_with(scan)
     print_gradle.assert_called_once_with(run)
@@ -387,24 +575,6 @@ def test_given_clean_scan_when_reported_then_notice_depends_on_timing_and_batch(
 
 
 @pytest.mark.parametrize(
-    "step",
-    [
-        FindingStepKind.PREPARE,
-        FindingStepKind.INSPECT,
-        FindingStepKind.COMMIT,
-        FindingStepKind.BOOKMARK,
-        FindingStepKind.DISCARD,
-    ],
-)
-@pytest.mark.parametrize("batch", [False, True])
-def test_given_non_package_finding_step_failure_when_rendered_then_error_is_printed(
-    output, step, batch
-):
-    cli._Renderer(batch=batch)(FindingStepFailed(step, "bad [state]"))
-    assert output.getvalue().strip("\n") == "  FAIL bad [state]"
-
-
-@pytest.mark.parametrize(
     ("reason", "detail", "single", "batch_text"),
     [
         (
@@ -452,60 +622,4 @@ def test_given_skip_reason_when_rendered_then_mode_specific_literal_is_printed(
     output, reason, detail, single, batch_text, batch
 ):
     cli._Renderer(batch=batch)(ProjectSkipped("a[b]", reason, detail))
-    assert output.getvalue().strip("\n") == (batch_text if batch else single)
-
-
-@pytest.mark.parametrize(
-    ("operation", "single", "batch_text"),
-    [
-        (
-            Operation.UPDATE_SETUP,
-            "  Error: a[b] — bad [state]",
-            "  Error: a[b] — bad [state]",
-        ),
-        (
-            Operation.PROMOTE,
-            "Promotion failed: bad [state]",
-            "Promotion failed: bad [state]",
-        ),
-        (
-            Operation.REFRESH,
-            "Workspace refresh failed: a[b]: bad [state]",
-            "Workspace refresh failed: a[b]: bad [state]",
-        ),
-        (
-            Operation.WORKSPACE_CLEANUP,
-            "Workspace cleanup failed: bad [state]",
-            "  Workspace cleanup failed: bad [state]",
-        ),
-        (
-            Operation.BOOKMARK_CLEANUP,
-            "Bookmark cleanup failed: bad [state]",
-            "  Bookmark cleanup failed: a[b] — bad [state]",
-        ),
-        (
-            Operation.RESOLVE_SETUP,
-            "  Resolve setup failed: bad [state]",
-            "  Resolve setup failed: bad [state]",
-        ),
-        (
-            Operation.SUBMIT,
-            "  bad [state]\n  Submit failed. Keeping mm/resolve-dependencies "
-            "for manual recovery.",
-            "  bad [state]\n  Submit failed. Keeping mm/resolve-dependencies "
-            "for manual recovery.",
-        ),
-        (
-            Operation.REMOTE_SYNC,
-            "Warning: a[b] — failed to sync remote: bad [state]",
-            "Warning: a[b] — failed to sync remote: bad [state]",
-        ),
-        (Operation.SYNC, "  a[b] — bad [state]", "  a[b] — bad [state]"),
-    ],
-)
-@pytest.mark.parametrize("batch", [False, True])
-def test_given_operation_failure_when_rendered_then_mode_specific_literal_is_printed(
-    output, operation, single, batch_text, batch
-):
-    cli._Renderer(batch=batch)(OperationFailed(operation, "a[b]", "bad [state]"))
     assert output.getvalue().strip("\n") == (batch_text if batch else single)

@@ -1,5 +1,6 @@
 import re
 import subprocess
+from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -69,6 +70,38 @@ def test_parse_selection(text, count, expected):
     assert cli._parse_selection(text, count) == expected
 
 
+def test_given_numeric_reply_when_choosing_findings_then_choices_and_prompt_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.stdin", StringIO("2\n"))
+    update = make_update()
+
+    chosen = cli._choose_findings([make_vuln()], [update])
+
+    captured = capsys.readouterr()
+    assert chosen == ([], [update])
+    assert captured.out == ""
+    lines = captured.err.splitlines()
+    assert "  1  ! vuln" in lines[0]
+    assert "some-pkg" in lines[0]
+    assert "  2  ~ update" in lines[1]
+    assert "pkg-a" in lines[1]
+    assert lines[2] == "Select updates [all/vulns/updates/1,2,.../none] (all): "
+
+
+def test_given_invalid_reply_when_choosing_findings_then_error_precedes_next_prompt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.stdin", StringIO("bogus\nnone\n"))
+
+    chosen = cli._choose_findings([make_vuln()], [make_update()])
+
+    captured = capsys.readouterr()
+    assert chosen == ([], [])
+    assert captured.out == ""
+    assert "error: Invalid selection: bogus" in captured.err
+
+
 def _seed_update_bookmark(deps: CliDeps) -> None:
     repo = deps.vcs_state.services().repository(deps.project_paths["vulnerable"])
     repo.set_bookmark(bookmark="mm/update-dependencies", revision="main")
@@ -107,7 +140,7 @@ def _use_real_mixed_processor(
     )
     monkeypatch.setattr("maintenance_man.updater.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_live", phase)
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
     return package, phase
 
 
@@ -298,12 +331,12 @@ def test_given_missing_test_config_when_run_then_warns_and_succeeds(
             finding.failed_phase = None
             finding.flow = None
         save_scan_results("no-tests", deps.scan_result)
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
 
     assert run_mm(command, "no-tests") == ExitCode.OK
     assert (
-        "  Warning: no-tests — no test configuration (test phases will be skipped)"
-        in capsys.readouterr().out.splitlines()
+        "warning: no-tests · no test configuration · test phases skipped"
+        in capsys.readouterr().err.splitlines()
     )
 
 
@@ -337,8 +370,8 @@ def test_given_batch_flow_conflict_when_run_then_exits_four_with_both_projects(
 
     assert run_mm("update", "vulnerable", "clean") == ExitCode.UPDATE_FAILED
     lines = capsys.readouterr().out.splitlines()
-    assert "vulnerable" in lines
-    assert "clean" in lines
+    assert any(line.startswith("  Skipped: vulnerable") for line in lines)
+    assert "clean\tpromotion\tpassed\tlocal main\t-\t-\t-" in lines
 
 
 class TestUpdatePreChecks:
@@ -399,11 +432,11 @@ class TestUpdateSelection:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         prompt = MagicMock(side_effect=["9", "1"])
-        monkeypatch.setattr("maintenance_man.cli.Prompt.ask", prompt)
+        monkeypatch.setattr("maintenance_man.output.prompt", prompt)
 
         assert run_mm("update", "vulnerable") == 0
         assert prompt.call_count == 2
-        assert capsys.readouterr().out.count("Invalid selection: '9'. Try again.") == 1
+        assert capsys.readouterr().err.count("error: Invalid selection: 9") == 1
         project_path = mock_update_cli_deps.project_paths["vulnerable"]
         assert (project_path / "mm-fixture-some-pkg.txt").is_file()
         assert not (project_path / "mm-fixture-pkg-a.txt").exists()
@@ -419,7 +452,7 @@ class TestUpdateSelection:
             "maintenance_man.services.update.process_findings", processor
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
+            "maintenance_man.output.prompt", MagicMock(return_value="none")
         )
         assert run_mm("update", "vulnerable") == 0
         processor.assert_not_called()
@@ -431,7 +464,7 @@ class TestUpdateSelection:
         monkeypatch: pytest.MonkeyPatch,
     ):
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+            "maintenance_man.output.prompt", MagicMock(return_value="vulns")
         )
         assert run_mm("update", "vulnerable") == 0
         project_path = mock_update_cli_deps.project_paths["vulnerable"]
@@ -506,36 +539,109 @@ class TestUpdateCrossCategoryStops:
             ),
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="all")
+            "maintenance_man.output.prompt", MagicMock(return_value="all")
         )
         assert run_mm("update", "vulnerable") == 4
 
-    def test_commit_failure_summary_uses_friendly_label(
+    def test_given_commit_failure_when_updated_then_record_and_totals_report_it(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: CliDeps,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
-        monkeypatch.setattr(
-            "maintenance_man.services.update.process_findings",
-            MagicMock(
-                return_value=[
-                    UpdateResult(
-                        pkg_name="some-pkg",
-                        kind="vuln",
-                        passed=False,
-                        failed_phase="commit",
-                    )
-                ]
-            ),
+        _use_real_mixed_processor(
+            mock_update_cli_deps, mm_home_with_projects, monkeypatch
         )
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="vulns")
+            "maintenance_man.output.prompt", MagicMock(return_value="vulns")
+        )
+        mock_update_cli_deps.vcs_state.fail(
+            "commit", error=RevisionError("cannot commit")
         )
 
-        assert run_mm("update", "vulnerable") == 4
-        assert "commit failed" in capsys.readouterr().out
+        assert run_mm("update", "outdated") == 4
+
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "outdated\tupdate\tfailed\tsome-pkg\t1.0.0\t1.0.1\tcommit failed"
+        ]
+        assert "error: commit · cannot commit" in captured.err.splitlines()
+        assert captured.err.splitlines()[-1] == "1 failed"
+
+
+class TestUpdateOutcomeRecords:
+    def test_given_one_failing_package_when_updated_then_records_and_totals_split(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: CliDeps,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _, phase = _use_real_mixed_processor(
+            mock_update_cli_deps, mm_home_with_projects, monkeypatch
+        )
+        phase.side_effect = [None, ProcessError("unit tests failed (exit 1)")]
+
+        assert run_mm("update", "outdated") == ExitCode.UPDATE_FAILED
+
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "outdated\tupdate\tpassed\tsome-pkg\t1.0.0\t1.0.1\t-",
+            "outdated\tupdate\tfailed\tpkg-a\t1.0.0\t1.0.1\tunit failed",
+        ]
+        assert captured.err.splitlines()[-1] == "1 passed · 1 failed"
+
+    def test_given_all_packages_pass_when_updated_then_promotion_is_a_third_record(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: CliDeps,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _use_real_mixed_processor(
+            mock_update_cli_deps, mm_home_with_projects, monkeypatch
+        )
+
+        assert run_mm("update", "outdated") == ExitCode.OK
+
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "outdated\tupdate\tpassed\tsome-pkg\t1.0.0\t1.0.1\t-",
+            "outdated\tupdate\tpassed\tpkg-a\t1.0.0\t1.0.1\t-",
+            "outdated\tpromotion\tpassed\tlocal main\t-\t-\t-",
+        ]
+        assert captured.err.splitlines()[-1] == "2 passed"
+
+    def test_given_blocked_vulnerability_when_updated_then_it_is_recorded_unpromoted(
+        self,
+        mm_home_with_projects: Path,
+        mock_update_cli_deps: CliDeps,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _use_real_mixed_processor(
+            mock_update_cli_deps, mm_home_with_projects, monkeypatch
+        )
+        saved = load_scan_results("outdated")
+        saved.vulnerabilities.append(
+            make_vuln(
+                pkg_name="stuck",
+                installed_version="2.0",
+                fixed_version=None,
+                status="affected",
+                blocked_reason="no fixed version",
+            )
+        )
+        save_scan_results("outdated", saved)
+
+        assert run_mm("update", "outdated") == ExitCode.UPDATE_FAILED
+
+        assert capsys.readouterr().out.splitlines() == [
+            "outdated\tupdate\tblocked\tstuck\t2.0\t-\tno fixed version",
+            "outdated\tupdate\tpassed\tsome-pkg\t1.0.0\t1.0.1\t-",
+            "outdated\tupdate\tpassed\tpkg-a\t1.0.0\t1.0.1\t-",
+        ]
 
 
 class TestUpdateNumberedSelection:
@@ -548,7 +654,7 @@ class TestUpdateNumberedSelection:
         """Selecting '1' should pick the first finding."""
 
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="1")
+            "maintenance_man.output.prompt", MagicMock(return_value="1")
         )
         assert run_mm("update", "vulnerable") == 0
         project_path = mock_update_cli_deps.project_paths["vulnerable"]
@@ -569,10 +675,10 @@ class TestUpdateNumberedSelection:
             ),
         )
         prompt = MagicMock(return_value="2,1")
-        monkeypatch.setattr("maintenance_man.cli.Prompt.ask", prompt)
+        monkeypatch.setattr("maintenance_man.output.prompt", prompt)
 
         assert run_mm("update", "vulnerable") == ExitCode.OK
-        assert "Select updates \\[all/updates/1,2,.../none]" in prompt.call_args.args[0]
+        assert "Select updates [all/updates/1,2,.../none]" in prompt.call_args.args[0]
 
 
 class TestUpdateResume:
@@ -595,7 +701,7 @@ class TestUpdateResume:
         state = mock_update_cli_deps.vcs_state
         state.clear_calls()
         mock_prompt = MagicMock()
-        monkeypatch.setattr("maintenance_man.cli.Prompt.ask", mock_prompt)
+        monkeypatch.setattr("maintenance_man.output.prompt", mock_prompt)
 
         assert run_mm("update", "vulnerable") == 0
 
@@ -624,19 +730,19 @@ class TestUpdateResume:
         _seed_update_bookmark(mock_update_cli_deps)
 
         monkeypatch.setattr(
-            "maintenance_man.cli.Prompt.ask", MagicMock(return_value="none")
+            "maintenance_man.output.prompt", MagicMock(return_value="none")
         )
 
         assert run_mm("update", "vulnerable") == 4
 
-        output = capsys.readouterr().out
-        assert "some-pkg" not in output
+        captured = capsys.readouterr()
+        assert "some-pkg" not in captured.err
         numbered_rows = [
             re.sub(r"\s+", " ", line.strip())
-            for line in output.splitlines()
-            if re.match(r"\s*\d+\.", line)
+            for line in captured.err.splitlines()
+            if re.match(r"\s*\d+\s", line)
         ]
-        assert numbered_rows == ["1. UPDATE pkg-a 1.0.0 -> 1.0.1 (patch)"]
+        assert numbered_rows == ["1 ~ update patch 1.0.0 → 1.0.1 pkg-a"]
 
 
 class TestUpdateAll:
@@ -692,8 +798,8 @@ class TestUpdateAll:
         )
 
         assert run_mm("update", "vulnerable", "clean") == ExitCode.UPDATE_FAILED
-        output = capsys.readouterr().out
-        assert "Bookmark cleanup failed" in output
+        output = capsys.readouterr().err
+        assert "error: vulnerable · bookmark cleanup · " in output
         vulnerable_repo = mock_update_cli_deps.vcs_state.services().repository(
             vulnerable_path
         )
@@ -709,12 +815,17 @@ class TestUpdateAll:
 
 
 @pytest.mark.parametrize(
-    ("failing_operation", "expected_line"),
+    ("failing_operation", "stream", "expected_line"),
     [
-        ("promote_bookmark_to_main", "Promotion failed: injected"),
+        (
+            "promote_bookmark_to_main",
+            "out",
+            "vulnerable\tpromotion\tfailed\tlocal main\t-\t-\tinjected",
+        ),
         (
             "working_copy_state",
-            "Workspace refresh failed: vulnerable: injected",
+            "err",
+            "error: vulnerable · workspace refresh · injected",
         ),
     ],
 )
@@ -724,9 +835,10 @@ def test_given_finalisation_failure_when_run_then_exits_four_with_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     failing_operation: str,
+    stream: str,
     expected_line: str,
 ) -> None:
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
     mock_update_cli_deps.vcs_state.fail(
         failing_operation,
         error=RevisionError("injected"),
@@ -734,7 +846,14 @@ def test_given_finalisation_failure_when_run_then_exits_four_with_error(
     )
 
     assert run_mm("update", "vulnerable") == ExitCode.UPDATE_FAILED
-    assert expected_line in capsys.readouterr().out.splitlines()
+    captured = capsys.readouterr()
+    expected, other = (
+        (captured.out, captured.err)
+        if stream == "out"
+        else (captured.err, captured.out)
+    )
+    assert expected_line in expected.splitlines()
+    assert expected_line not in other.splitlines()
 
 
 def test_given_successful_update_when_run_then_exits_zero_with_promotion(
@@ -743,11 +862,11 @@ def test_given_successful_update_when_run_then_exits_zero_with_promotion(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
 
     assert run_mm("update", "vulnerable") == ExitCode.OK
     assert (
-        "Promoted mm/update-dependencies to main."
+        "vulnerable\tpromotion\tpassed\tlocal main\t-\t-\t-"
         in capsys.readouterr().out.splitlines()
     )
 
@@ -758,7 +877,7 @@ def test_given_workspace_cleanup_failure_when_run_then_exits_four_with_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
     mock_update_cli_deps.vcs_state.fail(
         "forget_workspace",
         error=RevisionError("injected"),
@@ -766,7 +885,10 @@ def test_given_workspace_cleanup_failure_when_run_then_exits_four_with_error(
     )
 
     assert run_mm("update", "vulnerable") == ExitCode.UPDATE_FAILED
-    assert "Workspace cleanup failed: injected" in capsys.readouterr().out.splitlines()
+    assert (
+        "error: vulnerable · workspace cleanup · injected"
+        in capsys.readouterr().err.splitlines()
+    )
 
 
 def test_update_end_to_end_uses_one_graph_and_persists_completion(
@@ -781,7 +903,7 @@ def test_update_end_to_end_uses_one_graph_and_persists_completion(
         make_vuln(pkg_name="unrelated", vuln_id="CVE-open", fixed_version=None)
     )
     mock_update_cli_deps.save_scan()
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
+    monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
     state = mock_update_cli_deps.vcs_state
     source = mock_update_cli_deps.vcs_state.services().repository(
         mock_update_cli_deps.project_paths["vulnerable"]
@@ -984,10 +1106,6 @@ class TestUpdateTargetSelection:
             ]
         )
         monkeypatch.setattr(update_service, "update_project", mock_project)
-        monkeypatch.setattr(
-            "maintenance_man.cli._print_mass_update_summary",
-            MagicMock(),
-        )
 
         assert run_mm("update", "vulnerable", "clean") == 4
         assert [call.args[0] for call in mock_project.call_args_list] == [
@@ -1077,7 +1195,7 @@ def gradle_update_cli(
     )
     # `mm update <one project>` is the interactive single-project path, so every
     # test here must answer the selection prompt; individual tests override this.
-    monkeypatch.setattr("maintenance_man.cli.Prompt.ask", lambda *a, **k: "all")
+    monkeypatch.setattr("maintenance_man.output.prompt", lambda *a, **k: "all")
     return spies
 
 
@@ -1140,31 +1258,19 @@ def _gradle_scan_state(mock_update_cli_deps: CliDeps) -> ScanResult:
     return mock_update_cli_deps.scan_result
 
 
-def test_batch_summary_labels_pass_and_fail(capsys):
-    from maintenance_man.cli import _print_mass_update_summary
-
-    _print_mass_update_summary(
+def test_given_mixed_results_when_totals_printed_then_stderr_counts_each_state(capsys):
+    cli._print_result_totals(
         [
-            (
-                "a[b]",
-                [
-                    UpdateResult(pkg_name="room[x]", kind="update", passed=True),
-                    UpdateResult(
-                        pkg_name="okhttp",
-                        kind="vuln",
-                        passed=False,
-                        failed_phase="unit",
-                    ),
-                ],
-            )
+            UpdateResult(pkg_name="room", kind="update", passed=True),
+            UpdateResult(
+                pkg_name="okhttp", kind="vuln", passed=False, failed_phase="unit"
+            ),
         ]
     )
-    out = capsys.readouterr().out
-    assert "PASS" in out
-    assert "FAIL (unit)" in out
-    assert "BLOCKED" not in out
-    assert "a[b]" in out
-    assert "room[x]" in out
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "1 passed · 1 failed\n"
 
 
 @pytest.mark.parametrize("batch", [False, True])

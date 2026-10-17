@@ -79,10 +79,10 @@ def test_given_failed_resolve_when_run_then_exits_four_with_continuation(
         FakeFindingProcessor({"some-pkg": (False, "unit")}),
     )
     assert run_mm("resolve", "vulnerable") == ExitCode.UPDATE_FAILED
-    assert (
-        "  Resolve paused. Continue with mm resolve vulnerable --continue."
-        in capsys.readouterr().out.splitlines()
-    )
+    assert capsys.readouterr().err.splitlines()[-2:] == [
+        "Resolve paused",
+        "hint: mm resolve vulnerable --continue",
+    ]
 
 
 def test_given_paused_resolve_when_run_then_exits_one_with_instruction(

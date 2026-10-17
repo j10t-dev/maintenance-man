@@ -179,12 +179,16 @@ class FindingStepFailed:
 class FindingPassed:
     pkg: str
     already_applied: bool
+    installed: str
+    target: str
 
 
 @dataclass(frozen=True, slots=True)
 class FindingFailed:
     pkg: str
     phase: str
+    installed: str
+    target: str
 
 
 @dataclass(frozen=True, slots=True)

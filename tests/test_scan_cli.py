@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from rich.console import Console
 
 from maintenance_man import cli, scanner
 from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code
@@ -30,6 +29,7 @@ from maintenance_man.models.scan import (
     Severity,
     UpdateFinding,
     VulnFinding,
+    Workflow,
 )
 from maintenance_man.services import scan as scan_service
 from maintenance_man.services.scan import ScanSummary
@@ -83,12 +83,8 @@ def test_given_blocked_update_when_scan_result_printed_then_row_is_literal(
 
 
 def test_numbered_findings_print_bracketed_values_literally(
-    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=220, color_system=None)
-    )
     vuln = (
         _make_vulnerable_result()
         .vulnerabilities[0]
@@ -100,9 +96,11 @@ def test_numbered_findings_print_bracketed_values_literally(
 
     cli._print_numbered_findings([vuln], [update])
 
-    assert "a[b]" in output.getvalue()
-    assert "CVE-[x]" in output.getvalue()
-    assert "u[p]" in output.getvalue()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "a[b]" in captured.err
+    assert "CVE-[x]" in captured.err
+    assert "u[p]" in captured.err
 
 
 def _make_vulnerable_result() -> ScanResult:
@@ -263,8 +261,8 @@ def test_given_remote_sync_failure_when_scan_runs_then_exits_zero_with_warning(
 
     assert run_mm("scan", "clean") == ExitCode.OK
     assert (
-        "Warning: clean — failed to sync remote: offline"
-        in capsys.readouterr().out.splitlines()
+        "warning: clean · failed to sync remote · offline"
+        in capsys.readouterr().err.splitlines()
     )
 
 
@@ -475,11 +473,13 @@ def test_given_long_blocked_detail_when_rendered_narrow_then_text_ends_in_ellips
 
 
 def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
-    cli._Renderer(batch=False)(FindingsBlocked((("example", "apply failed"),)))
+    cli._Renderer(batch=False, project="api", flow="resolve")(
+        FindingsBlocked((("example", "apply failed"),))
+    )
 
-    out = capsys.readouterr().out
-    assert "BLOCKED example" in out
-    assert "apply failed" in out
+    assert capsys.readouterr().out == (
+        "api\tresolve\tblocked\texample\t-\t-\tapply failed\n"
+    )
 
 
 def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
@@ -508,7 +508,7 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
 
     assert run_mm("scan") == ExitCode.ERROR
     assert "clean" in scanned or len(scanned) > 1
-    assert "boom" in capsys.readouterr().out
+    assert "boom" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("all_projects", [False, True])
@@ -638,6 +638,8 @@ def test_gradle_advisories_keep_installed_versions_separate(capsys):
 
 def _summary_run(blocks=(), attempts=(), residuals=()):
     return SimpleNamespace(
+        project="api",
+        flow=Workflow.UPDATE,
         selection_blocks=tuple(blocks),
         attempts=tuple(attempts),
         accepted_snapshot=SimpleNamespace(findings=tuple(residuals)),
@@ -689,11 +691,7 @@ def _summary_attempt(state, reference="shared", reason="too young"):
     )
 
 
-def test_gradle_retry_summary_renders_persisted_selection_blocks(monkeypatch):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
+def test_gradle_retry_summary_renders_persisted_selection_blocks(capsys):
     blocks = [
         CandidateWithheld(
             group_key=group,
@@ -716,22 +714,18 @@ def test_gradle_retry_summary_renders_persisted_selection_blocks(monkeypatch):
     ]
     run = _summary_run(loaded, (_summary_attempt("completed"),), (object(),))
     cli._print_gradle_run_summary(run)
-    text = output.getvalue()
-    assert "Verified: 1; withheld: 3; failed: 0; residual advisories: 1" in text
-    assert text.count("WITHHELD TARGET") == 3
-    assert text.count("ref:first") == 2
-    assert text.count("ref:second") == 1
-    assert text.count("too young") == 2
-    assert text.count("unsupported routing") == 1
+    captured = capsys.readouterr()
+    assert "1 verified · 3 withheld · 0 failed · 1 residual advisories" in captured.err
+    assert captured.out.splitlines() == [
+        "api\tupdate\tblocked\tref:first\t-\t-\ttoo young",
+        "api\tupdate\tblocked\tref:first\t-\t-\tunsupported routing",
+        "api\tupdate\tblocked\tref:second\t-\t-\ttoo young",
+    ]
 
 
 def test_gradle_summary_keeps_unknown_versions_and_collapses_duplicate_reasons(
-    monkeypatch,
+    capsys,
 ):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
     blocks = [
         CandidateWithheld(
             group_key=None,
@@ -743,21 +737,17 @@ def test_gradle_summary_keeps_unknown_versions_and_collapses_duplicate_reasons(
         for version, advisory in (("1.0", "CVE-A"), ("1.0", "CVE-B"), ("2.0", "CVE-C"))
     ]
     cli._print_gradle_run_summary(_summary_run(blocks))
-    text = output.getvalue()
-    assert "withheld: 2" in text
-    assert text.count("RESIDUAL PACKAGE") == 2
-    assert text.count("g:unowned@1.0") == 1
-    assert text.count("g:unowned@2.0") == 1
-    assert text.count("ambiguous owner") == 2
+    captured = capsys.readouterr()
+    assert "2 withheld" in captured.err
+    assert captured.out.splitlines() == [
+        "api\tupdate\tblocked\tg:unowned@1.0\t-\t-\tambiguous owner",
+        "api\tupdate\tblocked\tg:unowned@2.0\t-\t-\tambiguous owner",
+    ]
 
 
 def test_gradle_summary_deduplicates_selection_and_attempt_but_retains_failures(
-    monkeypatch,
+    capsys,
 ):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
     block = CandidateWithheld(
         group_key="ref:shared",
         coordinate="g:shared",
@@ -774,10 +764,9 @@ def test_gradle_summary_deduplicates_selection_and_attempt_but_retains_failures(
         ),
     )
     cli._print_gradle_run_summary(run)
-    text = output.getvalue()
-    assert "Verified: 1; withheld: 1; failed: 2; residual advisories: 0" in text
-    assert text.count("WITHHELD TARGET") == 1
-    assert text.count("too young") == 1
-    assert "shared -> 2.0" in text
-    assert "FAILED broken -> 2.0" in text
-    assert "unit tests failed" in text
+    captured = capsys.readouterr()
+    assert "1 verified · 1 withheld · 2 failed · 0 residual advisories" in captured.err
+    assert captured.out.splitlines() == [
+        "api\tupdate\tblocked\tshared -> 2.0\t-\t-\ttoo young",
+        "api\tupdate\tfailed\tbroken -> 2.0\t-\t-\tunit tests failed",
+    ]

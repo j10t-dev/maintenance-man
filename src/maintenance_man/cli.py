@@ -10,7 +10,6 @@ from typing import Annotated, Literal, NoReturn
 import cyclopts
 from rich.console import Console
 from rich.markup import escape
-from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -40,7 +39,6 @@ from maintenance_man.models.events import (
     FindingsProcessed,
     FindingStarted,
     FindingStepFailed,
-    FindingStepKind,
     GradleFlowFailed,
     GradleRunArchived,
     GradleRunReported,
@@ -192,30 +190,19 @@ _SKIP_BATCH_OVERRIDES: dict[SkipReason, str | None] = {
     SkipReason.UNCHANGED: "[dim]{name} — unchanged since last deploy[/]",
 }
 
-_OPERATION_TEXT: dict[Operation, str] = {
-    Operation.UPDATE_SETUP: "  [bold red]Error:[/] {name} — {error}",
-    Operation.PROMOTE: "[bold red]Promotion failed:[/] {error}",
-    Operation.REFRESH: "[bold red]Workspace refresh failed:[/] {name}: {error}",
-    Operation.WORKSPACE_CLEANUP: "[bold red]Workspace cleanup failed:[/] {error}",
-    Operation.BOOKMARK_CLEANUP: "[bold red]Bookmark cleanup failed:[/] {error}",
-    Operation.RESOLVE_SETUP: "  [bold red]Resolve setup failed:[/] {error}",
-    Operation.SUBMIT: (
-        "  [dim]{error}[/]\n  [bold yellow]Submit failed.[/] Keeping {bookmark} "
-        "for manual recovery."
-    ),
-    Operation.REMOTE_SYNC: (
-        "[bold yellow]Warning:[/] {name} — failed to sync remote: {error}"
-    ),
-    Operation.SCAN: "[bold red]Error:[/] {name} — {error}",
-    Operation.SYNC: "[bold red]  {name} — {error}[/]",
+_OPERATION_WORDS: dict[Operation, str] = {
+    Operation.UPDATE_SETUP: "update setup",
+    Operation.REFRESH: "workspace refresh",
+    Operation.WORKSPACE_CLEANUP: "workspace cleanup",
+    Operation.BOOKMARK_CLEANUP: "bookmark cleanup",
+    Operation.RESOLVE_SETUP: "resolve setup",
+    Operation.SUBMIT: "submit failed",
+    Operation.REMOTE_SYNC: "failed to sync remote",
+    Operation.SCAN: "scan",
+    Operation.SYNC: "sync",
 }
-
-_OPERATION_BATCH_OVERRIDES: dict[Operation, str] = {
-    Operation.WORKSPACE_CLEANUP: "  [bold red]Workspace cleanup failed:[/] {error}",
-    Operation.BOOKMARK_CLEANUP: (
-        "  [bold red]Bookmark cleanup failed:[/] {name} — {error}"
-    ),
-}
+_WARNING_OPERATIONS = {Operation.SUBMIT, Operation.REMOTE_SYNC}
+_LOCAL_MAIN = "local main"
 
 
 @_render.register
@@ -238,20 +225,17 @@ def _render_project_skipped(
 def _render_operation_failed(
     event: OperationFailed, *, batch: bool, project: str, flow: str
 ) -> None:
-    template = (
-        _OPERATION_BATCH_OVERRIDES.get(
-            event.operation, _OPERATION_TEXT[event.operation]
+    if event.operation is Operation.PROMOTE:
+        output.outcome(
+            event.project, "promotion", "failed", _LOCAL_MAIN, reason=event.error
         )
-        if batch
-        else _OPERATION_TEXT[event.operation]
-    )
-    console.print(
-        template.format(
-            name=escape(event.project),
-            error=escape(event.error),
-            bookmark=escape(WORKFLOW_BOOKMARKS[Workflow.RESOLVE]),
-        )
-    )
+        return
+    words = _OPERATION_WORDS[event.operation]
+    if event.operation is Operation.SUBMIT:
+        bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
+        words = f"{words} · keeping {bookmark} for manual recovery"
+    kind = "warning" if event.operation in _WARNING_OPERATIONS else "error"
+    output.diagnostic(kind, f"{event.project} · {words} · {event.error}")
 
 
 @_render.register
@@ -277,9 +261,8 @@ def _render_scan_reported(
 def _render_missing_test_config(
     event: MissingTestConfig, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(
-        f"  [bold yellow]Warning:[/] {escape(event.project)} — no test "
-        "configuration (test phases will be skipped)"
+    output.diagnostic(
+        "warning", f"{event.project} · no test configuration · test phases skipped"
     )
 
 
@@ -287,10 +270,7 @@ def _render_missing_test_config(
 def _render_processing_started(
     event: ProcessingStarted, *, batch: bool, project: str, flow: str
 ) -> None:
-    if event.vulns:
-        console.print(f"\n[bold]Processing {event.vulns} vuln fix(es)...[/]")
-    if event.updates:
-        console.print(f"\n[bold]Processing {event.updates} update(s)...[/]")
+    output.heading(project, f"{event.vulns} vulnerabilities · {event.updates} updates")
 
 
 @_render.register
@@ -298,22 +278,20 @@ def _render_findings_processed(
     event: FindingsProcessed, *, batch: bool, project: str, flow: str
 ) -> None:
     if not batch:
-        _print_update_summary(list(event.results))
+        _print_result_totals(event.results)
 
 
 @_render.register
 def _render_promoted(event: Promoted, *, batch: bool, project: str, flow: str) -> None:
-    console.print(f"[bold green]Promoted {escape(event.bookmark)} to main.[/]")
+    output.outcome(project, "promotion", "passed", _LOCAL_MAIN)
 
 
 @_render.register
 def _render_resolve_paused(
     event: ResolvePaused, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(
-        f"  [bold yellow]Resolve paused.[/] Continue with "
-        f"[bold]mm resolve {escape(event.project)} --continue[/]."
-    )
+    output.notice("Resolve paused")
+    output.diagnostic("hint", f"mm resolve {event.project} --continue")
 
 
 @_render.register
@@ -321,16 +299,16 @@ def _render_findings_blocked(
     event: FindingsBlocked, *, batch: bool, project: str, flow: str
 ) -> None:
     for package, reason in event.findings:
-        console.print(f"  [yellow]BLOCKED[/] {escape(package)} — {escape(reason)}")
+        output.outcome(project, "resolve", "blocked", package, reason=reason)
 
 
 @_render.register
 def _render_submission_blocked(
     event: SubmissionBlocked, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(
-        "  [bold yellow]Not submitting:[/] blocked findings remain. "
-        "Rescan or resolve them manually."
+    output.diagnostic(
+        "warning",
+        f"{event.project} · blocked findings remain · rescan or resolve them manually",
     )
 
 
@@ -338,9 +316,8 @@ def _render_submission_blocked(
 def _render_blockers_still_failing(
     event: BlockersStillFailing, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(
-        f"  [bold red]FAIL[/] {escape(event.phase)} — still blocking: "
-        f"{escape(', '.join(event.pkgs))}"
+    output.diagnostic(
+        "error", f"{event.phase} · still blocking: {', '.join(event.pkgs)}"
     )
 
 
@@ -355,56 +332,58 @@ def _render_sync_completed(
 def _render_project_started(
     event: ProjectStarted, *, batch: bool, project: str, flow: str
 ) -> None:
-    if not batch:
-        return
-    console.print(f"\n{'═' * 40}")
-    console.print(f"[bold]{escape(event.project)}[/]")
-    console.print("═" * 40)
+    """The renderer records the project; its heading prints with the counts."""
 
 
 @_render.register
 def _render_finding_started(
     event: FindingStarted, *, batch: bool, project: str, flow: str
 ) -> None:
-    label = "[bold red]VULN[/]" if event.kind == "vuln" else "[bold cyan]UPDATE[/]"
-    console.print(
-        f"\n  {label} {escape(event.pkg)} {escape(event.installed)} -> "
-        f"{escape(event.target)} ({escape(event.detail)})"
-    )
+    """The outcome record carries the versions; progress is the runner's spinner."""
 
 
 @_render.register
 def _render_test_command_started(
     event: TestCommandStarted, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(f"  [dim]$ {escape(event.command)}[/]")
+    if output.is_verbose():
+        output.notice(f"$ {event.command}")
 
 
 @_render.register
 def _render_finding_step_failed(
     event: FindingStepFailed, *, batch: bool, project: str, flow: str
 ) -> None:
-    error = escape(event.error)
-    if event.step is FindingStepKind.PACKAGE_COMMAND:
-        console.print(f"  [bold red]FAIL[/] Package manager command failed: {error}")
-    else:
-        console.print(f"  [bold red]FAIL[/] {error}")
+    output.diagnostic("error", f"{event.step.value.replace('_', ' ')} · {event.error}")
 
 
 @_render.register
 def _render_finding_passed(
     event: FindingPassed, *, batch: bool, project: str, flow: str
 ) -> None:
-    suffix = " [dim](already applied)[/]" if event.already_applied else ""
-    console.print(f"  [bold green]PASS[/] {escape(event.pkg)}{suffix}")
+    output.outcome(
+        project,
+        flow,
+        "passed",
+        event.pkg,
+        installed=event.installed,
+        target=event.target,
+        reason="already applied" if event.already_applied else "",
+    )
 
 
 @_render.register
 def _render_finding_failed(
     event: FindingFailed, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(
-        f"  [bold red]FAIL[/] {escape(event.pkg)} — {escape(event.phase)} failed"
+    output.outcome(
+        project,
+        flow,
+        "failed",
+        event.pkg,
+        installed=event.installed,
+        target=event.target,
+        reason=f"{event.phase} failed",
     )
 
 
@@ -478,30 +457,30 @@ def _render_healthcheck_unconfigured(
 def _render_pull_request_output(
     event: PullRequestOutput, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(f"[dim]  {escape(event.text)}[/]")
+    output.notice(event.text)
 
 
 @_render.register
 def _render_gradle_withheld(
     event: GradleWithheld, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(f"Withheld {escape(event.label)}: {escape(event.reason)}")
+    output.outcome(project, flow, "blocked", event.label, reason=event.reason)
 
 
 @_render.register
 def _render_no_eligible_gradle_changes(
     event: NoEligibleGradleChanges, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print("No eligible Gradle changes")
+    output.notice(f"No eligible Gradle changes in {project}")
 
 
 @_render.register
 def _render_gradle_run_archived(
     event: GradleRunArchived, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(
-        f"Archived failed Gradle run to {escape(str(event.path))}; "
-        "rebuilding candidates from main"
+    output.diagnostic(
+        "warning",
+        f"archived failed Gradle run to {event.path} · rebuilding candidates from main",
     )
 
 
@@ -509,8 +488,8 @@ def _render_gradle_run_archived(
 def _render_gradle_flow_failed(
     event: GradleFlowFailed, *, batch: bool, project: str, flow: str
 ) -> None:
-    console.print(
-        f"Cannot complete Gradle {escape(event.flow.value)}: {escape(event.error)}"
+    output.diagnostic(
+        "error", f"cannot complete Gradle {event.flow.value} · {event.error}"
     )
 
 
@@ -649,7 +628,7 @@ def update(
             choose=_choose_findings,
             choose_gradle=_choose_gradle_candidates,
             vcs=vcs,
-            emit=_Renderer(batch=False),
+            emit=_Renderer(batch=False, project=name),
         )
         sys.exit(
             ExitCode.OK
@@ -660,15 +639,13 @@ def update(
     batch = update_service.update_projects(
         cfg, targets, vcs=vcs, emit=_Renderer(batch=True)
     )
-    summary = [
-        (project.project, list(project.results))
-        for project in batch.projects
-        if project.results
-    ]
-    if summary or not any(
+    results = [result for project in batch.projects for result in project.results]
+    if results:
+        _print_result_totals(results)
+    elif not any(
         project.route is update_service.UpdateRoute.GRADLE for project in batch.projects
     ):
-        _print_mass_update_summary(summary)
+        output.notice("No projects had actionable findings")
     sys.exit(ExitCode.UPDATE_FAILED if batch.outcome is Outcome.FAILED else ExitCode.OK)
 
 
@@ -704,50 +681,11 @@ def sync(
     sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
 
-def _print_update_summary(all_results: list[UpdateResult]) -> None:
-    passed = [r for r in all_results if r.passed]
-    failed = [r for r in all_results if not r.passed]
-    console.print("\n" + "─" * 40)
-    console.print("[bold]Summary:[/]")
-    if passed:
-        console.print(f"  [green]{len(passed)} passed[/]")
-    if failed:
-        phase_labels = {
-            "apply": "install failed",
-            "commit": "commit failed",
-        }
-        for r in failed:
-            phase = r.failed_phase or "unknown"
-            label = phase_labels.get(phase, phase)
-            console.print(f"  [red]FAIL[/] {escape(r.pkg_name)} — {escape(label)}")
-    console.print("─" * 40)
-
-
-def _print_mass_update_summary(
-    project_results: list[tuple[str, list[UpdateResult]]],
-) -> None:
-    """Print a cross-project summary table."""
-    if not project_results:
-        console.print("\n[dim]No projects had actionable findings.[/]")
-        return
-
-    table = Table(title="Update Summary")
-    table.add_column("Project", style="bold")
-    table.add_column("Package")
-    table.add_column("Kind")
-    table.add_column("Result")
-
-    for proj_name, results in project_results:
-        for r in results:
-            status = (
-                "[green]PASS[/]"
-                if r.passed
-                else (f"[red]FAIL ({escape(r.failed_phase or '')})[/]")
-            )
-            table.add_row(escape(proj_name), escape(r.pkg_name), escape(r.kind), status)
-
-    console.print()
-    console.print(table)
+def _print_result_totals(results: Sequence[UpdateResult]) -> None:
+    passed = sum(result.passed for result in results)
+    counts = {"passed": passed, "failed": len(results) - passed}
+    if results:
+        output.summary({state: count for state, count in counts.items() if count})
 
 
 def _print_deploy_summary(results: list[deploy_service.DeployResult]) -> None:
@@ -1225,23 +1163,37 @@ def _scan_exit_code(summary: ScanSummary) -> ExitCode:
 def _print_numbered_findings(
     vulns: list[VulnFinding], updates: list[UpdateFinding]
 ) -> list[VulnFinding | UpdateFinding]:
-    """Print numbered list of findings. Returns ordered list of findings."""
-    vulns = sort_vulns_by_severity(vulns)
-    numbered: list[VulnFinding | UpdateFinding] = []
-    for idx, v in enumerate(vulns, 1):
-        console.print(
-            f"  [dim]{idx:>3}.[/] [bold red]VULN[/] {escape(v.pkg_name)} "
-            f"{escape(v.installed_version)} -> {escape(v.fixed_version or '')} "
-            f"({escape(v.vuln_id)})"
+    numbered: list[VulnFinding | UpdateFinding] = [
+        *sort_vulns_by_severity(vulns),
+        *updates,
+    ]
+    rows = []
+    for finding in numbered:
+        if isinstance(finding, VulnFinding):
+            kind = "! vuln"
+            risk = f"{finding.severity.value.lower()} · {finding.vuln_id}"
+        else:
+            kind = "~ update"
+            risk = finding.semver_tier.value
+        rows.append(
+            (
+                kind,
+                risk,
+                f"{finding.installed_version} → {finding.target_version}",
+                finding.pkg_name,
+            )
         )
-        numbered.append(v)
-    for idx, u in enumerate(updates, len(vulns) + 1):
-        console.print(
-            f"  [dim]{idx:>3}.[/] [bold cyan]UPDATE[/] {escape(u.pkg_name)} "
-            f"{escape(u.installed_version)} -> {escape(u.latest_version)} "
-            f"({escape(u.semver_tier.value)})"
+    risk_width = max((len(row[1]) for row in rows), default=0)
+    version_width = max((len(row[2]) for row in rows), default=0)
+    screen = output.console(stderr=True)
+    for index, (kind, risk, versions, package) in enumerate(rows, 1):
+        text = output.literal(
+            f"  {index:>3}  {kind:<8}  {risk:<{risk_width}}  "
+            f"{versions:<{version_width}}  {package}"
         )
-        numbered.append(u)
+        screen.print(
+            text, no_wrap=True, overflow="ellipsis", soft_wrap=not screen.is_terminal
+        )
     return numbered
 
 
@@ -1304,12 +1256,10 @@ def _choose_findings(
     choices = "/".join(parts)
 
     while True:
-        text = Prompt.ask(f"\n  Select updates {escape(f'[{choices}]')}", default="all")
+        text = output.prompt(f"Select updates [{choices}]", default="all")
         selection = _parse_selection(text, len(numbered))
         if selection is None:
-            console.print(
-                f"[bold red]Invalid selection:[/] '{escape(text)}'. Try again."
-            )
+            output.diagnostic("error", f"Invalid selection: {text}")
             continue
         return _selected_findings(
             selection, numbered, selectable_vulns, selectable_updates
@@ -1319,24 +1269,31 @@ def _choose_findings(
 def _choose_gradle_candidates(
     candidates: tuple[GradleCandidate, ...],
 ) -> tuple[GradleCandidate, ...]:
+    screen = output.console(stderr=True)
     for index, candidate in enumerate(candidates, 1):
-        console.print(
-            f"{index}. {escape(candidate.target.display_name)} -> "
-            f"{escape(candidate.target.target_version)}"
+        target = candidate.target
+        screen.print(
+            output.literal(
+                f"{index:>3}  {target.display_name} → {target.target_version}"
+            ),
+            soft_wrap=True,
         )
-        for member in candidate.target.members:
-            console.print(
-                f"   {escape(member.alias)}: {escape(member.coordinate)} "
-                f"{escape(member.installed_version)} -> "
-                f"{escape(candidate.target.target_version)}"
+        for member in target.members:
+            screen.print(
+                output.literal(
+                    f"       {member.alias}: {member.coordinate} "
+                    f"{member.installed_version} → {target.target_version}"
+                ),
+                soft_wrap=True,
             )
     while True:
-        text = console.input(
-            "Select all, none, vulns, updates, or comma-separated numbers: "
+        text = output.prompt(
+            "Select all, none, vulns, updates, or comma-separated numbers",
+            default="all",
         )
         selection = _parse_selection(text, len(candidates))
         if selection is None:
-            console.print("Invalid selection")
+            output.diagnostic("error", f"Invalid selection: {text}")
             continue
         if selection == "all":
             return candidates
@@ -1388,7 +1345,7 @@ def resolve(
         minimum_age_days=minimum_age_days,
         continue_=continue_,
         vcs=vcs,
-        emit=_Renderer(batch=False),
+        emit=_Renderer(batch=False, project=project, flow="resolve"),
     )
     sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)
 
@@ -1412,23 +1369,26 @@ def _print_gradle_run_summary(run: GradleRun) -> None:
             target = attempt.candidate.target
             key = ("target", target.group_key, "", attempt.reason)
             withheld[key] = f"{target.display_name} -> {target.target_version}"
-    console.print(
-        f"Verified: {counts['ready'] + counts['completed']}; "
-        f"withheld: {len(withheld)}; "
-        f"failed: {counts['failed'] + counts['applying']}; "
-        f"residual advisories: {len(run.accepted_snapshot.findings)}"
-    )
-    for (kind, _identity, _version, reason), label in sorted(withheld.items()):
-        prefix = "WITHHELD TARGET" if kind == "target" else "RESIDUAL PACKAGE"
-        console.print(f"  {prefix} {escape(label)} — {escape(reason)}")
+    for (_kind, _identity, _version, reason), label in sorted(withheld.items()):
+        output.outcome(run.project, run.flow.value, "blocked", label, reason=reason)
     for attempt in run.attempts:
         if isinstance(attempt, FailedAttempt):
             target = attempt.candidate.target
-            console.print(
-                f"  FAILED {escape(target.display_name)} -> "
-                f"{escape(target.target_version)} "
-                f"— {escape(attempt.reason)}"
+            output.outcome(
+                run.project,
+                run.flow.value,
+                "failed",
+                f"{target.display_name} -> {target.target_version}",
+                reason=attempt.reason,
             )
+    output.summary(
+        {
+            "verified": counts["ready"] + counts["completed"],
+            "withheld": len(withheld),
+            "failed": counts["failed"] + counts["applying"],
+            "residual advisories": len(run.accepted_snapshot.findings),
+        }
+    )
 
 
 type _FindingRows = tuple[list[list[str | Text]], list[list[str]]]

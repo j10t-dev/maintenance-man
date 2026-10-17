@@ -274,7 +274,14 @@ def _retest_blockers(
         blocker.failed_phase = None
     save_scan_results(name, scan_result)
     for blocker in failed:
-        emit(FindingPassed(blocker.pkg_name, False))
+        emit(
+            FindingPassed(
+                blocker.pkg_name,
+                False,
+                blocker.installed_version,
+                blocker.target_version,
+            )
+        )
     return True
 
 

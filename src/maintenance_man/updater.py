@@ -296,6 +296,15 @@ def process_findings(
             )
         )
         step = _attempt_finding(finding, kind, project_config, repo, flow, emit)
+        if step.failed_phase is not None:
+            emit(
+                FindingFailed(
+                    finding.pkg_name,
+                    step.failed_phase,
+                    finding.installed_version,
+                    finding.target_version,
+                )
+            )
         finding.update_status, finding.failed_phase = finding_transition(step)
         finding.flow = flow
         save_scan_results(scan_result.project, scan_result)
@@ -333,7 +342,6 @@ def _attempt_finding(
 
     failed_phase = run_test_phases(project_config, project_path, emit=emit)
     if failed_phase is not None:
-        emit(FindingFailed(finding.pkg_name, failed_phase))
         return FindingStep(failed_phase)
 
     try:
@@ -342,7 +350,14 @@ def _attempt_finding(
         emit(FindingStepFailed(FindingStepKind.INSPECT, str(exc)))
         return FindingStep("commit", discardable=False)
     if not has_changes:
-        emit(FindingPassed(finding.pkg_name, True))
+        emit(
+            FindingPassed(
+                finding.pkg_name,
+                True,
+                finding.installed_version,
+                finding.target_version,
+            )
+        )
         return FindingStep(None)
 
     return _commit_finding(finding, kind, repo, flow, emit)
@@ -371,7 +386,11 @@ def _commit_finding(
     except RevisionError as exc:
         emit(FindingStepFailed(FindingStepKind.BOOKMARK, str(exc)))
         return FindingStep("commit", discardable=False)
-    emit(FindingPassed(finding.pkg_name, False))
+    emit(
+        FindingPassed(
+            finding.pkg_name, False, finding.installed_version, finding.target_version
+        )
+    )
     return FindingStep(None)
 
 

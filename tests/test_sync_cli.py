@@ -24,7 +24,7 @@ class TestSyncCommand:
         state.fail("fetch", error=RevisionError("fetch failed"), path=path)
 
         assert run_mm("sync", "vulnerable") == ExitCode.SYNC_FAILED
-        assert "fetch failed" in capsys.readouterr().out
+        assert "fetch failed" in capsys.readouterr().err
 
     def test_composes_once_without_extra_vcs_context(
         self,

@@ -164,7 +164,9 @@ class TestResolveCandidates:
         )
 
         assert outcome is Outcome.SUCCEEDED
-        assert emit.of_type(FindingPassed) == [FindingPassed("some-pkg", False)]
+        assert emit.of_type(FindingPassed) == [
+            FindingPassed("some-pkg", False, "1.0.0", "1.0.1")
+        ]
         assert processed == [("pkg-a",)]
         assert load_scan_results("api").findings == ()
 
@@ -431,7 +433,7 @@ def test_continue_passing_retest_marks_blocker_passed_then_submits(
     )
 
     assert outcome is Outcome.SUCCEEDED
-    assert FindingPassed("some-pkg", False) in emit.events
+    assert FindingPassed("some-pkg", False, "1.0.0", "1.0.1") in emit.events
     assert processed == [("pkg-a",)]
     assert emit.events[-1] == PullRequestOutput("PR #1")
     assert load_scan_results("api").findings == ()

@@ -745,7 +745,9 @@ def test_update_failure_discards_then_attempts_the_next_finding(
     assert findings[0].flow == Workflow.UPDATE
     assert processor_vcs["package"].call_count == 2
     assert "discard" in [call.method for call in processor_vcs["state"].effects]
-    assert emit.of_type(FindingFailed)[0].phase == "unit"
+    assert emit.of_type(FindingFailed)[0] == FindingFailed(
+        "pkg-a", "unit", "1.0.0", "1.0.1"
+    )
 
 
 @pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
@@ -938,6 +940,30 @@ def test_apply_failure_discards_and_continues(
     assert [result.passed for result in results] == [False, True]
     assert results[0].failed_phase == "apply"
     assert any(call.method == "discard" for call in processor_vcs["state"].effects)
+
+
+def test_given_failing_package_command_when_processed_then_apply_failure_emitted_once(
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    processor_vcs["package"].side_effect = ProcessError("package failed")
+    findings = [make_update()]
+    emit = RecordingEmit()
+
+    process_findings(
+        findings,
+        project_config,
+        flow=Workflow.UPDATE,
+        scan_result=_scan_result_for(project_config, findings),
+        vcs=_services(processor_vcs),
+        emit=emit,
+    )
+
+    assert emit.events[-2:] == [
+        FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, "package failed"),
+        FindingFailed("pkg-a", "apply", "1.0.0", "1.0.1"),
+    ]
+    assert len(emit.of_type(FindingFailed)) == 1
 
 
 @pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])

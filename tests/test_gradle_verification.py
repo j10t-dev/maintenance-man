@@ -1396,7 +1396,6 @@ def test_gradle_no_updates_does_not_require_build_hooks(workflow, monkeypatch):
 
 @pytest.fixture
 def driver(workflow, resolution, monkeypatch):
-    from maintenance_man import cli
     from maintenance_man.models.gradle import (
         CandidateValidation,
         CandidateValidationBatch,
@@ -1532,7 +1531,9 @@ def driver(workflow, resolution, monkeypatch):
         path=project.path,
         action=lambda: state.effects.append("refresh"),
     )
-    monkeypatch.setattr(cli.console, "input", lambda *args: state.selection)
+    monkeypatch.setattr(
+        "maintenance_man.output.prompt", lambda *args, **kwargs: state.selection
+    )
     return state
 
 
@@ -3986,8 +3987,8 @@ def test_batch_output_retains_verified_gradle_progress(driver, capsys):
     run = updater.load_gradle_run(updater.gradle_run_path("sample"))
     assert run is not None and run.refreshed
     assert any(isinstance(attempt, CompletedAttempt) for attempt in run.attempts)
-    output = capsys.readouterr().out
-    assert "Verified: 1" in output
+    output = capsys.readouterr().err
+    assert "1 verified" in output
     assert "No projects had actionable findings" not in output
 
 
