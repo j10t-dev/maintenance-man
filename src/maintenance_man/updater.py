@@ -34,7 +34,7 @@ from maintenance_man.package_managers import (
     UpdateCommandError,
     package_manager_ops,
 )
-from maintenance_man.process import ProcessError, run_live, run_logged
+from maintenance_man.process import ProcessError, run_logged, run_shell_command
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import Repository, RevisionError
 from maintenance_man.vcs_workflow import VcsServices
@@ -255,7 +255,9 @@ def run_test_phases(
     for phase_name, command in project_config.test_phases:
         emit(TestCommandStarted(command))
         try:
-            run_live(command, project_path, timeout=600, label=f"{phase_name} tests")
+            run_shell_command(
+                command, project_path, timeout=600, label=f"{phase_name} tests"
+            )
         except ProcessError as exc:
             emit(FindingStepFailed(FindingStepKind.TEST, str(exc)))
             return phase_name
@@ -288,11 +290,9 @@ def process_findings(
         kind = _kind(finding)
         emit(
             FindingStarted(
-                kind,
                 finding.pkg_name,
                 finding.installed_version,
                 finding.target_version,
-                finding.detail,
             )
         )
         step = _attempt_finding(finding, kind, project_config, repo, flow, emit)

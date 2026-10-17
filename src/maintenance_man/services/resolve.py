@@ -65,14 +65,14 @@ def resolve_project(
     if continue_:
         return _handle_continue(name, project, scan_result, vcs=vcs, emit=emit)
 
-    candidates = flows.ordered_findings(scan_result, _is_resolve_candidate)
+    candidates = _select_resolve_candidates(scan_result)
     repo = vcs.repository(project.path)
     try:
         prune_stale_bookmarks(repo=repo, host=vcs.code_host(project.path))
         ensure_main_bookmark(repo=repo)
     except (RevisionError, CodeHostError) as exc:
         raise WorkflowError(str(exc)) from exc
-    if flows.ordered_findings(scan_result, _is_failed_resolve_finding):
+    if any(_is_failed_resolve_finding(finding) for finding in scan_result.findings):
         msg = f"resolve already paused for {name} — rerun with --continue"
         raise WorkflowError(msg)
     if not _prepare_resolve_bookmark(
@@ -86,6 +86,18 @@ def resolve_project(
         msg = f"aborted resolve for {name}"
         raise WorkflowError(msg)
     return _run_candidates(name, project, scan_result, candidates, vcs=vcs, emit=emit)
+
+
+def _select_resolve_candidates(scan_result: ScanResult) -> list[Finding]:
+    vulns = [
+        finding
+        for finding in scan_result.vulnerabilities
+        if _is_resolve_candidate(finding)
+    ]
+    updates = [
+        finding for finding in scan_result.updates if _is_resolve_candidate(finding)
+    ]
+    return flows.ordered_findings(vulns, updates)
 
 
 def _is_resolve_candidate(finding: Finding) -> bool:
@@ -195,13 +207,15 @@ def _run_candidates(
         vcs=vcs,
         emit=emit,
     )
-    if any(not result.passed for result in results) or flows.ordered_findings(
-        scan_result, _is_failed_resolve_finding
+    if any(not result.passed for result in results) or any(
+        _is_failed_resolve_finding(finding) for finding in scan_result.findings
     ):
         emit(ResolvePaused(name))
         return Outcome.FAILED
 
-    ready = flows.ordered_findings(scan_result, _is_ready_resolve_finding)
+    has_ready_findings = any(
+        _is_ready_resolve_finding(finding) for finding in scan_result.findings
+    )
     blocked = scan_result.blocked_findings
     if blocked:
         emit(
@@ -215,7 +229,7 @@ def _run_candidates(
         emit(SubmissionBlocked(name))
         save_scan_results(name, scan_result)
         return Outcome.FAILED
-    if not ready:
+    if not has_ready_findings:
         return Outcome.SUCCEEDED
     return _submit(name, project.path, scan_result, vcs=vcs, emit=emit)
 
@@ -296,7 +310,18 @@ def _handle_continue(
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
     repo = vcs.repository(project.path)
     _check_resumable(repo, bookmark)
-    failed = flows.ordered_findings(scan_result, _is_failed_resolve_finding)
+    failed = flows.ordered_findings(
+        [
+            finding
+            for finding in scan_result.vulnerabilities
+            if _is_failed_resolve_finding(finding)
+        ],
+        [
+            finding
+            for finding in scan_result.updates
+            if _is_failed_resolve_finding(finding)
+        ],
+    )
     if failed and not _retest_blockers(
         name, project, scan_result, failed, repo=repo, emit=emit
     ):
@@ -305,7 +330,7 @@ def _handle_continue(
         name,
         project,
         scan_result,
-        flows.ordered_findings(scan_result, _is_resolve_candidate),
+        _select_resolve_candidates(scan_result),
         vcs=vcs,
         emit=emit,
     )

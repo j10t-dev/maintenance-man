@@ -18,7 +18,7 @@ from maintenance_man.models.scan import (
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import classify_semver
-from tests.conftest import make_scan_result, make_update, make_vuln
+from tests.support.findings import make_scan_result, make_update, make_vuln
 
 
 @pytest.mark.parametrize(

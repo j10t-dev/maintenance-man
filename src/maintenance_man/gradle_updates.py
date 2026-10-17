@@ -59,7 +59,7 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     Workflow,
 )
-from maintenance_man.process import run_live
+from maintenance_man.process import run_shell_command
 from maintenance_man.scanner import ScanError, capture_gradle_snapshot
 from maintenance_man.storage import atomic_write_text
 from maintenance_man.updater import run_test_phases
@@ -254,7 +254,7 @@ def run_gradle_checks(
     commands = gradle_check_commands(project)
     checks_started = time.monotonic()
     try:
-        run_live(
+        run_shell_command(
             commands[0],
             project.path,
             timeout=600,

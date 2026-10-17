@@ -49,9 +49,10 @@ from maintenance_man.uv_dependencies import (
     get_uv_dependency_locations,
 )
 from maintenance_man.vcs_workflow import VcsServices
-from tests.conftest import completed, make_gradle_target, make_update, make_vuln
 from tests.fake_vcs import FakeJj, FakeJjState
 from tests.fakes import RecordingEmit
+from tests.support.findings import make_gradle_target, make_update, make_vuln
+from tests.support.process import completed
 
 PASSED = FindingStep(None)
 FAILED = FindingStep("unit")
@@ -169,7 +170,7 @@ def processor_vcs(
     package = MagicMock(side_effect=run_package)
     phase = MagicMock(side_effect=run_phase)
     monkeypatch.setattr("maintenance_man.updater.run_logged", package)
-    monkeypatch.setattr("maintenance_man.updater.run_live", phase)
+    monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
     return {
         "state": state,
         "repo": repo,
@@ -398,7 +399,7 @@ def test_package_boundary_failure_is_persisted_as_a_failed_apply(
 class TestRunTestPhases:
     def test_all_green(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         mock_run = MagicMock(return_value=None)
-        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -411,7 +412,7 @@ class TestRunTestPhases:
 
     def test_unit_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         mock_run = MagicMock(side_effect=ProcessError("unit tests failed (exit 1)"))
-        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
         tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
         failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert failed_phase == "unit"
@@ -424,7 +425,7 @@ class TestRunTestPhases:
                 raise ProcessError(msg)
 
         mock_run = MagicMock(side_effect=side_effect)
-        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -438,7 +439,7 @@ class TestRunTestPhases:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
         mock_run = MagicMock(return_value=None)
-        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
         tc = ProjectConfig(
             path=tmp_path, package_manager="bun", test_unit="bun test"
         )  # no integration or component
@@ -448,7 +449,7 @@ class TestRunTestPhases:
 
     def test_blank_phase_is_skipped(self, monkeypatch, tmp_path):
         mock_run = MagicMock(return_value=None)
-        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -1217,7 +1218,7 @@ def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
         msg = "unit tests timed out after 600s"
         raise ProcessError(msg)
 
-    monkeypatch.setattr("maintenance_man.updater.run_live", _timeout)
+    monkeypatch.setattr("maintenance_man.updater.run_shell_command", _timeout)
 
     assert (
         run_test_phases(project_config, Path(project_config.path), emit=RecordingEmit())

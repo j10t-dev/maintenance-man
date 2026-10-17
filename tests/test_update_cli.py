@@ -22,20 +22,17 @@ from maintenance_man.process import ProcessError
 from maintenance_man.services import update as update_service
 from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import RevisionError
-from tests.conftest import (
-    CliDeps,
-    completed,
-    make_config,
+from tests.fake_vcs import FakeJjState
+from tests.fakes import RecordingEmit
+from tests.support.cli import CliDeps, run_mm
+from tests.support.findings import (
     make_gradle_target,
     make_scan_result,
     make_update,
     make_vuln,
-    missing_tool,
-    run_mm,
-    write_config,
 )
-from tests.fake_vcs import FakeJjState
-from tests.fakes import RecordingEmit
+from tests.support.process import completed, missing_tool
+from tests.support.projects import make_config, write_config
 
 
 @pytest.mark.parametrize(
@@ -139,7 +136,7 @@ def _use_real_mixed_processor(
         "maintenance_man.services.update.process_findings", updater.process_findings
     )
     monkeypatch.setattr("maintenance_man.updater.run_logged", package)
-    monkeypatch.setattr("maintenance_man.updater.run_live", phase)
+    monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
     monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
     return package, phase
 
@@ -902,7 +899,7 @@ def test_update_end_to_end_uses_one_graph_and_persists_completion(
     mock_update_cli_deps: CliDeps,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tests.conftest import make_vuln
+    from tests.support.findings import make_vuln
 
     scan_result: ScanResult = mock_update_cli_deps.scan_result
     scan_result.vulnerabilities.append(

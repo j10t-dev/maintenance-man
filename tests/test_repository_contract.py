@@ -7,17 +7,17 @@ import pytest
 from maintenance_man.gradle_updates import gradle_evidence_workspace
 from maintenance_man.vcs import ExpectedRevisions, RevisionError
 from maintenance_man.vcs_workflow import VcsServices, refresh_working_copy_from_main
-from tests.conftest import (
+from tests.fake_vcs import FakeJjState
+from tests.support.projects import make_project
+from tests.support.repository import (
     MANAGED,
     RepositoryCase,
-    _assert_origin_baseline_only,
-    _bookmark_state,
-    _bookmark_targets,
-    _real_case,
-    _run_jj,
-    make_project,
+    assert_origin_baseline_only,
+    bookmark_state,
+    bookmark_targets,
+    real_repository_case,
+    run_jj,
 )
-from tests.fake_vcs import FakeJjState
 
 _GUARDED = {
     "promote": lambda repo, bookmark, expected: repo.promote_bookmark_to_main(
@@ -375,7 +375,7 @@ def test_given_moved_or_conflicted_revisions_when_guarding_then_operation_is_ref
         c.conflict_bookmark(MANAGED, tip, sibling)
     candidates = {base, tip, sibling}
     before_targets = {
-        bookmark: _bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
+        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
         for bookmark in ("main", MANAGED)
     }
     if mutation == "base-conflict":
@@ -390,17 +390,17 @@ def test_given_moved_or_conflicted_revisions_when_guarding_then_operation_is_ref
         assert c.repo.resolve_revision(revision=MANAGED) == (
             base if mutation == "tip" else tip
         )
-    _assert_origin_baseline_only(c, base=base)
+    assert_origin_baseline_only(c, base=base)
     push_effects: list[str] = []
     if operation == "push":
         c.after_push(lambda: push_effects.append("pushed"))
     with pytest.raises(RevisionError):
         _GUARDED[operation](c.repo, MANAGED, expected)
     assert {
-        bookmark: _bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
+        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
         for bookmark in ("main", MANAGED)
     } == before_targets
-    _assert_origin_baseline_only(c, base=base)
+    assert_origin_baseline_only(c, base=base)
     assert push_effects == []
 
 
@@ -430,12 +430,12 @@ def test_guarded_operations_reject_sibling_base_and_tip(
     expected = ExpectedRevisions(base=tip, tip=sibling)
     candidates = {root, tip, sibling}
     before_targets = {
-        bookmark: _bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
+        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
         for bookmark in ("main", MANAGED)
     }
     assert c.repo.resolve_revision(revision="main") == tip
     assert c.repo.resolve_revision(revision=MANAGED) == sibling
-    _assert_origin_baseline_only(c, base=root)
+    assert_origin_baseline_only(c, base=root)
     push_effects: list[str] = []
     if operation == "push":
         c.after_push(lambda: push_effects.append("pushed"))
@@ -443,10 +443,10 @@ def test_guarded_operations_reject_sibling_base_and_tip(
     with pytest.raises(RevisionError):
         _GUARDED[operation](c.repo, MANAGED, expected)
     assert {
-        bookmark: _bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
+        bookmark: bookmark_state(c.repo, bookmark=bookmark, candidates=candidates)
         for bookmark in ("main", MANAGED)
     } == before_targets
-    _assert_origin_baseline_only(c, base=root)
+    assert_origin_baseline_only(c, base=root)
     assert push_effects == []
 
 
@@ -524,7 +524,7 @@ def test_given_guarded_effect_race_when_postchecking_then_completed_effect_is_re
 
     if operation in {"promote", "reset"}:
         assert c.repo.bookmark_conflicted(bookmark=changed_bookmark) is True
-        assert _bookmark_targets(
+        assert bookmark_targets(
             c.repo, bookmark=changed_bookmark, candidates={base, tip, sibling}
         ) == frozenset({completed_target, sibling})
     else:
@@ -534,7 +534,7 @@ def test_given_guarded_effect_race_when_postchecking_then_completed_effect_is_re
 
 @pytest.mark.integration
 def test_guarded_change_push_names_only_the_managed_bookmark(tmp_path: Path):
-    c = _real_case(tmp_path)
+    c = real_repository_case(tmp_path)
     base = c.repo.resolve_revision(revision="main")
     c.repo.new_change(revision="main")
     c.write_file("dep.txt", "version=2\n")
@@ -545,7 +545,7 @@ def test_guarded_change_push_names_only_the_managed_bookmark(tmp_path: Path):
     expected = ExpectedRevisions(base=base, tip=tip)
     c.repo.push_bookmark(bookmark=MANAGED, expected=expected)
     c.repo.push_bookmark(bookmark=MANAGED, expected=expected)
-    fetched = _run_jj(c.repo.path, "git", "fetch", "--remote", "origin")
+    fetched = run_jj(c.repo.path, "git", "fetch", "--remote", "origin")
     assert fetched.returncode == 0, fetched.stderr
-    assert _run_jj(c.repo.path, "log", "-r", f"{MANAGED}@origin").returncode == 0
-    assert _run_jj(c.repo.path, "log", "-r", "unrelated@origin").returncode != 0
+    assert run_jj(c.repo.path, "log", "-r", f"{MANAGED}@origin").returncode == 0
+    assert run_jj(c.repo.path, "log", "-r", "unrelated@origin").returncode != 0

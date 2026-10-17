@@ -34,17 +34,12 @@ from maintenance_man.models.scan import (
 from maintenance_man.services import scan as scan_service
 from maintenance_man.services.scan import ScanSummary
 from maintenance_man.vcs import RevisionError
-from tests.conftest import (
-    TerminalStream,
-    make_gradle_target,
-    make_scan_result,
-    make_update,
-    missing_tool,
-    ops_with_outdated,
-    run_mm,
-    write_config,
-)
 from tests.fake_vcs import FakeJjState
+from tests.support.cli import TerminalStream, run_mm
+from tests.support.findings import make_gradle_target, make_scan_result, make_update
+from tests.support.package_managers import ops_with_outdated
+from tests.support.process import missing_tool
+from tests.support.projects import write_config
 
 
 def _terminal_stdout(monkeypatch: pytest.MonkeyPatch, width: int = 220) -> StringIO:

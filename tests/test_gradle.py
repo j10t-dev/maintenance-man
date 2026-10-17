@@ -32,13 +32,10 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     SemverTier,
 )
-from tests.conftest import (
-    GRADLE_FIXTURES,
-    completed,
-    fixture_runner,
-    make_gradle_target,
-)
 from tests.fake_vcs import FakeJjState
+from tests.support.findings import make_gradle_target
+from tests.support.gradle import GRADLE_FIXTURES, fixture_runner
+from tests.support.process import completed
 
 
 def _digest(path: Path) -> str:

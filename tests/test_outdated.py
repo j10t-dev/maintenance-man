@@ -15,8 +15,9 @@ from maintenance_man.outdated import (
     mvn_outdated,
     uv_outdated,
 )
-from tests.conftest import completed, make_project
 from tests.fakes import FakeCommands
+from tests.support.process import completed
+from tests.support.projects import make_project
 
 
 def _fake_commands(

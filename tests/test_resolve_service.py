@@ -20,15 +20,10 @@ from maintenance_man.services import WorkflowError
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import RevisionError
-from tests.conftest import (
-    make_project,
-    make_scan_result,
-    make_update,
-    make_vuln,
-    seed_project,
-)
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor, RecordingEmit
+from tests.support.findings import make_scan_result, make_update, make_vuln
+from tests.support.projects import make_project, seed_project
 
 _BOOKMARK = "mm/resolve-dependencies"
 

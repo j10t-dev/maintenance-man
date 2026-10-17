@@ -10,8 +10,9 @@ from maintenance_man.deployer import BuildError, DeployError, HealthCheckResult
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from tests.conftest import configure_fake_vcs, run_mm, write_config
 from tests.fake_vcs import FakeJjState
+from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.projects import write_config
 
 
 @pytest.mark.parametrize(
@@ -58,7 +59,7 @@ def test_given_batch_deploy_with_failed_build_when_run_then_deploy_is_recorded_s
         if kwargs["error"] is BuildError:
             raise error
 
-    monkeypatch.setattr(deploy_service, "run_live", run)
+    monkeypatch.setattr(deploy_service, "run_shell_command", run)
     configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
 
     assert run_mm("deploy") == ExitCode.DEPLOY_FAILED
@@ -78,7 +79,9 @@ def test_given_unusable_projects_when_batch_deploy_then_records_and_summary_agre
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(deploy_service, "run_live", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        deploy_service, "run_shell_command", lambda *args, **kwargs: None
+    )
     configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
     config_path = mm_home_with_projects / "config.toml"
     missing = tmp_path / "missing"
@@ -158,7 +161,7 @@ def test_unresolved_main_deploy_gate_persists_no_invented_identity(
     deployed: list[str] = []
     monkeypatch.setattr(
         deploy_service,
-        "run_live",
+        "run_shell_command",
         lambda command, *args, **kwargs: deployed.append(command),
     )
 
@@ -198,7 +201,7 @@ def test_deploy_saves_the_exact_main_identity_used_by_the_gate(
         )
         state.seed_bookmark(project_path, bookmark="main", targets=(advanced,))
 
-    monkeypatch.setattr(deploy_service, "run_live", deploy)
+    monkeypatch.setattr(deploy_service, "run_shell_command", deploy)
 
     assert run_mm("deploy", "demo") == ExitCode.OK
 
@@ -218,7 +221,7 @@ class TestDeployCommand:
         """Error when project has no deploy_command configured."""
         assert run_mm("deploy", "no-deploy") == ExitCode.ERROR
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_successful_deploy(
         self, mock_deploy: MagicMock, mm_home_with_projects: Path
     ) -> None:
@@ -227,7 +230,7 @@ class TestDeployCommand:
         mock_deploy.assert_called_once()
 
     @patch(
-        "maintenance_man.services.deploy.run_live",
+        "maintenance_man.services.deploy.run_shell_command",
         side_effect=DeployError("deploy failed"),
     )
     def test_failed_deploy(
@@ -236,7 +239,7 @@ class TestDeployCommand:
         """Exit DEPLOY_FAILED on deploy failure."""
         assert run_mm("deploy", "deployable") == ExitCode.DEPLOY_FAILED
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_build_flag_runs_build_then_deploy(
         self,
         mock_run: MagicMock,
@@ -251,7 +254,7 @@ class TestDeployCommand:
         assert mock_run.call_count == 2
         assert calls == ["build", "deploy"]
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_build_flag_skips_when_no_build_command(
         self, mock_deploy: MagicMock, mm_home_with_projects: Path
     ) -> None:
@@ -260,7 +263,7 @@ class TestDeployCommand:
         mock_deploy.assert_called_once()
 
     @patch(
-        "maintenance_man.services.deploy.run_live",
+        "maintenance_man.services.deploy.run_shell_command",
         side_effect=BuildError("build failed"),
     )
     def test_build_failure_aborts_deploy(
@@ -277,7 +280,7 @@ class TestDeployCommand:
         """Error when project doesn't exist."""
         assert run_mm("deploy", "nonexistent") == ExitCode.ERROR
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_given_unchanged_deploy_when_run_then_exits_zero_with_force_hint(
         self,
         mock_deploy: MagicMock,
@@ -305,7 +308,7 @@ class TestDeployCheck:
         "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=True),
     )
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_check_calls_healthchecker(
         self,
         mock_deploy: MagicMock,
@@ -328,7 +331,7 @@ class TestDeployCheck:
         "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=False, error="connection refused"),
     )
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_check_unhealthy_still_exits_ok(
         self,
         mock_deploy: MagicMock,
@@ -347,7 +350,7 @@ class TestDeployCheck:
         mock_check.assert_called_once_with("http://pihost:8080", "deployable")
 
     @patch("maintenance_man.services.deploy.check_health")
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_given_unconfigured_check_when_run_then_exits_zero_with_warning(
         self,
         mock_deploy: MagicMock,
@@ -383,7 +386,7 @@ class TestDeployCheck:
             if kwargs["error"] is failure:
                 raise error
 
-        monkeypatch.setattr(deploy_service, "run_live", run)
+        monkeypatch.setattr(deploy_service, "run_shell_command", run)
 
         assert run_mm("deploy", "deployable", "--build", "--check") == expected_code
         captured = capsys.readouterr()
@@ -394,7 +397,7 @@ class TestDeployCheck:
 def test_given_empty_project_name_when_deploy_then_runs_deploy_all_in_batch_mode(
     mm_home_with_projects: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    monkeypatch.setattr(deploy_service, "run_live", lambda *a, **k: None)
+    monkeypatch.setattr(deploy_service, "run_shell_command", lambda *a, **k: None)
     configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
 
     code = run_mm("deploy", "")
@@ -410,7 +413,7 @@ class TestMassDeployCommand:
     def _gate(self, _deploy_vcs: _DeployVcs) -> None:
         pass
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_deploys_all_projects_and_prints_summary(
         self,
         mock_run: MagicMock,
@@ -434,7 +437,7 @@ class TestMassDeployCommand:
         )
         assert capsys.readouterr().err == "2 passed\n"
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_continues_after_deploy_failure(
         self,
         mock_run: MagicMock,
@@ -458,7 +461,7 @@ class TestMassDeployCommand:
         "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=True),
     )
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_check_flag_works_in_mass_mode(
         self,
         mock_run: MagicMock,
@@ -482,7 +485,7 @@ class TestMassDeployCommand:
 
     @pytest.mark.parametrize("healthcheck_line", [None, 'healthcheck_url = ""'])
     @patch("maintenance_man.services.deploy.check_health")
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_check_without_healthcheck_url_warns_in_mass_mode(
         self,
         mock_run: MagicMock,

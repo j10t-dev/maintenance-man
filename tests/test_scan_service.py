@@ -19,9 +19,10 @@ from maintenance_man.scanner import ScanError
 from maintenance_man.services import scan as scan_service
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import SyncAction, VcsServices
-from tests.conftest import make_config, make_project, make_scan_result
 from tests.fake_vcs import FakeJjState
 from tests.fakes import RecordingEmit
+from tests.support.findings import make_scan_result
+from tests.support.projects import make_config, make_project
 
 
 def _services(*paths: Path) -> VcsServices:

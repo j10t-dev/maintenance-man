@@ -21,7 +21,7 @@ from maintenance_man.storage import (
     record_activity,
     save_scan_results,
 )
-from tests.conftest import make_scan_result, make_update, make_vuln
+from tests.support.findings import make_scan_result, make_update, make_vuln
 
 
 @pytest.fixture()

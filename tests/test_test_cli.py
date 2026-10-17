@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from maintenance_man.cli import ExitCode
-from tests.conftest import run_mm
+from tests.support.cli import run_mm
 
 
 class TestTestCommand:

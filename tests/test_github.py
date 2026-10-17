@@ -7,7 +7,7 @@ import pytest
 
 from maintenance_man import github
 from maintenance_man.github import CodeHostError, GitHubCodeHost
-from tests.conftest import completed
+from tests.support.process import completed
 
 
 @pytest.mark.parametrize(

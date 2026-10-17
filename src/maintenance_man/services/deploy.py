@@ -24,7 +24,7 @@ from maintenance_man.models.events import (
     ProjectStarted,
     SkipReason,
 )
-from maintenance_man.process import run_live
+from maintenance_man.process import run_shell_command
 from maintenance_man.services import WorkflowError
 from maintenance_man.storage import load_activity, record_activity
 from maintenance_man.vcs import RevisionError
@@ -210,7 +210,7 @@ def _run_recorded(
     assert command is not None
     error = BuildError if kind == "build" else DeployError
     try:
-        run_live(
+        run_shell_command(
             command,
             project.path,
             timeout=600,

@@ -47,17 +47,17 @@ max-statements = 50
 "docs/**" = ["INP001"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-"subprocess.run" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"subprocess.Popen" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"subprocess.call" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"subprocess.check_call" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"subprocess.check_output" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"subprocess.getoutput" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"subprocess.getstatusoutput" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"os.system" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"os.popen" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"os.posix_spawn" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
-"os.posix_spawnp" = { msg = "Use maintenance_man.process.run_captured or run_live instead." }
+"subprocess.run" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"subprocess.Popen" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"subprocess.call" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"subprocess.check_call" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"subprocess.check_output" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"subprocess.getoutput" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"subprocess.getstatusoutput" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"os.system" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"os.popen" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"os.posix_spawn" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
+"os.posix_spawnp" = { msg = "Use maintenance_man.process.run_captured or run_shell_command instead." }
 "shutil.which" = { msg = "Use maintenance_man.process.require_tool instead." }
 
 [tool.ty.src]

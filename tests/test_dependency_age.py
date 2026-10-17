@@ -49,8 +49,10 @@ from maintenance_man.models.scan import (
     SemverTier,
 )
 from maintenance_man.process import ProcessError
-from tests.conftest import FakeClock, completed, make_gradle_member, make_update
 from tests.fakes import FakeCommands
+from tests.support.clock import FakeClock
+from tests.support.findings import make_gradle_member, make_update
+from tests.support.process import completed
 
 _PUB_NOW = datetime(2026, 9, 18, tzinfo=UTC)
 

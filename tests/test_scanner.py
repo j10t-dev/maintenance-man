@@ -54,19 +54,14 @@ from maintenance_man.scanner import (
 from maintenance_man.services import scan as scan_service
 from maintenance_man.storage import load_scan_results
 from maintenance_man.uv_dependencies import normalise_pkg_name
-from tests.conftest import (
-    GRADLE_FIXTURES,
-    FakeClock,
-    completed,
-    fixture_runner,
-    make_project,
-    make_update,
-    make_vuln,
-    ops_with_outdated,
-    write_config,
-)
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeCommands, RecordingEmit
+from tests.support.clock import FakeClock
+from tests.support.findings import make_update, make_vuln
+from tests.support.gradle import GRADLE_FIXTURES, fixture_runner
+from tests.support.package_managers import ops_with_outdated
+from tests.support.process import completed
+from tests.support.projects import make_project, write_config
 from tests.test_dependency_age import _pypi_body, _scan_age_inputs
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)

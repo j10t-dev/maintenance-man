@@ -11,15 +11,14 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.storage import load_scan_results
 from maintenance_man.vcs import RevisionError
-from tests.conftest import (
-    CliDeps,
+from tests.fakes import FakeFindingProcessor
+from tests.support.cli import CliDeps, run_mm
+from tests.support.findings import (
     make_gradle_target,
     make_scan_result,
     make_update,
     make_vuln,
-    run_mm,
 )
-from tests.fakes import FakeFindingProcessor
 
 _RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 

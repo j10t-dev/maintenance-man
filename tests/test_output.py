@@ -15,13 +15,9 @@ from maintenance_man import output
 from maintenance_man.cli import _print_project_todo, _print_scan_result
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.models.scan import ScanResult
-from tests.conftest import (
-    TerminalStream,
-    make_update,
-    make_vuln,
-    run_mm,
-    write_config,
-)
+from tests.support.cli import TerminalStream, run_mm
+from tests.support.findings import make_update, make_vuln
+from tests.support.projects import write_config
 
 _LONG_NAME = "a-project-with-a-long-name-that-must-survive"
 
@@ -228,7 +224,7 @@ def test_given_terminal_stderr_when_stdout_is_piped_then_width_uses_stderr(
         with os.fdopen(os.dup(slave), "w") as stderr:
             monkeypatch.setattr("sys.stderr", stderr)
             monkeypatch.setattr("sys.stdout", StringIO())
-            output.set_verbose(False)
+            output.reset_invocation_output(verbose=False)
             assert output.console(stderr=True).width == 111
     finally:
         os.close(master)
@@ -382,7 +378,7 @@ def test_given_stderr_stream_when_progress_runs_then_only_quiet_terminal_sees_it
     monkeypatch.setattr("sys.stderr", stream)
     monkeypatch.setenv("TERM", "xterm")
     monkeypatch.setattr(output, "_PROGRESS_DELAY_SECONDS", 0)
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
 
     with output.progress("Running tests"):
         time.sleep(0.1)

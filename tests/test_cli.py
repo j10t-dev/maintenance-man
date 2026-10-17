@@ -12,7 +12,8 @@ from maintenance_man.scanner import ScanError
 from maintenance_man.services import WorkflowError
 from maintenance_man.services.update import UpdateSetupError
 from maintenance_man.vcs import RevisionError
-from tests.conftest import configure_fake_vcs, run_mm, write_config
+from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.projects import write_config
 
 
 @pytest.mark.parametrize(

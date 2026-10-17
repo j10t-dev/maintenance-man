@@ -7,8 +7,9 @@ from maintenance_man import cli
 from maintenance_man.cli import ExitCode
 from maintenance_man.config import load_config
 from maintenance_man.vcs import RevisionError
-from tests.conftest import configure_fake_vcs, run_mm, write_config
 from tests.fake_vcs import FakeJjState
+from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.projects import write_config
 
 
 class TestSyncCommand:

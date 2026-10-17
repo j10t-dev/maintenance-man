@@ -16,7 +16,7 @@ from maintenance_man.models.gradle import (
     ScopeId,
     ScopeResolution,
 )
-from tests.conftest import GRADLE_FIXTURES
+from tests.support.gradle import GRADLE_FIXTURES
 
 SCOPE = ScopeId(project_path=":", domain="project", configuration="runtimeClasspath")
 OTHER_SCOPE = ScopeId(project_path=":app", domain="project", configuration="compile")

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 import hashlib
 import http.client
@@ -11,6 +13,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -50,8 +53,9 @@ class PublicationLookupContext:
         self.clock = clock
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.lock = threading.Lock()
-        self.inflight = {}
-        self.results = {}
+        self.maven_futures: dict[_MavenLookup, Future[_MavenResult]] = {}
+        self.registry_futures: dict[_RegistryLookup, Future[_RegistryResult]] = {}
+        self.results: dict[str, PublicationEvidence] = {}
         self.requests = 0
         self.cache_hits = 0
         self.seconds = 0.0
@@ -70,52 +74,82 @@ class PublicationLookupContext:
             self.seconds,
         )
 
+    def submit(
+        self, repository: RepositoryId, module: ModuleId
+    ) -> Future[PublicationFact | AgeBlock | None]:
+        """Schedule one exact Maven publication lookup with in-context deduplication."""
+        request = _MavenLookup(repository, module)
+        return self._submit(request, self.maven_futures, self._fetch_maven)
+
+    def submit_registry(
+        self, registry: Registry, package: str, version: str, project_path: Path
+    ) -> Future[RegistryFact | AgeBlock | None]:
+        """Schedule one exact registry lookup, using *project_path* for npm."""
+        request = _RegistryLookup(registry, package, version)
+        operation = functools.partial(self._fetch_registry, project_path=project_path)
+        return self._submit(request, self.registry_futures, operation)
+
+    def prefetch(self, requests):
+        """Schedule every routable module in the publication requests."""
+        for request in requests:
+            for module in (request.module, request.marker_implementation):
+                if not (request.routing_supported and module is not None):
+                    continue
+                for repository in request.repositories:
+                    self.submit(repository, module)
+
+    def evidence_for(self, candidate):
+        """Return the aggregate evidence already looked up for *candidate*.
+
+        Only requests that resolved to full ``PublicationEvidence`` (never a
+        block) are returned, for receipt persistence after a passed check.
+        """
+        return tuple(
+            self.results[r.model_dump_json()]
+            for r in candidate.publication_requests
+            if isinstance(self.results.get(r.model_dump_json()), PublicationEvidence)
+        )
+
     def _count(self):
         with self.lock:
             self.requests += 1
 
-    def _key(self, repository, module):
-        return (repository, module.group, module.artifact, module.version)
-
-    def _path(self, parts):
+    def _path(self, parts: tuple[str | int, ...]) -> Path:
         digest = hashlib.sha256(json.dumps(parts).encode()).hexdigest()
         return self.cache_dir / (digest + ".json")
+
+    def _maven_path(self, request: _MavenLookup, method: str) -> Path:
+        module = request.module
+        return self._path(
+            (
+                1,
+                request.repository,
+                module.group,
+                module.artifact,
+                module.version,
+                method,
+            )
+        )
+
+    def _registry_path(self, request: _RegistryLookup) -> Path:
+        return self._path(
+            ("registry", request.registry, request.package, request.version)
+        )
 
     def _fresh(self, checked_at):
         return timedelta(0) <= self.clock() - checked_at < timedelta(hours=24)
 
-    def _cached(self, key):
-        if key[0] == "registry":
-            _, registry, package, version = key
-            if registry == "npm":
-                return None
-            try:
-                fact = RegistryFact.model_validate_json(self._path(key).read_bytes())
-            except OSError, ValueError:
-                return None
-            if (
-                (fact.registry, fact.package, fact.version)
-                != (registry, package, version)
-                or fact.timestamp > self.clock()
-                or not self._fresh(fact.checked_at)
-            ):
-                return None
-            with self.lock:
-                self.cache_hits += 1
-            return fact
-
-        repository, group, artifact, version = key
-        module = ModuleId(group=group, artifact=artifact, version=version)
+    def _cached_maven(self, request: _MavenLookup) -> PublicationFact | None:
         for method in ("last_modified", "central_timestamp"):
             try:
                 fact = PublicationFact.model_validate_json(
-                    self._path((1, *key, method)).read_bytes()
+                    self._maven_path(request, method).read_bytes()
                 )
-                suffix = _artifact_suffix(module)
-                _public_url(fact.source_url, repository, suffix)
+                suffix = _artifact_suffix(request.module)
+                _public_url(fact.source_url, request.repository, suffix)
                 if (
-                    fact.repository != repository
-                    or fact.module != module
+                    fact.repository != request.repository
+                    or fact.module != request.module
                     or fact.method != method
                     or fact.timestamp > self.clock()
                     or not self._fresh(fact.checked_at)
@@ -128,9 +162,34 @@ class PublicationLookupContext:
                 continue
         return None
 
-    def _submit(self, key, project_path=None):
+    def _cached_registry(self, request: _RegistryLookup) -> RegistryFact | None:
+        if request.registry == "npm":
+            return None
+        try:
+            fact = RegistryFact.model_validate_json(
+                self._registry_path(request).read_bytes()
+            )
+        except OSError, ValueError:
+            return None
+        if (
+            (fact.registry, fact.package, fact.version)
+            != (request.registry, request.package, request.version)
+            or fact.timestamp > self.clock()
+            or not self._fresh(fact.checked_at)
+        ):
+            return None
         with self.lock:
-            prior = self.inflight.get(key)
+            self.cache_hits += 1
+        return fact
+
+    def _submit[Request, Fact: (PublicationFact, RegistryFact)](
+        self,
+        request: Request,
+        futures: dict[Request, Future[Fact | AgeBlock | None]],
+        operation: Callable[[Request], Fact | AgeBlock | None],
+    ) -> Future[Fact | AgeBlock | None]:
+        with self.lock:
+            prior = futures.get(request)
             if prior is not None:
                 if not prior.done():
                     return prior
@@ -139,32 +198,9 @@ class PublicationLookupContext:
                     value, (PublicationFact, RegistryFact)
                 ) or self._fresh(value.checked_at):
                     return prior
-            future = self.pool.submit(self._fetch, key, project_path)
-            self.inflight[key] = future
+            future = self.pool.submit(operation, request)
+            futures[request] = future
             return future
-
-    def submit(
-        self, repository: RepositoryId, module: ModuleId
-    ) -> Future[PublicationFact | AgeBlock | None]:
-        """Schedule one exact Maven publication lookup with in-context deduplication."""
-        key = self._key(repository, module)
-        return self._submit(key)
-
-    def submit_registry(
-        self, registry: Registry, package: str, version: str, project_path: Path
-    ) -> Future[RegistryFact | AgeBlock | None]:
-        """Schedule one exact registry lookup, using *project_path* for npm."""
-        key = ("registry", registry, package, version)
-        return self._submit(key, project_path)
-
-    def prefetch(self, requests):
-        """Schedule every routable module in the publication requests."""
-        for request in requests:
-            for module in (request.module, request.marker_implementation):
-                if not (request.routing_supported and module is not None):
-                    continue
-                for repository in request.repositories:
-                    self.submit(repository, module)
 
     def _publication_timestamp(self, repository, module, headers):
         raw = headers.get("last-modified")
@@ -217,53 +253,75 @@ class PublicationLookupContext:
         )
         return AgeBlock(reason=f"{label}: {reason}")
 
-    def _fetch(self, key, project_path=None):
+    def _fetch[Fact: (PublicationFact, RegistryFact)](
+        self,
+        *,
+        label: str,
+        cached: Callable[[], Fact | None],
+        lookup: Callable[[], Fact | None],
+        store: Callable[[Fact], None],
+    ) -> Fact | AgeBlock | None:
         started = time.monotonic()
         try:
-            if cached := self._cached(key):
-                return cached
-            if key[0] == "registry":
-                fact = self._registry_lookup(key, project_path)
-            else:
-                fact = self._pom_lookup(key)
+            if cached_fact := cached():
+                return cached_fact
+            fact = lookup()
             if fact is None:
                 return None
             if fact.timestamp > self.clock():
                 msg = "future publication timestamp"
                 raise PublicationError(msg)
-            if isinstance(fact, PublicationFact):
-                self._store(self._path((1, *key, fact.method)), fact)
-            elif fact.registry == "pypi":
-                self._store(self._path(key), fact)
+            store(fact)
             return fact
         except _LOOKUP_ERRORS as error:
-            if key[0] == "registry":
-                label = f"{key[2]}:{key[3]}"
-            else:
-                label = f"{key[1]}:{key[2]}:{key[3]}"
             return self._lookup_failed(label, error)
         finally:
             with self.lock:
                 self.seconds += time.monotonic() - started
 
-    def _pom_lookup(self, key):
-        repository, group, artifact, version = key
-        module = ModuleId(group=group, artifact=artifact, version=version)
+    def _fetch_maven(self, request: _MavenLookup) -> _MavenResult:
+        return self._fetch(
+            label=f"{request.module.coordinate}:{request.module.version}",
+            cached=functools.partial(self._cached_maven, request),
+            lookup=functools.partial(self._pom_lookup, request),
+            store=lambda fact: self._store(
+                self._maven_path(request, fact.method), fact
+            ),
+        )
+
+    def _fetch_registry(
+        self, request: _RegistryLookup, project_path: Path
+    ) -> _RegistryResult:
+        def store(fact: RegistryFact) -> None:
+            if fact.registry == "pypi":
+                self._store(self._registry_path(request), fact)
+
+        return self._fetch(
+            label=f"{request.package}:{request.version}",
+            cached=functools.partial(self._cached_registry, request),
+            lookup=functools.partial(self._registry_lookup, request, project_path),
+            store=store,
+        )
+
+    def _pom_lookup(self, request: _MavenLookup) -> PublicationFact | None:
+        module = request.module
         suffix = _artifact_suffix(module)
-        url = _ROOTS[repository] + "/" + suffix
-        response = self.transport(url, repository, suffix, self._count)
+        url = _ROOTS[request.repository] + "/" + suffix
+        response = self.transport(url, request.repository, suffix, self._count)
         if response is None:
             return None
         body, headers, final_url = response
-        _public_url(final_url, repository, suffix)
+        _public_url(final_url, request.repository, suffix)
         if len(body) > _MAX_BYTES:
             msg = "POM exceeds size limit"
             raise PublicationError(msg)
         implementation = _pom_identity(body, module)
         headers = {name.lower(): value for name, value in headers.items()}
-        method, timestamp = self._publication_timestamp(repository, module, headers)
+        method, timestamp = self._publication_timestamp(
+            request.repository, module, headers
+        )
         return PublicationFact(
-            repository=repository,
+            repository=request.repository,
             module=module,
             source_url=final_url,
             method=method,
@@ -289,34 +347,40 @@ class PublicationLookupContext:
             raise PublicationError(msg)
         return _pypi_timestamp(body, package, version)
 
-    def _registry_lookup(self, key, project_path):
-        _, registry, package, version = key
-        if registry == "pypi":
-            timestamp = self._pypi_timestamp(package, version)
+    def _registry_lookup(
+        self, request: _RegistryLookup, project_path: Path
+    ) -> RegistryFact | None:
+        if request.registry == "pypi":
+            timestamp = self._pypi_timestamp(request.package, request.version)
         else:
             self._count()
-            timestamp = _npm_timestamp(package, version, project_path)
+            timestamp = _npm_timestamp(request.package, request.version, project_path)
         if timestamp is None:
             return None
         return RegistryFact(
-            registry=registry,
-            package=package,
-            version=version,
+            registry=request.registry,
+            package=request.package,
+            version=request.version,
             timestamp=timestamp.astimezone(UTC),
             checked_at=self.clock(),
         )
 
-    def evidence_for(self, candidate):
-        """Return the aggregate evidence already looked up for *candidate*.
 
-        Only requests that resolved to full ``PublicationEvidence`` (never a
-        block) are returned, for receipt persistence after a passed check.
-        """
-        return tuple(
-            self.results[r.model_dump_json()]
-            for r in candidate.publication_requests
-            if isinstance(self.results.get(r.model_dump_json()), PublicationEvidence)
-        )
+@dataclass(frozen=True)
+class _MavenLookup:
+    repository: RepositoryId
+    module: ModuleId
+
+
+@dataclass(frozen=True)
+class _RegistryLookup:
+    registry: Registry
+    package: str
+    version: str
+
+
+type _MavenResult = PublicationFact | AgeBlock | None
+type _RegistryResult = RegistryFact | AgeBlock | None
 
 
 def filter_gradle_updates_by_age(

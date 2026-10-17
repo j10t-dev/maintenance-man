@@ -14,7 +14,8 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.output import relative_time
 from maintenance_man.storage import record_activity
-from tests.conftest import TerminalStream, run_mm, write_config
+from tests.support.cli import TerminalStream, run_mm
+from tests.support.projects import write_config
 
 _NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 

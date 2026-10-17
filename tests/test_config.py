@@ -13,7 +13,7 @@ from maintenance_man.config import (
     resolve_project,
 )
 from maintenance_man.models.config import DefaultsConfig, MmConfig, ProjectConfig
-from tests.conftest import write_config
+from tests.support.projects import write_config
 
 
 class TestDefaultsConfig:

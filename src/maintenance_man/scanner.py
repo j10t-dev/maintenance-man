@@ -15,8 +15,8 @@ from pydantic import (
     StrictStr,
     ValidationError,
     ValidationInfo,
-    ValidatorFunctionWrapHandler,
     field_validator,
+    model_validator,
 )
 
 from maintenance_man import paths
@@ -276,37 +276,20 @@ class _TrivyNonLanguageResult(BaseModel):
             raise ValueError(msg)
         return value
 
-    @field_validator("target", mode="wrap")
+    @model_validator(mode="before")
     @classmethod
-    def decode_consumed_secret_target(
-        cls,
-        value: object,
-        handler: ValidatorFunctionWrapHandler,
-        info: ValidationInfo,
-    ) -> str:
+    def normalise_unconsumed_secret_fields(
+        cls, value: object, info: ValidationInfo
+    ) -> object:
+        if not isinstance(value, dict):
+            return value
         if (
-            info.data.get("class_") == "secret"
+            value.get("Class") == "secret"
             and info.context is not None
             and info.context["consume_secrets"]
         ):
-            return handler(value)
-        return ""
-
-    @field_validator("secrets", mode="wrap")
-    @classmethod
-    def decode_consumed_secrets(
-        cls,
-        value: object,
-        handler: ValidatorFunctionWrapHandler,
-        info: ValidationInfo,
-    ) -> list[_TrivySecret] | None:
-        if (
-            info.data.get("class_") == "secret"
-            and info.context is not None
-            and info.context["consume_secrets"]
-        ):
-            return handler(value)
-        return None
+            return value
+        return {**value, "Target": "", "Secrets": None}
 
 
 type _TrivyResult = _TrivyLanguageResult | _TrivyNonLanguageResult

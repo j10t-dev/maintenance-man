@@ -8,9 +8,10 @@ from maintenance_man.gradle import GradleError
 from maintenance_man.gradle_updates import gradle_evidence_workspace
 from maintenance_man.vcs import Repository, RevisionError
 from maintenance_man.vcs_workflow import VcsServices
-from tests.conftest import completed, make_project
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeCommands
+from tests.support.process import completed
+from tests.support.projects import make_project
 
 
 @pytest.fixture

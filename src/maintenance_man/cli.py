@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Annotated, Literal, NoReturn, get_args
 
 import cyclopts
-from rich.cells import cell_len
 from rich.text import Text
 
 from maintenance_man import __version__, output, paths, vcs_workflow
@@ -97,16 +96,16 @@ from maintenance_man.updater import run_test_phases
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import make_vcs_services
 
-_EXIT_FOR: dict[type[Exception], ExitCode] = {
-    WorkflowError: ExitCode.ERROR,
-    ConfigError: ExitCode.ERROR,
-    ProjectNotFoundError: ExitCode.ERROR,
-    ToolNotFoundError: ExitCode.ERROR,
-    ScanError: ExitCode.ERROR,
-    GradleError: ExitCode.ERROR,
-    RevisionError: ExitCode.ERROR,
-    OutdatedCheckError: ExitCode.ERROR,
-}
+_HANDLED_ERRORS = (
+    WorkflowError,
+    ConfigError,
+    ProjectNotFoundError,
+    ToolNotFoundError,
+    ScanError,
+    GradleError,
+    RevisionError,
+    OutdatedCheckError,
+)
 
 
 _OVERVIEW_HEADERS = (
@@ -135,22 +134,14 @@ def _command[**P](function: Callable[P, None]) -> Callable[P, None]:
     def mapped_command(*args: P.args, **kwargs: P.kwargs) -> None:
         try:
             function(*args, **kwargs)
-        except tuple(_EXIT_FOR) as exc:
-            code = next(
-                code for kind, code in _EXIT_FOR.items() if isinstance(exc, kind)
-            )
+        except _HANDLED_ERRORS as exc:
             hint = "mm list" if isinstance(exc, UnknownProjectError) else None
-            _fatal(str(exc), code=code, hint=hint)
+            _fatal(str(exc), hint=hint)
 
     return mapped_command
 
 
 type _Flow = Literal["scan", "update", "resolve", "deploy"]
-
-
-@functools.singledispatch
-def _render(event: Event, *, batch: bool, project: str, flow: _Flow) -> None:
-    raise NotImplementedError(type(event))
 
 
 @dataclass(slots=True)
@@ -159,10 +150,245 @@ class _Renderer:
     project: str = ""
     flow: _Flow = "update"
 
+    @functools.singledispatchmethod
     def __call__(self, event: Event) -> None:
-        if isinstance(event, ProjectStarted):
-            self.project = event.project
-        _render(event, batch=self.batch, project=self.project, flow=self.flow)
+        raise NotImplementedError(type(event))
+
+    @__call__.register
+    def _render_project_skipped(self, event: ProjectSkipped) -> None:
+        if event.reason in _DEPLOY_SKIPS:
+            status, reason = _DEPLOY_SKIPS[event.reason]
+            _project_outcome(event.project, "deploy", status, "deploy", reason)
+            return
+        match event.reason:
+            case SkipReason.PATH_MISSING if self.flow == "deploy":
+                _project_outcome(
+                    event.project,
+                    "deploy",
+                    "failed",
+                    "deploy",
+                    f"path does not exist: {event.detail}",
+                )
+            case SkipReason.PATH_MISSING:
+                output.diagnostic(
+                    "warning", f"{event.project} · path does not exist: {event.detail}"
+                )
+            case SkipReason.FLOW_CONFLICT:
+                output.diagnostic("warning", f"{event.project} · {event.detail}")
+            case SkipReason.NO_SCAN_RESULTS if not self.batch:
+                output.notice(f"No scan results for {event.project}")
+            case SkipReason.NOTHING_TO_DO:
+                output.notice(f"Nothing to {event.detail} in {event.project}")
+
+    @__call__.register
+    def _render_operation_failed(self, event: OperationFailed) -> None:
+        if event.operation is Operation.PROMOTE:
+            output.outcome(
+                event.project, "promotion", "failed", _LOCAL_MAIN, reason=event.error
+            )
+            return
+        words = _OPERATION_WORDS[event.operation]
+        if event.operation is Operation.SUBMIT:
+            bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
+            words = f"{words} · keeping {bookmark} for manual recovery"
+        kind = "warning" if event.operation in _WARNING_OPERATIONS else "error"
+        output.diagnostic(kind, f"{event.project} · {words} · {event.error}")
+
+    @__call__.register
+    def _render_scan_reported(self, event: ScanReported) -> None:
+        result = event.result
+        if self.flow == "scan" or output.terminal():
+            _print_scan_result(result, elapsed_s=event.elapsed_s)
+        else:
+            _print_blocked_findings(result, self.flow)
+        if result.has_findings or self.batch:
+            return
+        if event.elapsed_s is None:
+            output.notice(f"No findings in {result.project}")
+        else:
+            output.notice(
+                f"No findings in {result.project} · scanned in {event.elapsed_s:.1f}s"
+            )
+
+    @__call__.register
+    def _render_missing_test_config(self, event: MissingTestConfig) -> None:
+        output.diagnostic(
+            "warning", f"{event.project} · no test configuration · test phases skipped"
+        )
+
+    @__call__.register
+    def _render_processing_started(self, event: ProcessingStarted) -> None:
+        output.heading(
+            self.project, f"{event.vulns} vulnerabilities · {event.updates} updates"
+        )
+
+    @__call__.register
+    def _render_findings_processed(self, event: FindingsProcessed) -> None:
+        if not self.batch:
+            _print_result_totals(event.results, event.blocked)
+
+    @__call__.register
+    def _render_promoted(self, event: Promoted) -> None:
+        output.outcome(self.project, "promotion", "passed", _LOCAL_MAIN)
+
+    @__call__.register
+    def _render_resolve_paused(self, event: ResolvePaused) -> None:
+        output.notice("Resolve paused")
+        output.diagnostic("hint", f"mm resolve {event.project} --continue")
+
+    @__call__.register
+    def _render_findings_blocked(self, event: FindingsBlocked) -> None:
+        if self.project:
+            output.heading(self.project)
+        for package, reason in event.findings:
+            output.outcome(self.project, "resolve", "blocked", package, reason=reason)
+
+    @__call__.register
+    def _render_submission_blocked(self, event: SubmissionBlocked) -> None:
+        output.diagnostic(
+            "warning",
+            f"{event.project} · blocked findings remain · "
+            "rescan or resolve them manually",
+        )
+
+    @__call__.register
+    def _render_blockers_still_failing(self, event: BlockersStillFailing) -> None:
+        output.diagnostic(
+            "error", f"{event.phase} · still blocking: {', '.join(event.pkgs)}"
+        )
+
+    @__call__.register
+    def _render_sync_completed(self, event: SyncCompleted) -> None:
+        if event.action == vcs_workflow.SyncAction.UNCHANGED:
+            _project_outcome(event.project, "sync", "unchanged", "main")
+        else:
+            _project_outcome(event.project, "sync", "passed", "main", event.action)
+
+    @__call__.register
+    def _render_project_started(self, event: ProjectStarted) -> None:
+        self.project = event.project
+
+    @__call__.register
+    def _render_finding_started(self, event: FindingStarted) -> None:
+        if output.stderr_terminal():
+            output.notice(f"Updating {event.pkg} {event.installed} → {event.target}")
+
+    @__call__.register
+    def _render_test_command_started(self, event: TestCommandStarted) -> None:
+        if output.is_verbose():
+            output.notice(f"$ {event.command}")
+
+    @__call__.register
+    def _render_finding_step_failed(self, event: FindingStepFailed) -> None:
+        words = event.step.value.replace("_", " ")
+        prefix = f"{self.project} · " if self.project else ""
+        output.diagnostic("error", f"{prefix}{words} · {event.error}")
+
+    @__call__.register
+    def _render_finding_passed(self, event: FindingPassed) -> None:
+        if self.project:
+            output.heading(self.project)
+        output.outcome(
+            self.project,
+            self.flow,
+            "passed",
+            event.pkg,
+            installed=event.installed,
+            target=event.target,
+            reason="already applied" if event.already_applied else "",
+        )
+
+    @__call__.register
+    def _render_finding_failed(self, event: FindingFailed) -> None:
+        if self.project:
+            output.heading(self.project)
+        output.outcome(
+            self.project,
+            self.flow,
+            "failed",
+            event.pkg,
+            installed=event.installed,
+            target=event.target,
+            reason=f"{event.phase} failed",
+        )
+
+    @__call__.register
+    def _render_deploy_step_started(self, event: DeployStepStarted) -> None:
+        output.heading(event.project)
+
+    @__call__.register
+    def _render_deploy_step_succeeded(self, event: DeployStepSucceeded) -> None:
+        word = _DEPLOY_STEP_WORDS.get(event.step)
+        if word is None:
+            return
+        _project_outcome(event.project, word, "passed", word)
+
+    @__call__.register
+    def _render_deploy_step_failed(self, event: DeployStepFailed) -> None:
+        word = _DEPLOY_STEP_WORDS.get(event.step)
+        if word is None:
+            return
+        _project_outcome(event.project, word, "failed", word, event.error)
+        if event.step is DeployStep.BUILD:
+            _project_outcome(
+                event.project, "deploy", "skipped", "deploy", "build failed"
+            )
+
+    @__call__.register
+    def _render_health_checked(self, event: HealthChecked) -> None:
+        if event.is_up:
+            _project_outcome(event.project, "health", "passed", "healthcheck")
+        else:
+            _project_outcome(
+                event.project,
+                "health",
+                "failed",
+                "healthcheck",
+                event.error or "not healthy",
+            )
+
+    @__call__.register
+    def _render_healthcheck_unconfigured(self, event: HealthcheckUnconfigured) -> None:
+        output.notice("--check: no healthcheck_url configured in [defaults]")
+
+    @__call__.register
+    def _render_pull_request_output(self, event: PullRequestOutput) -> None:
+        if self.project:
+            output.heading(self.project)
+        output.outcome(
+            self.project, "resolve", "passed", "pull request", reason=event.text
+        )
+
+    @__call__.register
+    def _render_gradle_withheld(self, event: GradleWithheld) -> None:
+        output.outcome(
+            self.project, self.flow, "blocked", event.label, reason=event.reason
+        )
+
+    @__call__.register
+    def _render_no_eligible_gradle_changes(
+        self, event: NoEligibleGradleChanges
+    ) -> None:
+        output.notice(f"No eligible Gradle changes in {self.project}")
+
+    @__call__.register
+    def _render_gradle_run_archived(self, event: GradleRunArchived) -> None:
+        output.diagnostic(
+            "warning",
+            f"archived failed Gradle run to {event.path} · "
+            "rebuilding candidates from main",
+        )
+
+    @__call__.register
+    def _render_gradle_flow_failed(self, event: GradleFlowFailed) -> None:
+        output.diagnostic(
+            "error", f"cannot complete Gradle {event.flow.value} · {event.error}"
+        )
+
+    @__call__.register
+    def _render_gradle_run_reported(self, event: GradleRunReported) -> None:
+        _print_scan_result(event.scan)
+        _print_gradle_run_summary(event.run)
 
 
 _DEPLOY_SKIPS: dict[SkipReason, tuple[output.Status, str]] = {
@@ -210,317 +436,6 @@ def _project_outcome(
     output.outcome(project, operation, status, subject, reason=reason)
 
 
-@_render.register
-def _render_project_skipped(
-    event: ProjectSkipped, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if event.reason in _DEPLOY_SKIPS:
-        status, reason = _DEPLOY_SKIPS[event.reason]
-        _project_outcome(event.project, "deploy", status, "deploy", reason)
-        return
-    match event.reason:
-        case SkipReason.PATH_MISSING if flow == "deploy":
-            _project_outcome(
-                event.project,
-                "deploy",
-                "failed",
-                "deploy",
-                f"path does not exist: {event.detail}",
-            )
-        case SkipReason.PATH_MISSING:
-            output.diagnostic(
-                "warning", f"{event.project} · path does not exist: {event.detail}"
-            )
-        case SkipReason.FLOW_CONFLICT:
-            output.diagnostic("warning", f"{event.project} · {event.detail}")
-        case SkipReason.NO_SCAN_RESULTS if not batch:
-            output.notice(f"No scan results for {event.project}")
-        case SkipReason.NOTHING_TO_DO:
-            output.notice(f"Nothing to {event.detail} in {event.project}")
-
-
-@_render.register
-def _render_operation_failed(
-    event: OperationFailed, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if event.operation is Operation.PROMOTE:
-        output.outcome(
-            event.project, "promotion", "failed", _LOCAL_MAIN, reason=event.error
-        )
-        return
-    words = _OPERATION_WORDS[event.operation]
-    if event.operation is Operation.SUBMIT:
-        bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-        words = f"{words} · keeping {bookmark} for manual recovery"
-    kind = "warning" if event.operation in _WARNING_OPERATIONS else "error"
-    output.diagnostic(kind, f"{event.project} · {words} · {event.error}")
-
-
-@_render.register
-def _render_scan_reported(
-    event: ScanReported, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    result = event.result
-    if flow == "scan" or output.terminal():
-        _print_scan_result(result, elapsed_s=event.elapsed_s)
-    else:
-        _print_blocked_findings(result, flow)
-    if result.has_findings or batch:
-        return
-    if event.elapsed_s is None:
-        output.notice(f"No findings in {result.project}")
-    else:
-        output.notice(
-            f"No findings in {result.project} · scanned in {event.elapsed_s:.1f}s"
-        )
-
-
-@_render.register
-def _render_missing_test_config(
-    event: MissingTestConfig, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.diagnostic(
-        "warning", f"{event.project} · no test configuration · test phases skipped"
-    )
-
-
-@_render.register
-def _render_processing_started(
-    event: ProcessingStarted, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.heading(project, f"{event.vulns} vulnerabilities · {event.updates} updates")
-
-
-@_render.register
-def _render_findings_processed(
-    event: FindingsProcessed, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if not batch:
-        _print_result_totals(event.results, event.blocked)
-
-
-@_render.register
-def _render_promoted(
-    event: Promoted, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.outcome(project, "promotion", "passed", _LOCAL_MAIN)
-
-
-@_render.register
-def _render_resolve_paused(
-    event: ResolvePaused, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.notice("Resolve paused")
-    output.diagnostic("hint", f"mm resolve {event.project} --continue")
-
-
-@_render.register
-def _render_findings_blocked(
-    event: FindingsBlocked, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if project:
-        output.heading(project)
-    for package, reason in event.findings:
-        output.outcome(project, "resolve", "blocked", package, reason=reason)
-
-
-@_render.register
-def _render_submission_blocked(
-    event: SubmissionBlocked, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.diagnostic(
-        "warning",
-        f"{event.project} · blocked findings remain · rescan or resolve them manually",
-    )
-
-
-@_render.register
-def _render_blockers_still_failing(
-    event: BlockersStillFailing, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.diagnostic(
-        "error", f"{event.phase} · still blocking: {', '.join(event.pkgs)}"
-    )
-
-
-@_render.register
-def _render_sync_completed(
-    event: SyncCompleted, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if event.action == vcs_workflow.SyncAction.UNCHANGED:
-        _project_outcome(event.project, "sync", "unchanged", "main")
-    else:
-        _project_outcome(event.project, "sync", "passed", "main", event.action)
-
-
-@_render.register
-def _render_project_started(
-    event: ProjectStarted, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    """The renderer records the project; its heading prints with the counts."""
-
-
-@_render.register
-def _render_finding_started(
-    event: FindingStarted, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if output.stderr_terminal():
-        output.notice(f"Updating {event.pkg} {event.installed} → {event.target}")
-
-
-@_render.register
-def _render_test_command_started(
-    event: TestCommandStarted, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if output.is_verbose():
-        output.notice(f"$ {event.command}")
-
-
-@_render.register
-def _render_finding_step_failed(
-    event: FindingStepFailed, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    words = event.step.value.replace("_", " ")
-    prefix = f"{project} · " if project else ""
-    output.diagnostic("error", f"{prefix}{words} · {event.error}")
-
-
-@_render.register
-def _render_finding_passed(
-    event: FindingPassed, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if project:
-        output.heading(project)
-    output.outcome(
-        project,
-        flow,
-        "passed",
-        event.pkg,
-        installed=event.installed,
-        target=event.target,
-        reason="already applied" if event.already_applied else "",
-    )
-
-
-@_render.register
-def _render_finding_failed(
-    event: FindingFailed, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if project:
-        output.heading(project)
-    output.outcome(
-        project,
-        flow,
-        "failed",
-        event.pkg,
-        installed=event.installed,
-        target=event.target,
-        reason=f"{event.phase} failed",
-    )
-
-
-@_render.register
-def _render_deploy_step_started(
-    event: DeployStepStarted, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.heading(event.project)
-
-
-@_render.register
-def _render_deploy_step_succeeded(
-    event: DeployStepSucceeded, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    word = _DEPLOY_STEP_WORDS.get(event.step)
-    if word is None:
-        return
-    _project_outcome(event.project, word, "passed", word)
-
-
-@_render.register
-def _render_deploy_step_failed(
-    event: DeployStepFailed, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    word = _DEPLOY_STEP_WORDS.get(event.step)
-    if word is None:
-        return
-    _project_outcome(event.project, word, "failed", word, event.error)
-    if event.step is DeployStep.BUILD:
-        _project_outcome(event.project, "deploy", "skipped", "deploy", "build failed")
-
-
-@_render.register
-def _render_health_checked(
-    event: HealthChecked, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if event.is_up:
-        _project_outcome(event.project, "health", "passed", "healthcheck")
-    else:
-        _project_outcome(
-            event.project,
-            "health",
-            "failed",
-            "healthcheck",
-            event.error or "not healthy",
-        )
-
-
-@_render.register
-def _render_healthcheck_unconfigured(
-    event: HealthcheckUnconfigured, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.notice("--check: no healthcheck_url configured in [defaults]")
-
-
-@_render.register
-def _render_pull_request_output(
-    event: PullRequestOutput, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    if project:
-        output.heading(project)
-    output.outcome(project, "resolve", "passed", "pull request", reason=event.text)
-
-
-@_render.register
-def _render_gradle_withheld(
-    event: GradleWithheld, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.outcome(project, flow, "blocked", event.label, reason=event.reason)
-
-
-@_render.register
-def _render_no_eligible_gradle_changes(
-    event: NoEligibleGradleChanges, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.notice(f"No eligible Gradle changes in {project}")
-
-
-@_render.register
-def _render_gradle_run_archived(
-    event: GradleRunArchived, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.diagnostic(
-        "warning",
-        f"archived failed Gradle run to {event.path} · rebuilding candidates from main",
-    )
-
-
-@_render.register
-def _render_gradle_flow_failed(
-    event: GradleFlowFailed, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    output.diagnostic(
-        "error", f"cannot complete Gradle {event.flow.value} · {event.error}"
-    )
-
-
-@_render.register
-def _render_gradle_run_reported(
-    event: GradleRunReported, *, batch: bool, project: str, flow: _Flow
-) -> None:
-    _print_scan_result(event.scan)
-    _print_gradle_run_summary(event.run)
-
-
 app = cyclopts.App(
     name="mm",
     help="Config-driven CLI for routine software project maintenance.",
@@ -543,7 +458,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 @_command
 def init() -> None:
     """Initialise the ~/.mm directory and skeleton config."""
-    output.set_verbose(False)
+    output.reset_invocation_output(verbose=False)
     ensure_mm_home()
     output.notice(f"Initialised {paths.mm_home()}")
     output.notice(f"Add projects to {paths.config_path()}")
@@ -565,7 +480,7 @@ def scan(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.set_verbose(False)
+    output.reset_invocation_output(verbose=False)
     cfg = _load_cfg(config)
 
     if not cfg.projects:
@@ -633,7 +548,7 @@ def update(
     verbose: bool
         Stream subprocess logs to stderr, including successful commands.
     """
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
     cfg = _load_cfg(config)
     mode, targets = update_service.resolve_update_targets(cfg, projects, negate=negate)
 
@@ -689,7 +604,7 @@ def sync(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.set_verbose(False)
+    output.reset_invocation_output(verbose=False)
     cfg = _load_cfg(config)
 
     if not cfg.projects:
@@ -759,7 +674,7 @@ def deploy(
     verbose: bool
         Stream subprocess logs to stderr, including successful commands.
     """
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
     cfg = _load_cfg(config)
     vcs = make_vcs_services()
     batch = not project
@@ -826,7 +741,7 @@ def test(
     verbose: bool
         Stream subprocess logs to stderr, including successful commands.
     """
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     _require_test_config(project, proj_config, config)
@@ -863,7 +778,7 @@ def build(
     verbose: bool
         Stream subprocess logs to stderr, including successful commands.
     """
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     vcs = make_vcs_services()
@@ -902,7 +817,7 @@ def list_projects(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.set_verbose(False)
+    output.reset_invocation_output(verbose=False)
     cfg = _load_cfg(config)
 
     if not cfg.projects:
@@ -1059,12 +974,10 @@ def _fit_columns(
     width = output.console().width
     dropped = []
     for name in _NARROW_DROP_ORDER:
-        widths = []
-        for column in fitting:
-            longest = max(cell_len(row[column]) for row in rows)
-            shown = longest if column == fitting[-1] else min(24, longest)
-            widths.append(max(cell_len(headers[column]), shown))
-        required = 2 + sum(widths) + 2 * (len(widths) - 1)
+        required = output.table_width(
+            [headers[column] for column in fitting],
+            [[row[column] for column in fitting] for row in rows],
+        )
         if required <= width:
             break
         index = headers.index(name)
@@ -1090,7 +1003,7 @@ def todo(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.set_verbose(False)
+    output.reset_invocation_output(verbose=False)
     cfg = _load_cfg(config)
 
     if project:
@@ -1340,7 +1253,7 @@ def resolve(
     verbose: bool
         Stream subprocess logs to stderr, including successful commands.
     """
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     minimum_age_days = cfg.defaults.min_version_age_days

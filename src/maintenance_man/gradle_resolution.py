@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import files
@@ -58,7 +58,6 @@ from maintenance_man.models.gradle import (
     UnknownOwner,
 )
 from maintenance_man.models.scan import (
-    GradleBlock,
     GradleKind,
     GradleUpdateTarget,
     UpdateFinding,
@@ -471,9 +470,9 @@ def _link_vulnerabilities(
     catalogue: Catalogue,
     resolution: CompleteResolution,
     vulnerabilities: Sequence[VulnFinding],
-    withheld: list[CandidateWithheld],
-) -> dict[str, list[_VulnerabilityLink]]:
+) -> tuple[dict[str, list[_VulnerabilityLink]], list[CandidateWithheld]]:
     linked: dict[str, list[_VulnerabilityLink]] = {}
+    withheld: list[CandidateWithheld] = []
     for finding in vulnerabilities:
         parts = finding.pkg_name.split(":")
         if len(parts) != 2:
@@ -505,7 +504,7 @@ def _link_vulnerabilities(
             )
             continue
         linked.setdefault(next(iter(groups)), []).append((finding, known))
-    return linked
+    return linked, withheld
 
 
 def _security_only_proposal(
@@ -564,12 +563,13 @@ def _security_only_proposal(
     )
 
 
-def _apply_vulnerability_links(
+def _build_security_proposals(
     catalogue: Catalogue,
-    candidates: dict[str, GradleCandidate],
-    withheld: list[CandidateWithheld],
+    candidates: Mapping[str, GradleCandidate],
     linked: dict[str, list[_VulnerabilityLink]],
-) -> None:
+) -> tuple[dict[str, GradleCandidate], list[CandidateWithheld]]:
+    proposals: dict[str, GradleCandidate] = {}
+    withheld: list[CandidateWithheld] = []
     for key, links in linked.items():
         advisory_ids = frozenset(finding.vuln_id for finding, _ in links)
         coordinates = frozenset(finding.pkg_name for finding, _ in links)
@@ -578,7 +578,7 @@ def _apply_vulnerability_links(
         )
         if key in candidates:
             existing = candidates[key]
-            candidates[key] = existing.model_copy(
+            proposals[key] = existing.model_copy(
                 update={
                     "origins": frozenset({"ordinary", "security"}),
                     "requested_advisories": advisory_ids,
@@ -593,7 +593,8 @@ def _apply_vulnerability_links(
         if isinstance(proposal, CandidateWithheld):
             withheld.append(proposal)
         else:
-            candidates[key] = proposal
+            proposals[key] = proposal
+    return proposals, withheld
 
 
 def select_gradle_candidates(
@@ -602,11 +603,19 @@ def select_gradle_candidates(
     vulnerabilities: Sequence[VulnFinding],
     discovered: Sequence[UpdateFinding],
 ) -> GradleFixPlan:
+    """Merge ordinary and security proposals, retaining each withheld reason."""
     candidates, withheld, conflicting = _collect_ordinary_proposals(
         resolution, discovered
     )
-    linked = _link_vulnerabilities(catalogue, resolution, vulnerabilities, withheld)
-    _apply_vulnerability_links(catalogue, candidates, withheld, linked)
+    linked, unlinked_findings = _link_vulnerabilities(
+        catalogue, resolution, vulnerabilities
+    )
+    security_candidates, security_withheld = _build_security_proposals(
+        catalogue, candidates, linked
+    )
+    candidates.update(security_candidates)
+    withheld.extend(unlinked_findings)
+    withheld.extend(security_withheld)
     for key in sorted(conflicting):
         candidate = candidates.pop(key)
         withheld.append(
@@ -812,8 +821,10 @@ def attach_gradle_publications(
 
 @dataclass(frozen=True)
 class PreparedCandidate:
+    """A checked proposal, with a reason when it must be withheld."""
+
     candidate: GradleCandidate
-    block: GradleBlock | None = None
+    withheld_reason: str | None = None
 
 
 def prepare_gradle_candidates(
@@ -831,11 +842,7 @@ def prepare_gradle_candidates(
     for candidate in candidates:
         bound = attach_gradle_publications(candidate, resolution, batch)
         if isinstance(bound, CandidateWithheld):
-            prepared.append(
-                PreparedCandidate(
-                    candidate, GradleBlock(kind="mapping", reason=bound.reason)
-                )
-            )
+            prepared.append(PreparedCandidate(candidate, withheld_reason=bound.reason))
         else:
             if project.gradle_repository_routing != "standard-public":
                 bound = bound.model_copy(update={"publication_requests": ()})
@@ -844,12 +851,12 @@ def prepare_gradle_candidates(
         publication.prefetch(
             request
             for item in prepared
-            if item.block is None
+            if item.withheld_reason is None
             for request in item.candidate.publication_requests
         )
     result = []
     for item in prepared:
-        if item.block is not None:
+        if item.withheld_reason is not None:
             result.append(item)
             continue
         age = evaluate_gradle_candidate_age(
@@ -858,7 +865,7 @@ def prepare_gradle_candidates(
         result.append(
             PreparedCandidate(
                 item.candidate,
-                GradleBlock(kind="age", reason=age.reason) if age else None,
+                age.reason if age else None,
             )
         )
     return tuple(result)

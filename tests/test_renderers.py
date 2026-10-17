@@ -52,7 +52,8 @@ from maintenance_man.models.gradle import (
     ResolutionReport,
 )
 from maintenance_man.models.scan import ScanResult, UpdateResult, Workflow
-from tests.conftest import TerminalStream, make_scan_result, make_update
+from tests.support.cli import TerminalStream
+from tests.support.findings import make_scan_result, make_update
 
 
 def _make_gradle_run() -> GradleRun:
@@ -142,7 +143,7 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
 @pytest.mark.parametrize(
     ("event", "flow", "stdout", "stderr"),
     [
-        (FindingStarted("vuln", "pkg", "1.0", "1.1", "CVE-1"), "update", "", ""),
+        (FindingStarted("pkg", "1.0", "1.1"), "update", "", ""),
         (events.TestCommandStarted("uv run pytest"), "update", "", ""),
         *[
             (
@@ -185,7 +186,7 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
             "",
         ),
         (
-            Promoted("mm/update-dependencies"),
+            Promoted(),
             "update",
             "api\tpromotion\tpassed\tlocal main\t-\t-\t-\n",
             "",
@@ -369,7 +370,7 @@ def test_given_finding_totals_when_rendered_then_zero_counts_are_omitted(
 def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
     capsys: pytest.CaptureFixture[str], verbose: bool, expected: str
 ) -> None:
-    maintenance_output.set_verbose(verbose)
+    maintenance_output.reset_invocation_output(verbose=verbose)
 
     renderer = cli._Renderer(batch=False, project="api")
     renderer(events.TestCommandStarted("uv run pytest"))
@@ -395,7 +396,7 @@ def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
             FindingsBlocked((("pkg", "no fix"),)),
             "api\n  ! blocked   pkg                       no fix",
         ),
-        (Promoted("mm/update-dependencies"), "  ✓ passed    local main"),
+        (Promoted(), "  ✓ passed    local main"),
         (ProcessingStarted(2, 1), "api · 2 vulnerabilities · 1 updates"),
         (
             PullRequestOutput("https://x/pull/1"),
@@ -465,9 +466,7 @@ def test_given_finding_started_when_rendered_then_only_a_stderr_terminal_shows_p
     monkeypatch.setattr("sys.stdout", stdout)
     monkeypatch.setattr("sys.stderr", stderr)
 
-    cli._Renderer(batch=False, project="api")(
-        FindingStarted("update", "pkg", "1.0", "2.0", "major")
-    )
+    cli._Renderer(batch=False, project="api")(FindingStarted("pkg", "1.0", "2.0"))
 
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == expected

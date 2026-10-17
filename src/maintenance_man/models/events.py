@@ -4,7 +4,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from maintenance_man.models.gradle import GradleRun
-from maintenance_man.models.scan import ScanResult, UpdateKind, UpdateResult, Workflow
+from maintenance_man.models.scan import ScanResult, UpdateResult, Workflow
 
 
 class Outcome(StrEnum):
@@ -95,7 +95,7 @@ class FindingsProcessed:
 
 @dataclass(frozen=True, slots=True)
 class Promoted:
-    bookmark: str
+    """The managed update bookmark has been promoted to local main."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +158,11 @@ class HealthcheckUnconfigured:
 
 @dataclass(frozen=True, slots=True)
 class FindingStarted:
-    kind: UpdateKind
+    """An update attempt has started for this package and version pair."""
+
     pkg: str
     installed: str
     target: str
-    detail: str
 
 
 @dataclass(frozen=True, slots=True)

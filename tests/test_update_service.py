@@ -22,16 +22,10 @@ from maintenance_man.services import update as update_service
 from maintenance_man.services.flows import FlowConflictError
 from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import RevisionError
-from tests.conftest import (
-    make_config,
-    make_project,
-    make_scan_result,
-    make_update,
-    make_vuln,
-    seed_project,
-)
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor, RecordingEmit, pick_findings
+from tests.support.findings import make_scan_result, make_update, make_vuln
+from tests.support.projects import make_config, make_project, seed_project
 
 
 def test_update_processes_in_managed_workspace(tmp_path: Path, monkeypatch) -> None:
@@ -109,7 +103,7 @@ def test_update_emits_processing_result_and_promotion_events(
     assert emit.events[1:] == [
         ProcessingStarted(0, 1),
         FindingsProcessed((expected_result,), blocked=0),
-        Promoted("mm/update-dependencies"),
+        Promoted(),
     ]
     assert [item.pkg_name for item in load_scan_results("api").updates] == ["pkg-a"]
     repo = state.services().repository(project.path)

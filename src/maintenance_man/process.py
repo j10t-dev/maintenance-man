@@ -132,7 +132,7 @@ def run_captured(
     return completed
 
 
-def run_live(
+def run_shell_command(
     command: str,
     cwd: str | Path,
     *,

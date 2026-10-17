@@ -442,7 +442,7 @@ def test_context_rejects_naive_time(frozen_context):
 def test_context_creation_stamps_the_injected_clock(
     frozen_context, resolution, tmp_path
 ):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     project, _, _ = frozen_context
     clock = FakeClock(datetime(2031, 5, 6, 7, 8, 9, tzinfo=UTC))
@@ -605,7 +605,7 @@ def _fake_trivy_report(monkeypatch, *, during=None):
 def test_capture_rejects_context_expiring_during_trivy(
     frozen_context, resolution, monkeypatch
 ):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     project, context, _ = frozen_context
     bom = project.path / "temporary-bom.json"
@@ -662,14 +662,14 @@ def test_capture_rejects_context_expiring_during_trivy(
 
 
 def test_checked_capture_rejects_context_expiring_during_build(workflow, monkeypatch):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     run = begin_workflow(workflow)
     clock = FakeClock(workflow.context.created_at + timedelta(hours=23, minutes=59))
     monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
     monkeypatch.setattr(
         updater,
-        "run_live",
+        "run_shell_command",
         lambda *args, **kwargs: clock.advance(timedelta(minutes=2)),
     )
     monkeypatch.setattr(updater, "run_test_phases", lambda *args, **kwargs: None)
@@ -701,7 +701,7 @@ def test_checked_capture_rejects_context_expiring_during_build(workflow, monkeyp
 
 
 def test_capture_unreadable_bom_is_gradle_error(frozen_context, monkeypatch):
-    from tests.conftest import fixture_runner
+    from tests.support.gradle import fixture_runner
 
     project, context, _ = frozen_context
     root = project.path
@@ -943,13 +943,13 @@ def begin_workflow(workflow, flow=Workflow.UPDATE, candidate=None, **options):
 
 
 def test_check_evidence_uses_clock_after_effects(workflow, monkeypatch):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     clock = FakeClock(datetime(2030, 1, 1, tzinfo=UTC))
     start = clock()
     monkeypatch.setattr(
         updater,
-        "run_live",
+        "run_shell_command",
         lambda *args, **kwargs: clock.advance(timedelta(hours=1)),
     )
 
@@ -1598,14 +1598,14 @@ def test_gradle_flow_opens_publications_with_its_clock(driver, monkeypatch):
 
 def test_gradle_driver_stamps_evidence_with_the_injected_clock(driver, monkeypatch):
     from maintenance_man.models.scan import ScanResult
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     start = driver.workflow.context.created_at + timedelta(hours=1)
     clock = FakeClock(start)
     monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
     monkeypatch.setattr(
         updater,
-        "run_live",
+        "run_shell_command",
         lambda *args, **kwargs: clock.advance(timedelta(minutes=1)),
     )
     monkeypatch.setattr(updater, "run_test_phases", lambda *args, **kwargs: None)
@@ -1663,7 +1663,7 @@ def test_gradle_driver_stamps_evidence_with_the_injected_clock(driver, monkeypat
 
 def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
     monkeypatch.setattr(updater, "run_gradle_checks", real_run_gradle_checks)
-    monkeypatch.setattr(updater, "run_live", lambda *args, **kwargs: None)
+    monkeypatch.setattr(updater, "run_shell_command", lambda *args, **kwargs: None)
     calls = 0
 
     def run_test(command, *_args, **_kwargs):
@@ -1673,7 +1673,7 @@ def test_gradle_driver_emits_failing_test_phase(driver, monkeypatch):
             msg = "configured unit test failed"
             raise ProcessError(msg)
 
-    monkeypatch.setattr("maintenance_man.updater.run_live", run_test)
+    monkeypatch.setattr("maintenance_man.updater.run_shell_command", run_test)
 
     assert invoke_driver(driver) is Outcome.FAILED
     assert driver.emit.of_type(CommandStartedEvent) == [
@@ -2012,7 +2012,7 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
         effects.append("tests")
         return "unit"
 
-    monkeypatch.setattr(updater, "run_live", build)
+    monkeypatch.setattr(updater, "run_shell_command", build)
     monkeypatch.setattr(updater, "run_test_phases", tests)
     monkeypatch.setattr(
         updater,
@@ -2027,7 +2027,7 @@ def test_gradle_baseline_checks_fail_before_capture_or_ledger(
 
 
 def test_gradle_checks_run_configured_tests_through_bash(tmp_path, monkeypatch):
-    monkeypatch.setattr(updater, "run_live", lambda *args, **kwargs: None)
+    monkeypatch.setattr(updater, "run_shell_command", lambda *args, **kwargs: None)
     project = ProjectConfig(
         path=tmp_path,
         package_manager="gradle",
@@ -2593,7 +2593,7 @@ def test_gradle_checked_commit_recovery_does_not_apply_twice(
 def test_gradle_recovery_sees_the_clock_advanced_by_an_effect(
     workflow, monkeypatch, advance
 ):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     clock = FakeClock(workflow.context.created_at + timedelta(hours=23, minutes=59))
     run, interrupted, accepted_commit, original_save = _interrupt_after_checked_commit(
@@ -2668,7 +2668,7 @@ def test_gradle_recovery_sees_the_clock_advanced_by_an_effect(
 
 
 def test_rebuild_forwards_one_clock_to_every_timed_step(rebuild_evidence, monkeypatch):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     state = rebuild_evidence
     clock = FakeClock(state.context.created_at)
@@ -3539,7 +3539,7 @@ def test_gradle_resume_requires_exact_empty_accepted_child(
 def test_gradle_flow_forwards_one_clock_to_recovery_and_processing(
     workflow, monkeypatch
 ):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     ready = updater.process_gradle_run(
         begin_workflow(workflow, Workflow.RESOLVE),
@@ -3597,7 +3597,7 @@ def test_gradle_flow_forwards_one_clock_to_recovery_and_processing(
 def test_gradle_continue_forwards_one_clock_to_rebuild_and_verification(
     workflow, monkeypatch
 ):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     failed = updater.process_gradle_run(
         begin_workflow(workflow, Workflow.RESOLVE),
@@ -3647,7 +3647,7 @@ def test_gradle_continue_forwards_one_clock_to_rebuild_and_verification(
 def test_gradle_continue_proves_repair_before_automatic_workspace_guard(
     workflow, monkeypatch
 ):
-    from tests.conftest import FakeClock
+    from tests.support.clock import FakeClock
 
     failed = updater.process_gradle_run(
         begin_workflow(workflow, Workflow.RESOLVE),

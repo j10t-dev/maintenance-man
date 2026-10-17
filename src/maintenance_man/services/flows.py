@@ -1,5 +1,3 @@
-from collections.abc import Callable
-
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Emit,
@@ -7,7 +5,13 @@ from maintenance_man.models.events import (
     ProjectSkipped,
     SkipReason,
 )
-from maintenance_man.models.scan import ScanResult, UpdateStatus, Workflow
+from maintenance_man.models.scan import (
+    ScanResult,
+    UpdateFinding,
+    UpdateStatus,
+    VulnFinding,
+    Workflow,
+)
 from maintenance_man.services import WorkflowError
 from maintenance_man.storage import (
     NoScanResultsError,
@@ -51,11 +55,9 @@ def load_validated_scan(
 
 
 def ordered_findings(
-    scan_result: ScanResult, keep: Callable[[Finding], bool]
+    vulns: list[VulnFinding], updates: list[UpdateFinding]
 ) -> list[Finding]:
     """Return consolidated vulns then risk-ordered updates, retaining source refs."""
-    vulns = [vuln for vuln in scan_result.vulnerabilities if keep(vuln)]
-    updates = [update for update in scan_result.updates if keep(update)]
     return [*consolidate_vulns(vulns), *sort_updates_by_risk(updates)]
 
 

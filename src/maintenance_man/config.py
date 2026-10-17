@@ -58,14 +58,7 @@ def load_config(config_path: Path | None = None) -> MmConfig:
 
 def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
     """Look up a project by name and validate its path exists on disk."""
-    if name not in config.projects:
-        msg = (
-            f"Unknown project '{name}'. "
-            f"Known projects: {', '.join(config.projects) or '(none)'}"
-        )
-        raise UnknownProjectError(msg)
-
-    project = config.projects[name]
+    project = _configured_project(config, name)
 
     if not project.path.exists():
         msg = f"Project '{name}' path does not exist: {project.path}"
@@ -74,20 +67,27 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
     return project
 
 
-def validate_project_names(config: MmConfig, names: Sequence[str]) -> list[str]:
+def ordered_unique_project_names(config: MmConfig, names: Sequence[str]) -> list[str]:
+    """Return configured project names once each, in their requested order."""
     seen: set[str] = set()
     ordered: list[str] = []
     for name in names:
-        if name not in config.projects:
-            msg = (
-                f"Unknown project '{name}'. "
-                f"Known projects: {', '.join(config.projects) or '(none)'}"
-            )
-            raise UnknownProjectError(msg)
+        _configured_project(config, name)
         if name not in seen:
             seen.add(name)
             ordered.append(name)
     return ordered
+
+
+def _configured_project(config: MmConfig, name: str) -> ProjectConfig:
+    try:
+        return config.projects[name]
+    except KeyError:
+        msg = (
+            f"Unknown project '{name}'. "
+            f"Known projects: {', '.join(config.projects) or '(none)'}"
+        )
+        raise UnknownProjectError(msg) from None
 
 
 def ensure_mm_home() -> None:

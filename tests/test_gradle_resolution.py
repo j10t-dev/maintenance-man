@@ -50,13 +50,10 @@ from maintenance_man.models.scan import (
     Severity,
     VulnFinding,
 )
-from tests.conftest import (
-    FakeClock,
-    completed,
-    fixture_runner,
-    make_project,
-    report_payload,
-)
+from tests.support.clock import FakeClock
+from tests.support.gradle import fixture_runner, report_payload
+from tests.support.process import completed
+from tests.support.projects import make_project
 
 
 @pytest.mark.parametrize(
@@ -1469,19 +1466,19 @@ def report_stub():
 )
 def test_candidate_age_boundary_uses_the_injected_clock(offset, minimum, withheld):
     prepared = _prepare_with_publication(_NOW - offset, minimum, FakeClock(_NOW))
-    assert (prepared.block is not None) is withheld
+    assert (prepared.withheld_reason is not None) is withheld
     if withheld:
-        assert prepared.block.reason == "publication younger than required 7 days"
+        assert prepared.withheld_reason == "publication younger than required 7 days"
 
 
 def test_candidate_age_reads_the_clock_after_prefetch():
     clock = FakeClock(_NOW)
     published = _NOW - timedelta(days=7) + timedelta(microseconds=1)
-    assert _prepare_with_publication(published, 7, clock).block is not None
+    assert _prepare_with_publication(published, 7, clock).withheld_reason is not None
     advanced = _prepare_with_publication(
         published,
         7,
         clock,
         prefetch=lambda requests: clock.advance(timedelta(microseconds=1)),
     )
-    assert advanced.block is None
+    assert advanced.withheld_reason is None

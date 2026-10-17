@@ -197,7 +197,7 @@ def resolve_update_targets(
     *,
     negate: bool,
 ) -> tuple[Literal["single", "batch"], list[str]]:
-    ordered = config_module.validate_project_names(cfg, names)
+    ordered = config_module.ordered_unique_project_names(cfg, names)
     if negate:
         excluded = set(ordered)
         return "batch", [name for name in sorted(cfg.projects) if name not in excluded]
@@ -287,7 +287,7 @@ def _finalise(
         return False
 
     flows.complete_ready_findings(scan_result, name, flow=Workflow.UPDATE)
-    emit(Promoted(bookmark))
+    emit(Promoted())
     return True
 
 
@@ -311,13 +311,7 @@ def _process_selected(
         selected_vulns, selected_updates = selectable_vulns, selectable_updates
 
     emit(ProcessingStarted(len(selected_vulns), len(selected_updates)))
-    selected = scan_result.model_copy(
-        update={
-            "vulnerabilities": selected_vulns,
-            "updates": selected_updates,
-        }
-    )
-    findings = flows.ordered_findings(selected, lambda _finding: True)
+    findings = flows.ordered_findings(selected_vulns, selected_updates)
     results = (
         process_findings(
             findings,

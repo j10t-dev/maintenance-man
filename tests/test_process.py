@@ -19,10 +19,11 @@ from maintenance_man.process import (
     ToolNotFoundError,
     require_tool,
     run_captured,
-    run_live,
     run_logged,
+    run_shell_command,
 )
-from tests.conftest import TerminalStream, completed
+from tests.support.cli import TerminalStream
+from tests.support.process import completed
 
 
 class _DomainError(Exception):
@@ -180,8 +181,8 @@ def test_captured_runs_a_real_command(tmp_path):
     assert Path(completed.stdout.strip()).resolve() == tmp_path.resolve()
 
 
-def test_live_run_executes_bash_syntax(tmp_path):
-    run_live(
+def test_run_shell_command_executes_bash_syntax(tmp_path):
+    run_shell_command(
         "printf '%s\\n' 'a b' | tr ' ' '_' > out.txt && [[ -s out.txt ]]",
         tmp_path,
         timeout=30,
@@ -198,33 +199,37 @@ def test_live_run_executes_bash_syntax(tmp_path):
         ("set -o pipefail; false | true", True),
     ],
 )
-def test_live_run_uses_normal_pipeline_status(tmp_path, command, fails):
+def test_run_shell_command_uses_normal_pipeline_status(tmp_path, command, fails):
     if fails:
         with pytest.raises(ProcessError, match=r"^pipeline failed \(exit 1\)$"):
-            run_live(command, tmp_path, timeout=30, label="pipeline")
+            run_shell_command(command, tmp_path, timeout=30, label="pipeline")
     else:
-        run_live(command, tmp_path, timeout=30, label="pipeline")
+        run_shell_command(command, tmp_path, timeout=30, label="pipeline")
 
 
-def test_live_run_strips_the_host_virtualenv(tmp_path, monkeypatch):
+def test_run_shell_command_strips_the_host_virtualenv(tmp_path, monkeypatch):
     monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
-    run_live('test -z "${VIRTUAL_ENV:-}"', tmp_path, timeout=30, label="env")
+    run_shell_command('test -z "${VIRTUAL_ENV:-}"', tmp_path, timeout=30, label="env")
 
 
-def test_live_run_launch_failure_raises_selected_error(tmp_path):
+def test_run_shell_command_launch_failure_raises_selected_error(tmp_path):
     missing = tmp_path / "missing"
     with pytest.raises(
         _DomainError, match=r"^Could not run build in .*missing: "
     ) as caught:
-        run_live("true", missing, timeout=30, label="build", error=_DomainError)
+        run_shell_command(
+            "true", missing, timeout=30, label="build", error=_DomainError
+        )
     assert isinstance(caught.value.__cause__, OSError)
 
 
-def test_live_run_timeout_raises_selected_error(tmp_path):
+def test_run_shell_command_timeout_raises_selected_error(tmp_path):
     with pytest.raises(
         _DomainError, match=r"^sleeper timed out after 1s in "
     ) as caught:
-        run_live("sleep 60", tmp_path, timeout=1, label="sleeper", error=_DomainError)
+        run_shell_command(
+            "sleep 60", tmp_path, timeout=1, label="sleeper", error=_DomainError
+        )
     assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
 
 
@@ -261,9 +266,9 @@ def test_given_child_logs_when_build_runs_then_only_failed_logs_reach_stderr(
         with pytest.raises(
             ProcessError, match=rf"^child failed \(exit {returncode}\)$"
         ):
-            run_live(command, tmp_path, timeout=5, label="child")
+            run_shell_command(command, tmp_path, timeout=5, label="child")
     else:
-        run_live(command, tmp_path, timeout=5, label="child")
+        run_shell_command(command, tmp_path, timeout=5, label="child")
 
     captured = capfd.readouterr()
     assert captured.out == ""
@@ -341,7 +346,7 @@ def test_given_verbose_command_when_child_waits_for_log_then_output_arrives_befo
 
     logs = LogObserver()
     monkeypatch.setattr(sys, "stderr", logs)
-    output.set_verbose(True)
+    output.reset_invocation_output(verbose=True)
     command = [
         sys.executable,
         "-c",
@@ -437,7 +442,7 @@ def test_given_background_child_when_command_exits_then_logging_preserves_succes
     verbose: bool,
     detached: bool,
 ) -> None:
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
     descendant = (
         "from pathlib import Path; import time\n"
         "deadline=time.monotonic()+10\n"
@@ -556,7 +561,7 @@ def test_given_exit_130_when_run_then_return_code_is_preserved(
     tmp_path: Path,
     verbose: bool,
 ) -> None:
-    output.set_verbose(verbose)
+    output.reset_invocation_output(verbose=verbose)
     with pytest.raises(ProcessError, match=r"^child failed \(exit 130\)$"):
         run_logged(
             [sys.executable, "-c", "import sys; sys.exit(130)"],

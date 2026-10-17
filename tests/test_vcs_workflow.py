@@ -16,8 +16,8 @@ from maintenance_man.vcs_workflow import (
     remove_workspace,
     sync_main,
 )
-from tests.conftest import MANAGED, RepositoryCase, _real_case
 from tests.fake_vcs import FakeCodeHost
+from tests.support.repository import MANAGED, RepositoryCase, real_repository_case
 
 
 def _fail_repository_method(
@@ -342,7 +342,7 @@ def test_given_local_and_remote_main_diverge_when_syncing_then_repository_is_pre
 def test_given_descendant_main_when_syncing_then_unconflicted_bookmark_reaches_push(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    c = _real_case(tmp_path, monkeypatch)
+    c = real_repository_case(tmp_path, monkeypatch)
     base = c.repo.resolve_revision(revision="main")
     c.repo.new_change(revision=base)
     c.write_file("dep.txt", "descendant\n")

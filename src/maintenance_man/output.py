@@ -20,8 +20,8 @@ from rich.text import Text
 type Status = Literal["passed", "failed", "blocked", "skipped", "unchanged"]
 
 
-def set_verbose(verbose: bool) -> None:
-    """Set the current invocation's child-log policy."""
+def reset_invocation_output(*, verbose: bool) -> None:
+    """Reset headings and consoles and set the invocation's child-log policy."""
     _verbose.set(verbose)
     _last_heading.set(None)
     _consoles.set({})
@@ -60,30 +60,57 @@ def records(
         [literal(value) if isinstance(value, str) else value.copy() for value in row]
         for row in rows
     ]
-    widths = [
-        max(
-            cell_len(headers[index]) if headers else 0,
-            *(row[index].cell_len for row in cells),
-        )
-        for index in range(len(cells[0]))
-    ]
+    widths = _column_widths(headers, cells)
     screen = console()
-    budget = max(1, screen.width - 2 - 2 * (len(widths) - 1))
-    widths = [min(width, 24) for width in widths[:-1]] + [widths[-1]]
+    budget = max(1, screen.width - _table_spacing(len(widths)))
     for index in reversed(range(len(widths))):
         widths[index] = max(1, widths[index] - max(0, sum(widths) - budget))
     if headers:
         cells.insert(0, [literal(header, "dim") for header in headers])
     for row in cells:
-        line = Text("  ")
+        line = Text(_TABLE_INDENT)
         for index, (cell, width) in enumerate(zip(row, widths, strict=True)):
             cell.truncate(width, overflow="ellipsis", pad=index < len(widths) - 1)
             if index:
-                line.append("  ")
+                line.append(_COLUMN_SEPARATOR)
             line.append_text(cell)
         screen.print(line, overflow="ellipsis", no_wrap=True)
     if footer:
         screen.print(literal(footer, "dim"))
+
+
+def table_width(headers: Sequence[str], rows: Sequence[Sequence[str | Text]]) -> int:
+    """Measure a table before terminal truncation, including padding and separators."""
+    widths = _column_widths(headers, rows)
+    return sum(widths) + _table_spacing(len(widths)) if widths else 0
+
+
+def _column_widths(
+    headers: Sequence[str], rows: Sequence[Sequence[str | Text]]
+) -> list[int]:
+    if not rows:
+        return []
+    widths = [
+        max(
+            cell_len(headers[index]) if headers else 0,
+            *(_cell_width(row[index]) for row in rows),
+        )
+        for index in range(len(rows[0]))
+    ]
+    return [min(width, _MAX_FIXED_COLUMN_WIDTH) for width in widths[:-1]] + widths[-1:]
+
+
+def _cell_width(cell: str | Text) -> int:
+    return cell.cell_len if isinstance(cell, Text) else cell_len(cell)
+
+
+def _table_spacing(columns: int) -> int:
+    return len(_TABLE_INDENT) + len(_COLUMN_SEPARATOR) * (columns - 1)
+
+
+_TABLE_INDENT = "  "
+_COLUMN_SEPARATOR = "  "
+_MAX_FIXED_COLUMN_WIDTH = 24
 
 
 def project_records(

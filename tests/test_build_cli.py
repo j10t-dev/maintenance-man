@@ -8,8 +8,9 @@ from maintenance_man.cli import ExitCode
 from maintenance_man.deployer import BuildError
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from tests.conftest import configure_fake_vcs, run_mm, write_config
 from tests.fake_vcs import FakeJjState
+from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.projects import write_config
 
 
 @pytest.fixture
@@ -40,7 +41,8 @@ def test_label_failure_does_not_block_persisted_build_activity(
     )
     monkeypatch.setattr(cli, "make_vcs_services", state.services)
     monkeypatch.setattr(
-        "maintenance_man.services.deploy.run_live", lambda *args, **kwargs: None
+        "maintenance_man.services.deploy.run_shell_command",
+        lambda *args, **kwargs: None,
     )
 
     assert run_mm("build", "demo") == ExitCode.OK
@@ -65,7 +67,7 @@ class TestBuildCommand:
         """Error when project has deploy_command but no build_command."""
         assert run_mm("build", "deploy-only") == ExitCode.ERROR
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_successful_build(
         self,
         mock_build: MagicMock,
@@ -78,7 +80,7 @@ class TestBuildCommand:
         assert any(call.method == "revision_bookmarks" for call in _build_vcs.attempts)
 
     @patch(
-        "maintenance_man.services.deploy.run_live",
+        "maintenance_man.services.deploy.run_shell_command",
         side_effect=BuildError("build failed"),
     )
     def test_failed_build(
@@ -96,7 +98,7 @@ class TestBuildCommand:
         """Error when project doesn't exist."""
         assert run_mm("build", "nonexistent") == ExitCode.ERROR
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_given_verbose_build_when_a_later_command_runs_then_verbosity_does_not_leak(
         self,
         mock_build: MagicMock,
@@ -109,7 +111,7 @@ class TestBuildCommand:
         assert run_mm("list") == ExitCode.OK
         assert output.is_verbose() is False
 
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_given_successful_build_when_piped_then_one_passed_record(
         self,
         mock_build: MagicMock,
@@ -124,7 +126,7 @@ class TestBuildCommand:
         assert captured.err == ""
 
     @patch(
-        "maintenance_man.services.deploy.run_live",
+        "maintenance_man.services.deploy.run_shell_command",
         side_effect=BuildError("Build for deployable failed (exit 2)"),
     )
     def test_given_failed_build_when_piped_then_failed_record_and_build_exit_code(
@@ -144,7 +146,7 @@ class TestBuildCommand:
         assert captured.err == ""
 
     @patch("maintenance_man.services.deploy.record_activity")
-    @patch("maintenance_man.services.deploy.run_live")
+    @patch("maintenance_man.services.deploy.run_shell_command")
     def test_successful_build_records_activity(
         self,
         mock_build: MagicMock,
@@ -160,7 +162,7 @@ class TestBuildCommand:
 
     @patch("maintenance_man.services.deploy.record_activity")
     @patch(
-        "maintenance_man.services.deploy.run_live",
+        "maintenance_man.services.deploy.run_shell_command",
         side_effect=BuildError("build failed"),
     )
     def test_failed_build_records_activity(

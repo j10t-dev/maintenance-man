@@ -4,7 +4,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from maintenance_man.config import validate_project_names
+from maintenance_man.config import ordered_unique_project_names
 from maintenance_man.github import CodeHostError
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import MmConfig, ProjectConfig
@@ -114,7 +114,7 @@ def sync_projects(
     vcs: VcsServices,
     emit: Emit,
 ) -> Outcome:
-    targets = validate_project_names(cfg, names) or sorted(cfg.projects)
+    targets = ordered_unique_project_names(cfg, names) or sorted(cfg.projects)
     failed = False
     for name in targets:
         project = cfg.projects[name]
