@@ -3,6 +3,7 @@ import os
 import pty
 import struct
 import termios
+import time
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
@@ -246,7 +247,7 @@ def test_given_short_success_when_narrow_then_padding_does_not_create_ellipsis(
         "api", "update", "passed", "http-client", installed="1.0.0", target="1.0.1"
     )
 
-    assert stream.getvalue().strip() == "✓ passed   http-client  1.0.0 → 1.0.1"
+    assert stream.getvalue().strip() == "✓ passed    http-client  1.0.0 → 1.0.1"
 
 
 @pytest.mark.parametrize("width", [40, 80, 120])
@@ -314,3 +315,91 @@ def test_given_one_clean_project_when_batch_scanned_then_notice_names_only_it(
         .err.splitlines()[-1]
         .startswith("1 projects have no findings: first · scanned in ")
     )
+
+
+def test_given_closed_input_when_prompt_runs_then_eof_does_not_accept_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.stdin", StringIO(""))
+
+    with pytest.raises(EOFError):
+        output.prompt("Select updates [all/none]", default="all")
+
+
+def test_given_choice_rows_when_printed_then_columns_align_and_text_stays_literal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output.choices([("! vuln", "high · CVE-1", "a[b]"), ("~ update", "patch", "u[p]")])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "    1  ! vuln    high · CVE-1  a[b]\n    2  ~ update  patch         u[p]\n"
+    )
+
+
+def test_given_long_last_column_when_choices_print_then_it_wraps_under_itself(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    members = " · ".join(
+        f"alias{number}: group:artifact{number} 1.{number} → 2.{number}"
+        for number in range(4)
+    )
+
+    output.choices([("room → 2.8.5", members)])
+
+    lines = capsys.readouterr().err.splitlines()
+    prefix = "    1  room → 2.8.5  "
+    assert len(lines) > 1
+    assert lines[0].startswith(prefix)
+    assert all(line.startswith(" " * len(prefix)) for line in lines[1:])
+    assert all(cell_len(line) <= 80 for line in lines)
+    assert "…" not in "".join(lines)
+    assert " ".join([lines[0][len(prefix) :], *map(str.strip, lines[1:])]) == members
+
+
+def test_given_help_aliases_when_rendered_then_description_stays_with_names(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert run_mm("--help") == ExitCode.OK
+
+    lines = capsys.readouterr().out.splitlines()
+    assert any("list, status, st:" in line and "List all" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("stderr_is_terminal", "verbose", "shown"),
+    [(False, False, False), (True, False, True), (True, True, False)],
+    ids=["pipe", "terminal", "verbose"],
+)
+def test_given_stderr_stream_when_progress_runs_then_only_quiet_terminal_sees_it(
+    monkeypatch: pytest.MonkeyPatch,
+    stderr_is_terminal: bool,
+    verbose: bool,
+    shown: bool,
+) -> None:
+    stream = TerminalStream() if stderr_is_terminal else StringIO()
+    monkeypatch.setattr("sys.stderr", stream)
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr(output, "_PROGRESS_DELAY_SECONDS", 0)
+    output.set_verbose(verbose)
+
+    with output.progress("Running tests"):
+        time.sleep(0.1)
+
+    assert ("Running tests" in stream.getvalue()) is shown
+    assert ("\x1b[?25h" in stream.getvalue()) is shown
+
+
+def test_given_terminal_stdout_when_summary_prints_then_totals_go_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout, stderr = TerminalStream(), TerminalStream()
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    output.summary({"passed": 2, "failed": 1})
+
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == "2 passed · 1 failed\n"

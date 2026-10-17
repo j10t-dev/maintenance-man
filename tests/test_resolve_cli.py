@@ -91,8 +91,10 @@ def test_given_paused_resolve_when_run_then_exits_one_with_instruction(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert run_mm("resolve", "vulnerable") == ExitCode.ERROR
-    assert capsys.readouterr().out.splitlines() == [
-        "Error: resolve already paused for vulnerable — rerun with --continue"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "error: resolve already paused for vulnerable — rerun with --continue"
     ]
 
 

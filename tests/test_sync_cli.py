@@ -55,7 +55,9 @@ class TestSyncCommand:
         configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
 
         assert run_mm("sync", "vulnerable") == ExitCode.OK
-        assert "vulnerable — already up to date" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == "vulnerable\tsync\tunchanged\tmain\t-\t-\t-\n"
+        assert captured.err == ""
 
     def test_no_configured_projects(
         self,
@@ -73,7 +75,7 @@ class TestSyncCommand:
         assert captured.out == ""
         assert captured.err.splitlines() == [
             "No projects configured",
-            "hint: add projects to ~/.mm/config.toml",
+            f"hint: add projects to {mm_home / 'config.toml'}",
         ]
         factory.assert_not_called()
 
@@ -100,5 +102,9 @@ test_unit = "uv run pytest"
         monkeypatch.setattr(cli, "make_vcs_services", state.services)
 
         assert run_mm("sync") == ExitCode.SYNC_FAILED
-        assert "ghost — path does not exist" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == (
+            f"warning: ghost · path does not exist: {missing_path}\n"
+        )
         assert state.attempts == []

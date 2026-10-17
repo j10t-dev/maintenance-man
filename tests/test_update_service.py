@@ -108,7 +108,7 @@ def test_update_emits_processing_result_and_promotion_events(
     assert isinstance(emit.events[0], ScanReported)
     assert emit.events[1:] == [
         ProcessingStarted(0, 1),
-        FindingsProcessed((expected_result,)),
+        FindingsProcessed((expected_result,), blocked=0),
         Promoted("mm/update-dependencies"),
     ]
     assert [item.pkg_name for item in load_scan_results("api").updates] == ["pkg-a"]
@@ -116,6 +116,40 @@ def test_update_emits_processing_result_and_promotion_events(
     assert repo.same_revision(left="main", right="@-")
     assert not repo.bookmark_exists(bookmark="mm/update-dependencies")
     assert "mm-api" not in repo.workspace_names()
+
+
+def test_update_reports_blocked_findings_in_the_project_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(pkg_name="pkg-a"),
+            make_update(pkg_name="stuck", blocked_reason="too young"),
+        ],
+    )
+    state, project = seed_project(tmp_path, "api", scan)
+    monkeypatch.setattr(
+        update_service,
+        "process_findings",
+        FakeFindingProcessor({"pkg-a": (True, None)}),
+    )
+    emit = RecordingEmit()
+
+    result = update_service.update_project(
+        "api",
+        project,
+        minimum_age_days=7,
+        choose=pick_findings("pkg-a"),
+        choose_gradle=None,
+        vcs=state.services(),
+        emit=emit,
+    )
+
+    assert result.blocked == 1
+    assert emit.of_type(FindingsProcessed) == [
+        FindingsProcessed((UpdateResult("pkg-a", "update", True),), blocked=1)
+    ]
 
 
 def test_resume_new_change_failure_removes_workspace(

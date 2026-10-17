@@ -90,6 +90,7 @@ class ProcessingStarted:
 @dataclass(frozen=True, slots=True)
 class FindingsProcessed:
     results: tuple[UpdateResult, ...]
+    blocked: int
 
 
 @dataclass(frozen=True, slots=True)

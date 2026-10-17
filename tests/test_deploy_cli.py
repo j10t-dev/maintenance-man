@@ -14,12 +14,91 @@ from tests.conftest import configure_fake_vcs, run_mm, write_config
 from tests.fake_vcs import FakeJjState
 
 
-def test_deploy_summary_prints_bracketed_project_literal(capsys) -> None:
-    cli._print_deploy_summary(
-        [deploy_service.DeployResult("a[b]", build_status="pass", deploy_status="pass")]
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ([], "No projects have deploy_command configured\n"),
+        (
+            [
+                deploy_service.DeployResult("a", "pass", "pass"),
+                deploy_service.DeployResult("b", "fail", "skip"),
+                deploy_service.DeployResult("c", "pass", "fail"),
+                deploy_service.DeployResult("d", "skip", "skip"),
+                deploy_service.DeployResult("e", "skip", "unchanged"),
+                deploy_service.DeployResult("f", "skip", "blocked"),
+                deploy_service.DeployResult("g", "skip", "fail"),
+            ],
+            "1 passed · 3 failed · 1 blocked · 1 skipped · 1 unchanged\n",
+        ),
+        ([deploy_service.DeployResult("a", "pass", "pass")], "1 passed\n"),
+    ],
+    ids=["none", "every-status", "passed-only"],
+)
+def test_given_deploy_results_when_summarised_then_one_status_counts_per_project(
+    capsys: pytest.CaptureFixture[str],
+    results: list[deploy_service.DeployResult],
+    expected: str,
+) -> None:
+    cli._print_deploy_summary(results)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
+
+
+def test_given_batch_deploy_with_failed_build_when_run_then_deploy_is_recorded_skipped(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = BuildError("Build for deployable failed (exit 2)")
+
+    def run(*args, **kwargs) -> None:
+        if kwargs["error"] is BuildError:
+            raise error
+
+    monkeypatch.setattr(deploy_service, "run_live", run)
+    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+
+    assert run_mm("deploy") == ExitCode.DEPLOY_FAILED
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "deploy-only\tdeploy\tpassed\tdeploy\t-\t-\t-",
+        "deployable\tbuild\tfailed\tbuild\t-\t-\tBuild for deployable failed (exit 2)",
+        "deployable\tdeploy\tskipped\tdeploy\t-\t-\tbuild failed",
+    ]
+    assert captured.err == "1 passed · 1 failed\n"
+
+
+def test_given_unusable_projects_when_batch_deploy_then_records_and_summary_agree(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(deploy_service, "run_live", lambda *args, **kwargs: None)
+    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+    config_path = mm_home_with_projects / "config.toml"
+    missing = tmp_path / "missing"
+    write_config(
+        mm_home_with_projects,
+        config_path.read_text()
+        + f'\n[projects.ghost]\npath = "{missing}"\npackage_manager = "uv"\n'
+        'deploy_command = "scripts/deploy.sh"\n'
+        f'\n[projects.parked]\npath = "{tmp_path}"\npackage_manager = "uv"\n'
+        'deploy_command = "scripts/deploy.sh"\ndeployable = false\n',
     )
 
-    assert "a[b]" in capsys.readouterr().out
+    assert run_mm("deploy") == ExitCode.DEPLOY_FAILED
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[-2:] == [
+        f"ghost\tdeploy\tfailed\tdeploy\t-\t-\tpath does not exist: {missing}",
+        "parked\tdeploy\tskipped\tdeploy\t-\t-\tnot deployable",
+    ]
+    assert captured.err == "2 passed · 1 failed · 1 skipped\n"
 
 
 @dataclass(frozen=True)
@@ -209,10 +288,12 @@ class TestDeployCommand:
         capsys.readouterr()
 
         assert run_mm("deploy", "deploy-only") == ExitCode.OK
-        assert (
-            "deploy-only unchanged since last deploy (use --force to redeploy)."
-            in capsys.readouterr().out.splitlines()
+        captured = capsys.readouterr()
+        assert captured.out == (
+            "deploy-only\tdeploy\tunchanged\tdeploy\t-\t-\t"
+            "unchanged since last deploy · use --force to redeploy\n"
         )
+        assert captured.err == ""
 
 
 class TestDeployCheck:
@@ -275,12 +356,12 @@ class TestDeployCheck:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert run_mm("deploy", "deployable", "--check") == ExitCode.OK
+        captured = capsys.readouterr()
         assert (
-            capsys.readouterr().out.count(
-                "--check: no healthcheck_url configured in [defaults]"
-            )
+            captured.err.count("--check: no healthcheck_url configured in [defaults]")
             == 1
         )
+        assert "healthcheck_url" not in captured.out
 
     @pytest.mark.parametrize(
         ("failure", "error", "expected_code"),
@@ -305,9 +386,9 @@ class TestDeployCheck:
         monkeypatch.setattr(deploy_service, "run_live", run)
 
         assert run_mm("deploy", "deployable", "--build", "--check") == expected_code
-        output = capsys.readouterr().out
-        assert str(error) in output
-        assert "no healthcheck_url" not in output
+        captured = capsys.readouterr()
+        assert str(error) in captured.out
+        assert "no healthcheck_url" not in captured.out + captured.err
 
 
 def test_given_empty_project_name_when_deploy_then_runs_deploy_all_in_batch_mode(
@@ -317,11 +398,11 @@ def test_given_empty_project_name_when_deploy_then_runs_deploy_all_in_batch_mode
     configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
 
     code = run_mm("deploy", "")
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
 
     assert code == 0
-    assert "Deploy Summary" in out
-    assert "Deploying deployable" not in out
+    assert captured.err == "2 passed\n"
+    assert "deployable\tbuild\tpassed\tbuild\t-\t-\t-" in captured.out
 
 
 class TestMassDeployCommand:
@@ -351,7 +432,7 @@ class TestMassDeployCommand:
             sum(call.kwargs["error"] is BuildError for call in mock_run.call_args_list)
             == 1
         )
-        assert "Deploy Summary" in capsys.readouterr().out
+        assert capsys.readouterr().err == "2 passed\n"
 
     @patch("maintenance_man.services.deploy.run_live")
     def test_continues_after_deploy_failure(
@@ -396,8 +477,8 @@ class TestMassDeployCommand:
         assert run_mm("deploy", "--check") == ExitCode.OK
         assert mock_check.call_count == 2
         output = capsys.readouterr().out
-        assert "Healthy: deploy-only is up" in output
-        assert "Healthy: deployable is up" in output
+        assert "deploy-only\thealth\tpassed\thealthcheck\t-\t-\t-\n" in output
+        assert "deployable\thealth\tpassed\thealthcheck\t-\t-\t-\n" in output
 
     @pytest.mark.parametrize("healthcheck_line", [None, 'healthcheck_url = ""'])
     @patch("maintenance_man.services.deploy.check_health")
@@ -421,8 +502,9 @@ class TestMassDeployCommand:
                 ),
             )
         assert run_mm("deploy", "--check") == ExitCode.OK
-        output = capsys.readouterr().out
-        assert output.count("--check: no healthcheck_url configured") == 1
+        captured = capsys.readouterr()
+        assert captured.err.count("--check: no healthcheck_url configured") == 1
+        assert "healthcheck_url" not in captured.out
         mock_check.assert_not_called()
 
     def test_no_projects_configured(
@@ -438,5 +520,5 @@ class TestMassDeployCommand:
         assert captured.out == ""
         assert captured.err.splitlines() == [
             "No projects configured",
-            "hint: add projects to ~/.mm/config.toml",
+            f"hint: add projects to {mm_home / 'config.toml'}",
         ]

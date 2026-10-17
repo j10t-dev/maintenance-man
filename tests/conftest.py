@@ -13,9 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from rich.console import Console
 
-from maintenance_man import cli, output, vcs
+from maintenance_man import output, vcs
 from maintenance_man.cli import main
 from maintenance_man.config import load_config
 from maintenance_man.gradle import (
@@ -128,7 +127,6 @@ def _plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COLUMNS", "80")
     monkeypatch.setenv("TERM", "dumb")
     output.set_verbose(False)
-    monkeypatch.setattr(cli, "console", Console(force_terminal=False, width=80))
 
 
 @pytest.fixture(autouse=True)

@@ -111,6 +111,7 @@ def deploy_all(
     for name, project in sorted(cfg.projects.items()):
         if not project.deployable:
             emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
+            results.append(DeployResult(name, "skip", "skip"))
             continue
         if not project.deploy_command:
             continue

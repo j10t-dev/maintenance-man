@@ -185,7 +185,9 @@ class TestSharedCommandPrerequisites:
         deps.vcs_state.clear_calls()
 
         assert run_mm(command, "vulnerable") == 1
-        assert "rescan" in capsys.readouterr().out.lower()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "rescan" in captured.err.lower()
         assert deps.vcs_state.effects == []
 
     def test_given_code_host_pruning_failure_when_run_then_exits_one(
@@ -241,11 +243,11 @@ def test_batch_reports_bookmark_access_error_without_requesting_rescan(
 @pytest.mark.parametrize(
     ("scenario", "expected_line"),
     [
-        ("missing", "vulnerable — no scan results; nothing to do."),
-        ("blocked", "vulnerable — nothing to update."),
+        ("missing", "No scan results for vulnerable"),
+        ("blocked", "Nothing to update in vulnerable"),
     ],
 )
-def test_given_update_noop_when_command_runs_then_it_exits_zero_and_prints_literal_line(
+def test_given_update_noop_when_command_runs_then_it_exits_zero_and_notices_on_stderr(
     mm_home_with_projects: Path,
     mock_update_cli_deps: CliDeps,
     capsys: pytest.CaptureFixture[str],
@@ -261,32 +263,28 @@ def test_given_update_noop_when_command_runs_then_it_exits_zero_and_prints_liter
         )
 
     assert run_mm("update", "vulnerable") == ExitCode.OK
-    assert expected_line in capsys.readouterr().out.splitlines()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [expected_line]
 
 
 @pytest.mark.parametrize(
-    ("command", "deps_fixture", "other_flow", "expected_lines"),
+    ("command", "deps_fixture", "other_flow", "expected_line"),
     [
         pytest.param(
             "update",
             "mock_update_cli_deps",
             Workflow.RESOLVE,
-            [
-                "Error: Cannot run update on vulnerable: 1 finding(s) owned by the "
-                "'resolve' ",
-                "flow. Complete or abandon that flow first.",
-            ],
+            "error: Cannot run update on vulnerable: 1 finding(s) owned by the "
+            "'resolve' flow. Complete or abandon that flow first.",
             id="update",
         ),
         pytest.param(
             "resolve",
             "mock_resolve_cli_deps",
             Workflow.UPDATE,
-            [
-                "Error: Cannot run resolve on vulnerable: 1 finding(s) owned by the "
-                "'update' ",
-                "flow. Complete or abandon that flow first.",
-            ],
+            "error: Cannot run resolve on vulnerable: 1 finding(s) owned by the "
+            "'update' flow. Complete or abandon that flow first.",
             id="resolve",
         ),
     ],
@@ -298,7 +296,7 @@ def test_given_opposite_workflow_when_run_then_flow_conflict_is_reported(
     command: str,
     deps_fixture: str,
     other_flow: Workflow,
-    expected_lines: list[str],
+    expected_line: str,
 ) -> None:
     deps: CliDeps = request.getfixturevalue(deps_fixture)
     for existing in deps.scan_result.findings:
@@ -312,7 +310,9 @@ def test_given_opposite_workflow_when_run_then_flow_conflict_is_reported(
     deps.save_scan()
 
     assert run_mm(command, "vulnerable") == ExitCode.ERROR
-    assert capsys.readouterr().out.splitlines() == expected_lines
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [expected_line]
 
 
 @pytest.mark.parametrize("command,deps_fixture", _COMMAND_FIXTURES)
@@ -351,10 +351,11 @@ def test_given_missing_update_bookmark_when_run_then_exits_one_with_error(
     mock_update_cli_deps.save_scan()
 
     assert run_mm("update", "vulnerable") == ExitCode.ERROR
-    assert capsys.readouterr().out.splitlines() == [
-        "Error: update bookmark 'mm/update-dependencies' is missing but in-progress "
-        "state",
-        "exists — rescan required",
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "error: update bookmark 'mm/update-dependencies' is missing but in-progress "
+        "state exists — rescan required"
     ]
 
 
@@ -369,9 +370,12 @@ def test_given_batch_flow_conflict_when_run_then_exits_four_with_both_projects(
     mock_update_cli_deps.save_scan()
 
     assert run_mm("update", "vulnerable", "clean") == ExitCode.UPDATE_FAILED
-    lines = capsys.readouterr().out.splitlines()
-    assert any(line.startswith("  Skipped: vulnerable") for line in lines)
-    assert "clean\tpromotion\tpassed\tlocal main\t-\t-\t-" in lines
+    captured = capsys.readouterr()
+    assert any(
+        line.startswith("warning: vulnerable · Cannot run update on vulnerable")
+        for line in captured.err.splitlines()
+    )
+    assert "clean\tpromotion\tpassed\tlocal main\t-\t-\t-" in captured.out.splitlines()
 
 
 class TestUpdatePreChecks:
@@ -566,7 +570,7 @@ class TestUpdateCrossCategoryStops:
         assert captured.out.splitlines() == [
             "outdated\tupdate\tfailed\tsome-pkg\t1.0.0\t1.0.1\tcommit failed"
         ]
-        assert "error: commit · cannot commit" in captured.err.splitlines()
+        assert "error: outdated · commit · cannot commit" in captured.err.splitlines()
         assert captured.err.splitlines()[-1] == "1 failed"
 
 
@@ -637,11 +641,13 @@ class TestUpdateOutcomeRecords:
 
         assert run_mm("update", "outdated") == ExitCode.UPDATE_FAILED
 
-        assert capsys.readouterr().out.splitlines() == [
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
             "outdated\tupdate\tblocked\tstuck\t2.0\t-\tno fixed version",
             "outdated\tupdate\tpassed\tsome-pkg\t1.0.0\t1.0.1\t-",
             "outdated\tupdate\tpassed\tpkg-a\t1.0.0\t1.0.1\t-",
         ]
+        assert captured.err.splitlines()[-1] == "2 passed · 1 blocked"
 
 
 class TestUpdateNumberedSelection:
@@ -1070,7 +1076,9 @@ class TestUpdateTargetSelection:
             )
             == 0
         )
-        assert "No target projects." in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "No target projects\n"
 
     def test_unknown_project_in_include_mode_exits_1(
         self,
@@ -1078,7 +1086,10 @@ class TestUpdateTargetSelection:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert run_mm("update", "missing") == 1
-        assert "Unknown project 'missing'" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("error: Unknown project 'missing'")
+        assert captured.err.splitlines()[-1] == "hint: mm list"
 
     def test_unknown_project_in_negate_mode_exits_1(
         self,
@@ -1086,7 +1097,10 @@ class TestUpdateTargetSelection:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert run_mm("update", "-n", "missing") == 1
-        assert "Unknown project 'missing'" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("error: Unknown project 'missing'")
+        assert captured.err.splitlines()[-1] == "hint: mm list"
 
     def test_batch_continues_after_project_failure(
         self,
@@ -1112,6 +1126,38 @@ class TestUpdateTargetSelection:
             "vulnerable",
             "clean",
         ]
+
+
+def test_given_batch_with_blocked_findings_when_updated_then_totals_sum_them(
+    mm_home_with_projects: Path,
+    mock_update_cli_deps: CliDeps,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    passed = UpdateResult(pkg_name="pkg-a", kind="update", passed=True)
+    mock_project = MagicMock(
+        side_effect=[
+            update_service.ProjectUpdate(
+                "vulnerable",
+                update_service.UpdateRoute.FINDINGS,
+                Outcome.FAILED,
+                (passed,),
+                blocked=1,
+            ),
+            update_service.ProjectUpdate(
+                "clean",
+                update_service.UpdateRoute.FINDINGS,
+                Outcome.FAILED,
+                (),
+                blocked=2,
+            ),
+        ]
+    )
+    monkeypatch.setattr(update_service, "update_project", mock_project)
+
+    assert run_mm("update", "vulnerable", "clean") == ExitCode.UPDATE_FAILED
+
+    assert capsys.readouterr().err.splitlines()[-1] == "1 passed · 3 blocked"
 
 
 class TestUpdateCliSurface:
@@ -1265,7 +1311,8 @@ def test_given_mixed_results_when_totals_printed_then_stderr_counts_each_state(c
             UpdateResult(
                 pkg_name="okhttp", kind="vuln", passed=False, failed_phase="unit"
             ),
-        ]
+        ],
+        blocked=0,
     )
 
     captured = capsys.readouterr()

@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
+    UnknownProjectError,
     ensure_mm_home,
     load_config,
     resolve_project,
@@ -236,7 +237,7 @@ class TestResolveProject:
         (mm_home / "workspaces").mkdir()
         write_config(mm_home, "[defaults]\n")
         config = load_config()
-        with pytest.raises(ProjectNotFoundError):
+        with pytest.raises(UnknownProjectError):
             resolve_project(config, "nonexistent")
 
     def test_missing_path_raises_project_not_found(self, mm_home: Path):
@@ -248,5 +249,6 @@ class TestResolveProject:
             '[projects.myapp]\npath = "/nonexistent/path"\npackage_manager = "bun"\n',
         )
         config = load_config()
-        with pytest.raises(ProjectNotFoundError):
+        with pytest.raises(ProjectNotFoundError) as raised:
             resolve_project(config, "myapp")
+        assert not isinstance(raised.value, UnknownProjectError)

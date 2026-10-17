@@ -4,7 +4,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from rich.console import Console
 from rich.text import Text
 
 from maintenance_man import cli
@@ -98,95 +97,6 @@ def _make_gradle_run() -> GradleRun:
     )
 
 
-@pytest.fixture()
-def output(monkeypatch):
-    buffer = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=buffer, width=220, color_system=None)
-    )
-    monkeypatch.setattr(
-        cli, "_print_scan_result", lambda *args, **kwargs: cli.console.print("SCAN")
-    )
-    monkeypatch.setattr(
-        cli, "_print_gradle_run_summary", lambda *args: cli.console.print("GRADLE")
-    )
-    return buffer
-
-
-@pytest.mark.parametrize("batch", [False, True])
-@pytest.mark.parametrize(
-    "event, expected",
-    [
-        (
-            ProjectSkipped("a[b]", SkipReason.PATH_MISSING, "/tmp/[x]"),
-            "Warning: a[b] — path does not exist: /tmp/[x]\n",
-        ),
-        (
-            SyncCompleted("a[b]", "already [up] to date"),
-            "  a[b] — already [up] to date\n",
-        ),
-        (
-            DeployStepStarted("a[b]", DeployStep.BUILD),
-            ("Building a[b]\n\n", "  Building...\n"),
-        ),
-        (
-            DeployStepStarted("a[b]", DeployStep.DEPLOY),
-            ("Deploying a[b]\n\n", "  Deploying...\n"),
-        ),
-        (
-            DeployStepStarted("a[b]", DeployStep.HEALTH),
-            ("\nChecking health of a[b]...\n", ""),
-        ),
-        (
-            DeployStepSucceeded("a[b]", DeployStep.BUILD),
-            ("\nBuild succeeded.\n\n", ""),
-        ),
-        (
-            DeployStepSucceeded("a[b]", DeployStep.DEPLOY),
-            ("\nDeploy succeeded.\n", ""),
-        ),
-        (DeployStepSucceeded("a[b]", DeployStep.HEALTH), ""),
-        (
-            DeployStepFailed("a[b]", DeployStep.BUILD, "bad [state]"),
-            ("Error: bad [state]\n", "  Build failed: bad [state]\n"),
-        ),
-        (
-            DeployStepFailed("a[b]", DeployStep.DEPLOY, "bad [state]"),
-            ("Error: bad [state]\n", "  Deploy failed: bad [state]\n"),
-        ),
-        (
-            DeployStepFailed("a[b]", DeployStep.HEALTH, "bad [state]"),
-            ("Error: bad [state]\n", ""),
-        ),
-        (
-            HealthChecked("a[b]", True, None),
-            ("Healthy: a[b] is up\n", "  Healthy: a[b] is up\n"),
-        ),
-        (
-            HealthChecked("a[b]", False, "bad [state]"),
-            ("Warning: bad [state]\n", "  Warning: bad [state]\n"),
-        ),
-        (
-            HealthChecked("a[b]", False, None),
-            (
-                "Warning: a[b] is not healthy\n",
-                "  Warning: a[b] is not healthy\n",
-            ),
-        ),
-        (
-            HealthcheckUnconfigured(),
-            "--check: no healthcheck_url configured in [defaults]\n",
-        ),
-    ],
-)
-def test_given_unconverted_event_when_rendered_in_both_modes_then_text_is_printed(
-    output, batch, event, expected
-):
-    cli._Renderer(batch=batch)(event)
-    rendered = expected[batch] if isinstance(expected, tuple) else expected
-    assert output.getvalue() == rendered
-
-
 def _pipe_scan() -> ScanResult:
     scan = make_scan_result(
         updates=[
@@ -239,7 +149,7 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
                 FindingStepFailed(step, "boom"),
                 "update",
                 "",
-                f"error: {words} · boom\n",
+                f"error: api · {words} · boom\n",
             )
             for step, words in _STEP_WORDS
         ],
@@ -325,7 +235,12 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
             "",
             "error: unit · still blocking: a, b\n",
         ),
-        (PullRequestOutput("https://x/pull/1"), "update", "", "https://x/pull/1\n"),
+        (
+            PullRequestOutput("https://x/pull/1"),
+            "resolve",
+            "api\tresolve\tpassed\tpull request\t-\t-\thttps://x/pull/1\n",
+            "",
+        ),
         (
             GradleWithheld("org.x:lib -> 2", "too young"),
             "update",
@@ -369,7 +284,7 @@ def test_given_event_when_rendered_in_pipe_then_records_and_diagnostics_split_by
     capsys: pytest.CaptureFixture[str],
     batch: bool,
     event: Event,
-    flow: str,
+    flow: cli._Flow,
     stdout: str,
     stderr: str,
 ) -> None:
@@ -378,6 +293,16 @@ def test_given_event_when_rendered_in_pipe_then_records_and_diagnostics_split_by
     captured = capsys.readouterr()
     assert captured.out == stdout
     assert captured.err == stderr
+
+
+def test_given_step_failure_without_project_when_rendered_then_error_omits_project(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._Renderer(batch=False)(FindingStepFailed(FindingStepKind.COMMIT, "boom"))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: commit · boom\n"
 
 
 @pytest.mark.parametrize(
@@ -395,7 +320,7 @@ def test_given_operation_failure_when_rendered_then_diagnostic_goes_to_stderr(
 
 @pytest.mark.parametrize(
     ("batch", "expected"),
-    [(False, "1 passed · 1 failed\n"), (True, "")],
+    [(False, "1 passed · 1 failed · 2 blocked\n"), (True, "")],
     ids=["single", "batch"],
 )
 def test_given_processed_findings_when_rendered_then_only_single_project_prints_totals(
@@ -406,7 +331,7 @@ def test_given_processed_findings_when_rendered_then_only_single_project_prints_
         UpdateResult("b", "vuln", False, "unit"),
     )
 
-    cli._Renderer(batch=batch, project="api")(FindingsProcessed(results))
+    cli._Renderer(batch=batch, project="api")(FindingsProcessed(results, blocked=2))
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -414,23 +339,26 @@ def test_given_processed_findings_when_rendered_then_only_single_project_prints_
 
 
 @pytest.mark.parametrize(
-    ("results", "expected"),
+    ("results", "blocked", "expected"),
     [
         (
             (UpdateResult("a", "update", True), UpdateResult("b", "update", True)),
+            0,
             "2 passed\n",
         ),
-        ((UpdateResult("a", "update", False, "unit"),), "1 failed\n"),
-        ((), ""),
+        ((UpdateResult("a", "update", False, "unit"),), 0, "1 failed\n"),
+        ((), 3, "3 blocked\n"),
+        ((), 0, ""),
     ],
-    ids=["passed-only", "failed-only", "none"],
+    ids=["passed-only", "failed-only", "blocked-only", "none"],
 )
 def test_given_finding_totals_when_rendered_then_zero_counts_are_omitted(
     capsys: pytest.CaptureFixture[str],
     results: tuple[UpdateResult, ...],
+    blocked: int,
     expected: str,
 ) -> None:
-    cli._Renderer(batch=False, project="api")(FindingsProcessed(results))
+    cli._Renderer(batch=False, project="api")(FindingsProcessed(results, blocked))
 
     assert capsys.readouterr().err == expected
 
@@ -456,16 +384,25 @@ def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
     [
         (
             FindingPassed("pkg", False, "1.0", "1.1"),
-            "  ✓ passed   pkg                       1.0 → 1.1",
+            "api\n  ✓ passed    pkg                       1.0 → 1.1",
         ),
         (
             FindingFailed("pkg", "unit", "1.0", "1.1"),
-            "  ✗ failed   pkg                       1.0 → 1.1             unit failed",
+            "api\n  ✗ failed    pkg                       1.0 → 1.1             "
+            "unit failed",
         ),
-        (Promoted("mm/update-dependencies"), "  ✓ passed   local main"),
+        (
+            FindingsBlocked((("pkg", "no fix"),)),
+            "api\n  ! blocked   pkg                       no fix",
+        ),
+        (Promoted("mm/update-dependencies"), "  ✓ passed    local main"),
         (ProcessingStarted(2, 1), "api · 2 vulnerabilities · 1 updates"),
+        (
+            PullRequestOutput("https://x/pull/1"),
+            "api\n  ✓ passed    pull request              https://x/pull/1",
+        ),
     ],
-    ids=["passed", "failed", "promoted", "processing"],
+    ids=["passed", "failed", "blocked", "promoted", "processing", "pull-request"],
 )
 def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
     monkeypatch: pytest.MonkeyPatch, event: Event, expected: str
@@ -478,20 +415,62 @@ def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
     assert Text.from_ansi(stream.getvalue()).plain == f"{expected}\n"
 
 
-@pytest.mark.parametrize("batch", [False, True])
-def test_given_pull_request_output_when_rendered_then_stderr_text_is_dim(
-    monkeypatch: pytest.MonkeyPatch, batch: bool
+def test_given_processing_heading_when_finding_rendered_then_heading_is_not_repeated(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stream = TerminalStream()
-    monkeypatch.setattr("sys.stderr", stream)
-    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr("sys.stdout", stream)
 
-    cli._Renderer(batch=batch)(PullRequestOutput("https://x/pull/[1]"))
+    renderer = cli._Renderer(batch=False, project="api")
+    renderer(ProcessingStarted(2, 1))
+    renderer(FindingPassed("pkg", False, "1.0", "1.1"))
 
-    rendered = Text.from_ansi(stream.getvalue())
-    assert rendered.plain == "https://x/pull/[1]\n"
-    assert rendered.spans
-    assert all("dim" in str(span.style) for span in rendered.spans)
+    assert Text.from_ansi(stream.getvalue()).plain.splitlines() == [
+        "api · 2 vulnerabilities · 1 updates",
+        "  ✓ passed    pkg                       1.0 → 1.1",
+    ]
+
+
+def test_given_no_project_when_finding_rendered_on_terminal_then_no_heading_prints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+
+    cli._Renderer(batch=False)(FindingPassed("pkg", False, "1.0", "1.1"))
+
+    assert Text.from_ansi(stream.getvalue()).plain.splitlines() == [
+        "  ✓ passed    pkg                       1.0 → 1.1"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stdout_is_terminal", "stderr_is_terminal", "expected"),
+    [
+        (False, True, "Updating pkg 1.0 → 2.0\n"),
+        (True, True, "Updating pkg 1.0 → 2.0\n"),
+        (True, False, ""),
+        (False, False, ""),
+    ],
+    ids=["stderr-terminal", "both-terminals", "stdout-terminal-only", "both-pipes"],
+)
+def test_given_finding_started_when_rendered_then_only_a_stderr_terminal_shows_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+    expected: str,
+) -> None:
+    stdout = TerminalStream() if stdout_is_terminal else StringIO()
+    stderr = TerminalStream() if stderr_is_terminal else StringIO()
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    cli._Renderer(batch=False, project="api")(
+        FindingStarted("update", "pkg", "1.0", "2.0", "major")
+    )
+
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == expected
 
 
 def test_given_summary_events_when_rendered_then_exact_payloads_are_forwarded(
@@ -524,7 +503,7 @@ def _blocked_scan() -> ScanResult:
 
 @pytest.mark.parametrize("flow", ["update", "resolve"])
 def test_given_blocked_findings_when_saved_scan_reported_in_pipe_then_one_outcome_each(
-    flow: str, capsys: pytest.CaptureFixture[str]
+    flow: cli._Flow, capsys: pytest.CaptureFixture[str]
 ) -> None:
     cli._Renderer(batch=False, flow=flow)(ScanReported(_blocked_scan()))
 
@@ -574,52 +553,267 @@ def test_given_clean_scan_when_reported_then_notice_depends_on_timing_and_batch(
     assert captured.err == expected
 
 
+_NO_STDERR = ""
+_DEPLOY_RECORD = "api\tdeploy\t{status}\tdeploy\t-\t-\t{reason}\n"
+_SKIPPED_AFTER_BUILD = "api\tdeploy\tskipped\tdeploy\t-\t-\tbuild failed\n"
+
+
+@pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize(
-    ("reason", "detail", "single", "batch_text"),
+    ("event", "stdout", "stderr"),
     [
+        *[(DeployStepStarted("api", step), "", _NO_STDERR) for step in DeployStep],
         (
-            SkipReason.NO_SCAN_RESULTS,
-            None,
-            "a[b] — no scan results; nothing to do.",
+            DeployStepSucceeded("api", DeployStep.BUILD),
+            "api\tbuild\tpassed\tbuild\t-\t-\t-\n",
+            _NO_STDERR,
+        ),
+        (
+            DeployStepSucceeded("api", DeployStep.DEPLOY),
+            "api\tdeploy\tpassed\tdeploy\t-\t-\t-\n",
+            _NO_STDERR,
+        ),
+        (
+            DeployStepFailed("api", DeployStep.BUILD, "exit 2"),
+            "api\tbuild\tfailed\tbuild\t-\t-\texit 2\n" + _SKIPPED_AFTER_BUILD,
+            _NO_STDERR,
+        ),
+        (
+            DeployStepFailed("api", DeployStep.DEPLOY, "exit 3"),
+            "api\tdeploy\tfailed\tdeploy\t-\t-\texit 3\n",
+            _NO_STDERR,
+        ),
+        (DeployStepSucceeded("api", DeployStep.HEALTH), "", _NO_STDERR),
+        (DeployStepFailed("api", DeployStep.HEALTH, "x"), "", _NO_STDERR),
+        (
+            HealthChecked("api", True, None),
+            "api\thealth\tpassed\thealthcheck\t-\t-\t-\n",
+            _NO_STDERR,
+        ),
+        (
+            HealthChecked("api", False, "HTTP 503"),
+            "api\thealth\tfailed\thealthcheck\t-\t-\tHTTP 503\n",
+            _NO_STDERR,
+        ),
+        (
+            HealthChecked("api", False, None),
+            "api\thealth\tfailed\thealthcheck\t-\t-\tnot healthy\n",
+            _NO_STDERR,
+        ),
+        (
+            HealthChecked("api", False, "bad [state]"),
+            "api\thealth\tfailed\thealthcheck\t-\t-\tbad [state]\n",
+            _NO_STDERR,
+        ),
+        (
+            HealthcheckUnconfigured(),
             "",
+            "--check: no healthcheck_url configured in [defaults]\n",
         ),
         (
-            SkipReason.NOTHING_TO_DO,
-            "resolve",
-            "a[b] — nothing to resolve.",
-            "  a[b] — nothing to update",
+            ProjectSkipped("api", SkipReason.NOT_DEPLOYABLE),
+            _DEPLOY_RECORD.format(status="skipped", reason="not deployable"),
+            _NO_STDERR,
         ),
         (
-            SkipReason.FLOW_CONFLICT,
-            "bad [flow]",
-            "  Skipped: a[b] — bad [flow]",
-            "  Skipped: a[b] — bad [flow]",
+            ProjectSkipped("api", SkipReason.UNCHANGED),
+            _DEPLOY_RECORD.format(
+                status="unchanged",
+                reason="unchanged since last deploy · use --force to redeploy",
+            ),
+            _NO_STDERR,
         ),
         (
-            SkipReason.NOT_DEPLOYABLE,
-            None,
-            "a[b] — skipped (not deployable)",
-            "a[b] — skipped (not deployable)",
+            ProjectSkipped("api", SkipReason.BLOCKED),
+            _DEPLOY_RECORD.format(
+                status="blocked",
+                reason=(
+                    "could not resolve main revision · use --force to deploy anyway"
+                ),
+            ),
+            _NO_STDERR,
         ),
         (
-            SkipReason.UNCHANGED,
-            None,
-            "a[b] unchanged since last deploy (use --force to redeploy).",
-            "a[b] — unchanged since last deploy",
+            ProjectSkipped("api", SkipReason.PATH_MISSING, "/x"),
+            "",
+            "warning: api · path does not exist: /x\n",
         ),
         (
-            SkipReason.BLOCKED,
-            None,
-            "Warning: a[b] — could not resolve main revision; skipping "
-            "(use --force to deploy anyway)",
-            "Warning: a[b] — could not resolve main revision; skipping "
-            "(use --force to deploy anyway)",
+            ProjectSkipped("a[b]", SkipReason.PATH_MISSING, "/tmp/[x]"),
+            "",
+            "warning: a[b] · path does not exist: /tmp/[x]\n",
+        ),
+        (
+            ProjectSkipped("api", SkipReason.NOTHING_TO_DO, "update"),
+            "",
+            "Nothing to update in api\n",
+        ),
+        (
+            ProjectSkipped("api", SkipReason.FLOW_CONFLICT, "owned by resolve"),
+            "",
+            "warning: api · owned by resolve\n",
+        ),
+        (
+            SyncCompleted("api", "already up to date"),
+            "api\tsync\tunchanged\tmain\t-\t-\t-\n",
+            _NO_STDERR,
+        ),
+        (
+            SyncCompleted("api", "pulled from remote"),
+            "api\tsync\tpassed\tmain\t-\t-\tpulled from remote\n",
+            _NO_STDERR,
+        ),
+        (
+            SyncCompleted("api", "pushed to remote"),
+            "api\tsync\tpassed\tmain\t-\t-\tpushed to remote\n",
+            _NO_STDERR,
+        ),
+        (
+            SyncCompleted("a[b]", "already up to date"),
+            "a[b]\tsync\tunchanged\tmain\t-\t-\t-\n",
+            _NO_STDERR,
         ),
     ],
 )
-@pytest.mark.parametrize("batch", [False, True])
-def test_given_skip_reason_when_rendered_then_mode_specific_literal_is_printed(
-    output, reason, detail, single, batch_text, batch
-):
-    cli._Renderer(batch=batch)(ProjectSkipped("a[b]", reason, detail))
-    assert output.getvalue().strip("\n") == (batch_text if batch else single)
+def test_given_deploy_or_sync_event_when_rendered_in_pipe_then_streams_split(
+    capsys: pytest.CaptureFixture[str],
+    batch: bool,
+    event: Event,
+    stdout: str,
+    stderr: str,
+) -> None:
+    cli._Renderer(batch=batch, project="api")(event)
+
+    captured = capsys.readouterr()
+    assert captured.out == stdout
+    assert captured.err == stderr
+
+
+@pytest.mark.parametrize(
+    ("flow", "stdout", "stderr"),
+    [
+        ("deploy", "api\tdeploy\tfailed\tdeploy\t-\t-\tpath does not exist: /x\n", ""),
+        ("update", "", "warning: api · path does not exist: /x\n"),
+        ("scan", "", "warning: api · path does not exist: /x\n"),
+    ],
+)
+def test_given_missing_project_path_when_rendered_then_only_deploy_records_a_failure(
+    capsys: pytest.CaptureFixture[str], flow: cli._Flow, stdout: str, stderr: str
+) -> None:
+    cli._Renderer(batch=True, flow=flow)(
+        ProjectSkipped("api", SkipReason.PATH_MISSING, "/x")
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == stdout
+    assert captured.err == stderr
+
+
+@pytest.mark.parametrize(
+    ("batch", "expected"),
+    [(False, "No scan results for api\n"), (True, "")],
+    ids=["single", "batch"],
+)
+def test_given_project_without_scan_results_when_skipped_then_only_single_notice(
+    capsys: pytest.CaptureFixture[str], batch: bool, expected: str
+) -> None:
+    cli._Renderer(batch=batch, project="api")(
+        ProjectSkipped("api", SkipReason.NO_SCAN_RESULTS)
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected"),
+    [
+        (
+            [
+                DeployStepStarted("api", DeployStep.BUILD),
+                DeployStepSucceeded("api", DeployStep.BUILD),
+                DeployStepStarted("api", DeployStep.DEPLOY),
+                DeployStepSucceeded("api", DeployStep.DEPLOY),
+                DeployStepStarted("api", DeployStep.HEALTH),
+                HealthChecked("api", False, "HTTP 503"),
+            ],
+            [
+                "api",
+                "  ✓ passed    build",
+                "  ✓ passed    deploy",
+                "  ✗ failed    healthcheck               HTTP 503",
+            ],
+        ),
+        (
+            [
+                DeployStepStarted("api", DeployStep.BUILD),
+                DeployStepFailed("api", DeployStep.BUILD, "exit 2"),
+            ],
+            [
+                "api",
+                "  ✗ failed    build                     exit 2",
+                "  ○ skipped   deploy                    build failed",
+            ],
+        ),
+        (
+            [
+                ProjectSkipped("api", SkipReason.NOT_DEPLOYABLE),
+                ProjectSkipped("web", SkipReason.BLOCKED),
+            ],
+            [
+                "api",
+                "  ○ skipped   deploy                    not deployable",
+                "",
+                "web",
+                "  ! blocked   deploy                    "
+                "could not resolve main revision · use --force to deploy anyway",
+            ],
+        ),
+        (
+            [SyncCompleted("api", "pulled from remote")],
+            ["api", "  ✓ passed    main                      pulled from remote"],
+        ),
+    ],
+    ids=["deploy-then-health", "failed-build", "two-projects", "sync"],
+)
+def test_given_project_events_when_rendered_on_terminal_then_one_heading_per_project(
+    monkeypatch: pytest.MonkeyPatch,
+    steps: list[Event],
+    expected: list[str],
+) -> None:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+    monkeypatch.setenv("COLUMNS", "120")
+
+    renderer = cli._Renderer(batch=True)
+    for step in steps:
+        renderer(step)
+
+    assert Text.from_ansi(stream.getvalue()).plain.splitlines() == expected
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (SyncCompleted("api", "already up to date"), ["api", "  ○ unchanged main"]),
+        (
+            ProjectSkipped("api", SkipReason.UNCHANGED),
+            [
+                "api",
+                "  ○ unchanged deploy                    "
+                "unchanged since last deploy · use --for…",
+            ],
+        ),
+    ],
+    ids=["sync", "deploy"],
+)
+def test_given_unchanged_outcome_when_rendered_on_terminal_then_subject_is_separated(
+    monkeypatch: pytest.MonkeyPatch, event: Event, expected: list[str]
+) -> None:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+
+    cli._Renderer(batch=True)(event)
+
+    assert Text.from_ansi(stream.getvalue()).plain.splitlines() == expected

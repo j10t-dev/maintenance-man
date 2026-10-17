@@ -64,9 +64,11 @@ def run_logged(
     """Run *cmd* with its logs hidden on success and replayed on stderr on failure.
 
     When output is verbose the logs stream to stderr while the child runs.  Child
-    output never enters the raised error.  ``stdin=None`` inherits mm's stdin,
-    so configured scripts may prompt; the child shares mm's terminal and process
-    group, so its prompts and Ctrl-C behave as they would run directly.
+    output never enters the raised error.  ``stdin=None`` inherits mm's stdin.
+    Quiet mode writes the child's stdout and stderr to temporary files, so a
+    prompt written to either stream stays hidden until the command ends; only a
+    prompt that opens ``/dev/tty`` appears.  Ctrl-C still reaches the child.
+    Interactive scripts should run with ``--verbose`` or prompt on ``/dev/tty``.
     ``capture=True`` also returns the two streams for the caller to parse.
     """
     with TemporaryFile() as stdout, TemporaryFile() as stderr:

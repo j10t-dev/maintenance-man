@@ -65,6 +65,7 @@ class ProjectUpdate:
     route: UpdateRoute
     outcome: Outcome
     results: tuple[UpdateResult, ...]
+    blocked: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +145,13 @@ def update_project(
             emit(OperationFailed(Operation.BOOKMARK_CLEANUP, name, str(exc)))
             finalised = False
     outcome = Outcome.SUCCEEDED if finalised else Outcome.FAILED
-    return ProjectUpdate(name, UpdateRoute.FINDINGS, outcome, results)
+    return ProjectUpdate(
+        name,
+        UpdateRoute.FINDINGS,
+        outcome,
+        results,
+        blocked=len(scan_result.blocked_findings),
+    )
 
 
 def update_projects(
@@ -324,5 +331,5 @@ def _process_selected(
         else []
     )
     result_tuple = tuple(results)
-    emit(FindingsProcessed(result_tuple))
+    emit(FindingsProcessed(result_tuple, len(scan_result.blocked_findings)))
     return result_tuple

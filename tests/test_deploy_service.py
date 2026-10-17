@@ -167,6 +167,7 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         deploy_service.DeployResult("b", "skip", "unchanged"),
         deploy_service.DeployResult("c", "skip", "blocked"),
         deploy_service.DeployResult("d", "skip", "fail"),
+        deploy_service.DeployResult("e", "skip", "skip"),
     )
     assert runs == [
         (

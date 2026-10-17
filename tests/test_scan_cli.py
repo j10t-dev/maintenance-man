@@ -36,6 +36,7 @@ from maintenance_man.services.scan import ScanSummary
 from maintenance_man.vcs import RevisionError
 from tests.conftest import (
     TerminalStream,
+    make_gradle_target,
     make_scan_result,
     make_update,
     missing_tool,
@@ -101,6 +102,27 @@ def test_numbered_findings_print_bracketed_values_literally(
     assert "a[b]" in captured.err
     assert "CVE-[x]" in captured.err
     assert "u[p]" in captured.err
+
+
+def test_gradle_candidates_print_one_row_each_and_reprompt_after_invalid_selection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate = GradleCandidate(
+        target=make_gradle_target(), origins=frozenset({"ordinary"})
+    )
+    replies = iter(["9", "1"])
+    monkeypatch.setattr(
+        "maintenance_man.output.prompt", lambda *args, **kwargs: next(replies)
+    )
+
+    assert cli._choose_gradle_candidates((candidate,)) == (candidate,)
+
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0].startswith("    1  room")
+    assert lines[-1] == "error: Invalid selection: 9"
+    listing = " ".join(line.strip() for line in lines[:-1])
+    for alias in ("room-runtime", "room-compiler", "room-testing"):
+        assert f"{alias}: androidx.room:{alias} 2.8.4 → 2.8.5" in listing
 
 
 def _make_vulnerable_result() -> ScanResult:
@@ -233,7 +255,7 @@ def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys
     assert captured.out == ""
     assert captured.err.splitlines() == [
         "No projects configured",
-        "hint: add projects to ~/.mm/config.toml",
+        f"hint: add projects to {mm_home / 'config.toml'}",
     ]
 
 

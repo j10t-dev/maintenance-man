@@ -40,23 +40,46 @@ mm update api -n worker   # same exclusion mode; flag position does not matter
 
 If jj or gh is missing, `mm scan` warns and skips bookmark pruning; `mm update` and `mm resolve` still require both.
 
-```bash
-➜  maintenance-man git:(main) ✗ mm --help
+```text
 Usage: mm COMMAND
 
 Config-driven CLI for routine software project maintenance.
 
-╭─ Commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ build           Build a project's artefacts.                                                                                                   │
-│ deploy          Deploy a project.                                                                                                              │
-│ list            List all configured projects with scan findings summary.                                                                       │
-│ scan            Scan projects for vulnerabilities and available updates.                                                                       │
-│ test            Run a project's test suite.                                                                                                    │
-│ update          Apply updates from scan results to a project.                                                                                  │
-│ --help (-h)     Display this message and exit.                                                                                                 │
-│ --version (-v)  Display application version.                                                                                                   │
-╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Commands:
+  build: Build a project's artefacts.
+  deploy: Deploy a project.
+  init: Initialise the ~/.mm directory and skeleton config.
+  list, status, st: List all configured projects with scan findings summary.
+  resolve: Work through failed findings for a project.
+  scan: Scan projects for vulnerabilities and available updates.
+  sync: Sync local main with remote for one, many, or all configured projects.
+  test: Run a project's test suite.
+  todo: Show TODO.md items for projects.
+  update: Apply updates from scan results to one, many, or all projects.
+  --help, -h: Display this message and exit.
+  --version, -v: Display application version.
 ```
+
+## Output and subprocess logs
+
+Build, test, deploy, update and resolve hide successful subprocess logs by default. Failed commands replay stdout and stderr once on stderr. Add `--verbose` to stream both child streams live to stderr, including successful commands. Timeouts and interruptions expose partial logs and ask the command to terminate, escalating to SIGKILL after two seconds. Successful output is hidden, and so are prompts the command writes to stdout or stderr, because both streams go to temporary files until the command ends; only a prompt that opens `/dev/tty` appears. Ctrl-C still reaches the command. Run interactive scripts with `--verbose`, or have them write their prompt to `/dev/tty`. Logging ends when the command exits; services started in the background should own their log destinations. Protocol queries keep their output captured for parsing.
+
+Terminal output uses grouped, borderless records. Status words remain readable without colour. Narrow terminals abbreviate long fields and omit secondary columns; pipe the command to retain full values. Footers name hidden columns and may wrap to preserve that information. `NO_COLOR`, `TERM=dumb` and an unset `TERM` disable colour. Progress appears only on a stderr terminal after 500 ms, never while the command can read the terminal, and disappears on completion.
+
+When stdout is redirected, records are headerless TSV. Warnings, prompts, errors, progress and totals go to stderr. Help and version remain human-readable text. Field order:
+
+| Command or record | Fields |
+| --- | --- |
+| `mm list` | project, package_manager, vulnerabilities, updates, secrets, scanned_at, built_at, build_status, deployed_at, deploy_status |
+| `mm list --detail`, `mm scan` findings | project, kind, package or path, installed, target, severity or tier, identifier, published_at, status, reason |
+| Outcome (`update`, `resolve`, `build`, `test`, `deploy`, `sync`) | project, operation, status, subject, installed, target, reason |
+| `mm todo` | project, line_number, text |
+
+A piped `update` or `resolve` of a Gradle project also prints the engine's findings records, in the 10-field form above, before its outcome records.
+
+Timestamps use exact ISO 8601 in pipes and short relative values on a terminal. Unknown counts use `-`; known empty counts use `0`. Other absent values use `-`, with explicit reasons such as `never` or `not deployable` where relevant. TSV fields escape backslash, tab, carriage return and newline as `\\`, `\t`, `\r` and `\n`; other ASCII and C1 controls use `\xNN`, and Unicode line/paragraph separators use `\u2028`/`\u2029`. Bracketed text is literal. The reason field is human-readable explanation and may include `selected fix` for the chosen advisory fix.
+
+A passed package update and promotion to local main are separate outcomes. A failed build records deployment as skipped. Command exit codes and saved scan formats are unchanged.
 
 ## Application contract 
 

@@ -1,13 +1,11 @@
-from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from rich.console import Console
 
 from maintenance_man import __version__, cli
 from maintenance_man.config import ConfigError
-from maintenance_man.deployer import BuildError
+from maintenance_man.exit_codes import ExitCode
 from maintenance_man.gradle import GradleError
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.scanner import ScanError
@@ -56,12 +54,6 @@ from tests.conftest import configure_fake_vcs, run_mm, write_config
             UpdateSetupError("refused"),
             1,
         ),
-        (
-            ("build", "deployable"),
-            "maintenance_man.services.deploy.build_project",
-            BuildError("make failed"),
-            6,
-        ),
     ],
     ids=[
         "scan-error",
@@ -70,7 +62,6 @@ from tests.conftest import configure_fake_vcs, run_mm, write_config
         "outdated-check-error",
         "workflow-error",
         "workflow-error-subclass",
-        "build-error",
     ],
 )
 def test_given_a_service_refusal_when_a_command_runs_then_it_maps_to_one_error_line(
@@ -87,15 +78,15 @@ def test_given_a_service_refusal_when_a_command_runs_then_it_maps_to_one_error_l
     monkeypatch.setattr(service_seam, MagicMock(side_effect=error))
 
     code = run_mm(*argv)
+    captured = capsys.readouterr()
     error_lines = [
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith("Error:")
+        line for line in captured.err.splitlines() if line.startswith("error:")
     ]
 
-    assert (code, error_lines) == (
+    assert (code, captured.out, error_lines) == (
         expected_code,
-        [f"Error: {error}"],
+        "",
+        [f"error: {error}"],
     )
 
 
@@ -103,6 +94,26 @@ class TestHelp:
     def test_help_contains_description(self, capsys: pytest.CaptureFixture[str]):
         assert run_mm("--help") == 0
         assert "maintenance" in capsys.readouterr().out.lower()
+
+    def test_given_help_when_printed_then_commands_are_listed_without_panels(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run_mm("--help") == ExitCode.OK
+
+        out = capsys.readouterr().out
+        assert "Commands:" in out
+        assert not set("╭╮╰╯│─") & set(out)
+
+    def test_given_invalid_option_when_parsing_then_error_is_plain_stderr_exit_one(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run_mm("scan", "--bogus") == ExitCode.ERROR
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("error: ")
+        assert "--bogus" in captured.err
+        assert not set("╭╮╰╯│─") & set(captured.err)
 
 
 class TestVersion:
@@ -116,38 +127,84 @@ class TestInitCommand:
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]
     ):
         assert run_mm("init") == 0
-        out = capsys.readouterr().out.replace("\n", "")
-        assert str(mm_home) in out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert str(mm_home) in captured.err.replace("\n", "")
         assert (mm_home / "config.toml").is_file()
 
     def test_init_prints_bracketed_home_path_literally(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         home = tmp_path / "[home]"
-        output = StringIO()
         monkeypatch.setattr("maintenance_man.paths.MM_HOME", home)
-        monkeypatch.setattr(
-            cli, "console", Console(file=output, width=220, color_system=None)
-        )
 
         assert run_mm("init") == 0
-        assert str(home) in output.getvalue()
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines() == [
+            f"Initialised {home}",
+            f"Add projects to {home / 'config.toml'}",
+        ]
 
 
 def test_fatal_prints_bracketed_plain_text_literally(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=220, color_system=None)
-    )
-
     monkeypatch.setattr(
         cli, "_load_cfg", MagicMock(side_effect=ConfigError("bad [projects.x]"))
     )
 
     assert run_mm("scan") == 1
-    assert "Error: bad [projects.x]" in output.getvalue()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: bad [projects.x]\n"
+
+
+@pytest.mark.parametrize(
+    ("project", "expects_hint"),
+    [("unlisted", True), ("ghost", False)],
+    ids=["unknown-name", "missing-path"],
+)
+def test_given_unresolvable_project_when_build_runs_then_only_unknown_name_hints_list(
+    mm_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    project: str,
+    expects_hint: bool,
+) -> None:
+    write_config(
+        mm_home,
+        f'[projects.ghost]\npath = "{tmp_path / "gone"}"\npackage_manager = "uv"\n',
+    )
+
+    assert run_mm("build", project) == ExitCode.ERROR
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert project in captured.err
+    assert ("hint: mm list" in captured.err.splitlines()) is expects_hint
+
+
+def test_given_empty_config_when_listed_then_notice_and_hint_use_stderr_exit_zero(
+    mm_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mm_home.mkdir(parents=True)
+    write_config(mm_home, "[defaults]\n")
+
+    assert run_mm("list") == ExitCode.OK
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "No projects configured",
+        f"hint: add projects to {mm_home / 'config.toml'}",
+    ]
 
 
 def test_config_validation_error_keeps_pydantic_type_suffix(
@@ -158,15 +215,16 @@ def test_config_validation_error_keeps_pydantic_type_suffix(
 
     assert run_mm("scan") == 1
 
-    assert "[type=missing" in capsys.readouterr().out
+    assert "[type=missing" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("use_config_flag", [False, True], ids=["default", "flag"])
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
         ("deploy", "Add deploy_command to [projects.api] in ~/.mm/config.toml."),
-        ("build", "Add build_command to [projects.api]"),
-        ("test", "Add test_unit to [projects.api]"),
+        ("build", "hint: add build_command to [projects.api] in {config}"),
+        ("test", "hint: add test_unit to [projects.api] in {config}"),
     ],
 )
 def test_missing_command_error_keeps_config_table_literal(
@@ -175,6 +233,7 @@ def test_missing_command_error_keeps_config_table_literal(
     capsys: pytest.CaptureFixture[str],
     command: str,
     expected: str,
+    use_config_flag: bool,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -183,10 +242,34 @@ def test_missing_command_error_keeps_config_table_literal(
         mm_home,
         f'[projects.api]\npath = "{project}"\npackage_manager = "uv"\n',
     )
+    config = mm_home / "config.toml"
+    argv = [command, "api"]
+    if use_config_flag:
+        config = write_config(
+            tmp_path,
+            f'[projects.api]\npath = "{project}"\npackage_manager = "uv"\n',
+            filename="elsewhere.toml",
+        )
+        argv += ["--config", str(config)]
 
-    assert run_mm(command, "api") == 1
+    assert run_mm(*argv) == 1
 
-    assert expected in " ".join(capsys.readouterr().out.split())
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert expected.format(config=config) in " ".join(captured.err.split())
+
+
+def test_given_empty_config_flag_when_listed_then_hint_names_that_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = write_config(tmp_path, "[defaults]\n", filename="elsewhere.toml")
+
+    assert run_mm("list", "--config", str(config)) == ExitCode.OK
+
+    assert capsys.readouterr().err.splitlines() == [
+        "No projects configured",
+        f"hint: add projects to {config}",
+    ]
 
 
 def test_deploy_check_hint_keeps_defaults_table_literal(
@@ -197,7 +280,9 @@ def test_deploy_check_hint_keeps_defaults_table_literal(
 
     assert run_mm("deploy", "--check") == 0
 
-    assert "configured in [defaults]" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "configured in [defaults]" in captured.err
 
 
 class TestDeployCommand:
@@ -298,7 +383,7 @@ class TestTodoCommand:
         assert captured.out == ""
         assert captured.err.splitlines() == [
             "No projects configured",
-            "hint: add projects to ~/.mm/config.toml",
+            f"hint: add projects to {mm_home / 'config.toml'}",
         ]
 
     def test_given_bracketed_name_and_markdown_when_todo_runs_then_both_print_literally(

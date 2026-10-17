@@ -11,7 +11,7 @@ from threading import Lock, Timer
 from typing import Literal, TextIO
 
 from cyclopts.help import HelpPanel, PlainFormatter
-from rich.cells import cell_len
+from rich.cells import cell_len, set_cell_size
 from rich.console import Console, ConsoleOptions
 from rich.live import Live
 from rich.spinner import Spinner
@@ -52,9 +52,7 @@ def records(
     """Terminal omission never changes the independently supplied pipe fields."""
     if not terminal():
         for row in pipe_rows:
-            sys.stdout.write(
-                "\t".join(_escape(field) for field in (group, *row)) + "\n"
-            )
+            sys.stdout.write(_pipe_line((group, *row)))
         return
     if not rows:
         return
@@ -100,7 +98,7 @@ def project_records(
         records("", headers, rows, pipe_rows=(), footer=footer)
     else:
         for row in pipe_rows:
-            sys.stdout.write("\t".join(_escape(field) for field in row) + "\n")
+            sys.stdout.write(_pipe_line(row))
 
 
 def outcome(
@@ -113,10 +111,17 @@ def outcome(
     target: str = "-",
     reason: str = "",
 ) -> None:
+    if not terminal():
+        sys.stdout.write(
+            _pipe_line(
+                (project, operation, status, subject, installed, target, reason or "-")
+            )
+        )
+        return
     symbol, style = _STATES[status]
     versions = f"{installed} → {target}" if installed != "-" or target != "-" else ""
     text = Text("  ")
-    text.append(f"{symbol} {status:<9}", style=style)
+    text.append(f"{symbol} {status:<10}", style=style)
     subject_width = 24 if console().width >= 80 and (versions or reason) else 0
     text.append_text(literal(f"{subject:<{subject_width}}"))
     if versions or reason:
@@ -127,15 +132,26 @@ def outcome(
         if reason:
             text.append("  ")
     text.append_text(literal(reason, "dim"))
-    if terminal():
-        console().print(text, overflow="ellipsis", no_wrap=True)
-    else:
-        records(
-            project,
-            (),
-            (),
-            pipe_rows=[(operation, status, subject, installed, target, reason or "-")],
-        )
+    console().print(text, overflow="ellipsis", no_wrap=True)
+
+
+def choices(rows: Sequence[Sequence[str]]) -> None:
+    """Print numbered selection rows on stderr; the last column wraps."""
+    widths = [
+        max(map(cell_len, column)) for column in list(zip(*rows, strict=True))[:-1]
+    ]
+    screen = console(stderr=True)
+    for index, row in enumerate(rows, 1):
+        cells = [
+            set_cell_size(cell, width) for cell, width in zip(row, widths, strict=False)
+        ]
+        prefix = "  ".join([f"  {index:>3}", *cells, ""])
+        indent = cell_len(prefix)
+        wrapped = literal(row[-1]).wrap(screen, max(1, screen.width - indent))
+        for number, text in enumerate(wrapped):
+            line = literal(prefix if number == 0 else " " * indent)
+            line.append_text(text)
+            screen.print(line, soft_wrap=True)
 
 
 def diagnostic(kind: Literal["error", "warning", "hint"], message: str) -> None:
@@ -179,7 +195,7 @@ def is_verbose() -> bool:
 def progress(message: str) -> Iterator[None]:
     """Show slow operations only on a stderr terminal; erase on completion."""
     if (
-        not sys.stderr.isatty()
+        not stderr_terminal()
         or is_verbose()
         or os.environ.get("TERM", "dumb") == "dumb"
     ):
@@ -213,6 +229,10 @@ def progress(message: str) -> Iterator[None]:
 
 def terminal() -> bool:
     return sys.stdout.isatty()
+
+
+def stderr_terminal() -> bool:
+    return sys.stderr.isatty()
 
 
 def console(*, stderr: bool = False) -> Console:
@@ -269,6 +289,10 @@ def relative_time(value: datetime, now: datetime | None = None) -> str:
     if seconds < 86400:
         return f"{seconds // 3600}h ago"
     return f"{seconds // 86400}d ago"
+
+
+def _pipe_line(fields: Sequence[str]) -> str:
+    return "\t".join(_escape(field) for field in fields) + "\n"
 
 
 def _escape(value: str, *, backslash: bool = True) -> str:

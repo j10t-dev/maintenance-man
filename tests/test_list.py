@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from maintenance_man import cli
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -85,6 +86,36 @@ class TestRelativeTime:
         assert relative_time(_NOW - delta, _NOW) == expected
 
 
+def test_given_wide_project_name_when_narrow_terminal_then_columns_drop_by_cell_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.stdout", TerminalStream())
+    wide_name = "日本語プロジェクト"
+    row = [wide_name, "uv", "0", "0", "0", "never", "-", "not deployable"]
+
+    visible, dropped = cli._fit_columns(
+        cli._OVERVIEW_HEADERS, [row], list(range(len(row)))
+    )
+
+    assert dropped == ["scanned"]
+    assert visible == [0, 1, 2, 3, 4, 6, 7]
+
+
+def test_given_long_last_column_when_terminal_is_narrow_then_it_is_not_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.stdout", TerminalStream())
+    monkeypatch.setenv("COLUMNS", "84")
+    row = ["api", "uv", "0", "0", "0", "never", "-", "failed " + "9" * 25]
+
+    visible, dropped = cli._fit_columns(
+        cli._OVERVIEW_HEADERS, [row], list(range(len(row)))
+    )
+
+    assert dropped == ["scanned"]
+    assert visible == [0, 1, 2, 3, 4, 6, 7]
+
+
 class TestListCommand:
     def test_list_no_projects(self, mm_home: Path, capsys: pytest.CaptureFixture[str]):
         assert run_mm("list") == 0
@@ -92,7 +123,7 @@ class TestListCommand:
         assert captured.out == ""
         assert captured.err.splitlines() == [
             "No projects configured",
-            "hint: add projects to ~/.mm/config.toml",
+            f"hint: add projects to {mm_home / 'config.toml'}",
         ]
 
     def test_list_shows_projects(

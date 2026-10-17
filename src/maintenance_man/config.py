@@ -16,6 +16,10 @@ class ProjectNotFoundError(Exception):
     """Raised when a requested project is not found or its path does not exist."""
 
 
+class UnknownProjectError(ProjectNotFoundError):
+    """Raised when a requested project name is not configured."""
+
+
 def load_config(config_path: Path | None = None) -> MmConfig:
     """Load and validate config from a TOML file.
 
@@ -59,7 +63,7 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
             f"Unknown project '{name}'. "
             f"Known projects: {', '.join(config.projects) or '(none)'}"
         )
-        raise ProjectNotFoundError(msg)
+        raise UnknownProjectError(msg)
 
     project = config.projects[name]
 
@@ -79,7 +83,7 @@ def validate_project_names(config: MmConfig, names: Sequence[str]) -> list[str]:
                 f"Unknown project '{name}'. "
                 f"Known projects: {', '.join(config.projects) or '(none)'}"
             )
-            raise ProjectNotFoundError(msg)
+            raise UnknownProjectError(msg)
         if name not in seen:
             seen.add(name)
             ordered.append(name)

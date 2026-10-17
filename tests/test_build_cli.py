@@ -109,6 +109,40 @@ class TestBuildCommand:
         assert run_mm("list") == ExitCode.OK
         assert output.is_verbose() is False
 
+    @patch("maintenance_man.services.deploy.run_live")
+    def test_given_successful_build_when_piped_then_one_passed_record(
+        self,
+        mock_build: MagicMock,
+        mm_home_with_projects: Path,
+        _build_vcs: FakeJjState,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        assert run_mm("build", "deployable") == ExitCode.OK
+
+        captured = capsys.readouterr()
+        assert captured.out == "deployable\tbuild\tpassed\tbuild\t-\t-\t-\n"
+        assert captured.err == ""
+
+    @patch(
+        "maintenance_man.services.deploy.run_live",
+        side_effect=BuildError("Build for deployable failed (exit 2)"),
+    )
+    def test_given_failed_build_when_piped_then_failed_record_and_build_exit_code(
+        self,
+        mock_build: MagicMock,
+        mm_home_with_projects: Path,
+        _build_vcs: FakeJjState,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
+
+        captured = capsys.readouterr()
+        assert captured.out == (
+            "deployable\tbuild\tfailed\tbuild\t-\t-\t"
+            "Build for deployable failed (exit 2)\n"
+        )
+        assert captured.err == ""
+
     @patch("maintenance_man.services.deploy.record_activity")
     @patch("maintenance_man.services.deploy.run_live")
     def test_successful_build_records_activity(
