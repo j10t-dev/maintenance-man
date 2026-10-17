@@ -428,10 +428,15 @@ class TestMassDeployCommand:
     def test_no_projects_configured(
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Mass deploy with no projects prints message and exits OK."""
+        """Mass deploy with no projects notices with a hint and exits OK."""
         mm_home.mkdir(parents=True, exist_ok=True)
         (mm_home / "scan-results").mkdir(exist_ok=True)
         (mm_home / "workspaces").mkdir(exist_ok=True)
         write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
         assert run_mm("deploy") == ExitCode.OK
-        assert "no projects" in capsys.readouterr().out.lower()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines() == [
+            "No projects configured",
+            "hint: add projects to ~/.mm/config.toml",
+        ]

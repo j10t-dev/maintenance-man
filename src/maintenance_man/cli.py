@@ -1,20 +1,20 @@
 import functools
 import sys
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn
+from typing import Annotated, Literal, NoReturn
 
 import cyclopts
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.markup import escape
-from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.text import Text
 
-from maintenance_man import __version__, paths, vcs_workflow
+from maintenance_man import __version__, output, paths, vcs_workflow
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
@@ -25,7 +25,7 @@ from maintenance_man.config import (
 from maintenance_man.deployer import BuildError
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.gradle import GradleError
-from maintenance_man.models.activity import ActivityEvent
+from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
     BlockersStillFailing,
@@ -101,8 +101,6 @@ from maintenance_man.vcs_workflow import make_vcs_services
 
 console = Console()
 
-_TABLE_STYLE: dict[str, Any] = {"show_edge": False, "pad_edge": False, "box": None}
-_NO_PROJECTS = "No projects configured. Edit ~/.mm/config.toml to add projects."
 
 _EXIT_FOR: dict[type[Exception], ExitCode] = {
     WorkflowError: ExitCode.ERROR,
@@ -115,6 +113,27 @@ _EXIT_FOR: dict[type[Exception], ExitCode] = {
     RevisionError: ExitCode.ERROR,
     OutdatedCheckError: ExitCode.ERROR,
 }
+
+
+_OVERVIEW_HEADERS = (
+    "project",
+    "type",
+    "vulns",
+    "updates",
+    "secrets",
+    "scanned",
+    "built",
+    "deployed",
+)
+_NARROW_DROP_ORDER = (
+    "scanned",
+    "built",
+    "deployed",
+    "type",
+    "secrets",
+    "updates",
+    "vulns",
+)
 
 
 def _command[**P](function: Callable[P, None]) -> Callable[P, None]:
@@ -132,16 +151,20 @@ def _command[**P](function: Callable[P, None]) -> Callable[P, None]:
 
 
 @functools.singledispatch
-def _render(event: Event, *, batch: bool) -> None:
+def _render(event: Event, *, batch: bool, project: str, flow: str) -> None:
     raise NotImplementedError(type(event))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Renderer:
     batch: bool
+    project: str = ""
+    flow: str = "update"
 
     def __call__(self, event: Event) -> None:
-        _render(event, batch=self.batch)
+        if isinstance(event, ProjectStarted):
+            self.project = event.project
+        _render(event, batch=self.batch, project=self.project, flow=self.flow)
 
 
 _SKIP_TEXT: dict[SkipReason, str] = {
@@ -196,7 +219,9 @@ _OPERATION_BATCH_OVERRIDES: dict[Operation, str] = {
 
 
 @_render.register
-def _render_project_skipped(event: ProjectSkipped, *, batch: bool) -> None:
+def _render_project_skipped(
+    event: ProjectSkipped, *, batch: bool, project: str, flow: str
+) -> None:
     template = (
         _SKIP_BATCH_OVERRIDES.get(event.reason, _SKIP_TEXT[event.reason])
         if batch
@@ -210,7 +235,9 @@ def _render_project_skipped(event: ProjectSkipped, *, batch: bool) -> None:
 
 
 @_render.register
-def _render_operation_failed(event: OperationFailed, *, batch: bool) -> None:
+def _render_operation_failed(
+    event: OperationFailed, *, batch: bool, project: str, flow: str
+) -> None:
     template = (
         _OPERATION_BATCH_OVERRIDES.get(
             event.operation, _OPERATION_TEXT[event.operation]
@@ -228,12 +255,28 @@ def _render_operation_failed(event: OperationFailed, *, batch: bool) -> None:
 
 
 @_render.register
-def _render_scan_reported(event: ScanReported, *, batch: bool) -> None:
-    _print_scan_result(event.result, elapsed_s=event.elapsed_s)
+def _render_scan_reported(
+    event: ScanReported, *, batch: bool, project: str, flow: str
+) -> None:
+    result = event.result
+    if flow == "scan" or output.terminal():
+        _print_scan_result(result, elapsed_s=event.elapsed_s)
+    else:
+        _print_blocked_findings(result, flow)
+    if result.has_findings or batch:
+        return
+    if event.elapsed_s is None:
+        output.notice(f"No findings in {result.project}")
+    else:
+        output.notice(
+            f"No findings in {result.project} · scanned in {event.elapsed_s:.1f}s"
+        )
 
 
 @_render.register
-def _render_missing_test_config(event: MissingTestConfig, *, batch: bool) -> None:
+def _render_missing_test_config(
+    event: MissingTestConfig, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(
         f"  [bold yellow]Warning:[/] {escape(event.project)} — no test "
         "configuration (test phases will be skipped)"
@@ -241,7 +284,9 @@ def _render_missing_test_config(event: MissingTestConfig, *, batch: bool) -> Non
 
 
 @_render.register
-def _render_processing_started(event: ProcessingStarted, *, batch: bool) -> None:
+def _render_processing_started(
+    event: ProcessingStarted, *, batch: bool, project: str, flow: str
+) -> None:
     if event.vulns:
         console.print(f"\n[bold]Processing {event.vulns} vuln fix(es)...[/]")
     if event.updates:
@@ -249,18 +294,22 @@ def _render_processing_started(event: ProcessingStarted, *, batch: bool) -> None
 
 
 @_render.register
-def _render_findings_processed(event: FindingsProcessed, *, batch: bool) -> None:
+def _render_findings_processed(
+    event: FindingsProcessed, *, batch: bool, project: str, flow: str
+) -> None:
     if not batch:
         _print_update_summary(list(event.results))
 
 
 @_render.register
-def _render_promoted(event: Promoted, *, batch: bool) -> None:
+def _render_promoted(event: Promoted, *, batch: bool, project: str, flow: str) -> None:
     console.print(f"[bold green]Promoted {escape(event.bookmark)} to main.[/]")
 
 
 @_render.register
-def _render_resolve_paused(event: ResolvePaused, *, batch: bool) -> None:
+def _render_resolve_paused(
+    event: ResolvePaused, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(
         f"  [bold yellow]Resolve paused.[/] Continue with "
         f"[bold]mm resolve {escape(event.project)} --continue[/]."
@@ -268,13 +317,17 @@ def _render_resolve_paused(event: ResolvePaused, *, batch: bool) -> None:
 
 
 @_render.register
-def _render_findings_blocked(event: FindingsBlocked, *, batch: bool) -> None:
+def _render_findings_blocked(
+    event: FindingsBlocked, *, batch: bool, project: str, flow: str
+) -> None:
     for package, reason in event.findings:
         console.print(f"  [yellow]BLOCKED[/] {escape(package)} — {escape(reason)}")
 
 
 @_render.register
-def _render_submission_blocked(event: SubmissionBlocked, *, batch: bool) -> None:
+def _render_submission_blocked(
+    event: SubmissionBlocked, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(
         "  [bold yellow]Not submitting:[/] blocked findings remain. "
         "Rescan or resolve them manually."
@@ -282,7 +335,9 @@ def _render_submission_blocked(event: SubmissionBlocked, *, batch: bool) -> None
 
 
 @_render.register
-def _render_blockers_still_failing(event: BlockersStillFailing, *, batch: bool) -> None:
+def _render_blockers_still_failing(
+    event: BlockersStillFailing, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(
         f"  [bold red]FAIL[/] {escape(event.phase)} — still blocking: "
         f"{escape(', '.join(event.pkgs))}"
@@ -290,12 +345,16 @@ def _render_blockers_still_failing(event: BlockersStillFailing, *, batch: bool) 
 
 
 @_render.register
-def _render_sync_completed(event: SyncCompleted, *, batch: bool) -> None:
+def _render_sync_completed(
+    event: SyncCompleted, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(f"  {escape(event.project)} — {escape(event.action)}")
 
 
 @_render.register
-def _render_project_started(event: ProjectStarted, *, batch: bool) -> None:
+def _render_project_started(
+    event: ProjectStarted, *, batch: bool, project: str, flow: str
+) -> None:
     if not batch:
         return
     console.print(f"\n{'═' * 40}")
@@ -304,7 +363,9 @@ def _render_project_started(event: ProjectStarted, *, batch: bool) -> None:
 
 
 @_render.register
-def _render_finding_started(event: FindingStarted, *, batch: bool) -> None:
+def _render_finding_started(
+    event: FindingStarted, *, batch: bool, project: str, flow: str
+) -> None:
     label = "[bold red]VULN[/]" if event.kind == "vuln" else "[bold cyan]UPDATE[/]"
     console.print(
         f"\n  {label} {escape(event.pkg)} {escape(event.installed)} -> "
@@ -313,12 +374,16 @@ def _render_finding_started(event: FindingStarted, *, batch: bool) -> None:
 
 
 @_render.register
-def _render_test_command_started(event: TestCommandStarted, *, batch: bool) -> None:
+def _render_test_command_started(
+    event: TestCommandStarted, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(f"  [dim]$ {escape(event.command)}[/]")
 
 
 @_render.register
-def _render_finding_step_failed(event: FindingStepFailed, *, batch: bool) -> None:
+def _render_finding_step_failed(
+    event: FindingStepFailed, *, batch: bool, project: str, flow: str
+) -> None:
     error = escape(event.error)
     if event.step is FindingStepKind.PACKAGE_COMMAND:
         console.print(f"  [bold red]FAIL[/] Package manager command failed: {error}")
@@ -327,20 +392,26 @@ def _render_finding_step_failed(event: FindingStepFailed, *, batch: bool) -> Non
 
 
 @_render.register
-def _render_finding_passed(event: FindingPassed, *, batch: bool) -> None:
+def _render_finding_passed(
+    event: FindingPassed, *, batch: bool, project: str, flow: str
+) -> None:
     suffix = " [dim](already applied)[/]" if event.already_applied else ""
     console.print(f"  [bold green]PASS[/] {escape(event.pkg)}{suffix}")
 
 
 @_render.register
-def _render_finding_failed(event: FindingFailed, *, batch: bool) -> None:
+def _render_finding_failed(
+    event: FindingFailed, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(
         f"  [bold red]FAIL[/] {escape(event.pkg)} — {escape(event.phase)} failed"
     )
 
 
 @_render.register
-def _render_deploy_step_started(event: DeployStepStarted, *, batch: bool) -> None:
+def _render_deploy_step_started(
+    event: DeployStepStarted, *, batch: bool, project: str, flow: str
+) -> None:
     if batch:
         if event.step is DeployStep.BUILD:
             console.print("  [bold]Building...[/]")
@@ -357,7 +428,9 @@ def _render_deploy_step_started(event: DeployStepStarted, *, batch: bool) -> Non
 
 
 @_render.register
-def _render_deploy_step_succeeded(event: DeployStepSucceeded, *, batch: bool) -> None:
+def _render_deploy_step_succeeded(
+    event: DeployStepSucceeded, *, batch: bool, project: str, flow: str
+) -> None:
     if batch:
         return
     if event.step is DeployStep.BUILD:
@@ -367,7 +440,9 @@ def _render_deploy_step_succeeded(event: DeployStepSucceeded, *, batch: bool) ->
 
 
 @_render.register
-def _render_deploy_step_failed(event: DeployStepFailed, *, batch: bool) -> None:
+def _render_deploy_step_failed(
+    event: DeployStepFailed, *, batch: bool, project: str, flow: str
+) -> None:
     error = escape(event.error)
     if not batch:
         console.print(f"[bold red]Error:[/] {error}")
@@ -378,7 +453,9 @@ def _render_deploy_step_failed(event: DeployStepFailed, *, batch: bool) -> None:
 
 
 @_render.register
-def _render_health_checked(event: HealthChecked, *, batch: bool) -> None:
+def _render_health_checked(
+    event: HealthChecked, *, batch: bool, project: str, flow: str
+) -> None:
     indent = "  " if batch else ""
     if event.is_up:
         console.print(f"{indent}[bold green]Healthy:[/] {escape(event.project)} is up")
@@ -392,30 +469,36 @@ def _render_health_checked(event: HealthChecked, *, batch: bool) -> None:
 
 @_render.register
 def _render_healthcheck_unconfigured(
-    event: HealthcheckUnconfigured, *, batch: bool
+    event: HealthcheckUnconfigured, *, batch: bool, project: str, flow: str
 ) -> None:
     console.print("[dim]--check: no healthcheck_url configured in \\[defaults][/]")
 
 
 @_render.register
-def _render_pull_request_output(event: PullRequestOutput, *, batch: bool) -> None:
+def _render_pull_request_output(
+    event: PullRequestOutput, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(f"[dim]  {escape(event.text)}[/]")
 
 
 @_render.register
-def _render_gradle_withheld(event: GradleWithheld, *, batch: bool) -> None:
+def _render_gradle_withheld(
+    event: GradleWithheld, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(f"Withheld {escape(event.label)}: {escape(event.reason)}")
 
 
 @_render.register
 def _render_no_eligible_gradle_changes(
-    event: NoEligibleGradleChanges, *, batch: bool
+    event: NoEligibleGradleChanges, *, batch: bool, project: str, flow: str
 ) -> None:
     console.print("No eligible Gradle changes")
 
 
 @_render.register
-def _render_gradle_run_archived(event: GradleRunArchived, *, batch: bool) -> None:
+def _render_gradle_run_archived(
+    event: GradleRunArchived, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(
         f"Archived failed Gradle run to {escape(str(event.path))}; "
         "rebuilding candidates from main"
@@ -423,14 +506,18 @@ def _render_gradle_run_archived(event: GradleRunArchived, *, batch: bool) -> Non
 
 
 @_render.register
-def _render_gradle_flow_failed(event: GradleFlowFailed, *, batch: bool) -> None:
+def _render_gradle_flow_failed(
+    event: GradleFlowFailed, *, batch: bool, project: str, flow: str
+) -> None:
     console.print(
         f"Cannot complete Gradle {escape(event.flow.value)}: {escape(event.error)}"
     )
 
 
 @_render.register
-def _render_gradle_run_reported(event: GradleRunReported, *, batch: bool) -> None:
+def _render_gradle_run_reported(
+    event: GradleRunReported, *, batch: bool, project: str, flow: str
+) -> None:
     _print_scan_result(event.scan)
     _print_gradle_run_summary(event.run)
 
@@ -479,7 +566,7 @@ def scan(
     cfg = _load_cfg(config)
 
     if not cfg.projects:
-        console.print(_NO_PROJECTS)
+        _notice_no_projects()
         return
 
     vcs = make_vcs_services()
@@ -491,17 +578,26 @@ def scan(
             proj_config,
             minimum_age_days=cfg.defaults.min_version_age_days,
             vcs=vcs,
-            emit=_Renderer(batch=False),
+            emit=_Renderer(batch=False, project=project, flow="scan"),
         )
         sys.exit(_scan_exit_code(ScanSummary.of(result)))
 
-    summary = scan_service.scan_all(cfg, vcs=vcs, emit=_Renderer(batch=True))
+    started = time.monotonic()
+    summary = scan_service.scan_all(
+        cfg, vcs=vcs, emit=_Renderer(batch=True, flow="scan")
+    )
+    if summary.clean:
+        elapsed = time.monotonic() - started
+        output.notice(
+            f"{len(summary.clean)} projects have no findings: "
+            f"{', '.join(summary.clean)} · scanned in {elapsed:.1f}s"
+        )
     sys.exit(_scan_exit_code(summary))
 
 
 def _exit_if_no_update_targets(cfg: MmConfig, target_names: list[str]) -> None:
     if not cfg.projects:
-        console.print(_NO_PROJECTS)
+        _notice_no_projects()
         sys.exit(ExitCode.OK)
 
     if not target_names:
@@ -588,7 +684,7 @@ def sync(
     cfg = _load_cfg(config)
 
     if not cfg.projects:
-        console.print(_NO_PROJECTS)
+        _notice_no_projects()
         sys.exit(ExitCode.OK)
 
     vcs_services = make_vcs_services()
@@ -713,7 +809,7 @@ def deploy(
         if check and not cfg.defaults.healthcheck_url:
             renderer(HealthcheckUnconfigured())
         if not cfg.projects:
-            console.print(_NO_PROJECTS)
+            _notice_no_projects()
             sys.exit(ExitCode.OK)
         results = deploy_service.deploy_all(
             cfg,
@@ -819,9 +915,6 @@ def build(
     sys.exit(ExitCode.OK)
 
 
-_NO_DATA = "[dim]—[/]"
-
-
 @app.command(name=("list", "status", "st"))
 @_command
 def list_projects(
@@ -841,7 +934,7 @@ def list_projects(
     cfg = _load_cfg(config)
 
     if not cfg.projects:
-        console.print(_NO_PROJECTS)
+        _notice_no_projects()
         return
 
     scan_results: dict[str, ScanResult] = {}
@@ -851,54 +944,161 @@ def list_projects(
         except NoScanResultsError:
             pass
         except Exception:
-            console.print(
-                f"[yellow]Warning:[/] corrupt scan results for "
-                f"'{escape(name)}' — skipping"
-            )
-
-    activity = load_activity(paths.activity_path())
-
-    table = Table(title="Configured Projects")
-    for col, kw in [
-        ("Name", {"style": "bold"}),
-        ("Type", {}),
-        ("Vulns", {"justify": "right"}),
-        ("Updates", {"justify": "right"}),
-        ("Secrets", {"justify": "right"}),
-        ("Scanned", {}),
-        ("Built", {}),
-        ("Deployed", {}),
-    ]:
-        table.add_column(col, **kw)  # type: ignore
-
-    for name, project in sorted(cfg.projects.items()):
-        sr = scan_results.get(name)
-        if sr:
-            counts = (
-                str(sum(v.actionable for v in sr.vulnerabilities)),
-                str(len(sr.updates)),
-                str(len(sr.secrets)),
-                _relative_time(sr.scanned_at),
-            )
-        else:
-            counts = (_NO_DATA, _NO_DATA, _NO_DATA, "[dim]never[/]")
-
-        proj_activity = activity.get(name)
-        table.add_row(
-            escape(name),
-            escape(str(project.package_manager)),
-            *counts,
-            _format_activity(proj_activity.last_build if proj_activity else None),
-            "[dim]n/a[/]"
-            if not project.deployable
-            else _format_activity(proj_activity.last_deploy if proj_activity else None),
-        )
-
-    console.print(table)
+            output.diagnostic("warning", f"corrupt scan results for {name}; skipped")
 
     if detail:
-        for name in sorted(scan_results):
-            _print_scan_result(scan_results[name])
+        _print_project_detail(cfg, scan_results)
+    else:
+        activity = load_activity(paths.activity_path())
+        _print_project_overview(cfg, scan_results, activity)
+
+
+def _print_project_detail(cfg: MmConfig, scan_results: dict[str, ScanResult]) -> None:
+    clean = []
+    unscanned = []
+    for name in sorted(cfg.projects):
+        result = scan_results.get(name)
+        if result is None:
+            unscanned.append(name)
+        elif result.has_findings:
+            _print_scan_result(result)
+        else:
+            clean.append(name)
+    if clean:
+        output.notice(f"{len(clean)} projects have no findings: {', '.join(clean)}")
+    if unscanned:
+        output.notice(
+            f"{len(unscanned)} projects have no saved scan: {', '.join(unscanned)}"
+        )
+
+
+def _print_project_overview(
+    cfg: MmConfig,
+    scan_results: dict[str, ScanResult],
+    activity: dict[str, ProjectActivity],
+) -> None:
+    rows: list[list[str]] = []
+    pipe_rows: list[list[str]] = []
+    for name, project in sorted(cfg.projects.items()):
+        row, pipe_row = _project_row(
+            name, project, scan_results.get(name), activity.get(name)
+        )
+        rows.append(row)
+        pipe_rows.append(pipe_row)
+
+    visible, footer_parts = _hidden_columns(_OVERVIEW_HEADERS, rows)
+    visible, narrow = _fit_columns(_OVERVIEW_HEADERS, rows, visible)
+    if narrow:
+        footer_parts.append("hidden: " + ", ".join(narrow))
+    output.heading("projects", f"{len(rows)} configured")
+    output.project_records(
+        [_OVERVIEW_HEADERS[index] for index in visible],
+        [
+            [
+                output.literal(row[index], "bold" if index == 0 else "")
+                for index in visible
+            ]
+            for row in rows
+        ],
+        pipe_rows,
+        footer=" · ".join(footer_parts),
+    )
+
+
+def _project_row(
+    name: str,
+    project: ProjectConfig,
+    result: ScanResult | None,
+    events: ProjectActivity | None,
+) -> tuple[list[str], list[str]]:
+    """The terminal row and the complete pipe row for one project."""
+    counts = (
+        [
+            str(sum(v.actionable for v in result.vulnerabilities)),
+            str(len(result.updates)),
+            str(len(result.secrets)),
+        ]
+        if result
+        else ["-"] * 3
+    )
+    built = events.last_build if events else None
+    deployed = events.last_deploy if events else None
+    deploy_status = (
+        _activity_status(deployed) if project.deployable else "not deployable"
+    )
+    row = [
+        name,
+        project.package_manager,
+        *counts,
+        output.timestamp(result.scanned_at) if result else "never",
+        _activity_cell(built),
+        _activity_cell(deployed) if project.deployable else deploy_status,
+    ]
+    pipe_row = [
+        name,
+        project.package_manager,
+        *counts,
+        result.scanned_at.isoformat() if result else "never",
+        built.timestamp.isoformat() if built else "-",
+        _activity_status(built),
+        deployed.timestamp.isoformat() if deployed else "-",
+        deploy_status,
+    ]
+    return row, pipe_row
+
+
+def _activity_status(event: ActivityEvent | None) -> str:
+    if event is None:
+        return "-"
+    return "passed" if event.success else "failed"
+
+
+def _activity_cell(event: ActivityEvent | None) -> str:
+    text = output.timestamp(event.timestamp if event else None)
+    return f"failed {text}" if event and not event.success else text
+
+
+def _hidden_columns(
+    headers: Sequence[str], rows: Sequence[Sequence[str]]
+) -> tuple[list[int], list[str]]:
+    """Visible column indexes, plus footer fragments for columns that never vary."""
+    visible = [0]
+    footer_parts = []
+    for index, title in enumerate(headers[1:], 1):
+        values = {row[index] for row in rows}
+        if len(rows) < 2 or len(values) > 1:
+            visible.append(index)
+        elif values == {"-"}:
+            footer_parts.append(f"{title} -")
+        elif values == {"0"}:
+            footer_parts.append(f"0 {title}")
+        else:
+            footer_parts.append(f"{title} {next(iter(values))}")
+    return visible, footer_parts
+
+
+def _fit_columns(
+    headers: Sequence[str], rows: Sequence[Sequence[str]], visible: Sequence[int]
+) -> tuple[list[int], list[str]]:
+    """Visible column indexes that fit the terminal, plus the names dropped."""
+    fitting = list(visible)
+    if not output.terminal():
+        return fitting, []
+    width = output.console().width
+    dropped = []
+    for name in _NARROW_DROP_ORDER:
+        required = sum(
+            max(len(headers[column]), min(24, max(len(row[column]) for row in rows)))
+            + 2
+            for column in fitting
+        )
+        if required <= width:
+            break
+        index = headers.index(name)
+        if index in fitting:
+            fitting.remove(index)
+            dropped.append(name)
+    return fitting, dropped
 
 
 @app.command
@@ -925,7 +1125,7 @@ def todo(
         return
 
     if not cfg.projects:
-        console.print(_NO_PROJECTS)
+        _notice_no_projects()
         return
 
     empty = []
@@ -938,8 +1138,8 @@ def todo(
         else:
             empty.append(name)
 
-    for name in empty:
-        _print_project_todo(name, cfg.projects[name].path)
+    if empty:
+        output.notice(f"{len(empty)} projects have no TODO items: {', '.join(empty)}")
     for name in has_content:
         _print_project_todo(name, cfg.projects[name].path)
 
@@ -948,18 +1148,24 @@ def todo(
 
 
 def _print_project_todo(name: str, project_path: Path) -> None:
-    """Print a single project's TODO.md content with header."""
     todo_path = project_path / "TODO.md"
-    if not todo_path.exists():
-        console.print(
-            Panel("[dim]no TODO.md[/]", title=escape(name), border_style="dim")
-        )
+    content = todo_path.read_text() if todo_path.exists() else ""
+    if not content.strip():
+        output.notice(f"No TODO items in {name}")
         return
-    content = todo_path.read_text().strip()
-    if not content:
-        console.print(Panel("[dim]empty[/]", title=escape(name), border_style="dim"))
-        return
-    console.print(Panel(Markdown(content), title=escape(name)))
+    lines = content.splitlines()
+    output.heading(name, "TODO.md")
+    output.records(
+        name,
+        (),
+        [[line] for line in lines],
+        pipe_rows=[[str(index), line] for index, line in enumerate(lines, 1)],
+    )
+
+
+def _notice_no_projects() -> None:
+    output.notice("No projects configured")
+    output.diagnostic("hint", "add projects to ~/.mm/config.toml")
 
 
 def _fatal(msg: str, code: int = ExitCode.ERROR) -> NoReturn:
@@ -993,35 +1199,6 @@ def _scan_exit_code(summary: ScanSummary) -> ExitCode:
             return ExitCode.UPDATES_FOUND
         case _:
             return ExitCode.OK
-
-
-def _pluralise(n: int, singular: str, plural: str) -> str:
-    return f"{n} {singular if n == 1 else plural}"
-
-
-def _relative_time(dt: datetime, now: datetime | None = None) -> str:
-    """Format a datetime as a human-readable relative time string."""
-    now = now or datetime.now(UTC)
-    total_seconds = int((now - dt).total_seconds())
-    match total_seconds:
-        case s if s < 60:
-            return "just now"
-        case s if s < 3600:
-            return f"{s // 60}m ago"
-        case s if s < 86400:
-            return f"{s // 3600}h ago"
-        case s:
-            return f"{s // 86400}d ago"
-
-
-def _format_activity(event: ActivityEvent | None, now: datetime | None = None) -> str:
-    """Format an activity event as relative time with optional failure marker."""
-    if event is None:
-        return _NO_DATA
-    time_str = _relative_time(event.timestamp, now)
-    if not event.success:
-        return f"{time_str} [red]\\[F][/]"
-    return time_str
 
 
 def _print_numbered_findings(
@@ -1229,133 +1406,165 @@ def _print_gradle_run_summary(run: GradleRun) -> None:
             )
 
 
-def _print_scan_result(
-    result: ScanResult,
-    elapsed_s: float | None = None,
-) -> None:
-    """Print a Rich-formatted summary of scan results for one project."""
-    actionable = sort_vulns_by_severity(
-        [v for v in result.vulnerabilities if v.actionable]
-    )
-    advisories = sort_vulns_by_severity(
-        [v for v in result.vulnerabilities if not v.actionable]
-    )
-    secrets = result.secrets
-    updates = result.updates
+type _FindingRows = tuple[list[list[str | Text]], list[list[str]]]
 
-    total = len(actionable) + len(advisories) + len(secrets) + len(updates)
-    timing = f" [dim]({elapsed_s:.1f}s)[/]" if elapsed_s is not None else ""
 
-    if total == 0:
-        console.print(f"[bold green]{escape(result.project)}[/] — clean{timing}")
+def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
+    wins = _selected_fix_versions(result.vulnerabilities)
+    rows, pipe_rows = _vulnerability_rows(result.vulnerabilities, wins)
+    for found_rows, found_pipe_rows in (
+        _secret_rows(result.secrets),
+        _update_rows(result.updates),
+    ):
+        rows += found_rows
+        pipe_rows += found_pipe_rows
+    if not rows:
         return
+    output.heading(result.project, f"{len(rows)} findings")
+    headers = ["kind", "severity", "versions", "package / detail"]
+    visible = [0, 1, 2, 3] if output.console().width >= 70 else [0, 3]
+    output.records(
+        result.project,
+        [headers[index] for index in visible],
+        [[row[index] for index in visible] for row in rows],
+        pipe_rows=pipe_rows,
+        footer="hidden: severity, versions · pipe for full records"
+        if len(visible) < len(headers)
+        else "",
+    )
+    if elapsed_s is not None:
+        output.notice(f"Scanned {result.project} in {elapsed_s:.1f}s")
 
-    categories = [
-        (actionable, "vulnerability", "vulnerabilities"),
-        (advisories, "advisory", "advisories"),
-        (secrets, "secret", "secrets"),
-        (updates, "update", "updates"),
-    ]
-    parts = [_pluralise(len(items), s, p) for items, s, p in categories if items]
 
-    console.print(f"\n[bold]{escape(result.project)}[/] — {', '.join(parts)}{timing}")
-    _print_vuln_table(actionable)
-    _print_advisory_table(advisories)
-    _print_secrets(secrets)
-    _print_update_table(updates)
-
-
-def _print_vuln_table(vulnerabilities: list[VulnFinding]) -> None:
-    if not vulnerabilities:
-        return
-    win_versions: dict[str, str] = {}
-    for package in {item.pkg_name for item in vulnerabilities}:
-        group = [item for item in vulnerabilities if item.pkg_name == package]
+def _selected_fix_versions(vulnerabilities: list[VulnFinding]) -> dict[str, str]:
+    """For packages with several actionable fixes, the one version that fixes all."""
+    wins = {}
+    for package in {v.pkg_name for v in vulnerabilities if v.actionable}:
+        group = [v for v in vulnerabilities if v.pkg_name == package and v.actionable]
         if len(group) > 1:
-            win_versions[package] = highest_fix_version(group)
+            wins[package] = highest_fix_version(group)
+    return wins
 
-    table = Table(show_header=True, **_TABLE_STYLE)
-    table.add_column("", style="bold red", width=4)
-    table.add_column("Package", overflow="fold")
-    table.add_column("Installed")
-    table.add_column("Fix")
-    table.add_column("Severity")
-    table.add_column("CVE")
-    for item in vulnerabilities:
-        fix = item.fixed_version or ""
-        if item.pkg_name in win_versions and fix == win_versions[item.pkg_name]:
-            fix += " ← fix"
-        table.add_row(
-            "VULN",
-            escape(item.pkg_name),
-            escape(item.installed_version),
-            escape(fix),
-            escape(item.severity.value),
-            escape(item.vuln_id),
+
+def _vulnerability_rows(
+    vulnerabilities: list[VulnFinding], wins: dict[str, str]
+) -> _FindingRows:
+    rows: list[list[str | Text]] = []
+    pipe_rows: list[list[str]] = []
+    for vuln in sort_vulns_by_severity(vulnerabilities):
+        kind = "vuln" if vuln.actionable else "advisory"
+        reason = vuln.blocked_reason or ""
+        if vuln.fixed_version and wins.get(vuln.pkg_name) == vuln.fixed_version:
+            reason = " · ".join(filter(None, ["selected fix", reason]))
+        versions = (
+            f"{vuln.installed_version} → {vuln.fixed_version}"
+            if vuln.fixed_version
+            else "no fix"
         )
-    console.print(table)
-
-
-def _print_advisory_table(advisories: list[VulnFinding]) -> None:
-    if not advisories:
-        return
-    table = Table(show_header=False, **_TABLE_STYLE)
-    table.add_column("", style="bold yellow", width=4)
-    table.add_column("Package", overflow="fold")
-    table.add_column("Installed")
-    table.add_column("Status")
-    table.add_column("Severity")
-    table.add_column("CVE")
-    for item in advisories:
-        table.add_row(
-            "ADV",
-            escape(item.pkg_name),
-            escape(item.installed_version),
-            escape(item.status),
-            escape(item.severity.value),
-            escape(item.vuln_id),
+        rows.append(
+            [
+                output.literal(
+                    "! blocked" if vuln.blocked_reason else f"! {kind}",
+                    "yellow" if kind == "advisory" or vuln.blocked_reason else "red",
+                ),
+                vuln.severity.value.lower(),
+                versions,
+                " · ".join(filter(None, [vuln.pkg_name, vuln.vuln_id, reason])),
+            ]
         )
-    console.print(table)
-
-
-def _print_secrets(secrets: list[SecretFinding]) -> None:
-    for item in secrets:
-        console.print(
-            f"  [bold magenta]SECRET[/]  {escape(item.file)} — {escape(item.title)}"
+        pipe_rows.append(
+            [
+                kind,
+                vuln.pkg_name,
+                vuln.installed_version,
+                vuln.fixed_version or "-",
+                vuln.severity.value,
+                vuln.vuln_id,
+                vuln.published_date.isoformat() if vuln.published_date else "-",
+                "blocked" if vuln.blocked_reason else vuln.status,
+                reason or "-",
+            ]
         )
+    return rows, pipe_rows
 
 
-def _print_update_table(updates: list[UpdateFinding]) -> None:
-    if not updates:
-        return
-    table = Table(show_header=True, **_TABLE_STYLE)
-    table.add_column("", style="bold cyan", width=7, no_wrap=True)
-    table.add_column("Package", overflow="fold")
-    table.add_column("Installed")
-    table.add_column("Latest")
-    table.add_column("Tier")
-    table.add_column("Age / reason")
-    for item in updates:
-        if item.blocked_reason:
-            table.add_row(
-                "BLOCKED",
-                escape(item.pkg_name),
-                "",
-                "",
-                "",
-                escape(item.blocked_reason),
-            )
-            continue
-        age = ""
-        if item.published_date:
-            days = (datetime.now(UTC) - item.published_date).days
-            age = f"({days} days old)"
-        table.add_row(
-            "UPDATE",
-            escape(item.pkg_name),
-            escape(item.installed_version),
-            escape(item.latest_version),
-            escape(item.semver_tier.value),
-            age,
+def _secret_rows(secrets: list[SecretFinding]) -> _FindingRows:
+    rows: list[list[str | Text]] = [
+        [
+            output.literal("! secret", "yellow"),
+            secret.severity.value.lower(),
+            "-",
+            f"{secret.file} · {secret.title}",
+        ]
+        for secret in secrets
+    ]
+    pipe_rows = [
+        [
+            "secret",
+            secret.file,
+            "-",
+            "-",
+            secret.severity.value,
+            secret.rule_id,
+            "-",
+            "found",
+            secret.title,
+        ]
+        for secret in secrets
+    ]
+    return rows, pipe_rows
+
+
+def _update_rows(updates: list[UpdateFinding]) -> _FindingRows:
+    rows: list[list[str | Text]] = []
+    pipe_rows: list[list[str]] = []
+    for update in updates:
+        reason = update.blocked_reason or ""
+        age = (
+            f"{(datetime.now(UTC) - update.published_date).days}d old"
+            if update.published_date
+            else ""
         )
-    console.print(table)
+        rows.append(
+            [
+                output.literal(
+                    "! blocked" if reason else "~ update", "yellow" if reason else ""
+                ),
+                update.semver_tier.value,
+                f"{update.installed_version} → {update.latest_version}",
+                " · ".join(filter(None, [update.pkg_name, age, reason])),
+            ]
+        )
+        pipe_rows.append(
+            [
+                "update",
+                update.pkg_name,
+                update.installed_version,
+                update.latest_version,
+                update.semver_tier.value,
+                "-",
+                update.published_date.isoformat() if update.published_date else "-",
+                "blocked" if reason else "available",
+                reason or "-",
+            ]
+        )
+    return rows, pipe_rows
+
+
+def _print_blocked_findings(result: ScanResult, flow: str) -> None:
+    """Piped update and resolve runs record each blocked package once."""
+    for finding in result.blocked_findings:
+        target = (
+            finding.latest_version
+            if isinstance(finding, UpdateFinding)
+            else finding.fixed_version or "-"
+        )
+        output.outcome(
+            result.project,
+            flow,
+            "blocked",
+            finding.pkg_name,
+            installed=finding.installed_version,
+            target=target,
+            reason=finding.blocked_reason or "",
+        )

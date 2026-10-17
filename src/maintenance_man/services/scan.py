@@ -44,6 +44,7 @@ class ScanSummary:
     has_vulns: bool
     has_updates: bool
     had_error: bool = False
+    clean: tuple[str, ...] = ()
 
     @classmethod
     def of(cls, result: ScanResult) -> ScanSummary:
@@ -77,6 +78,7 @@ def scan_one(
 
 def scan_all(cfg: MmConfig, *, vcs: VcsServices, emit: Emit) -> ScanSummary:
     results: list[ScanResult] = []
+    clean: list[str] = []
     had_error = False
     for name, project in cfg.projects.items():
         if not project.path.exists():
@@ -95,10 +97,13 @@ def scan_all(cfg: MmConfig, *, vcs: VcsServices, emit: Emit) -> ScanSummary:
             had_error = True
             continue
         results.append(result)
+        if not result.has_findings:
+            clean.append(name)
     return ScanSummary(
         any(result.has_actionable_vulns for result in results),
         any(result.has_updates for result in results),
         had_error,
+        tuple(clean),
     )
 
 

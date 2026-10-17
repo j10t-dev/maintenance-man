@@ -207,6 +207,10 @@ class ScanResult(BaseModel):
         return bool(self.updates)
 
     @property
+    def has_findings(self) -> bool:
+        return bool(self.findings or self.secrets)
+
+    @property
     def findings(self) -> tuple[VulnFinding | UpdateFinding, ...]:
         return (*self.vulnerabilities, *self.updates)
 

@@ -240,42 +240,46 @@ class TestTodoCommand:
     def test_todo_all_shows_content_and_missing_file(
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """mm todo shows content and missing-file status for all projects."""
+        """mm todo pipes items for alpha and notices that beta has none."""
         assert run_mm("todo") == 0
-        output = capsys.readouterr().out
-        assert "alpha" in output
-        assert "Fix the widget" in output
-        assert "beta" in output
-        assert "no TODO.md" in output
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "alpha\t1\t- Fix the widget",
+            "alpha\t2\t- Refactor utils",
+        ]
+        assert captured.err == "1 projects have no TODO items: beta\n"
 
     def test_todo_all_shows_empty_message(
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """mm todo shows 'empty' for projects with blank TODO.md."""
+        """mm todo collapses blank and missing TODO.md files into one notice."""
         alpha_dir = mm_home_with_todos.parent / "alpha"
         (alpha_dir / "TODO.md").write_text("   \n\n  ")
         assert run_mm("todo") == 0
-        output = capsys.readouterr().out
-        assert "alpha" in output
-        assert "empty" in output
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "2 projects have no TODO items: alpha, beta\n"
 
     def test_todo_single_project_shows_content(
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
         """mm todo <project> shows that project's TODO.md."""
         assert run_mm("todo", "alpha") == 0
-        output = capsys.readouterr().out
-        assert "alpha" in output
-        assert "Fix the widget" in output
-        assert "beta" not in output
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "alpha\t1\t- Fix the widget",
+            "alpha\t2\t- Refactor utils",
+        ]
+        assert captured.err == ""
 
     def test_todo_single_project_no_file(
         self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """mm todo <project> with no TODO.md logs missing file, exits 0."""
+        """mm todo <project> with no TODO.md notices on stderr, exits 0."""
         assert run_mm("todo", "beta") == 0
-        output = capsys.readouterr().out
-        assert "no TODO.md" in output
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "No TODO items in beta\n"
 
     def test_todo_unknown_project_exits_error(self, mm_home_with_todos: Path):
         """mm todo <unknown> exits with error (config error, not missing file)."""
@@ -284,15 +288,20 @@ class TestTodoCommand:
     def test_todo_no_projects_configured(
         self, mm_home: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """mm todo with no projects configured prints message and exits 0."""
+        """mm todo with no projects configured notices with a hint and exits 0."""
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
         write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
         assert run_mm("todo") == 0
-        assert "no projects" in capsys.readouterr().out.lower()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines() == [
+            "No projects configured",
+            "hint: add projects to ~/.mm/config.toml",
+        ]
 
-    def test_todo_prints_bracketed_panel_title_literally(
+    def test_given_bracketed_name_and_markdown_when_todo_runs_then_both_print_literally(
         self, mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         project = tmp_path / "project"
@@ -306,6 +315,4 @@ class TestTodoCommand:
 
         assert run_mm("todo", "a[b]") == 0
 
-        output = capsys.readouterr().out
-        assert "a[b]" in output
-        assert "Keep Markdown" in output
+        assert capsys.readouterr().out == "a[b]\t1\t# Keep *Markdown*\n"

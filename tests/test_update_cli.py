@@ -630,8 +630,7 @@ class TestUpdateResume:
         assert run_mm("update", "vulnerable") == 4
 
         output = capsys.readouterr().out
-        assert "vulnerable — 1 vulnerability, 1 update" in output
-        assert "some-pkg" in output
+        assert "some-pkg" not in output
         numbered_rows = [
             re.sub(r"\s+", " ", line.strip())
             for line in output.splitlines()

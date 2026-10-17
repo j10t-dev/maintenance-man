@@ -8,13 +8,14 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import pytest
 from rich.console import Console
 
-from maintenance_man import cli, vcs
+from maintenance_man import cli, output, vcs
 from maintenance_man.cli import main
 from maintenance_man.config import load_config
 from maintenance_man.gradle import (
@@ -114,19 +115,19 @@ def configure_fake_vcs(
     return state, paths_by_name
 
 
-_TERMINAL_OVERRIDES = ("FORCE_COLOR", "NO_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE")
+class TerminalStream(StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 @pytest.fixture(autouse=True)
-def _plain_console(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Render CLI output as plain 80-column text whatever terminal runs the suite.
-
-    The CLI console is built at import, during collection, so it has already
-    read the invoking environment. Replace it with one that is never treated
-    as a terminal, and clear the overrides so child processes are plain too.
-    """
-    for name in _TERMINAL_OVERRIDES:
+def _plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test starts in pipe mode at 80 columns with no colour overrides."""
+    for name in ("FORCE_COLOR", "NO_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("TERM", "dumb")
+    output.set_verbose(False)
     monkeypatch.setattr(cli, "console", Console(force_terminal=False, width=80))
 
 

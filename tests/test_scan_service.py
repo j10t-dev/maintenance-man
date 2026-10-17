@@ -71,8 +71,34 @@ def test_scan_all_continues_after_failure_and_summarises_results(
         ScanReported(third, 0.5),
     ]
     assert summary == scan_service.ScanSummary(
-        has_vulns=True, has_updates=False, had_error=True
+        has_vulns=True, has_updates=False, had_error=True, clean=("third",)
     )
+
+
+def test_given_two_clean_projects_when_scanned_in_batch_then_summary_lists_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects = {}
+    for name in ("a", "b"):
+        path = tmp_path / name
+        path.mkdir()
+        projects[name] = make_project(path)
+    cfg = make_config(projects=projects)
+    monkeypatch.setattr(scan_service, "require_vcs_tools", lambda: None)
+    monkeypatch.setattr(scan_service, "prune_stale_bookmarks", lambda **kwargs: None)
+    monkeypatch.setattr(
+        scan_service,
+        "scan_project",
+        lambda name, project, minimum_age_days: make_scan_result(vulns=[], updates=[]),
+    )
+
+    summary = scan_service.scan_all(
+        cfg,
+        vcs=_services(*(project.path for project in projects.values())),
+        emit=RecordingEmit(),
+    )
+
+    assert summary.clean == ("a", "b")
 
 
 def test_scan_all_skips_missing_path_without_error(tmp_path: Path) -> None:

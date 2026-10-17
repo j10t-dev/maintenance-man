@@ -1,10 +1,8 @@
-import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from maintenance_man.cli import _relative_time
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -13,8 +11,9 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
+from maintenance_man.output import relative_time
 from maintenance_man.storage import record_activity
-from tests.conftest import run_mm, write_config
+from tests.conftest import TerminalStream, run_mm, write_config
 
 _NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
@@ -27,15 +26,8 @@ def _write_scan_result(mm_home: Path, name: str, result: ScanResult) -> None:
     )
 
 
-def _table_row(output: str, name: str) -> tuple[str, ...]:
-    for line in output.splitlines():
-        if "│" not in line:
-            continue
-        cells = tuple(cell.strip() for cell in line.split("│")[1:-1])
-        if cells and cells[0] == name:
-            return cells
-    message = f"No table row found for {name!r}"
-    raise AssertionError(message)
+def _records(output: str) -> list[list[str]]:
+    return [line.split("\t") for line in output.splitlines()]
 
 
 @pytest.fixture()
@@ -90,29 +82,34 @@ class TestRelativeTime:
         ids=["seconds", "minutes", "1hour", "hours", "1day", "days"],
     )
     def test_relative_time(self, delta: timedelta, expected: str):
-        assert _relative_time(_NOW - delta, _NOW) == expected
+        assert relative_time(_NOW - delta, _NOW) == expected
 
 
 class TestListCommand:
     def test_list_no_projects(self, mm_home: Path, capsys: pytest.CaptureFixture[str]):
         assert run_mm("list") == 0
-        assert "no projects" in capsys.readouterr().out.lower()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines() == [
+            "No projects configured",
+            "hint: add projects to ~/.mm/config.toml",
+        ]
 
     def test_list_shows_projects(
         self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
     ):
         assert run_mm("list") == 0
-        output = capsys.readouterr().out
-        assert "myapp" in output
-        assert "uv" in output
+        assert [row[:2] for row in _records(capsys.readouterr().out)] == [
+            ["myapp", "uv"]
+        ]
 
     def test_st_alias_shows_projects(
         self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
     ):
         assert run_mm("st") == 0
-        output = capsys.readouterr().out
-        assert "myapp" in output
-        assert "uv" in output
+        assert [row[:2] for row in _records(capsys.readouterr().out)] == [
+            ["myapp", "uv"]
+        ]
 
     def test_list_prints_bracketed_project_name_literally(
         self, mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -126,7 +123,7 @@ class TestListCommand:
         )
 
         assert run_mm("list") == 0
-        assert "a[b]" in capsys.readouterr().out
+        assert [row[0] for row in _records(capsys.readouterr().out)] == ["a[b]"]
 
 
 class TestListFindings:
@@ -135,13 +132,10 @@ class TestListFindings:
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Projects without scan results show 'never' in scanned column."""
+        """Projects without scan results have unknown counts and 'never' scanned."""
         assert run_mm("list") == 0
-        output = capsys.readouterr().out
-        # Look for the table having a Scanned column and a row with "never"
-        assert "Scanned" in output
-        # Match pattern: ends of table rows that should have "never" as last column
-        assert re.search(r"\│\s+never\s+\│", output, re.IGNORECASE)
+        (row,) = _records(capsys.readouterr().out)
+        assert row[2:6] == ["-", "-", "-", "never"]
 
     def test_summary_shows_counts(
         self,
@@ -160,8 +154,8 @@ class TestListFindings:
         _write_scan_result(list_project_home, "myapp", result)
         assert run_mm("list") == 0
         output = capsys.readouterr().out
-        row = _table_row(output, "myapp")
-        assert row[2:5] == ("2", "3", "1")
+        (row,) = _records(output)
+        assert row[2:5] == ["2", "3", "1"]
 
     def test_corrupt_scan_results_skipped(
         self,
@@ -174,9 +168,11 @@ class TestListFindings:
             encoding="utf-8",
         )
         assert run_mm("list") == 0
-        output = capsys.readouterr().out
-        assert "myapp" in output
-        assert "Warning" in output
+        captured = capsys.readouterr()
+        assert [row[:5] for row in _records(captured.out)] == [
+            ["myapp", "uv", "-", "-", "-"]
+        ]
+        assert captured.err == "warning: corrupt scan results for myapp; skipped\n"
 
     @pytest.mark.parametrize(
         "expected_substring",
@@ -272,7 +268,7 @@ class TestListFindings:
         vuln_ids: tuple[str, str],
         expected_order: tuple[str, str] | None,
     ):
-        """'← fix' marks the highest fix version for duplicate-package vulns."""
+        """'selected fix' marks the highest fix version for duplicate-package vulns."""
         vulns = [
             VulnFinding(
                 vuln_id=vuln_ids[0],
@@ -306,7 +302,7 @@ class TestListFindings:
         output = capsys.readouterr().out
         assert "2.32.4" in output
         lines_with_marker = [
-            line for line in output.splitlines() if "\u2190 fix" in line
+            line for line in output.splitlines() if "selected fix" in line
         ]
         assert len(lines_with_marker) == 1
         assert "2.32.4" in lines_with_marker[0]
@@ -318,7 +314,7 @@ class TestListFindings:
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Single-vuln packages should not get the '← fix' marker."""
+        """Single-vuln packages should not get the 'selected fix' marker."""
         result = ScanResult(
             project="myapp",
             scanned_at=_NOW,
@@ -328,7 +324,7 @@ class TestListFindings:
         _write_scan_result(list_project_home, "myapp", result)
         assert run_mm("list", "--detail") == 0
         output = capsys.readouterr().out
-        assert "\u2190 fix" not in output
+        assert "selected fix" not in output
 
 
 class TestListActivity:
@@ -337,34 +333,46 @@ class TestListActivity:
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Projects with no activity show dash in Built/Deployed columns."""
+        """Projects with no activity pipe '-' for every build and deploy field."""
         assert run_mm("list") == 0
-        output = capsys.readouterr().out
-        assert "Built" in output
-        assert "Deployed" in output
-        row = _table_row(output, "myapp")
-        assert row[6:8] == ("—", "—")
+        (row,) = _records(capsys.readouterr().out)
+        assert row[6:10] == ["-", "-", "-", "-"]
 
-    def test_shows_relative_time_for_build(
+    def test_given_successful_build_when_listed_in_pipe_then_iso_time_and_passed_status(
         self,
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Build activity shows relative time."""
+        """Piped build activity carries an ISO timestamp and a status word."""
         activity_path = list_project_home / "activity.json"
         record_activity(activity_path, "myapp", "build", success=True, branch="main")
         assert run_mm("list") == 0
-        output = capsys.readouterr().out
-        assert "just now" in output.lower() or "0m ago" in output or "1m ago" in output
+        (row,) = _records(capsys.readouterr().out)
+        assert datetime.fromisoformat(row[6]).tzinfo is not None
+        assert row[7] == "passed"
 
-    def test_shows_failure_marker(
+    def test_given_failed_build_when_listed_in_pipe_then_status_is_failed(
         self,
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Failed build/deploy shows [F] marker."""
+        """A failed build is a status field, not a marker inside a timestamp."""
         activity_path = list_project_home / "activity.json"
         record_activity(activity_path, "myapp", "build", success=False, branch="main")
         assert run_mm("list") == 0
-        output = capsys.readouterr().out
-        assert "[F]" in output
+        (row,) = _records(capsys.readouterr().out)
+        assert row[7] == "failed"
+
+    def test_given_failed_build_when_listed_on_terminal_then_row_reads_failed_just_now(
+        self,
+        list_project_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """On a terminal a failed build reads 'failed just now'."""
+        activity_path = list_project_home / "activity.json"
+        record_activity(activity_path, "myapp", "build", success=False, branch="main")
+        stream = TerminalStream()
+        monkeypatch.setattr("sys.stdout", stream)
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert run_mm("list") == 0
+        assert "failed just now" in stream.getvalue()

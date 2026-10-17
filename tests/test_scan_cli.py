@@ -35,6 +35,7 @@ from maintenance_man.services import scan as scan_service
 from maintenance_man.services.scan import ScanSummary
 from maintenance_man.vcs import RevisionError
 from tests.conftest import (
+    TerminalStream,
     make_scan_result,
     make_update,
     missing_tool,
@@ -45,6 +46,14 @@ from tests.conftest import (
 from tests.fake_vcs import FakeJjState
 
 
+def _terminal_stdout(monkeypatch: pytest.MonkeyPatch, width: int = 220) -> StringIO:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+    monkeypatch.setenv("COLUMNS", str(width))
+    monkeypatch.setenv("NO_COLOR", "1")
+    return stream
+
+
 @pytest.mark.parametrize(
     ("pkg_name", "reason"),
     [
@@ -52,13 +61,10 @@ from tests.fake_vcs import FakeJjState
         ("org.x:[lib]", "cannot render [catalogue]"),
     ],
 )
-def test_given_update_table_renders_blocked_rows_with_reason_when_blocked_then_literal(
+def test_given_blocked_update_when_scan_result_printed_then_row_is_literal(
     monkeypatch, pkg_name, reason
 ):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=220, color_system=None)
-    )
+    stream = _terminal_stdout(monkeypatch)
     blocked = make_update(
         pkg_name=pkg_name,
         installed_version="unknown",
@@ -67,14 +73,13 @@ def test_given_update_table_renders_blocked_rows_with_reason_when_blocked_then_l
     )
     plain = make_update(pkg_name="pkg-a")
 
-    cli._print_update_table([blocked, plain])
+    cli._print_scan_result(make_scan_result(vulns=[], updates=[blocked, plain]))
 
-    lines = output.getvalue().splitlines()
+    lines = stream.getvalue().splitlines()
     assert any(
-        line.startswith("BLOCKED") and pkg_name in line and reason in line
-        for line in lines
+        "! blocked" in line and pkg_name in line and reason in line for line in lines
     )
-    assert any(line.startswith("UPDATE") and "pkg-a" in line for line in lines)
+    assert any("~ update" in line and "pkg-a" in line for line in lines)
 
 
 def test_numbered_findings_print_bracketed_values_literally(
@@ -190,6 +195,34 @@ def _two_project_config(mm_home, tmp_path):
     return results
 
 
+def test_given_two_clean_projects_when_batch_scanned_then_one_notice_names_both(
+    mm_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _two_project_config(mm_home, tmp_path)
+    monkeypatch.setattr(
+        "maintenance_man.services.scan.prune_stale_bookmarks", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        "maintenance_man.services.scan.scan_project",
+        lambda name, project, days: ScanResult(
+            project=name,
+            scanned_at=datetime(2026, 1, 15, 12, tzinfo=UTC),
+            trivy_target=".",
+        ),
+    )
+
+    assert run_mm("scan") == ExitCode.OK
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines()[-1].startswith(
+        "2 projects have no findings: first, second · scanned in "
+    )
+
+
 def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys):
     mm_home.mkdir(parents=True)
     write_config(mm_home, "")
@@ -198,9 +231,12 @@ def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys
     )
     monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
     assert run_mm("scan") == 0
-    output = capsys.readouterr().out
-    assert "No projects configured" in output
-    assert "trivy" not in output.lower()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "No projects configured",
+        "hint: add projects to ~/.mm/config.toml",
+    ]
 
 
 def test_scan_without_trivy_reports_an_unknown_project(
@@ -335,12 +371,12 @@ def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
     _print_scan_result(result)
     out = capsys.readouterr().out
 
-    assert "clean" not in out
-    assert "ksp" in out
-    assert "BLOCKED" in out
-    assert "publication date" in out
-    assert "UPDATE" in out
-    assert "pkg-a" in out
+    rows = [line.split("\t") for line in out.splitlines()]
+    assert [(row[1], row[2], row[8]) for row in rows] == [
+        ("update", "ksp", "blocked"),
+        ("update", "pkg-a", "available"),
+    ]
+    assert "publication date" in rows[0][9]
 
 
 def test_blocked_update_candidates_still_exit_updates_found():
@@ -366,13 +402,7 @@ def test_blocked_update_candidates_still_exit_updates_found():
     assert _scan_exit_code(ScanSummary.of(result)) == ExitCode.UPDATES_FOUND
 
 
-def test_given_blocked_scan_when_rendered_then_advisory_and_vuln_diagnostics_hidden(
-    monkeypatch,
-):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=220, color_system=None)
-    )
+def _blocked_mixed_result() -> ScanResult:
     result = _make_vulnerable_result()
     result.vulnerabilities[0].blocked_reason = "Cannot identify catalogue entry"
     result.vulnerabilities.append(
@@ -389,30 +419,46 @@ def test_given_blocked_scan_when_rendered_then_advisory_and_vuln_diagnostics_hid
         make_update(pkg_name="agp", blocked_reason="Publication lookup timed out"),
         make_update(pkg_name="available"),
     ]
+    return result
 
-    cli._print_scan_result(result)
-    lines = output.getvalue().splitlines()
-    for label, package, reason in (
-        ("VULN", "some-pkg", "Cannot identify catalogue entry"),
-        ("ADV", "unfixed-pkg", "No published fix"),
+
+def test_given_blocked_scan_when_rendered_then_each_blocked_row_carries_its_reason(
+    monkeypatch,
+):
+    stream = _terminal_stdout(monkeypatch)
+
+    cli._print_scan_result(_blocked_mixed_result())
+
+    lines = stream.getvalue().splitlines()
+    for package, reason in (
+        ("some-pkg", "Cannot identify catalogue entry"),
+        ("unfixed-pkg", "No published fix"),
+        ("agp", "Publication lookup timed out"),
     ):
-        rows = [line for line in lines if package in line]
-        assert len(rows) == 1
-        assert label in rows[0]
-        assert reason not in output.getvalue()
-    blocked = next(line for line in lines if "agp" in line)
-    assert "BLOCKED" in blocked
-    assert "Publication lookup timed out" in blocked
+        (row,) = [line for line in lines if package in line]
+        assert "! blocked" in row
+        assert reason in row
     available = next(line for line in lines if "available" in line)
-    assert "UPDATE" in available
+    assert "~ update" in available
     assert "timed out" not in available
 
 
-def test_scan_wraps_long_package_names_without_crowding_out_cves(monkeypatch):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=80, color_system=None)
-    )
+def test_given_blocked_scan_when_piped_then_kind_stays_and_status_is_blocked(capsys):
+    cli._print_scan_result(_blocked_mixed_result())
+
+    rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+    assert [(row[1], row[2], row[8], row[9]) for row in rows] == [
+        ("vuln", "some-pkg", "blocked", "Cannot identify catalogue entry"),
+        ("advisory", "unfixed-pkg", "blocked", "No published fix"),
+        ("update", "agp", "blocked", "Publication lookup timed out"),
+        ("update", "available", "available", "-"),
+    ]
+
+
+def test_given_long_blocked_detail_when_rendered_narrow_then_text_ends_in_ellipsis(
+    monkeypatch,
+):
+    stream = _terminal_stdout(monkeypatch, width=80)
     result = _make_vulnerable_result()
     result.vulnerabilities[0].pkg_name = "org.apache.commons:commons-lang3"
     result.vulnerabilities[
@@ -421,9 +467,11 @@ def test_scan_wraps_long_package_names_without_crowding_out_cves(monkeypatch):
 
     cli._print_scan_result(result)
 
-    assert "VULN" in output.getvalue()
-    assert "CVE-2024-0001" in output.getvalue()
-    assert "…" not in output.getvalue()
+    lines = stream.getvalue().splitlines()
+    (row,) = [line for line in lines if "! blocked" in line]
+    assert "org.apache.commons:commons-lang3" in row
+    assert row.endswith("…")
+    assert all(len(line) <= 80 for line in lines)
 
 
 def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
@@ -515,10 +563,7 @@ def test_scan_blocked_no_fix_vulnerability_exit(
 
 @pytest.mark.parametrize("manager", ["gradle", "uv", "bun", "mvn"])
 def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_path):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
+    stream = _terminal_stdout(monkeypatch, width=180)
     scope = ":app/project/debugRuntimeClasspath"
     findings = [
         VulnFinding(
@@ -549,27 +594,23 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_pat
         ProjectConfig(path=project_path, package_manager=manager),
         minimum_age_days=7,
         vcs=state.services(),
-        emit=cli._Renderer(batch=False),
+        emit=cli._Renderer(batch=False, project="android", flow="scan"),
     )
-    rendered = output.getvalue()
+    rendered = stream.getvalue()
     assert rendered.count("org.example:shared") == 2
-    assert "VULN" in rendered
-    assert "ADV" in rendered
-    assert "Fix" in rendered
-    assert "1.1" in rendered
+    assert "! vuln" in rendered
+    assert "! advisory" in rendered
+    assert "versions" in rendered
+    assert "1.0 → 1.1" in rendered
     assert "CVE-A" in rendered
     assert "CVE-B" in rendered
-    assert "HIGH" in rendered
+    assert "high" in rendered
     assert [
         row["vuln_id"] for row in result.model_dump(mode="json")["vulnerabilities"]
     ] == ["CVE-A", "CVE-B"]
 
 
-def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
+def test_gradle_advisories_keep_installed_versions_separate(capsys):
     result = ScanResult(
         project="android",
         scanned_at=datetime.now(UTC),
@@ -588,7 +629,11 @@ def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
         ],
     )
     cli._print_scan_result(result)
-    assert output.getvalue().count("org.example:shared") == 2
+    rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+    assert [(row[2], row[3]) for row in rows] == [
+        ("org.example:shared", "1.0"),
+        ("org.example:shared", "2.0"),
+    ]
 
 
 def _summary_run(blocks=(), attempts=(), residuals=()):

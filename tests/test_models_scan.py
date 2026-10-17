@@ -79,6 +79,43 @@ def test_findings_lists_vulnerabilities_then_updates():
     assert result.findings == (vuln, update)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, False),
+        ({"vulnerabilities": [make_vuln()]}, True),
+        ({"updates": [make_update()]}, True),
+        (
+            {
+                "secrets": [
+                    SecretFinding(
+                        file="a.env",
+                        rule_id="key",
+                        title="Key",
+                        severity=Severity.HIGH,
+                    )
+                ]
+            },
+            True,
+        ),
+    ],
+    ids=["clean", "vulnerability", "update", "secret"],
+)
+def test_given_scan_result_when_checked_for_findings_then_secrets_count_too(
+    overrides: dict[str, list], expected: bool
+) -> None:
+    result = ScanResult.model_validate(
+        {
+            "project": "api",
+            "scanned_at": datetime(2026, 1, 30, tzinfo=UTC),
+            "trivy_target": ".",
+        }
+        | overrides
+    )
+
+    assert result.has_findings is expected
+
+
 class TestVulnFinding:
     def test_vuln_finding_with_fix(self):
         finding = VulnFinding(

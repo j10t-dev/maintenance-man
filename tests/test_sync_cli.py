@@ -69,7 +69,12 @@ class TestSyncCommand:
         monkeypatch.setattr(cli, "make_vcs_services", factory)
 
         assert run_mm("sync") == ExitCode.OK
-        assert "No projects configured" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines() == [
+            "No projects configured",
+            "hint: add projects to ~/.mm/config.toml",
+        ]
         factory.assert_not_called()
 
     def test_skips_nonexistent_path(

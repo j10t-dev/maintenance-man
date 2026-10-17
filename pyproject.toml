@@ -90,10 +90,10 @@ forbidden_modules = [
 
 [[tool.importlinter.contracts]]
 id = "rich-cli-only"
-name = "Only the CLI imports rich"
+name = "Only the CLI and output modules import rich"
 type = "protected"
 protected_modules = ["rich"]
-allowed_importers = ["maintenance_man.cli"]
+allowed_importers = ["maintenance_man.cli", "maintenance_man.output"]
 
 [[tool.importlinter.contracts]]
 id = "vcs-no-gradle"

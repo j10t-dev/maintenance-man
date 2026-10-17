@@ -50,8 +50,8 @@ from maintenance_man.models.gradle import (
     GradleSnapshot,
     ResolutionReport,
 )
-from maintenance_man.models.scan import UpdateResult, Workflow
-from tests.conftest import make_scan_result
+from maintenance_man.models.scan import ScanResult, UpdateResult, Workflow
+from tests.conftest import TerminalStream, make_scan_result, make_update
 
 
 def _make_gradle_run() -> GradleRun:
@@ -147,7 +147,7 @@ def output(monkeypatch):
             OperationFailed(Operation.SCAN, "a[b]", "bad [state]"),
             "Error: a[b] — bad [state]\n",
         ),
-        (ScanReported(make_scan_result()), "SCAN\n"),
+        (ScanReported(make_scan_result()), ""),
         (
             MissingTestConfig("a[b]"),
             "  Warning: a[b] — no test configuration (test phases will be skipped)\n",
@@ -314,7 +314,7 @@ def test_given_summary_events_when_rendered_then_exact_payloads_are_forwarded(
     monkeypatch.setattr(cli, "_print_update_summary", print_updates)
     monkeypatch.setattr(cli, "_print_gradle_run_summary", print_gradle)
 
-    cli._Renderer(batch=False)(ScanReported(scan, elapsed_s=1.25))
+    cli._Renderer(batch=False, flow="scan")(ScanReported(scan, elapsed_s=1.25))
     print_scan.assert_called_once_with(scan, elapsed_s=1.25)
     print_scan.reset_mock()
     cli._Renderer(batch=False)(FindingsProcessed(results))
@@ -322,6 +322,68 @@ def test_given_summary_events_when_rendered_then_exact_payloads_are_forwarded(
     cli._Renderer(batch=False)(GradleRunReported(scan, run))
     print_scan.assert_called_once_with(scan)
     print_gradle.assert_called_once_with(run)
+
+
+def _blocked_scan() -> ScanResult:
+    scan = make_scan_result(vulns=[], updates=[])
+    scan.project = "api"
+    scan.updates = [
+        make_update(pkg_name="blocked-pkg", blocked_reason="no publication date"),
+        make_update(pkg_name="available-pkg"),
+    ]
+    return scan
+
+
+@pytest.mark.parametrize("flow", ["update", "resolve"])
+def test_given_blocked_findings_when_saved_scan_reported_in_pipe_then_one_outcome_each(
+    flow: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli._Renderer(batch=False, flow=flow)(ScanReported(_blocked_scan()))
+
+    captured = capsys.readouterr()
+    assert captured.out == (
+        f"api\t{flow}\tblocked\tblocked-pkg\t1.0.0\t1.0.1\tno publication date\n"
+    )
+
+
+def test_given_update_flow_when_saved_scan_reported_on_terminal_then_findings_print(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    cli._Renderer(batch=False)(ScanReported(_blocked_scan()))
+
+    lines = stream.getvalue().splitlines()
+    assert lines[0] == "api · 2 findings"
+    assert any("! blocked" in line and "blocked-pkg" in line for line in lines)
+    assert any("~ update" in line and "available-pkg" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("batch", "elapsed_s", "expected"),
+    [
+        (False, 1.25, "No findings in api · scanned in 1.2s\n"),
+        (False, None, "No findings in api\n"),
+        (True, 1.25, ""),
+    ],
+    ids=["timed", "untimed", "batch"],
+)
+def test_given_clean_scan_when_reported_then_notice_depends_on_timing_and_batch(
+    batch: bool,
+    elapsed_s: float | None,
+    expected: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scan = make_scan_result(vulns=[], updates=[])
+    scan.project = "api"
+
+    cli._Renderer(batch=batch, flow="scan")(ScanReported(scan, elapsed_s))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
 
 
 @pytest.mark.parametrize(
