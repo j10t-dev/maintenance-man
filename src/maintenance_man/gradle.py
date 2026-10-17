@@ -30,7 +30,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     classify_semver,
 )
-from maintenance_man.process import run_captured
+from maintenance_man.process import run_logged
 
 GRADLE_CATALOGUE_RELPATH = "gradle/libs.versions.toml"
 GRADLE_UPDATE_REPORT_RELPATH = "gradle/libs.versions.updates.toml"
@@ -519,12 +519,14 @@ def run_gradle(
         msg = f"No executable Gradle wrapper at {wrapper}"
         raise GradleError(msg)
 
-    return run_captured(
+    return run_logged(
         [str(wrapper), *args],
         root,
         timeout=GRADLE_TIMEOUT_SECONDS,
         label=f"./gradlew {label or args[0]}",
         error=GradleError,
+        stdin=subprocess.DEVNULL,
+        capture=True,
     )
 
 

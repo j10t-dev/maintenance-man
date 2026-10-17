@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from maintenance_man import cli, paths
+from maintenance_man import cli, output, paths
 from maintenance_man.cli import ExitCode
 from maintenance_man.deployer import BuildError
 from maintenance_man.storage import load_activity
@@ -95,6 +95,19 @@ class TestBuildCommand:
     ) -> None:
         """Error when project doesn't exist."""
         assert run_mm("build", "nonexistent") == ExitCode.ERROR
+
+    @patch("maintenance_man.services.deploy.run_live")
+    def test_given_verbose_build_when_a_later_command_runs_then_verbosity_does_not_leak(
+        self,
+        mock_build: MagicMock,
+        mm_home_with_projects: Path,
+        _build_vcs: FakeJjState,
+    ) -> None:
+        assert run_mm("build", "deployable", "--verbose") == ExitCode.OK
+        assert output.is_verbose() is True
+
+        assert run_mm("list") == ExitCode.OK
+        assert output.is_verbose() is False
 
     @patch("maintenance_man.services.deploy.record_activity")
     @patch("maintenance_man.services.deploy.run_live")

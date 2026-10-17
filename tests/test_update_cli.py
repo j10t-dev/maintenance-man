@@ -105,7 +105,7 @@ def _use_real_mixed_processor(
     monkeypatch.setattr(
         "maintenance_man.services.update.process_findings", updater.process_findings
     )
-    monkeypatch.setattr("maintenance_man.updater.run_captured", package)
+    monkeypatch.setattr("maintenance_man.updater.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_live", phase)
     monkeypatch.setattr("maintenance_man.cli.Prompt.ask", MagicMock(return_value="all"))
     return package, phase
@@ -1242,11 +1242,12 @@ def test_gradle_legacy_update_history_is_preserved_without_effects(
         row.flow = Workflow.UPDATE
         row.failed_phase = "unit"
     before = scan.model_dump_json()
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *args, **kwargs: pytest.fail("legacy history cannot authorize commands"),
-    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("legacy history cannot authorize commands")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", forbidden)
     vcs_state = mock_update_cli_deps.vcs_state
     vcs_state.clear_calls()
     exit_code = run_mm("update") if batch else run_mm("update", "android")

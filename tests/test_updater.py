@@ -1,4 +1,7 @@
+import dataclasses
+import shlex
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
@@ -26,6 +29,7 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     Workflow,
 )
+from maintenance_man.package_managers import package_manager_ops
 from maintenance_man.process import ProcessError
 from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
@@ -148,7 +152,11 @@ def processor_vcs(
     def run_package(cmd, cwd, **kwargs):
         assert cmd[:2] == ["bun", "add"]
         assert cwd == path
-        assert kwargs == {"timeout": 300, "label": " ".join(cmd)}
+        assert kwargs == {
+            "timeout": 300,
+            "label": " ".join(cmd),
+            "stdin": subprocess.DEVNULL,
+        }
         current = (path / "dep.txt").read_text(encoding="utf-8")
         (path / "dep.txt").write_text(f"{current}{cmd[-1]}\n", encoding="utf-8")
         return completed(cmd, returncode=0, stdout="", stderr="")
@@ -160,7 +168,7 @@ def processor_vcs(
 
     package = MagicMock(side_effect=run_package)
     phase = MagicMock(side_effect=run_phase)
-    monkeypatch.setattr("maintenance_man.updater.run_captured", package)
+    monkeypatch.setattr("maintenance_man.updater.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_live", phase)
     return {
         "state": state,
@@ -208,7 +216,7 @@ class TestApplyUpdate:
         mock_run = MagicMock(
             return_value=completed([], returncode=0, stdout="", stderr="")
         )
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
 
         assert (
             _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=RecordingEmit())
@@ -235,11 +243,11 @@ class TestApplyUpdate:
         mock_run = MagicMock(
             side_effect=[
                 completed([], returncode=0, stdout="", stderr=""),
-                completed([], returncode=1, stdout="", stderr="boom"),
+                ProcessError("uv add --group dev pytest==9.0.3 failed (exit 1)"),
                 completed([], returncode=0, stdout="", stderr=""),
             ]
         )
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
 
         emit = RecordingEmit()
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
@@ -247,7 +255,7 @@ class TestApplyUpdate:
         assert emit.of_type(FindingStepFailed) == [
             FindingStepFailed(
                 FindingStepKind.PACKAGE_COMMAND,
-                "uv add --group dev pytest==9.0.3 failed (exit 1): boom",
+                "uv add --group dev pytest==9.0.3 failed (exit 1)",
             )
         ]
 
@@ -257,7 +265,7 @@ class TestApplyUpdate:
         tmp_path: Path,
     ):
         mock_run = MagicMock()
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
 
         emit = RecordingEmit()
         assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
@@ -266,15 +274,37 @@ class TestApplyUpdate:
         assert "Failed to read" in emit.of_type(FindingStepFailed)[0].error
 
 
-@pytest.mark.parametrize(
-    "raised",
-    [
-        subprocess.TimeoutExpired(["uv", "add"], 300),
-        FileNotFoundError(2, "No such file or directory", "uv"),
-    ],
-)
+def test_given_failing_package_command_when_applied_then_error_omits_child_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command = [sys.executable, "-c", "print('boom'); raise SystemExit(7)"]
+    ops = dataclasses.replace(
+        package_manager_ops("bun"), update_commands=lambda *args: [command]
+    )
+    monkeypatch.setattr("maintenance_man.updater.package_manager_ops", lambda _: ops)
+
+    emit = RecordingEmit()
+    assert _apply_update("bun", "left-pad", "2.0.0", tmp_path, emit=emit) is False
+
+    assert emit.of_type(FindingStepFailed) == [
+        FindingStepFailed(
+            FindingStepKind.PACKAGE_COMMAND, f"{shlex.join(command)} failed (exit 7)"
+        )
+    ]
+    assert capsys.readouterr() == ("", "boom\n")
+
+
+_EXECUTION_FAILURES = [
+    "{label} timed out after 300s in {cwd}",
+    "Could not run {label} in {cwd}: [Errno 2] No such file or directory",
+]
+
+
+@pytest.mark.parametrize("failure", _EXECUTION_FAILURES)
 def test_package_command_execution_failure_stops_the_apply(
-    tmp_path, monkeypatch, raised
+    tmp_path, monkeypatch, failure
 ):
     (tmp_path / "pyproject.toml").write_text(
         '[project]\ndependencies = ["pytest>=8.0"]\n\n'
@@ -283,38 +313,34 @@ def test_package_command_execution_failure_stops_the_apply(
         encoding="utf-8",
     )
     calls = []
+    message = failure.format(label="uv add pytest==9.0.3", cwd=tmp_path)
 
-    def run(cmd, **kwargs):
+    def run(cmd, cwd, **kwargs):
         calls.append(cmd)
-        raise raised
+        raise ProcessError(message)
 
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    monkeypatch.setattr("maintenance_man.updater.run_logged", run)
     emit = RecordingEmit()
     assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
     assert calls == [["uv", "add", "pytest==9.0.3"]]
-    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PACKAGE_COMMAND
-    assert "uv add pytest==9.0.3" in emit.of_type(FindingStepFailed)[0].error
+    assert emit.of_type(FindingStepFailed) == [
+        FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, message)
+    ]
 
 
-@pytest.mark.parametrize(
-    "raised",
-    [
-        subprocess.TimeoutExpired(["mvn", "versions:commit"], 300),
-        FileNotFoundError(2, "No such file or directory", "mvn"),
-    ],
-)
+@pytest.mark.parametrize("failure", _EXECUTION_FAILURES)
 def test_maven_finalisation_execution_failure_is_an_apply_failure(
-    tmp_path, monkeypatch, raised
+    tmp_path, monkeypatch, failure
 ):
     calls = []
 
-    def run(cmd, **kwargs):
+    def run(cmd, cwd, **kwargs):
         calls.append((cmd, kwargs["timeout"]))
         if cmd == ["mvn", "versions:commit"]:
-            raise raised
+            raise ProcessError(failure.format(label="mvn versions:commit", cwd=cwd))
         return completed(cmd, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    monkeypatch.setattr("maintenance_man.updater.run_logged", run)
     assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
     assert calls == [
         (
@@ -328,11 +354,12 @@ def test_maven_finalisation_execution_failure_is_an_apply_failure(
 def test_maven_finalisation_does_not_run_after_a_failed_update(tmp_path, monkeypatch):
     calls = []
 
-    def run(cmd, **kwargs):
+    def run(cmd, cwd, **kwargs):
         calls.append(cmd)
-        return completed(cmd, returncode=1, stdout="", stderr="no such dependency")
+        msg = f"{kwargs['label']} failed (exit 1)"
+        raise ProcessError(msg)
 
-    monkeypatch.setattr("maintenance_man.process.subprocess.run", run)
+    monkeypatch.setattr("maintenance_man.updater.run_logged", run)
     assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
     assert calls == [
         ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"]
@@ -370,10 +397,8 @@ def test_package_boundary_failure_is_persisted_as_a_failed_apply(
 
 class TestRunTestPhases:
     def test_all_green(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        mock_run = MagicMock(
-            return_value=completed([], returncode=0, stdout="", stderr="")
-        )
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        mock_run = MagicMock(return_value=None)
+        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -385,10 +410,8 @@ class TestRunTestPhases:
         assert mock_run.call_count == 2
 
     def test_unit_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        mock_run = MagicMock(
-            return_value=completed([], returncode=1, stdout="FAIL", stderr="")
-        )
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        mock_run = MagicMock(side_effect=ProcessError("unit tests failed (exit 1)"))
+        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
         tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
         failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
         assert failed_phase == "unit"
@@ -397,11 +420,11 @@ class TestRunTestPhases:
     def test_integration_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         def side_effect(*args, **kwargs):
             if "integration" in args[0]:
-                return completed([], returncode=1, stdout="", stderr="")
-            return completed([], returncode=0, stdout="", stderr="")
+                msg = f"{kwargs['label']} failed (exit 1)"
+                raise ProcessError(msg)
 
         mock_run = MagicMock(side_effect=side_effect)
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -414,10 +437,8 @@ class TestRunTestPhases:
     def test_skips_unconfigured_phases(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
-        mock_run = MagicMock(
-            return_value=completed([], returncode=0, stdout="", stderr="")
-        )
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        mock_run = MagicMock(return_value=None)
+        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
         tc = ProjectConfig(
             path=tmp_path, package_manager="bun", test_unit="bun test"
         )  # no integration or component
@@ -426,10 +447,8 @@ class TestRunTestPhases:
         assert mock_run.call_count == 1  # only unit
 
     def test_blank_phase_is_skipped(self, monkeypatch, tmp_path):
-        mock_run = MagicMock(
-            return_value=completed([], returncode=0, stdout="", stderr="")
-        )
-        monkeypatch.setattr("maintenance_man.process.subprocess.run", mock_run)
+        mock_run = MagicMock(return_value=None)
+        monkeypatch.setattr("maintenance_man.updater.run_live", mock_run)
         tc = ProjectConfig(
             path=tmp_path,
             package_manager="bun",
@@ -1168,10 +1187,11 @@ def test_gradle_config_records_a_failed_apply_not_a_crash(tmp_path):
 def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
     project_config, monkeypatch
 ):
-    def _timeout(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, 600)
+    def _timeout(command, cwd, **kwargs):
+        msg = "unit tests timed out after 600s"
+        raise ProcessError(msg)
 
-    monkeypatch.setattr(subprocess, "run", _timeout)
+    monkeypatch.setattr("maintenance_man.updater.run_live", _timeout)
 
     assert (
         run_test_phases(project_config, Path(project_config.path), emit=RecordingEmit())
@@ -1199,7 +1219,7 @@ def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(
 
 def test_bun_update_without_a_manifest_runs_no_command(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "maintenance_man.process.subprocess.run",
+        "maintenance_man.updater.run_logged",
         lambda *args, **kwargs: pytest.fail("no command may run"),
     )
     emit = RecordingEmit()

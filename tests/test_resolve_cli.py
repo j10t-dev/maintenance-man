@@ -398,6 +398,7 @@ def test_gradle_legacy_resolve_history_never_authorizes_effects(
         pytest.fail("legacy history must not run commands or alter bookmarks")
 
     monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", forbidden)
     args = ["resolve", "android"] + (["--continue"] if continue_ else [])
     assert run_mm(*args) == 4
     assert results.read_bytes() == before
@@ -418,9 +419,12 @@ def test_gradle_continuation_without_ledger_preserves_interrupted_outputs(
     marker = gradle_project.path / "gradle/.mm-owned-report"
     if owned:
         marker.write_bytes(b"")
-    monkeypatch.setattr(
-        subprocess, "run", lambda *args, **kwargs: pytest.fail("no ledger")
-    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("no ledger")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", forbidden)
     assert run_mm("resolve", "android", "--continue") == 4
     assert report.read_bytes() == b"preserved output"
     assert marker.exists() is owned

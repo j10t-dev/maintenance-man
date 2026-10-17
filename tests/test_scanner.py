@@ -1523,22 +1523,22 @@ def _prepare_scan_failure_commands(
 ) -> list[list[str]]:
     commands: list[list[str]] = []
 
-    def run(cmd, **kwargs):
+    def wrapper(cmd, cwd, **kwargs):
         commands.append(cmd)
         if cmd[1] == "mmGradleReport":
-            if failure == "wrapper-decode":
-                message = "utf8"
-                raise UnicodeDecodeError(message, b"\xff", 0, 1, "invalid")
             _write_gradle_capture(root)
-            return completed(cmd)
-        if cmd[1] == "versionCatalogUpdate":
+        else:
+            assert cmd[1] == "versionCatalogUpdate"
             report = root / GRADLE_UPDATE_REPORT_RELPATH
             report.write_text(
                 "libraries = false\n"
                 if failure == "report-false"
                 else (GRADLE_FIXTURES / "updates-clean.toml").read_text()
             )
-            return completed(cmd)
+        return completed(cmd)
+
+    def run(cmd, **kwargs):
+        commands.append(cmd)
         if failure == "trivy-launch":
             message = "missing interpreter"
             raise FileNotFoundError(message)
@@ -1552,6 +1552,7 @@ def _prepare_scan_failure_commands(
         }.get(failure, {"Results": []})
         return completed(cmd, stdout=json.dumps(payload))
 
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", wrapper)
     monkeypatch.setattr(subprocess, "run", run)
     return commands
 
@@ -1563,6 +1564,7 @@ def _inject_scan_service_failure(monkeypatch, root: Path, failure: str) -> list 
     if failure in {"inventory-mkdir", "inventory-marker"}:
         commands = FakeCommands()
         monkeypatch.setattr(subprocess, "run", commands)
+        monkeypatch.setattr("maintenance_man.gradle.run_logged", commands)
         _inject_scan_filesystem_failure(monkeypatch, root, failure)
         return commands.calls
     if failure in {"report-false", "report-cleanup"}:
@@ -1596,7 +1598,6 @@ def _inject_scan_service_failure(monkeypatch, root: Path, failure: str) -> list 
         ("trivy-row", False, False, False, None),
         ("trivy-launch", False, False, False, None),
         ("trivy-decode", False, False, False, None),
-        ("wrapper-decode", False, False, False, None),
     ],
 )
 def test_given_gradle_scan_failure_when_scanning_all_then_next_project_is_saved(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +34,7 @@ from maintenance_man.package_managers import (
     UpdateCommandError,
     package_manager_ops,
 )
-from maintenance_man.process import ProcessError, run_captured, run_live
+from maintenance_man.process import ProcessError, run_live, run_logged
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import Repository, RevisionError
 from maintenance_man.vcs_workflow import VcsServices
@@ -402,7 +403,13 @@ def _apply_update(
 
     for cmd in commands:
         try:
-            run_captured(cmd, project_path, timeout=300, label=shlex.join(cmd))
+            run_logged(
+                cmd,
+                project_path,
+                timeout=300,
+                label=shlex.join(cmd),
+                stdin=subprocess.DEVNULL,
+            )
         except ProcessError as e:
             emit(FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, str(e)))
             return False

@@ -542,6 +542,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 @_command
 def init() -> None:
     """Initialise the ~/.mm directory and skeleton config."""
+    output.set_verbose(False)
     ensure_mm_home()
     console.print(f"Initialised {escape(str(paths.mm_home()))}")
     console.print(f"Edit {escape(str(paths.config_path()))} to add projects.")
@@ -563,6 +564,7 @@ def scan(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
 
     if not cfg.projects:
@@ -611,6 +613,7 @@ def update(
     *projects: str,
     negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
     config: Path | None = None,
+    verbose: bool = False,
 ) -> None:
     """Apply updates from scan results to one, many, or all projects.
 
@@ -624,7 +627,10 @@ def update(
         Treat all positional project names as exclusions.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     mode, targets = update_service.resolve_update_targets(cfg, projects, negate=negate)
 
@@ -681,6 +687,7 @@ def sync(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
 
     if not cfg.projects:
@@ -782,6 +789,7 @@ def deploy(
     check: bool = False,
     force: Annotated[bool, cyclopts.Parameter(name=["--force", "-f"])] = False,
     config: Path | None = None,
+    verbose: bool = False,
 ) -> None:
     """Deploy a project.
 
@@ -799,7 +807,10 @@ def deploy(
         could not be resolved.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     vcs = make_vcs_services()
     batch = not project
@@ -850,6 +861,7 @@ def test(
     project: str,
     *,
     config: Path | None = None,
+    verbose: bool = False,
 ) -> None:
     """Run a project's test suite.
 
@@ -862,7 +874,10 @@ def test(
         Project name to test.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     _require_test_config(project, proj_config)
@@ -887,6 +902,7 @@ def build(
     project: str,
     *,
     config: Path | None = None,
+    verbose: bool = False,
 ) -> None:
     """Build a project's artefacts.
 
@@ -896,7 +912,10 @@ def build(
         Project name to build.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     vcs = make_vcs_services()
@@ -931,6 +950,7 @@ def list_projects(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
 
     if not cfg.projects:
@@ -1117,6 +1137,7 @@ def todo(
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
     """
+    output.set_verbose(False)
     cfg = _load_cfg(config)
 
     if project:
@@ -1335,6 +1356,7 @@ def resolve(
     project: str,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
     config: Path | None = None,
+    verbose: bool = False,
 ) -> None:
     """Work through failed findings for a project.
 
@@ -1351,7 +1373,10 @@ def resolve(
         Re-test a paused, manually fixed finding on the resolve branch.
     config: Path | None
         Path to config file. Uses ~/.mm/config.toml if omitted.
+    verbose: bool
+        Stream subprocess logs to stderr, including successful commands.
     """
+    output.set_verbose(verbose)
     cfg = _load_cfg(config)
     proj_config = _resolve_proj(cfg, project)
     minimum_age_days = cfg.defaults.min_version_age_days
