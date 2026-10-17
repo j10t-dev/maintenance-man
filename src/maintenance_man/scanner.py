@@ -1,41 +1,40 @@
+import contextlib
 import hashlib
-import json
 import logging
 import re
-import shutil
-import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeGuard
-from urllib.parse import parse_qs, unquote, urlsplit
+from typing import Annotated, Literal, assert_never
 
-from pydantic import ValidationError
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    StrictStr,
+    ValidationError,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+)
 
-from maintenance_man import config as _config
-from maintenance_man import sanitise_project_name
+from maintenance_man import paths
+from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
-    evaluate_gradle_candidate_age,
-    filter_by_age,
+    filter_gradle_updates_by_age,
+    filter_registry_updates_by_age,
 )
 from maintenance_man.gradle import (
-    GRADLE_CATALOGUE_RELPATH,
     GradleError,
-    parse_catalogue,
+    discover_gradle_updates,
 )
-from maintenance_man.gradle_resolution import (
-    attach_gradle_publications,
-    generate_gradle_report,
-    gradle_routing_prerequisite,
-    select_gradle_candidates,
-    validate_gradle_candidates,
-)
-from maintenance_man.gradle_verification import context_inputs_valid
+from maintenance_man.gradle_inventory import bind_inventory
+from maintenance_man.gradle_resolution import generate_gradle_report
+from maintenance_man.gradle_verification import TRIVY_INSTALL_HINT, context_inputs_valid
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
-    CandidateWithheld,
     ComparisonContext,
     CompleteResolution,
     FindingEvidence,
@@ -43,8 +42,6 @@ from maintenance_man.models.gradle import (
     GradleSnapshot,
     IncompleteResolution,
     ModuleId,
-    ResolutionReport,
-    ScopeId,
 )
 from maintenance_man.models.scan import (
     ScanResult,
@@ -53,156 +50,66 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
-from maintenance_man.outdated import get_outdated
-from maintenance_man.vcs import revision_tree_id
+from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
+from maintenance_man.process import require_tool, run_captured
+from maintenance_man.storage import save_scan_results
+from maintenance_man.vcs_workflow import VcsServices
 
 
-class TrivyNotFoundError(Exception):
-    pass
-
-
-class TrivyScanError(Exception):
-    pass
+class ScanError(Exception):
+    """Trivy and uv audit execution and response errors."""
 
 
 def scan_project(
-    name: str, project: ProjectConfig, min_version_age_days: int = 7
+    name: str,
+    project: ProjectConfig,
+    min_version_age_days: int = 7,
+    *,
+    clock: Clock = utc_now,
 ) -> ScanResult:
     """Run Trivy and outdated checks against a project and return parsed results.
 
     Also writes the results JSON to ~/.mm/scan-results/<name>.json.
 
     Raises:
-        TrivyScanError: If trivy exits with non-zero status.
+        ScanError: If trivy exits with non-zero status.
         FileNotFoundError: If the project path does not exist.
     """
     project_path = Path(project.path)
     if not project_path.exists():
-        raise FileNotFoundError(f"Project path does not exist: {project_path}")
+        msg = f"Project path does not exist: {project_path}"
+        raise FileNotFoundError(msg)
     resolution = None
-    if project.package_manager == "uv":
-        vulns = _run_uv_audit(project_path)
-        secrets = (
-            _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
-            if project.scan_secrets
-            else []
-        )
-        updates = _check_outdated(name, project, vulns, min_version_age_days)
-    elif project.package_manager == "gradle":
-        vulns, resolution = _run_gradle_scan(project)
-        updates = get_outdated(project)
-        catalogue = parse_catalogue(project_path / GRADLE_CATALOGUE_RELPATH)
-        plan = select_gradle_candidates(catalogue, resolution, vulns, updates)
-        routing_block = gradle_routing_prerequisite(project)
-        blocks = {
-            block.group_key: block.reason
-            for block in plan.withheld
-            if block.group_key is not None
-        }
-        eligible = {}
-        prepared_candidates = []
-        with PublicationLookupContext(_config.MM_HOME / "publication-cache") as context:
-            if routing_block is not None:
-                for candidate in plan.candidates:
-                    blocks[candidate.target.group_key] = routing_block.reason
-            else:
-                batch = validate_gradle_candidates(project, plan.candidates, resolution)
-                for candidate in plan.candidates:
-                    key = candidate.target.group_key
-                    prepared = attach_gradle_publications(candidate, resolution, batch)
-                    if isinstance(prepared, CandidateWithheld):
-                        blocks[key] = prepared.reason
-                        continue
-                    prepared_candidates.append(prepared)
-            context.prefetch(
-                request
-                for candidate in prepared_candidates
-                for request in candidate.publication_requests
+    with PublicationLookupContext(paths.publications_dir(), clock=clock) as publication:
+        if project.package_manager == "gradle":
+            vulns, updates, secrets, resolution = _scan_gradle_project(
+                project, min_version_age_days, publication
             )
-            for prepared in prepared_candidates:
-                key = prepared.target.group_key
-                block = evaluate_gradle_candidate_age(
-                    prepared, min_version_age_days, context, datetime.now(timezone.utc)
-                )
-                if block is not None:
-                    blocks[key] = block.reason
-                eligible[key] = prepared
-        for update in updates:
-            if update.gradle_target is None:
-                update.blocked_reason = (
-                    update.blocked_reason or "no supported catalogue target"
-                )
-                update.gradle_block_kind = "mapping"
-                continue
-            key = update.gradle_target.group_key
-            if key in blocks:
-                update.blocked_reason = blocks[key]
-                update.gradle_block_kind = (
-                    "age"
-                    if key in eligible
-                    or (
-                        routing_block is not None
-                        and any(
-                            candidate.target.group_key == key
-                            for candidate in plan.candidates
-                        )
+        else:
+            ops = package_manager_ops(project.package_manager)
+            match ops.vulnerability_source:
+                case "uv-audit":
+                    vulns = _run_uv_audit(project_path)
+                    secrets = (
+                        scan_secrets(project_path, project.scan_skip_dirs)
+                        if project.scan_secrets
+                        else []
                     )
-                    else "mapping"
-                )
-            elif key in eligible:
-                update.blocked_reason = None
-                update.gradle_block_kind = None
-        for finding in vulns:
-            matches = [
-                candidate
-                for candidate in plan.candidates
-                if finding.vuln_id in candidate.requested_advisories
-                and finding.pkg_name in candidate.requested_coordinates
-            ]
-            if len(matches) == 1:
-                candidate = matches[0]
-                key = candidate.target.group_key
-                finding.gradle_target = candidate.target
-                finding.blocked_reason = blocks.get(key)
-                if finding.blocked_reason is None:
-                    finding.gradle_block_kind = None
-                else:
-                    finding.gradle_block_kind = (
-                        "age"
-                        if key in eligible
-                        or (
-                            routing_block is not None
-                            and any(
-                                other.target.group_key == key
-                                for other in plan.candidates
-                            )
-                        )
-                        else "mapping"
+                case "trivy":
+                    vulns, secrets = _run_trivy_scan(
+                        project_path,
+                        project.scan_skip_dirs,
+                        scanners="vuln,secret" if project.scan_secrets else "vuln",
                     )
-            else:
-                reasons = [
-                    block.reason
-                    for block in plan.withheld
-                    if finding.vuln_id in block.advisory_ids
-                    and finding.pkg_name == block.coordinate
-                ]
-                if reasons:
-                    finding.blocked_reason = "; ".join(dict.fromkeys(reasons))
-                    finding.gradle_block_kind = "mapping"
-        secrets = (
-            _run_trivy_secret_scan(project_path, project.scan_skip_dirs)
-            if project.scan_secrets
-            else []
-        )
-    else:
-        vulns, secrets = _run_trivy_scan(
-            project_path, project.scan_secrets, project.scan_skip_dirs
-        )
-        updates = _check_outdated(name, project, vulns, min_version_age_days)
+                case unreachable:
+                    assert_never(unreachable)
+            updates = _check_outdated(
+                project, ops, vulns, min_version_age_days, publication
+            )
 
     scan_result = ScanResult(
         project=name,
-        scanned_at=datetime.now(timezone.utc),
+        scanned_at=datetime.now(UTC),
         trivy_target=str(project_path),
         vulnerabilities=vulns,
         secrets=secrets,
@@ -213,191 +120,213 @@ def scan_project(
             else None
         ),
     )
-    results_dir = _config.MM_HOME / "scan-results"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = sanitise_project_name(name)
-    results_file = results_dir / f"{safe_name}.json"
-    if not results_file.resolve().is_relative_to(results_dir.resolve()):
-        raise ValueError(f"Invalid project name for results file: {name!r}")
-    temporary = results_file.with_suffix(".json.tmp")
-    temporary.write_text(scan_result.model_dump_json(indent=2), encoding="utf-8")
-    temporary.replace(results_file)
+    save_scan_results(name, scan_result)
     return scan_result
 
 
-def check_trivy_available() -> None:
-    """Raise TrivyNotFoundError if trivy is not on PATH."""
-    if shutil.which("trivy") is None:
-        raise TrivyNotFoundError(
-            "Trivy is not installed or not on PATH. Install it from https://trivy.dev/"
-        )
+def _scan_gradle_project(
+    project: ProjectConfig,
+    min_version_age_days: int,
+    publication: PublicationLookupContext,
+) -> tuple[
+    list[VulnFinding], list[UpdateFinding], list[SecretFinding], CompleteResolution
+]:
+    vulns, resolution = scan_gradle(project)
+    updates = discover_gradle_updates(project)
+    updates = filter_gradle_updates_by_age(
+        updates, project, resolution, min_version_age_days, publication
+    )
+    secrets = (
+        scan_secrets(Path(project.path), project.scan_skip_dirs)
+        if project.scan_secrets
+        else []
+    )
+    return vulns, updates, secrets, resolution
 
 
 def _check_outdated(
-    name: str,
     project: ProjectConfig,
+    ops: PackageManagerOps,
     vulns: list[VulnFinding],
     min_version_age_days: int,
+    publication: PublicationLookupContext,
 ) -> list[UpdateFinding]:
-    """Run non-Gradle outdated checks and return de-duplicated findings."""
-    try:
-        raw_updates = get_outdated(project)
-        aged_updates = filter_by_age(
-            raw_updates,
-            manager=project.package_manager,
-            min_age_days=min_version_age_days,
-            project_path=project.path,
-        )
-        vuln_pkgs = {v.pkg_name for v in vulns}
-        return [u for u in aged_updates if u.pkg_name not in vuln_pkgs]
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "Outdated check failed for %s — skipping update results",
-            name,
-            exc_info=True,
-        )
-        return []
+    """Run the table's outdated check and return aged, de-duplicated findings."""
+    raw_updates = ops.outdated(project)
+    vuln_pkgs = {v.pkg_name for v in vulns}
+    eligible_updates = [u for u in raw_updates if u.pkg_name not in vuln_pkgs]
+    return filter_registry_updates_by_age(
+        eligible_updates,
+        ops.publication_source,
+        project.path,
+        min_age_days=min_version_age_days,
+        context=publication,
+    )
 
 
-def _run_gradle_scan(
+def scan_gradle(
     project: ProjectConfig,
 ) -> tuple[list[VulnFinding], CompleteResolution]:
     """Scan the project's own freshly captured resolution and inventory."""
-    with generate_gradle_report(project) as (bom, outcome):
+    require_tool("trivy", TRIVY_INSTALL_HINT)
+    with generate_gradle_report(project) as generated:
+        outcome = generated.resolution
         if isinstance(outcome, IncompleteResolution):
             raise GradleError(
                 "Incomplete Gradle resolution: " + "; ".join(outcome.reasons)
             )
-        modules = _inventory_modules(bom.read_bytes(), outcome.report)
-        module_scopes = _resolution_module_scopes(outcome.report)
-        coverage_errors = _inventory_coverage_errors(modules, module_scopes)
-        if coverage_errors:
+        coverage = bind_inventory(generated.inventory, outcome.report)
+        if coverage.errors:
             raise GradleError(
-                "Incomplete Gradle inventory: " + "; ".join(coverage_errors)
+                "Incomplete Gradle inventory: " + "; ".join(coverage.errors)
             )
+        bom = generated.bom_path
         cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
-        try:
-            completed = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=project.path,
-                timeout=300,
-            )
-        except subprocess.TimeoutExpired as e:
-            raise TrivyScanError(f"Trivy timed out scanning {bom}") from e
-        except (OSError, UnicodeDecodeError) as e:
-            raise TrivyScanError(f"Could not run Trivy SBOM scan of {bom}: {e}") from e
-
-        if completed.returncode != 0:
-            raise TrivyScanError(
-                f"Trivy exited with code {completed.returncode}: "
-                f"{completed.stderr.strip()}"
-            )
+        completed = run_captured(
+            cmd,
+            project.path,
+            timeout=300,
+            label="Trivy SBOM scan",
+            error=ScanError,
+        )
         findings = _parse_gradle_trivy_output(completed.stdout)
         scoped = {
             (module.coordinate, module.version): {
                 f"{scope.project_path}/{scope.domain}/{scope.configuration}"
                 for scope in scopes
             }
-            for module, scopes in module_scopes.items()
+            for module, scopes in coverage.scopes.items()
         }
         for finding in findings:
             scopes = scoped.get((finding.pkg_name, finding.installed_version))
             if not scopes:
-                raise GradleError(
+                msg = (
                     f"Security finding has no selected resolution scope: "
                     f"{finding.pkg_name}"
                 )
+                raise GradleError(msg)
             finding.gradle_scopes = tuple(sorted(scopes))
         return findings, outcome
 
 
-def _run_gradle_vuln_scan(project: ProjectConfig) -> list[VulnFinding]:
-    findings, _ = _run_gradle_scan(project)
-    return findings
-
-
-def _is_trivy_object(value: object) -> TypeGuard[dict[str, object]]:
-    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
-
-
 def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
-    """Validate consumed SBOM response fields before using the common parser."""
+    """Parse consumed SBOM response fields and return vulnerability findings."""
+    response = _parse_trivy_response(payload, "Trivy SBOM", consume_secrets=False)
     try:
-        output: object = json.loads(payload)
-    except json.JSONDecodeError as e:
-        raise TrivyScanError(f"Failed to parse Trivy SBOM output: {e}") from e
-    if not _is_trivy_object(output):
-        raise TrivyScanError("Malformed Trivy SBOM output: expected an object")
-    results = output.get("Results", [])
-    if not isinstance(results, list):
-        raise TrivyScanError("Malformed Trivy SBOM Results: expected an array")
-    validated_results: list[dict[str, object]] = []
-    for index, result in enumerate(results):
-        label = f"Trivy SBOM Results[{index}]"
-        if not _is_trivy_object(result):
-            raise TrivyScanError(f"Malformed {label}: expected an object")
-        validated_results.append(result)
-        if "Class" in result and not isinstance(result["Class"], str):
-            raise TrivyScanError(f"Malformed {label}.Class: expected a string")
-        vulnerabilities = result.get("Vulnerabilities")
-        if vulnerabilities is None:
-            continue
-        if not isinstance(vulnerabilities, list):
-            raise TrivyScanError(
-                f"Malformed {label}.Vulnerabilities: expected an array"
-            )
-        for row_index, row in enumerate(vulnerabilities):
-            row_label = f"{label}.Vulnerabilities[{row_index}]"
-            if not _is_trivy_object(row):
-                raise TrivyScanError(f"Malformed {row_label}: expected an object")
-            if result.get("Class") != "lang-pkgs":
-                continue
-            for field in ("VulnerabilityID", "PkgName", "InstalledVersion"):
-                if not isinstance(row.get(field), str) or not row[field]:
-                    raise TrivyScanError(
-                        f"Malformed {row_label}.{field}: expected a nonempty string"
-                    )
-            for field in ("Severity", "Title", "Description", "Status"):
-                if field in row and not isinstance(row[field], str):
-                    raise TrivyScanError(
-                        f"Malformed {row_label}.{field}: expected a string"
-                    )
-            for field in ("FixedVersion", "PrimaryURL", "PublishedDate"):
-                if (
-                    field in row
-                    and row[field] is not None
-                    and not isinstance(row[field], str)
-                ):
-                    raise TrivyScanError(
-                        f"Malformed {row_label}.{field}: expected a string or null"
-                    )
-    try:
-        return _parse_vulns(validated_results)
+        return _parse_vulns(response.results)
     except ValidationError as e:
-        raise TrivyScanError(f"Malformed Trivy SBOM vulnerability fields: {e}") from e
+        msg = f"Malformed Trivy SBOM vulnerability fields: {e}"
+        raise ScanError(msg) from e
+
+
+def _parse_trivy_response(
+    payload: str, label: str, *, consume_secrets: bool
+) -> _TrivyResponse:
+    try:
+        return _TrivyResponse.model_validate_json(
+            payload, context={"consume_secrets": consume_secrets}
+        )
+    except ValidationError as e:
+        msg = f"Malformed {label} output: {e}"
+        raise ScanError(msg) from e
+
+
+_NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
+
+
+class _TrivyVulnerability(BaseModel):
+    vulnerability_id: _NonEmptyString = Field(alias="VulnerabilityID")
+    pkg_name: _NonEmptyString = Field(alias="PkgName")
+    installed_version: _NonEmptyString = Field(alias="InstalledVersion")
+    severity: StrictStr = Field("UNKNOWN", alias="Severity")
+    title: StrictStr = Field("", alias="Title")
+    description: StrictStr = Field("", alias="Description")
+    status: StrictStr = Field("unknown", alias="Status")
+    fixed_version: StrictStr | None = Field(None, alias="FixedVersion")
+    primary_url: StrictStr | None = Field(None, alias="PrimaryURL")
+    published_date: StrictStr | None = Field(None, alias="PublishedDate")
+
+
+class _TrivySecret(BaseModel):
+    rule_id: StrictStr = Field("", alias="RuleID")
+    title: StrictStr = Field("", alias="Title")
+    severity: Severity = Field(Severity.UNKNOWN, alias="Severity")
+
+
+class _TrivyLanguageResult(BaseModel):
+    class_: Literal["lang-pkgs"] = Field(alias="Class")
+    vulnerabilities: list[_TrivyVulnerability] | None = Field(
+        None, alias="Vulnerabilities"
+    )
+
+
+class _TrivyNonLanguageResult(BaseModel):
+    class_: StrictStr = Field("", alias="Class")
+    vulnerabilities: list[dict[str, JsonValue]] | None = Field(
+        None, alias="Vulnerabilities"
+    )
+    target: StrictStr = Field("", alias="Target")
+    secrets: list[_TrivySecret] | None = Field(None, alias="Secrets")
+
+    @field_validator("class_")
+    @classmethod
+    def reject_language_class(cls, value: str) -> str:
+        if value == "lang-pkgs":
+            msg = "language package results must use the language result schema"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("target", mode="wrap")
+    @classmethod
+    def decode_consumed_secret_target(
+        cls,
+        value: object,
+        handler: ValidatorFunctionWrapHandler,
+        info: ValidationInfo,
+    ) -> str:
+        if (
+            info.data.get("class_") == "secret"
+            and info.context is not None
+            and info.context["consume_secrets"]
+        ):
+            return handler(value)
+        return ""
+
+    @field_validator("secrets", mode="wrap")
+    @classmethod
+    def decode_consumed_secrets(
+        cls,
+        value: object,
+        handler: ValidatorFunctionWrapHandler,
+        info: ValidationInfo,
+    ) -> list[_TrivySecret] | None:
+        if (
+            info.data.get("class_") == "secret"
+            and info.context is not None
+            and info.context["consume_secrets"]
+        ):
+            return handler(value)
+        return None
+
+
+type _TrivyResult = _TrivyLanguageResult | _TrivyNonLanguageResult
+
+
+class _TrivyResponse(BaseModel):
+    results: list[_TrivyResult] = Field(default_factory=list, alias="Results")
 
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
     """Run uv's native lockfile-based audit against a project."""
     cmd = ["uv", "audit", "--locked"]
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=project_path,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise TrivyScanError(f"uv audit timed out scanning {project_path}") from e
-
-    if completed.returncode not in {0, 1}:
-        raise TrivyScanError(
-            f"uv audit exited with code {completed.returncode}: "
-            f"{completed.stderr.strip()}"
-        )
+    completed = run_captured(
+        cmd,
+        project_path,
+        timeout=300,
+        label="uv audit --locked",
+        error=ScanError,
+        ok_codes={0, 1},
+    )
 
     return _parse_uv_audit_vulns(completed.stdout)
 
@@ -479,25 +408,23 @@ _UV_AUDIT_FIXED_RE = re.compile(r"^\s+Fixed in:\s+(?P<version>\S+)\s*$")
 _UV_AUDIT_URL_RE = re.compile(r"^\s+Advisory information:\s+(?P<url>\S+)\s*$")
 
 
-def _run_trivy_secret_scan(
+def scan_secrets(
     project_path: Path,
     skip_dirs: list[str] | None = None,
 ) -> list[SecretFinding]:
     """Run Trivy secrets-only scan against *project_path*."""
-    _, secrets = _run_trivy_scan(
-        project_path, scan_secrets=True, skip_dirs=skip_dirs, scanners="secret"
-    )
+    _, secrets = _run_trivy_scan(project_path, skip_dirs, scanners="secret")
     return secrets
 
 
 def _run_trivy_scan(
     project_path: Path,
-    scan_secrets: bool,
     skip_dirs: list[str] | None = None,
-    scanners: str | None = None,
+    *,
+    scanners: str,
 ) -> tuple[list[VulnFinding], list[SecretFinding]]:
     """Run Trivy against *project_path* and return parsed findings."""
-    scanners = scanners or ("vuln,secret" if scan_secrets else "vuln")
+    require_tool("trivy", TRIVY_INSTALL_HINT)
     cmd = [
         "trivy",
         "fs",
@@ -509,179 +436,87 @@ def _run_trivy_scan(
     for d in skip_dirs or []:
         cmd.extend(["--skip-dirs", d])
     cmd.append(".")
+    completed = run_captured(
+        cmd,
+        project_path,
+        timeout=300,
+        label="Trivy filesystem scan",
+        error=ScanError,
+    )
+
+    response = _parse_trivy_response(
+        completed.stdout, "Trivy", consume_secrets="secret" in scanners
+    )
     try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=project_path,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise TrivyScanError(f"Trivy timed out scanning {project_path}") from e
-
-    if completed.returncode != 0:
-        raise TrivyScanError(
-            f"Trivy exited with code {completed.returncode}: {completed.stderr.strip()}"
-        )
-
-    try:
-        trivy_output = json.loads(completed.stdout)
-    except json.JSONDecodeError as e:
-        raise TrivyScanError(f"Failed to parse Trivy output: {e}") from e
-
-    results = trivy_output.get("Results", [])
-    return _parse_vulns(results), _parse_secrets(results)
+        return _parse_vulns(response.results), _parse_secrets(response.results)
+    except ValidationError as e:
+        msg = f"Malformed Trivy finding fields: {e}"
+        raise ScanError(msg) from e
 
 
-def _parse_vulns(results: list[dict]) -> list[VulnFinding]:
+def _parse_vulns(results: list[_TrivyResult]) -> list[VulnFinding]:
     """Extract vulnerability findings from Trivy results."""
     findings: list[VulnFinding] = []
     for result in results:
-        if result.get("Class") != "lang-pkgs":
+        if not isinstance(result, _TrivyLanguageResult):
             continue
-        for v in result.get("Vulnerabilities") or []:
-            severity_raw = v.get("Severity", "UNKNOWN").upper()
+        for vulnerability in result.vulnerabilities or []:
+            severity_raw = vulnerability.severity.upper()
             try:
                 severity = Severity(severity_raw)
             except ValueError:
                 severity = Severity.UNKNOWN
 
             published = None
-            if v.get("PublishedDate"):
-                try:
-                    published = datetime.fromisoformat(v["PublishedDate"])
-                except ValueError:
-                    pass
+            if vulnerability.published_date:
+                with contextlib.suppress(ValueError):
+                    published = datetime.fromisoformat(vulnerability.published_date)
 
             findings.append(
                 VulnFinding(
-                    vuln_id=v["VulnerabilityID"],
-                    pkg_name=v["PkgName"],
-                    installed_version=v["InstalledVersion"],
-                    fixed_version=v.get("FixedVersion"),
+                    vuln_id=vulnerability.vulnerability_id,
+                    pkg_name=vulnerability.pkg_name,
+                    installed_version=vulnerability.installed_version,
+                    fixed_version=vulnerability.fixed_version,
                     severity=severity,
-                    title=v.get("Title", ""),
-                    description=v.get("Description", ""),
-                    status=v.get("Status", "unknown"),
-                    primary_url=v.get("PrimaryURL"),
+                    title=vulnerability.title,
+                    description=vulnerability.description,
+                    status=vulnerability.status,
+                    primary_url=vulnerability.primary_url,
                     published_date=published,
                 )
             )
     return findings
 
 
-def _parse_secrets(results: list[dict]) -> list[SecretFinding]:
+def _parse_secrets(results: list[_TrivyResult]) -> list[SecretFinding]:
     """Extract secret findings from Trivy results."""
     return [
         SecretFinding(
-            file=result.get("Target", ""),
-            rule_id=s.get("RuleID", ""),
-            title=s.get("Title", ""),
-            severity=s.get("Severity", "UNKNOWN"),
+            file=result.target,
+            rule_id=secret.rule_id,
+            title=secret.title,
+            severity=secret.severity,
         )
         for result in results
-        if result.get("Class") == "secret"
-        for s in result.get("Secrets") or []
+        if isinstance(result, _TrivyNonLanguageResult) and result.class_ == "secret"
+        for secret in result.secrets or []
     ]
 
 
-def _inventory_modules(
-    payload: bytes, report: ResolutionReport
-) -> tuple[ModuleId, ...]:
-    try:
-        document = json.loads(payload)
-        if not isinstance(document, dict) or document.get("bomFormat") != "CycloneDX":
-            raise ValueError("expected CycloneDX object")
-        found: set[ModuleId] = set()
-        local_projects = {
-            project.project_path: project.module for project in report.local_projects
-        }
-
-        def visit(rows):
-            if not isinstance(rows, list):
-                raise ValueError("components must be an array")
-            for row in rows:
-                if not isinstance(row, dict):
-                    raise ValueError("component must be an object")
-                purl = row.get("purl", "")
-                if not isinstance(purl, str):
-                    raise ValueError("component purl must be a string")
-                if purl.startswith("pkg:maven/"):
-                    identity = (
-                        purl.removeprefix("pkg:maven/")
-                        .split("?", 1)[0]
-                        .split("#", 1)[0]
-                    )
-                    coordinate, separator, version = identity.rpartition("@")
-                    group, slash, artifact = coordinate.partition("/")
-                    if (
-                        not separator
-                        or not slash
-                        or not group
-                        or not artifact
-                        or not version
-                    ):
-                        raise ValueError("malformed Maven purl")
-                    module = ModuleId(
-                        group=unquote(group),
-                        artifact=unquote(artifact),
-                        version=unquote(version),
-                    )
-                    qualifiers = parse_qs(urlsplit(purl).query, keep_blank_values=True)
-                    if "project_path" in qualifiers:
-                        paths = qualifiers["project_path"]
-                        if len(paths) != 1 or local_projects.get(paths[0]) != module:
-                            raise ValueError("unverified local project identity")
-                    else:
-                        found.add(module)
-                elif row.get("type") == "library" and not purl:
-                    raise ValueError("library component has no package identity")
-                visit(row.get("components", []))
-
-        visit(document.get("components", []))
-        return tuple(
-            sorted(
-                found,
-                key=lambda module: (module.group, module.artifact, module.version),
-            )
-        )
-    except (ValueError, TypeError, ValidationError) as exc:
-        raise GradleError(f"Malformed CycloneDX inventory: {exc}") from exc
-
-
-def _resolution_module_scopes(report: ResolutionReport) -> dict[ModuleId, set[ScopeId]]:
-    scopes: dict[ModuleId, set[ScopeId]] = {}
-    for result in report.scopes:
-        for component in result.components:
-            if component.module is not None:
-                scopes.setdefault(component.module, set()).add(result.scope)
-    return scopes
-
-
-def _inventory_coverage_errors(
-    modules: tuple[ModuleId, ...], scopes: dict[ModuleId, set[ScopeId]]
-) -> tuple[str, ...]:
-    inventory = set(modules)
-    return tuple(
-        f"Inventory module has no selected resolution identity: {module}"
-        for module in modules
-        if module not in scopes
-    ) + tuple(
-        f"resolved module missing from inventory: {module}"
-        for module in scopes
-        if module not in inventory
-    )
-
-
 def capture_gradle_snapshot(
-    project: ProjectConfig, context: ComparisonContext
+    project: ProjectConfig,
+    context: ComparisonContext,
+    *,
+    vcs: VcsServices,
+    clock: Clock,
 ) -> GradleSnapshot | IncompleteResolution:
-    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
-        raise TrivyScanError(
-            "Comparison context expired or inputs changed; rebuild baseline and tip"
-        )
-    with generate_gradle_report(project) as (bom, resolution):
+    services = vcs
+    if not context_inputs_valid(context, project, clock()):
+        msg = "Comparison context expired or inputs changed; rebuild baseline and tip"
+        raise GradleError(msg)
+    with generate_gradle_report(project) as generated:
+        resolution = generated.resolution
         if isinstance(resolution, IncompleteResolution):
             return resolution
         report = resolution.report
@@ -692,33 +527,25 @@ def capture_gradle_snapshot(
             return IncompleteResolution(
                 report=report, reasons=("selected scopes or producer versions changed",)
             )
-        inventory = bom.read_bytes()
-        modules = _inventory_modules(inventory, report)
-        scopes = _resolution_module_scopes(report)
-        coverage_errors = _inventory_coverage_errors(modules, scopes)
-        if coverage_errors:
-            return IncompleteResolution(
-                report=report,
-                reasons=coverage_errors,
-            )
+        coverage = bind_inventory(generated.inventory, report)
+        if coverage.errors:
+            return IncompleteResolution(report=report, reasons=coverage.errors)
+        modules, scopes = coverage.modules, coverage.scopes
+        inventory = generated.inventory_bytes
+        bom = generated.bom_path
         binary = next(
             key.removeprefix("binary:")
             for key in context.loaded_input_digests
             if key.startswith("binary:")
         )
         trivy_started = time.monotonic()
-        try:
-            completed = subprocess.run(
-                [binary, *context.scanner_flags, str(bom)],
-                cwd=project.path,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
-            raise TrivyScanError(f"Trivy snapshot failed: {exc}") from exc
-        if completed.returncode != 0:
-            raise TrivyScanError(f"Trivy snapshot failed: {completed.stderr.strip()}")
+        completed = run_captured(
+            [binary, *context.scanner_flags, str(bom)],
+            project.path,
+            timeout=300,
+            label="Trivy snapshot",
+            error=ScanError,
+        )
         logging.getLogger(__name__).info(
             "Gradle Trivy snapshot %.3fs", time.monotonic() - trivy_started
         )
@@ -742,18 +569,14 @@ def capture_gradle_snapshot(
                     advisory_id=row.vuln_id, coordinate=row.pkg_name, scope=scope
                 )
                 grouped.setdefault(key, []).append(row)
-        rank = {
-            Severity.UNKNOWN: 0,
-            Severity.LOW: 1,
-            Severity.MEDIUM: 2,
-            Severity.HIGH: 3,
-            Severity.CRITICAL: 4,
-        }
         findings = tuple(
             FindingEvidence(
                 key=key,
                 affected_versions=frozenset(row.installed_version for row in evidence),
-                severity=max((row.severity for row in evidence), key=rank.__getitem__),
+                severity=max(
+                    (row.severity for row in evidence),
+                    key=lambda severity: severity.rank,
+                ),
                 has_unknown=any(row.severity == Severity.UNKNOWN for row in evidence),
                 rows=tuple(evidence),
             )
@@ -769,10 +592,11 @@ def capture_gradle_snapshot(
             )
         )
     # Generated report/BOM cleanup must precede the jj source-tree snapshot.
-    if not context_inputs_valid(context, project, datetime.now(timezone.utc)):
-        raise TrivyScanError("Comparison inputs changed during capture")
+    if not context_inputs_valid(context, project, clock()):
+        msg = "Comparison inputs changed during capture"
+        raise GradleError(msg)
     return GradleSnapshot(
-        tree_id=revision_tree_id(Path(project.path)),
+        tree_id=services.repository(Path(project.path)).tree_id(),
         resolution=resolution,
         context_identity=context.identity,
         findings=findings,

@@ -7,11 +7,13 @@ from pydantic import ValidationError
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
+    UnknownProjectError,
     ensure_mm_home,
     load_config,
     resolve_project,
 )
 from maintenance_man.models.config import DefaultsConfig, MmConfig, ProjectConfig
+from tests.conftest import write_config
 
 
 class TestDefaultsConfig:
@@ -141,7 +143,7 @@ class TestEnsureMmHome:
     def test_does_not_overwrite_existing_config(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         config_path = mm_home / "config.toml"
-        config_path.write_text("[defaults]\nmin_version_age_days = 30\n")
+        write_config(mm_home, "[defaults]\nmin_version_age_days = 30\n")
         ensure_mm_home()
         text = config_path.read_text()
         assert "30" in text
@@ -152,7 +154,7 @@ class TestLoadConfig:
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
-        (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 14\n")
+        write_config(mm_home, "[defaults]\nmin_version_age_days = 14\n")
         config = load_config()
         assert config.defaults.min_version_age_days == 14
 
@@ -164,21 +166,25 @@ class TestLoadConfig:
 
     def test_invalid_config_raises_config_error(self, mm_home: Path):
         mm_home.mkdir(parents=True)
-        (mm_home / "config.toml").write_text("[defaults]\nbogus_key = true\n")
+        write_config(mm_home, "[defaults]\nbogus_key = true\n")
         with pytest.raises(ConfigError):
             load_config()
 
     def test_loads_from_custom_path(self, tmp_path: Path):
         """load_config(config_path=...) reads from the given file."""
-        config_file = tmp_path / "custom-config.toml"
-        config_file.write_text("[defaults]\nmin_version_age_days = 42\n")
+        config_file = write_config(
+            tmp_path,
+            "[defaults]\nmin_version_age_days = 42\n",
+            filename="custom-config.toml",
+        )
         config = load_config(config_path=config_file)
         assert config.defaults.min_version_age_days == 42
 
     def test_custom_path_does_not_create_mm_home(self, mm_home: Path):
         """Using a custom config path should not create ~/.mm/."""
-        config_file = mm_home.parent / "custom-config.toml"
-        config_file.write_text("[defaults]\n")
+        config_file = write_config(
+            mm_home.parent, "[defaults]\n", filename="custom-config.toml"
+        )
         load_config(config_path=config_file)
         assert not mm_home.exists()
 
@@ -191,9 +197,9 @@ class TestLoadConfig:
         """Relative project paths resolve against config file's parent dir."""
         project_dir = tmp_path / "projects" / "myapp"
         project_dir.mkdir(parents=True)
-        config_file = tmp_path / "config.toml"
-        config_file.write_text(
-            '[projects.myapp]\npath = "projects/myapp"\npackage_manager = "bun"\n'
+        config_file = write_config(
+            tmp_path,
+            '[projects.myapp]\npath = "projects/myapp"\npackage_manager = "bun"\n',
         )
         config = load_config(config_path=config_file)
         assert config.projects["myapp"].path == project_dir
@@ -202,9 +208,9 @@ class TestLoadConfig:
         """Absolute project paths are not modified during resolution."""
         project_dir = tmp_path / "myapp"
         project_dir.mkdir()
-        config_file = tmp_path / "config.toml"
-        config_file.write_text(
-            f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "bun"\n'
+        config_file = write_config(
+            tmp_path,
+            f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "bun"\n',
         )
         config = load_config(config_path=config_file)
         assert config.projects["myapp"].path == project_dir
@@ -217,8 +223,9 @@ class TestResolveProject:
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
-        (mm_home / "config.toml").write_text(
-            f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "bun"\n'
+        write_config(
+            mm_home,
+            f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "bun"\n',
         )
         config = load_config()
         proj = resolve_project(config, "myapp")
@@ -228,18 +235,20 @@ class TestResolveProject:
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
-        (mm_home / "config.toml").write_text("[defaults]\n")
+        write_config(mm_home, "[defaults]\n")
         config = load_config()
-        with pytest.raises(ProjectNotFoundError):
+        with pytest.raises(UnknownProjectError):
             resolve_project(config, "nonexistent")
 
     def test_missing_path_raises_project_not_found(self, mm_home: Path):
         mm_home.mkdir(parents=True)
         (mm_home / "scan-results").mkdir()
         (mm_home / "workspaces").mkdir()
-        (mm_home / "config.toml").write_text(
-            '[projects.myapp]\npath = "/nonexistent/path"\npackage_manager = "bun"\n'
+        write_config(
+            mm_home,
+            '[projects.myapp]\npath = "/nonexistent/path"\npackage_manager = "bun"\n',
         )
         config = load_config()
-        with pytest.raises(ProjectNotFoundError):
+        with pytest.raises(ProjectNotFoundError) as raised:
             resolve_project(config, "myapp")
+        assert not isinstance(raised.value, UnknownProjectError)

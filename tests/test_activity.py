@@ -1,27 +1,22 @@
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock
 
-from maintenance_man.cli import _current_label
-from maintenance_man.models.activity import (
-    ActivityEvent,
-    load_activity,
-    record_activity,
-)
+from maintenance_man.models.activity import ActivityEvent
+from maintenance_man.storage import load_activity, record_activity
 
-_TS = datetime(2026, 3, 20, 14, 32, tzinfo=timezone.utc)
+_TS = datetime(2026, 3, 20, 14, 32, tzinfo=UTC)
 
 
 class TestActivityEvent:
     def test_timestamp_truncated_to_minutes(self):
         """Seconds and microseconds stripped from timestamp."""
         event = ActivityEvent(
-            timestamp=datetime(2026, 3, 20, 14, 32, 45, 123456, tzinfo=timezone.utc),
+            timestamp=datetime(2026, 3, 20, 14, 32, 45, 123456, tzinfo=UTC),
             success=True,
             branch="main",
         )
-        assert event.timestamp == datetime(2026, 3, 20, 14, 32, tzinfo=timezone.utc)
+        assert event.timestamp == datetime(2026, 3, 20, 14, 32, tzinfo=UTC)
         assert event.timestamp.second == 0
         assert event.timestamp.microsecond == 0
 
@@ -55,22 +50,6 @@ class TestLoadActivity:
         assert result["myapp"].last_build.success is True
 
 
-class TestCliCurrentLabel:
-    def test_uses_jj_current_label(self, tmp_path: Path, monkeypatch):
-        mock_label = MagicMock(return_value="mm/update-dependencies")
-        monkeypatch.setattr("maintenance_man.cli.current_label", mock_label)
-
-        assert _current_label(tmp_path) == "mm/update-dependencies"
-        mock_label.assert_called_once_with(tmp_path)
-
-    def test_never_raises(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setattr(
-            "maintenance_man.cli.current_label", MagicMock(side_effect=RuntimeError)
-        )
-
-        assert _current_label(tmp_path) == "unknown"
-
-
 class TestRecordActivity:
     def test_records_build_event(self, tmp_path: Path):
         path = tmp_path / "activity.json"
@@ -79,6 +58,7 @@ class TestRecordActivity:
         assert result["myapp"].last_build is not None
         assert result["myapp"].last_build.success is True
         assert result["myapp"].last_build.branch == "main"
+        assert result["myapp"].last_build.commit_id is None
         assert result["myapp"].last_deploy is None
 
     def test_records_deploy_event(self, tmp_path: Path):
@@ -130,13 +110,6 @@ class TestCommitId:
         result = load_activity(path)
         assert result["myapp"].last_deploy is not None
         assert result["myapp"].last_deploy.commit_id == "abc123"
-
-    def test_commit_id_defaults_to_none(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        record_activity(path, "myapp", "build", success=True, branch="main")
-        result = load_activity(path)
-        assert result["myapp"].last_build is not None
-        assert result["myapp"].last_build.commit_id is None
 
     def test_legacy_record_without_commit_id_loads_as_none(self, tmp_path: Path):
         path = tmp_path / "activity.json"

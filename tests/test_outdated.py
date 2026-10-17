@@ -1,74 +1,46 @@
 import json
+import os
 import subprocess
 from pathlib import Path
-from typing import Literal
 from unittest.mock import patch
 
 import pytest
 
-import maintenance_man.outdated
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import SemverTier
 from maintenance_man.outdated import (
     OutdatedCheckError,
     _get_uv_direct_dep_names,
-    _normalise_pkg_name,
     bun_outdated,
-    classify_semver,
-    get_outdated,
     mvn_outdated,
     uv_outdated,
 )
-from tests.conftest import make_update
+from tests.conftest import completed, make_project
+from tests.fakes import FakeCommands
 
 
-def _make_project(
-    pm: Literal["bun", "uv", "mvn", "gradle"], path: str = "/tmp/fake"
-) -> ProjectConfig:
-    return ProjectConfig(path=Path(path), package_manager=pm)
-
-
-class TestClassifySemver:
-    def test_patch_update(self):
-        assert classify_semver("1.2.3", "1.2.4") == SemverTier.PATCH
-
-    def test_minor_update(self):
-        assert classify_semver("1.2.3", "1.3.0") == SemverTier.MINOR
-
-    def test_major_update(self):
-        assert classify_semver("1.2.3", "2.0.0") == SemverTier.MAJOR
-
-    def test_major_update_no_reset(self):
-        assert classify_semver("1.2.3", "2.1.0") == SemverTier.MAJOR
-
-    def test_same_version(self):
-        assert classify_semver("1.2.3", "1.2.3") == SemverTier.UNKNOWN
-
-    def test_non_semver_input(self):
-        assert classify_semver("abc", "def") == SemverTier.UNKNOWN
-
-    def test_two_part_version(self):
-        assert classify_semver("1.2", "1.3") == SemverTier.MINOR
-
-    def test_four_part_version(self):
-        assert classify_semver("1.2.3.4", "1.2.4.0") == SemverTier.PATCH
-
-
-class TestNormalisePkgName:
-    def test_lowercase(self):
-        assert _normalise_pkg_name("Requests") == "requests"
-
-    def test_underscores_to_hyphens(self):
-        assert _normalise_pkg_name("pydantic_core") == "pydantic-core"
-
-    def test_dots_to_hyphens(self):
-        assert _normalise_pkg_name("zope.interface") == "zope-interface"
-
-    def test_consecutive_separators(self):
-        assert _normalise_pkg_name("Foo-_.Bar") == "foo-bar"
-
-    def test_already_normalised(self):
-        assert _normalise_pkg_name("rich") == "rich"
+def _fake_commands(
+    project: ProjectConfig,
+    *results: subprocess.CompletedProcess[str] | BaseException,
+) -> FakeCommands:
+    commands = FakeCommands()
+    command_lines = {
+        "uv": (
+            ("uv", "sync", "--locked"),
+            ("uv", "pip", "list", "--outdated", "--format", "json"),
+        ),
+        "bun": (("bun", "outdated", "--no-progress"),),
+        "mvn": (
+            (
+                "mvn",
+                "versions:display-dependency-updates",
+                "-DprocessDependencyManagement=false",
+            ),
+        ),
+    }[project.package_manager]
+    for index, result in enumerate(results):
+        commands.add(command_lines[index], cwd=project.path, result=result)
+    return commands
 
 
 class TestGetUvDirectDepNames:
@@ -138,41 +110,40 @@ class TestUvOutdated:
     def test_syncs_environment_before_checking_outdated(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text('[project]\ndependencies = ["requests==2.31.0"]\n')
-        sync_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        list_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="[]", stderr=""
-        )
+        sync_result = completed([], returncode=0, stdout="", stderr="")
+        list_result = completed([], returncode=0, stdout="[]", stderr="")
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch(
-            "maintenance_man.outdated.subprocess.run",
-            side_effect=[sync_completed, list_completed],
-        ) as run:
+        commands = _fake_commands(project, sync_result, list_result)
+        with patch("maintenance_man.outdated.run_captured", commands):
             updates = uv_outdated(project)
 
         assert updates == []
-        assert run.call_args_list[0].args[0] == ["uv", "sync", "--locked"]
-        assert run.call_args_list[1].args[0][:5] == [
-            "uv",
-            "pip",
-            "list",
-            "--outdated",
-            "--format",
+        assert [call[0] for call in commands.calls] == [
+            ("uv", "sync", "--locked"),
+            ("uv", "pip", "list", "--outdated", "--format", "json"),
         ]
 
     def test_sync_failure_raises(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text('[project]\ndependencies = ["requests==2.31.0"]\n')
-        failed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="", stderr="lock stale"
-        )
+        failed = OutdatedCheckError("uv sync --locked failed (exit 1): lock stale")
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=failed):
-            with pytest.raises(OutdatedCheckError, match="uv sync --locked"):
-                uv_outdated(project)
+        commands = _fake_commands(project, failed)
+        with (
+            patch("maintenance_man.outdated.run_captured", commands),
+            pytest.raises(OutdatedCheckError, match="uv sync --locked"),
+        ):
+            uv_outdated(project)
+        ((argv, cwd, kwargs),) = commands.calls
+        assert argv == ("uv", "sync", "--locked")
+        assert cwd == project.path
+        assert kwargs == {
+            "timeout": 300,
+            "label": "uv sync --locked",
+            "error": OutdatedCheckError,
+        }
 
     def test_parses_json_output(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
@@ -196,18 +167,12 @@ class TestUvOutdated:
                 },
             ]
         )
-        sync_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        list_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_json, stderr=""
-        )
+        sync_result = completed([], returncode=0, stdout="", stderr="")
+        list_result = completed([], returncode=0, stdout=fake_json, stderr="")
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch(
-            "maintenance_man.outdated.subprocess.run",
-            side_effect=[sync_completed, list_completed],
-        ):
+        commands = _fake_commands(project, sync_result, list_result)
+        with patch("maintenance_man.outdated.run_captured", commands):
             updates = uv_outdated(project)
 
         assert len(updates) == 2
@@ -221,37 +186,84 @@ class TestUvOutdated:
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text("[project]\ndependencies = []\n")
 
-        sync_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        list_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="[]", stderr=""
-        )
+        sync_result = completed([], returncode=0, stdout="", stderr="")
+        list_result = completed([], returncode=0, stdout="[]", stderr="")
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch(
-            "maintenance_man.outdated.subprocess.run",
-            side_effect=[sync_completed, list_completed],
-        ):
+        commands = _fake_commands(project, sync_result, list_result)
+        with patch("maintenance_man.outdated.run_captured", commands):
             updates = uv_outdated(project)
 
         assert updates == []
 
     def test_command_failure_raises(self, tmp_path):
-        sync_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        list_failed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="", stderr="error"
+        sync_result = completed([], returncode=0, stdout="", stderr="")
+        list_failed = OutdatedCheckError(
+            "uv pip list --outdated failed (exit 1): error"
         )
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch(
-            "maintenance_man.outdated.subprocess.run",
-            side_effect=[sync_completed, list_failed],
+        commands = _fake_commands(project, sync_result, list_failed)
+        with (
+            patch("maintenance_man.outdated.run_captured", commands),
+            pytest.raises(OutdatedCheckError, match="uv pip list --outdated"),
         ):
-            with pytest.raises(OutdatedCheckError, match="uv pip list --outdated"):
-                uv_outdated(project)
+            uv_outdated(project)
+        _, (argv, cwd, kwargs) = commands.calls
+        assert argv == ("uv", "pip", "list", "--outdated", "--format", "json")
+        assert cwd == project.path
+        assert kwargs == {
+            "timeout": 120,
+            "label": "uv pip list --outdated",
+            "error": OutdatedCheckError,
+        }
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            '{"name": "a"}',
+            '"text"',
+            "[1]",
+            '[{"version": "1.0", "latest_version": "2.0"}]',
+            '[{"name": "a", "version": 1, "latest_version": "2.0"}]',
+            '[{"name": "a", "version": "1.0"}]',
+        ],
+    )
+    def test_uv_outdated_rejects_wrongly_shaped_output(
+        self, tmp_path, monkeypatch, payload
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: {"a"}
+        )
+        project = make_project(tmp_path, package_manager="uv")
+        commands = _fake_commands(
+            project,
+            completed(),
+            completed(stdout=payload),
+        )
+        monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+        with pytest.raises(OutdatedCheckError, match="Unexpected uv output"):
+            uv_outdated(project)
+
+    def test_given_empty_latest_version_when_uv_outdated_runs_then_row_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: {"a"}
+        )
+        project = make_project(tmp_path, package_manager="uv")
+        commands = _fake_commands(
+            project,
+            completed(),
+            completed(
+                stdout='[{"name":"a","version":"1.0","latest_version":"","Extra":1}]'
+            ),
+        )
+        monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+
+        updates = uv_outdated(project)
+
+        assert updates == []
 
     def test_excludes_transitive_deps(self, tmp_path):
         """uv_outdated should only return direct dependencies from pyproject.toml."""
@@ -279,18 +291,12 @@ class TestUvOutdated:
                 },
             ]
         )
-        sync_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        list_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_json, stderr=""
-        )
+        sync_result = completed([], returncode=0, stdout="", stderr="")
+        list_result = completed([], returncode=0, stdout=fake_json, stderr="")
         project = ProjectConfig(path=tmp_path, package_manager="uv")
 
-        with patch(
-            "maintenance_man.outdated.subprocess.run",
-            side_effect=[sync_completed, list_completed],
-        ):
+        commands = _fake_commands(project, sync_result, list_result)
+        with patch("maintenance_man.outdated.run_captured", commands):
             updates = uv_outdated(project)
 
         pkg_names = [u.pkg_name for u in updates]
@@ -307,12 +313,12 @@ class TestBunOutdated:
             "| lodash     | 4.17.20 | 4.17.21 | 4.17.21 |\n"
             "| express    | 4.18.0  | 4.18.3  | 5.0.0   |\n"
         )
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_output, stderr=""
-        )
-        project = _make_project("bun")
+        result = completed([], returncode=0, stdout=fake_output, stderr="")
+        project = make_project(Path("/tmp/fake"), package_manager="bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch(
+            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
+        ):
             updates = bun_outdated(project)
 
         assert len(updates) == 2
@@ -331,51 +337,40 @@ class TestBunOutdated:
             "| typescript (peer) | 5.9.3   | 6.0.2  | 6.0.2  |\n"
             "| eslint (dev)      | 8.0.0   | 9.0.0  | 9.0.0  |\n"
         )
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_output, stderr=""
-        )
-        project = _make_project("bun")
+        result = completed([], returncode=0, stdout=fake_output, stderr="")
+        project = make_project(Path("/tmp/fake"), package_manager="bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch(
+            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
+        ):
             updates = bun_outdated(project)
 
         assert len(updates) == 2
         assert updates[0].pkg_name == "typescript"
         assert updates[1].pkg_name == "eslint"
 
-    def test_empty_output(self):
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        project = _make_project("bun")
+    def test_empty_output_disables_progress(self):
+        result = completed([], returncode=0, stdout="", stderr="")
+        project = make_project(Path("/tmp/fake"), package_manager="bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        commands = _fake_commands(project, result)
+        with patch("maintenance_man.outdated.run_captured", commands):
             updates = bun_outdated(project)
 
         assert updates == []
-
-    def test_disables_progress_output_to_avoid_bun_resolving_hangs(self):
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
-        project = _make_project("bun")
-
-        with patch(
-            "maintenance_man.outdated.subprocess.run", return_value=completed
-        ) as run:
-            bun_outdated(project)
-
-        assert run.call_args.args[0] == ["bun", "outdated", "--no-progress"]
+        assert commands.calls[0][0] == ("bun", "outdated", "--no-progress")
 
     def test_command_failure_raises(self):
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="", stderr="error"
-        )
-        project = _make_project("bun")
+        result = completed([], returncode=1, stdout="", stderr="error")
+        project = make_project(Path("/tmp/fake"), package_manager="bun")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            with pytest.raises(OutdatedCheckError):
-                bun_outdated(project)
+        with (
+            patch(
+                "maintenance_man.outdated.run_captured", _fake_commands(project, result)
+            ),
+            pytest.raises(OutdatedCheckError),
+        ):
+            bun_outdated(project)
 
 
 class TestMvnOutdated:
@@ -386,12 +381,12 @@ class TestMvnOutdated:
             "[INFO]   org.slf4j:slf4j-api .................. 2.0.9 -> 2.0.16\n"
             "[INFO] \n"
         )
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_output, stderr=""
-        )
-        project = _make_project("mvn")
+        result = completed([], returncode=0, stdout=fake_output, stderr="")
+        project = make_project(Path("/tmp/fake"), package_manager="mvn")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch(
+            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
+        ):
             updates = mvn_outdated(project)
 
         assert len(updates) == 2
@@ -403,78 +398,99 @@ class TestMvnOutdated:
 
     def test_no_updates_available(self):
         fake_output = "[INFO] No dependencies in Dependencies have newer versions.\n"
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_output, stderr=""
-        )
-        project = _make_project("mvn")
+        result = completed([], returncode=0, stdout=fake_output, stderr="")
+        project = make_project(Path("/tmp/fake"), package_manager="mvn")
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
+        with patch(
+            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
+        ):
             updates = mvn_outdated(project)
 
         assert updates == []
 
     def test_command_failure_raises(self):
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="", stderr="BUILD FAILURE"
+        result = OutdatedCheckError(
+            "mvn versions:display-dependency-updates failed (exit 1): BUILD FAILURE"
         )
-        project = _make_project("mvn")
+        project = make_project(Path("/tmp/fake"), package_manager="mvn")
+        commands = _fake_commands(project, result)
 
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            with pytest.raises(OutdatedCheckError):
-                mvn_outdated(project)
-
-
-class TestGetOutdated:
-    def test_dispatches_to_bun(self):
-        project = _make_project("bun")
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
+        with (
+            patch("maintenance_man.outdated.run_captured", commands),
+            pytest.raises(OutdatedCheckError),
+        ):
+            mvn_outdated(project)
+        ((argv, cwd, kwargs),) = commands.calls
+        assert argv == (
+            "mvn",
+            "versions:display-dependency-updates",
+            "-DprocessDependencyManagement=false",
         )
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            updates = get_outdated(project)
-        assert updates == []
-
-    def test_dispatches_to_uv(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text("[project]\ndependencies = []\n")
-
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="[]", stderr=""
-        )
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            updates = get_outdated(project)
-        assert updates == []
-
-    def test_dispatches_to_mvn(self):
-        project = _make_project("mvn")
-        fake_output = "[INFO] No dependencies in Dependencies have newer versions.\n"
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=fake_output, stderr=""
-        )
-        with patch("maintenance_man.outdated.subprocess.run", return_value=completed):
-            updates = get_outdated(project)
-        assert updates == []
-
-    def test_unsupported_manager_raises(self):
-        project = _make_project("bun")
-        # Bypass Pydantic validation to test the guard
-        object.__setattr__(project, "package_manager", "npm")
-        with pytest.raises(OutdatedCheckError):
-            get_outdated(project)
+        assert cwd == project.path
+        assert kwargs == {
+            "timeout": 300,
+            "label": "mvn versions:display-dependency-updates",
+            "error": OutdatedCheckError,
+        }
 
 
-def test_get_outdated_dispatches_gradle(monkeypatch):
-    project = ProjectConfig(path=Path("/tmp/fake"), package_manager="gradle")
-    seen: list[ProjectConfig] = []
-    sentinel = [make_update(pkg_name="room")]
-    # _CHECKERS captures the function object at import time, so patching the
-    # module attribute would not change what get_outdated calls.
-    monkeypatch.setitem(
-        maintenance_man.outdated._CHECKERS,
-        "gradle",
-        lambda p: (seen.append(p), sentinel)[1],
+def test_given_uv_project_when_checking_outdated_then_command_contract_is_delegated(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    monkeypatch.setenv("PATH", os.pathsep.join(["/host/venv/bin", "/usr/bin"]))
+    monkeypatch.setattr(
+        "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: set()
     )
+    project = make_project(tmp_path, package_manager="uv")
+    commands = _fake_commands(project, completed(), completed(stdout="[]"))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
 
-    assert get_outdated(project) is sentinel
-    assert seen == [project]
+    assert uv_outdated(project) == []
+    assert [cmd[:3] for cmd, _, _ in commands.calls] == [
+        ("uv", "sync", "--locked"),
+        ("uv", "pip", "list"),
+    ]
+    assert [kwargs for _, _, kwargs in commands.calls] == [
+        {
+            "timeout": 300,
+            "label": "uv sync --locked",
+            "error": OutdatedCheckError,
+        },
+        {
+            "timeout": 120,
+            "label": "uv pip list --outdated",
+            "error": OutdatedCheckError,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        FileNotFoundError(2, "No such file or directory", "uv"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_given_command_execution_failure_when_checking_outdated_then_error_is_requested(
+    tmp_path, monkeypatch, raised
+):
+    project = make_project(tmp_path, package_manager="uv")
+    error = OutdatedCheckError(
+        f"Could not run uv sync --locked in {tmp_path}: {raised}"
+    )
+    error.__cause__ = raised
+    commands = _fake_commands(project, error)
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+    with pytest.raises(
+        OutdatedCheckError, match=r"^Could not run uv sync --locked in "
+    ):
+        uv_outdated(project)
+    ((argv, cwd, kwargs),) = commands.calls
+    assert argv == ("uv", "sync", "--locked")
+    assert cwd == project.path
+    assert kwargs == {
+        "timeout": 300,
+        "label": "uv sync --locked",
+        "error": OutdatedCheckError,
+    }

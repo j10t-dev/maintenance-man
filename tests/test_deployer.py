@@ -1,97 +1,6 @@
-import subprocess
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from maintenance_man.deployer import (
-    BuildError,
-    DeployError,
-    check_health,
-    run_build,
-    run_deploy,
-)
-
-
-class TestRunBuild:
-    @patch("maintenance_man.deployer.subprocess.run")
-    def test_successful_build(self, mock_run: MagicMock, tmp_path: Path) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
-        run_build("myproject", "scripts/build.sh", tmp_path)
-        mock_run.assert_called_once()
-        call_kwargs = mock_run.call_args.kwargs
-        assert call_kwargs["cwd"] == tmp_path
-        assert call_kwargs["shell"] is True
-        assert call_kwargs["executable"] == "/bin/bash"
-        assert call_kwargs["timeout"] == 600
-
-    @patch("maintenance_man.deployer.subprocess.run")
-    def test_failed_build_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1)
-        with pytest.raises(BuildError, match="myproject"):
-            run_build("myproject", "scripts/build.sh", tmp_path)
-
-    @patch("maintenance_man.deployer.subprocess.run")
-    def test_build_strips_virtual_env(
-        self,
-        mock_run: MagicMock,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("VIRTUAL_ENV", "/some/venv")
-        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
-        run_build("myproject", "scripts/build.sh", tmp_path)
-        env = mock_run.call_args.kwargs["env"]
-        assert "VIRTUAL_ENV" not in env
-
-    @patch("maintenance_man.deployer.subprocess.run")
-    def test_build_scrubs_venv_from_path(
-        self,
-        mock_run: MagicMock,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        venv_dir = "/some/venv"
-        monkeypatch.setenv("VIRTUAL_ENV", venv_dir)
-        monkeypatch.setenv("PATH", f"{venv_dir}/bin:/usr/bin:/bin")
-        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
-        run_build("myproject", "scripts/build.sh", tmp_path)
-        env = mock_run.call_args.kwargs["env"]
-        assert f"{venv_dir}/bin" not in env["PATH"].split(":")
-        assert "/usr/bin" in env["PATH"].split(":")
-
-    @patch(
-        "maintenance_man.deployer.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(cmd="scripts/build.sh", timeout=600),
-    )
-    def test_build_timeout_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
-        with pytest.raises(BuildError, match="timed out"):
-            run_build("myproject", "scripts/build.sh", tmp_path)
-
-
-class TestRunDeploy:
-    @patch("maintenance_man.deployer.subprocess.run")
-    def test_successful_deploy(self, mock_run: MagicMock, tmp_path: Path) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
-        run_deploy("myproject", "scripts/deploy.sh", tmp_path)
-        mock_run.assert_called_once()
-        call_kwargs = mock_run.call_args.kwargs
-        assert call_kwargs["shell"] is True
-        assert call_kwargs["executable"] == "/bin/bash"
-
-    @patch("maintenance_man.deployer.subprocess.run")
-    def test_failed_deploy_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1)
-        with pytest.raises(DeployError, match="myproject"):
-            run_deploy("myproject", "scripts/deploy.sh", tmp_path)
-
-    @patch(
-        "maintenance_man.deployer.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(cmd="scripts/deploy.sh", timeout=600),
-    )
-    def test_deploy_timeout_raises(self, mock_run: MagicMock, tmp_path: Path) -> None:
-        with pytest.raises(DeployError, match="timed out"):
-            run_deploy("myproject", "scripts/deploy.sh", tmp_path)
+from maintenance_man.deployer import check_health
 
 
 class TestCheckHealth:
@@ -107,7 +16,9 @@ class TestCheckHealth:
 
         assert result.is_up is True
         assert result.error is None
-        mock_urlopen.assert_called_once()
+        mock_urlopen.assert_called_once_with(
+            "http://pihost:8080/api/status/lifts", timeout=10
+        )
 
     @patch("maintenance_man.deployer.urllib.request.urlopen")
     def test_unhealthy_service(self, mock_urlopen: MagicMock) -> None:

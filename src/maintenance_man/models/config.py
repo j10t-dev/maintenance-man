@@ -26,6 +26,20 @@ class ProjectConfig(BaseModel):
     deploy_command: str | None = None
     gradle_repository_routing: Literal["standard-public"] | None = None
 
+    @property
+    def test_phases(self) -> tuple[tuple[str, str], ...]:
+        """Configured test phases in run order, skipping blank commands."""
+        phases = (
+            ("unit", self.test_unit),
+            ("integration", self.test_integration),
+            ("component", self.test_component),
+        )
+        return tuple(
+            (name, command)
+            for name, command in phases
+            if command is not None and command.strip()
+        )
+
 
 class MmConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")

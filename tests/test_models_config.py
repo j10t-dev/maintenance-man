@@ -6,6 +6,24 @@ from pydantic import ValidationError
 from maintenance_man.models.config import DefaultsConfig, ProjectConfig
 
 
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
+        ({}, ()),
+        ({"test_unit": "make unit"}, (("unit", "make unit"),)),
+        (
+            {"test_unit": "u", "test_integration": "i", "test_component": "c"},
+            (("unit", "u"), ("integration", "i"), ("component", "c")),
+        ),
+        ({"test_unit": "", "test_integration": "i"}, (("integration", "i"),)),
+        ({"test_unit": "  ", "test_component": "c"}, (("component", "c"),)),
+    ],
+)
+def test_test_phases(tmp_path, fields, expected):
+    project = ProjectConfig(path=tmp_path, package_manager="uv", **fields)
+    assert project.test_phases == expected
+
+
 class TestProjectConfigTestFields:
     def test_no_test_fields(self):
         pc = ProjectConfig(path=Path("/tmp/x"), package_manager="bun")
@@ -31,10 +49,6 @@ class TestProjectConfigTestFields:
         assert pc.test_unit == "bun test"
         assert pc.test_integration == "bun run test:integration"
         assert pc.test_component == "bun run test:component"
-
-    def test_rejects_extra_fields(self):
-        with pytest.raises(ValidationError, match="unknown"):
-            ProjectConfig(path=Path("/tmp/x"), package_manager="bun", unknown="bad")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
 
 
 class TestProjectConfigScanSkipDirs:
@@ -77,12 +91,6 @@ class TestProjectConfigDeployFields:
         assert pc.deploy_command == "scripts/deploy.sh"
 
 
-def test_gradle_package_manager_is_accepted(tmp_path):
-    project = ProjectConfig(path=tmp_path, package_manager="gradle")
-
-    assert project.package_manager == "gradle"
-
-
 class TestDefaultsConfigHealthcheck:
     def test_no_healthcheck_url(self):
         dc = DefaultsConfig()
@@ -96,7 +104,11 @@ class TestDefaultsConfigHealthcheck:
 @pytest.mark.parametrize("value", [None, "standard-public"])
 def test_gradle_routing_declaration_values(tmp_path, value):
     project = ProjectConfig.model_validate(
-        dict(path=tmp_path, package_manager="gradle", gradle_repository_routing=value)
+        {
+            "path": tmp_path,
+            "package_manager": "gradle",
+            "gradle_repository_routing": value,
+        }
     )
     assert project.gradle_repository_routing == value
 
@@ -110,9 +122,9 @@ def test_gradle_routing_omission_is_backward_compatible(tmp_path):
 def test_gradle_routing_rejects_unknown_declarations(tmp_path, value):
     with pytest.raises(ValidationError, match="gradle_repository_routing"):
         ProjectConfig.model_validate(
-            dict(
-                path=tmp_path,
-                package_manager="gradle",
-                gradle_repository_routing=value,
-            )
+            {
+                "path": tmp_path,
+                "package_manager": "gradle",
+                "gradle_repository_routing": value,
+            }
         )
