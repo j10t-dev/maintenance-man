@@ -21,9 +21,7 @@ from maintenance_man.gradle import (
     discover_gradle_updates,
     parse_catalogue,
 )
-from maintenance_man.gradle_inventory import bind_inventory
 from maintenance_man.gradle_resolution import (
-    PreparedCandidate,
     generate_gradle_report,
     prepare_gradle_candidates,
     select_gradle_candidates,
@@ -31,8 +29,8 @@ from maintenance_man.gradle_resolution import (
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     CandidateWithheld,
-    CompleteResolution,
-    IncompleteResolution,
+    GradleCandidate,
+    ResolutionReport,
 )
 from maintenance_man.models.scan import (
     ScanResult,
@@ -74,11 +72,11 @@ def scan_project(
     with PublicationLookupContext(paths.publications_dir(), clock=clock) as publication:
         match project.package_manager:
             case "gradle":
-                vulns, resolution = scan_gradle(project)
+                vulns, report = scan_gradle(project)
                 vulns, updates = _prepare_gradle_scan_findings(
                     project,
                     vulns,
-                    resolution,
+                    report,
                     discover_gradle_updates(project),
                     min_version_age_days,
                     publication,
@@ -121,7 +119,7 @@ def _requested_secrets(project: ProjectConfig) -> list[SecretFinding]:
 def _prepare_gradle_scan_findings(
     project: ProjectConfig,
     vulnerabilities: list[VulnFinding],
-    resolution: CompleteResolution,
+    report: ResolutionReport,
     proposals: list[UpdateFinding],
     minimum_age_days: int,
     publication: PublicationLookupContext,
@@ -129,11 +127,11 @@ def _prepare_gradle_scan_findings(
     """Save one vulnerability row per exact source/target association, and give
     every Gradle row either its prepared target or the reason it is blocked."""
     catalogue = parse_catalogue(project.path / GRADLE_CATALOGUE_RELPATH)
-    plan = select_gradle_candidates(catalogue, resolution, vulnerabilities, proposals)
+    plan = select_gradle_candidates(catalogue, report, vulnerabilities, proposals)
     prepared = prepare_gradle_candidates(
         project,
         plan.candidates,
-        resolution,
+        report,
         publication,
         minimum_age_days,
         clock=publication.clock,
@@ -144,8 +142,7 @@ def _prepare_gradle_scan_findings(
         for row in _vulnerability_rows(index, finding, prepared, plan.withheld)
     ]
     updates = [
-        _prepared_update(update, prepared, plan.withheld, publication)
-        for update in proposals
+        _prepared_update(update, prepared, plan.withheld) for update in proposals
     ]
     return rows, updates
 
@@ -153,18 +150,18 @@ def _prepare_gradle_scan_findings(
 def _vulnerability_rows(
     index: int,
     finding: VulnFinding,
-    prepared: tuple[PreparedCandidate, ...],
+    prepared: tuple[GradleCandidate, ...],
     withheld: tuple[CandidateWithheld, ...],
 ) -> Iterator[VulnFinding]:
     if finding.fixed_version is None:
         yield finding.model_copy(update={"blocked_reason": "no published fix"})
         return
-    for item in prepared:
-        if index in item.candidate.vulnerability_indices:
+    for candidate in prepared:
+        if index in candidate.vulnerability_indices:
             yield finding.model_copy(
                 update={
-                    "gradle_target": item.candidate.target,
-                    "blocked_reason": item.withheld_reason,
+                    "gradle_target": candidate.target,
+                    "blocked_reason": candidate.reason,
                 }
             )
     for entry in withheld:
@@ -174,9 +171,8 @@ def _vulnerability_rows(
 
 def _prepared_update(
     update: UpdateFinding,
-    prepared: tuple[PreparedCandidate, ...],
+    prepared: tuple[GradleCandidate, ...],
     withheld: tuple[CandidateWithheld, ...],
-    publication: PublicationLookupContext,
 ) -> UpdateFinding:
     unsupported = "no supported catalogue target"
     if update.blocked_reason is not None:
@@ -184,19 +180,15 @@ def _prepared_update(
     if update.gradle_target is None:
         return update.model_copy(update={"blocked_reason": unsupported})
     key = update.gradle_target.group_key
-    for item in prepared:
-        if item.candidate.target.group_key != key:
-            continue
-        changes: dict[str, object] = {
-            "gradle_target": item.candidate.target,
-            "blocked_reason": item.withheld_reason,
-        }
-        if item.withheld_reason is None:
-            changes["published_date"] = max(
-                publication.results[request.model_dump_json()].timestamp
-                for request in item.candidate.publication_requests
+    for candidate in prepared:
+        if candidate.target.group_key == key:
+            return update.model_copy(
+                update={
+                    "gradle_target": candidate.target,
+                    "blocked_reason": candidate.reason,
+                    "published_date": candidate.published_date,
+                }
             )
-        return update.model_copy(update=changes)
     reason = next((entry.reason for entry in withheld if entry.group_key == key), None)
     return update.model_copy(update={"blocked_reason": reason or unsupported})
 
@@ -231,22 +223,19 @@ _OUTDATED: dict[
 
 def scan_gradle(
     project: ProjectConfig,
-) -> tuple[list[VulnFinding], CompleteResolution]:
+) -> tuple[list[VulnFinding], ResolutionReport]:
     """Scan the project's own freshly captured resolution and inventory."""
     require_tool("trivy", TRIVY_INSTALL_HINT)
     with generate_gradle_report(project) as generated:
-        outcome = generated.resolution
-        if isinstance(outcome, IncompleteResolution):
-            raise GradleError(
-                "Incomplete Gradle resolution: " + "; ".join(outcome.reasons)
-            )
-        coverage = bind_inventory(generated.inventory, outcome.report)
-        if coverage.errors:
-            raise GradleError(
-                "Incomplete Gradle inventory: " + "; ".join(coverage.errors)
-            )
-        bom = generated.bom_path
-        cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
+        cmd = [
+            "trivy",
+            "sbom",
+            "--format",
+            "json",
+            "--scanners",
+            "vuln",
+            str(generated.bom_path),
+        ]
         completed = _run_scan_command(cmd, project.path, "Trivy SBOM scan")
         findings = _parse_trivy(completed.stdout, "Trivy SBOM", secrets=False)[0]
         scoped = {
@@ -254,7 +243,7 @@ def scan_gradle(
                 f"{scope.project_path}/{scope.domain}/{scope.configuration}"
                 for scope in scopes
             }
-            for module, scopes in coverage.scopes.items()
+            for module, scopes in generated.scopes.items()
         }
         for finding in findings:
             scopes = scoped.get((finding.pkg_name, finding.installed_version))
@@ -265,7 +254,7 @@ def scan_gradle(
                 )
                 raise GradleError(msg)
             finding.gradle_scopes = tuple(sorted(scopes))
-        return findings, outcome
+        return findings, generated.report
 
 
 def _run_scan_command(

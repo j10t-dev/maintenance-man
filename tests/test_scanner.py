@@ -1,4 +1,3 @@
-import hashlib
 import json
 import shutil
 from contextlib import contextmanager
@@ -10,17 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from maintenance_man import dependency_age, paths, scanner
-from maintenance_man.gradle import (
-    GRADLE_CATALOGUE_RELPATH,
-    GRADLE_INVENTORY_BOM_RELPATH,
-    GRADLE_INVENTORY_RELPATH,
-    GradleError,
-)
-from maintenance_man.gradle_inventory import (
-    CycloneDxInventory,
-    load_inventory,
-    parse_inventory_text,
-)
+from maintenance_man.gradle import GradleError
+from maintenance_man.gradle_inventory import inventory_scopes, load_inventory
 from maintenance_man.gradle_resolution import (
     ROUTING_UNDECLARED,
     GeneratedGradleReport,
@@ -29,7 +19,6 @@ from maintenance_man.gradle_resolution import (
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     CandidateValidation,
-    CandidateValidationBatch,
     CandidateWithheld,
     GradleCandidate,
     GradleFixPlan,
@@ -56,7 +45,7 @@ from maintenance_man.storage import load_scan_results, save_scan_results
 from tests.fakes import FakeCommands
 from tests.support.clock import FakeClock
 from tests.support.findings import make_scan_result, make_update, make_vuln
-from tests.support.gradle import GRADLE_FIXTURES, fixture_runner
+from tests.support.gradle import GRADLE_FIXTURES, fixture_runner, report_directory
 from tests.support.process import completed, missing_tool
 from tests.support.projects import FIXTURES_DIR, make_project
 from tests.support.publication import pypi_body, scan_age_inputs
@@ -412,7 +401,7 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
     for index in range(2):
         module = ModuleId(group="org.example", artifact=f"lib{index}", version="2")
         modules[module.artifact] = module
-        finding, project, resolution = scan_age_inputs(
+        finding, project, report = scan_age_inputs(
             gradle_project.path,
             member_specs=(("library", f"lib{index}", module.coordinate),),
             repository_specs=(("library", "https://dl.google.com/dl/android/maven2"),),
@@ -465,32 +454,35 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         )
         return body, {"Last-Modified": published}, url
 
-    def validate(project, candidates, resolution):
-        return CandidateValidationBatch(
-            schema_version=1,
-            results=tuple(
-                CandidateValidation(
-                    request_id=f"{candidate.target.group_key}/{member.alias}",
-                    project_path=":",
-                    group_key=candidate.target.group_key,
-                    alias=member.alias,
-                    kind=member.kind,
+    def validate(project, candidates, report):
+        validations = []
+        for candidate in candidates:
+            key = candidate.target.group_key
+            for member in candidate.target.members:
+                request = {
+                    "request_id": f"{key}/{member.alias}",
+                    "group_key": key,
+                    "alias": member.alias,
+                    "project_path": ":",
+                    "kind": member.kind,
+                    "coordinate": member.coordinate,
+                    "installed_version": member.installed_version,
+                    "candidate_version": candidate.target.target_version,
+                }
+                result = CandidateValidation(
+                    request_id=request["request_id"],
                     selected_version=candidate.target.target_version,
                     implementation=None,
                     reason=None,
                 )
-                for candidate in candidates
-                for member in candidate.target.members
-            ),
-        )
+                validations.append((request, result))
+        return validations
 
     monkeypatch.setattr(dependency_age, "_publication_http", transport)
     monkeypatch.setattr(
         "maintenance_man.gradle_resolution.validate_gradle_candidates", validate
     )
-    monkeypatch.setattr(
-        scanner, "scan_gradle", lambda project: (state.vulns, resolution)
-    )
+    monkeypatch.setattr(scanner, "scan_gradle", lambda project: (state.vulns, report))
     monkeypatch.setattr(
         scanner, "discover_gradle_updates", lambda project: state.findings
     )
@@ -603,17 +595,11 @@ def test_given_recorded_plan_when_scanned_then_rows_follow_exact_associations(
 ):
     state = scoped_publication_scan
     first, second = (
-        GradleCandidate(
-            target=row.gradle_target,
-            origins=frozenset({"ordinary"}),
-            vulnerability_indices=indices,
-        )
+        GradleCandidate(target=row.gradle_target, vulnerability_indices=indices)
         for row, indices in zip(state.findings, ((0,), (0, 1, 3)), strict=True)
     )
     unowned = CandidateWithheld(
         group_key=None,
-        coordinate="g:x",
-        installed_version="1",
         reason="cannot identify an unambiguous catalogue entry",
         vulnerability_indices=(2,),
     )
@@ -659,10 +645,10 @@ _GRADLE_BOM_MODULES = [
 ]
 
 
-def _gradle_report_payload(catalogue_digest: str = "a" * 64) -> dict:
+def _gradle_report_payload() -> dict:
     """A resolution report whose scope covers every ``bom.json`` component."""
     components: list[dict[str, object]] = [
-        {"id": "root", "kind": "root", "module": None, "variants": []}
+        {"id": "root", "kind": "root", "module": None}
     ]
     for index, (group, artifact, version) in enumerate(_GRADLE_BOM_MODULES):
         components.append(
@@ -670,7 +656,6 @@ def _gradle_report_payload(catalogue_digest: str = "a" * 64) -> dict:
                 "id": f"c{index}",
                 "kind": "module",
                 "module": {"group": group, "artifact": artifact, "version": version},
-                "variants": ["runtime"],
             }
         )
     scope = {
@@ -680,9 +665,6 @@ def _gradle_report_payload(catalogue_digest: str = "a" * 64) -> dict:
     }
     return {
         "schema_version": 1,
-        "root_project": ":",
-        "producer_versions": {"gradle": "8.14.3", "cyclonedx": "3.4.1", "report": "1"},
-        "catalogue_digest": catalogue_digest,
         "repositories": [],
         "selected_scopes": [scope],
         "scopes": [
@@ -698,42 +680,25 @@ def _gradle_report_payload(catalogue_digest: str = "a" * 64) -> dict:
 
 
 def _gradle_resolution_fixture():
-
     return parse_resolution_report(json.dumps(_gradle_report_payload()))
 
 
-def _generated(bom, resolution):
-    payload, inventory = load_inventory(bom)
+def _fixture_bom() -> Path:
+    return paths.mm_home() / "gradle-report-fixture" / "bom.json"
+
+
+def _generated(bom, report):
     return GeneratedGradleReport(
         bom_path=bom,
-        inventory_bytes=payload,
-        inventory=inventory,
-        resolution=resolution,
+        report=report,
+        scopes=inventory_scopes(load_inventory(bom), report),
     )
-
-
-def _nested_malformed_inventory() -> tuple[bytes, CycloneDxInventory]:
-    """Envelope-valid top level whose nested identity is malformed."""
-    text = json.dumps(
-        {
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.6",
-            "components": [
-                {
-                    "type": "library",
-                    "purl": "pkg:maven/g/lib@1",
-                    "components": [{"type": "library", "purl": 42}],
-                }
-            ],
-        }
-    )
-    return text.encode(), parse_inventory_text(text, source="memory-bom")
 
 
 def _yield_fixture_bom(project):
     @contextmanager
     def _generate(_project):
-        bom = Path(project.path) / GRADLE_INVENTORY_BOM_RELPATH
+        bom = _fixture_bom()
         bom.parent.mkdir(parents=True, exist_ok=True)
         bom.write_text(
             (GRADLE_FIXTURES / "bom.json").read_text(encoding="utf-8"), encoding="utf-8"
@@ -761,7 +726,7 @@ def _trivy_sbom(
     )
 
     if bom is None:
-        bom = Path(gradle_project.path) / GRADLE_INVENTORY_BOM_RELPATH
+        bom = _fixture_bom()
     commands = FakeCommands()
     commands.add(
         ("trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)),
@@ -775,14 +740,14 @@ def test_gradle_scan_unreadable_bom_is_gradle_error(gradle_project, monkeypatch)
 
     def runner(root, args, *, label):
         completed = fixture_runner(root, args, label=label)
-        (root / GRADLE_INVENTORY_BOM_RELPATH).unlink()
+        (report_directory(args) / "bom.json").unlink()
         return completed
 
     monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", runner)
     monkeypatch.setattr(scanner, "run_captured", FakeCommands())
     with pytest.raises(GradleError, match="cyclonedxBom produced no inventory"):
         scan_gradle(gradle_project)
-    assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
+    assert list(paths.mm_home().glob("gradle-report-*")) == []
 
 
 def test_gradle_scan_finding_without_resolution_scope_is_error(
@@ -814,37 +779,36 @@ def test_gradle_scan_finding_without_resolution_scope_is_error(
         scan_gradle(gradle_project)
 
 
-def _inject_gradle_capture_failure(monkeypatch, root: Path, failure: str) -> None:
+_NESTED_MALFORMED_BOM = {
+    "bomFormat": "CycloneDX",
+    "specVersion": "1.6",
+    "components": [
+        {
+            "type": "library",
+            "purl": "pkg:maven/g/lib@1",
+            "components": [{"type": "library", "purl": 42}],
+        }
+    ],
+}
+
+
+def _inject_gradle_capture_failure(monkeypatch, failure: str) -> None:
     if failure == "incomplete-resolution":
-        raw = json.loads((GRADLE_FIXTURES / "resolution/empty.json").read_text())
-        raw["scopes"][0]["unresolved"] = ["g:missing:1.0"]
-        resolution = parse_resolution_report(json.dumps(raw))
-
-        @contextmanager
-        def capture(project):
-            payload, inventory = _nested_malformed_inventory()
-            yield GeneratedGradleReport(
-                root / "bom.json", payload, inventory, resolution
-            )
-
-        monkeypatch.setattr(scanner, "generate_gradle_report", capture)
-        return
-
-    inventory = json.loads((GRADLE_FIXTURES / "bom.json").read_text())
-    inventory["components"] = [
-        row for row in inventory["components"] if row["name"] == "gson"
-    ]
+        report = json.loads((GRADLE_FIXTURES / "resolution/empty.json").read_text())
+        report["scopes"][0]["unresolved"] = ["g:missing:1.0"]
+        inventory = _NESTED_MALFORMED_BOM
+    else:
+        report = _gradle_report_payload()
+        inventory = json.loads((GRADLE_FIXTURES / "bom.json").read_text())
+        inventory["components"] = [
+            row for row in inventory["components"] if row["name"] == "gson"
+        ]
 
     def run_gradle(project_root, args, *, label):
         assert (args[0], label) == ("mmGradleReport", "mmGradleReport")
-        bom = project_root / GRADLE_INVENTORY_BOM_RELPATH
-        bom.write_text(json.dumps(inventory), encoding="utf-8")
-        digest = hashlib.sha256(
-            (project_root / GRADLE_CATALOGUE_RELPATH).read_bytes()
-        ).hexdigest()
-        bom.with_name("report.json").write_text(
-            json.dumps(_gradle_report_payload(digest))
-        )
+        directory = report_directory(args)
+        (directory / "bom.json").write_text(json.dumps(inventory), encoding="utf-8")
+        (directory / "report.json").write_text(json.dumps(report), encoding="utf-8")
         return completed(args, stdout="", stderr="boom")
 
     monkeypatch.setattr("maintenance_man.gradle_resolution.run_gradle", run_gradle)
@@ -860,19 +824,18 @@ def _inject_gradle_capture_failure(monkeypatch, root: Path, failure: str) -> Non
 def test_given_gradle_capture_failure_when_project_scanned_then_saved_bytes_survive(
     mm_home, gradle_project, monkeypatch, failure, message
 ):
-    root = Path(gradle_project.path)
     saved = mm_home / "scan-results/android.json"
     saved.parent.mkdir(parents=True)
     saved.write_bytes(b"previous findings\n")
     commands = FakeCommands()
     monkeypatch.setattr(scanner, "run_captured", commands)
-    _inject_gradle_capture_failure(monkeypatch, root, failure)
+    _inject_gradle_capture_failure(monkeypatch, failure)
 
     with pytest.raises(GradleError, match=message):
         scan_project("android", gradle_project, 7)
 
     assert saved.read_bytes() == b"previous findings\n"
-    assert not (root / GRADLE_INVENTORY_RELPATH).exists()
+    assert list(paths.mm_home().glob("gradle-report-*")) == []
     assert commands.calls == []
 
 

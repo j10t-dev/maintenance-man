@@ -1,5 +1,7 @@
+import re
 from datetime import UTC, datetime
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     AfterValidator,
@@ -10,10 +12,7 @@ from pydantic import (
     model_validator,
 )
 
-from maintenance_man.models.scan import (
-    GradleKind,
-    GradleUpdateTarget,
-)
+from maintenance_man.models.scan import GradleUpdateTarget
 
 
 def _utc_date(value: datetime) -> datetime:
@@ -30,10 +29,18 @@ class GradleRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class ScopeId(GradleRecord):
-    project_path: str
+class ReportRecord(GradleRecord):
+    """A record of Gradle's resolution report. The report may grow fields mm does
+    not read, so these ignore extra fields; the catalogue and target records are
+    mm's own and stay strict."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+
+class ScopeId(ReportRecord):
+    project_path: str = Field(pattern=r"^:")
     domain: Literal["project", "buildscript"]
-    configuration: str
+    configuration: str = Field(min_length=1)
 
 
 class ModuleId(GradleRecord):
@@ -46,27 +53,47 @@ class ModuleId(GradleRecord):
         return f"{self.group}:{self.artifact}"
 
 
-class RepositoryDeclaration(GradleRecord):
+class RepositoryDeclaration(ReportRecord):
     project_path: str
     domain: Literal["library", "plugin"]
     url: str | None
 
+    @field_validator("url")
+    @classmethod
+    def public_url(cls, value: str | None) -> str | None:
+        if value is not None:
+            url = urlsplit(value)
+            if url.username or url.password or url.query or url.fragment:
+                msg = "repository report contains private or ambiguous URL"
+                raise ValueError(msg)
+        return value
 
-class ResolvedComponent(GradleRecord):
-    id: str
+
+class ResolvedComponent(ReportRecord):
+    id: str = Field(min_length=1)
     kind: Literal["root", "project", "module"]
     module: ModuleId | None
-    variants: tuple[str, ...]
+
+    @field_validator("module")
+    @classmethod
+    def maven_identity(cls, value: ModuleId | None) -> ModuleId | None:
+        if value is not None and any(
+            not part or re.search(r"[\s:/\\]", part)
+            for part in (value.group, value.artifact, value.version)
+        ):
+            msg = "invalid Maven identity"
+            raise ValueError(msg)
+        return value
 
 
-class ResolutionEdge(GradleRecord):
+class ResolutionEdge(ReportRecord):
     source: str
     target: str
     requested: str
     constraint: bool
 
 
-class ScopeResolution(GradleRecord):
+class ScopeResolution(ReportRecord):
     scope: ScopeId
     components: tuple[ResolvedComponent, ...]
     edges: tuple[ResolutionEdge, ...]
@@ -91,16 +118,13 @@ class ScopeResolution(GradleRecord):
         return self
 
 
-class LocalProjectIdentity(GradleRecord):
+class LocalProjectIdentity(ReportRecord):
     project_path: str
     module: ModuleId
 
 
-class ResolutionReport(GradleRecord):
+class ResolutionReport(ReportRecord):
     schema_version: Literal[1]
-    root_project: str
-    producer_versions: dict[str, str]
-    catalogue_digest: str
     repositories: tuple[RepositoryDeclaration, ...]
     selected_scopes: tuple[ScopeId, ...]
     scopes: tuple[ScopeResolution, ...]
@@ -118,9 +142,6 @@ class ResolutionReport(GradleRecord):
         if any(scope.scope not in self.selected_scopes for scope in self.scopes):
             msg = "unselected scope result"
             raise ValueError(msg)
-        if set(self.producer_versions) != {"gradle", "cyclonedx", "report"}:
-            msg = "producer versions missing"
-            raise ValueError(msg)
         paths = [project.project_path for project in self.local_projects]
         if len(set(paths)) != len(paths) or not set(paths) <= {
             scope.project_path for scope in self.selected_scopes
@@ -129,33 +150,14 @@ class ResolutionReport(GradleRecord):
             raise ValueError(msg)
         return self
 
-
-class CompleteResolution(GradleRecord):
-    kind: Literal["complete"] = "complete"
-    report: ResolutionReport
-
-    @model_validator(mode="after")
-    def complete(self):
-        if self.report.selection_errors or any(
-            s.unresolved for s in self.report.scopes
-        ):
-            msg = "incomplete graph"
-            raise ValueError(msg)
-        if set(self.report.selected_scopes) != {s.scope for s in self.report.scopes}:
-            msg = "missing scope result"
-            raise ValueError(msg)
-        return self
-
-
-class IncompleteResolution(GradleRecord):
-    kind: Literal["incomplete"] = "incomplete"
-    report: ResolutionReport
-    reasons: tuple[str, ...] = Field(min_length=1)
-
-
-type ResolutionOutcome = Annotated[
-    CompleteResolution | IncompleteResolution, Field(discriminator="kind")
-]
+    def module_scopes(self) -> dict[ModuleId, frozenset[ScopeId]]:
+        """Every resolved module and the selected scopes it appears in."""
+        scopes: dict[ModuleId, set[ScopeId]] = {}
+        for result in self.scopes:
+            for component in result.components:
+                if component.module is not None:
+                    scopes.setdefault(component.module, set()).add(result.scope)
+        return {module: frozenset(found) for module, found in scopes.items()}
 
 
 RepositoryId = Literal["central", "google", "portal"]
@@ -209,32 +211,16 @@ class PublicationEvidence(GradleRecord):
 
 class GradleCandidate(GradleRecord):
     target: GradleUpdateTarget
-    origins: frozenset[Literal["ordinary", "security"]] = Field(min_length=1)
     vulnerability_indices: tuple[int, ...] = ()
     """Positions, in the vulnerability sequence given to select_gradle_candidates,
     of the advisories this candidate fixes."""
     publication_requests: tuple[PublicationRequest, ...] = ()
-
-
-type OwnerKind = Literal["direct", "parent", "platform", "plugin"]
-
-
-class KnownOwner(GradleRecord):
-    kind: OwnerKind
-    group_key: str
-
-
-class UnknownOwner(GradleRecord):
-    kind: Literal["unknown"] = "unknown"
-
-
-type OwnerResolution = Annotated[KnownOwner | UnknownOwner, Field(discriminator="kind")]
+    reason: str | None = None
+    published_date: UtcDatetime | None = None
 
 
 class CandidateWithheld(GradleRecord):
     group_key: str | None
-    coordinate: str
-    installed_version: str
     reason: str
     vulnerability_indices: tuple[int, ...] = ()
     """Positions, in the same sequence, of the advisories this withheld entry
@@ -248,10 +234,6 @@ class GradleFixPlan(GradleRecord):
 
 class CandidateValidation(GradleRecord):
     request_id: str
-    project_path: str
-    group_key: str
-    alias: str
-    kind: GradleKind
     selected_version: str | None
     implementation: ModuleId | None
     reason: str | None

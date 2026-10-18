@@ -3,9 +3,14 @@ import os
 import shutil
 import subprocess
 import zipfile
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
+
+from maintenance_man.gradle_inventory import inventory_scopes, load_inventory
+from maintenance_man.gradle_resolution import parse_resolution_report
+from maintenance_man.models.gradle import CandidateValidationBatch, ModuleId
 
 
 @pytest.mark.integration
@@ -27,9 +32,8 @@ def test_real_gradle_reports_effective_plugin_repositories(tmp_path, repositorie
     (tmp_path / "build.gradle").write_text("tasks.register('cyclonedxBom')\n")
     (tmp_path / "gradle").mkdir()
     (tmp_path / "gradle/libs.versions.toml").write_text("[versions]\n")
-    owned = tmp_path / ".mm-gradle-inventory"
-    owned.mkdir()
-    (owned / ".mm-owned").write_text("")
+    output = tmp_path / "output"
+    output.mkdir()
     script = (
         Path(__file__).resolve().parents[1]
         / "src/maintenance_man/resources/gradle-report.gradle"
@@ -40,6 +44,7 @@ def test_real_gradle_reports_effective_plugin_repositories(tmp_path, repositorie
             "mmGradleReport",
             "--init-script",
             str(script),
+            f"-Pmm.reportDirectory={output}",
             "--offline",
             "--no-daemon",
             "--console=plain",
@@ -50,7 +55,7 @@ def test_real_gradle_reports_effective_plugin_repositories(tmp_path, repositorie
         text=True,
         timeout=120,
     )
-    report = json.loads((owned / "report.json").read_text())
+    report = json.loads((output / "report.json").read_text())
     assert [row for row in report["repositories"] if row["domain"] == "plugin"] == [
         {
             "project_path": ":",
@@ -156,7 +161,10 @@ def _prepare_gradle_project(root: Path, source: Path, repository: Path) -> None:
         + "dependencies { implementation project(':app') }\n"
         + "tasks.named('cyclonedxBom') { "
         "jsonOutput = layout.projectDirectory.file('.mm-gradle-inventory/bom.json'); "
-        "xmlOutput.unsetConvention() }\n"
+        "xmlOutput = layout.projectDirectory.file('.mm-gradle-inventory/bom.xml') }\n"
+        + "allprojects { tasks.matching { it.name == 'cyclonedxDirectBom' }"
+        ".configureEach { xmlOutput = "
+        "layout.projectDirectory.file('.mm-gradle-inventory/direct.xml') } }\n"
     )
     (root / "gradle.properties").write_text("org.gradle.parallel=true\n")
     (root / "app").mkdir()
@@ -165,18 +173,22 @@ def _prepare_gradle_project(root: Path, source: Path, repository: Path) -> None:
         '[versions]\nartifact = "1.0"\n[libraries]\n'
         'artifact = { module = "g:a", version.ref = "artifact" }\n'
     )
-    owned = root / ".mm-gradle-inventory"
-    owned.mkdir()
-    (owned / ".mm-owned").write_text("")
-    from importlib.resources import files
 
-    (owned / "gradle-report.gradle").write_bytes(
-        files("maintenance_man.resources").joinpath("gradle-report.gradle").read_bytes()
-    )
+
+_VALIDATION_REQUESTS = [
+    ("library", ":", "1.0", "2.0", "2.0", None),
+    ("library", ":", "2.0", "1.0", None, "Native metadata validation failed"),
+    ("library", ":", "1.0", "1.0", None, "Native metadata validation failed"),
+    ("plugin", ":", "1.0", "2.0", "2.0", None),
+    ("library", ":", "1.0", "2.5", None, "Native metadata validation failed"),
+    ("library", ":app", "1.0", "2.0", "2.0", None),
+    ("library", ":missing", "1.0", "2.0", None, "Native metadata validation failed"),
+    ("plugin", ":app", "1.0", "2.0", None, "Native metadata validation failed"),
+]
 
 
 @pytest.mark.integration
-def test_real_gradle_producer_and_native_intervals(tmp_path):
+def test_real_gradle_producer_and_native_intervals(tmp_path, mm_home):
     wrapper = os.environ.get("MM_GRADLE_WRAPPER")
     if not wrapper:
         pytest.skip("Set MM_GRADLE_WRAPPER to an existing executable wrapper")
@@ -185,13 +197,17 @@ def test_real_gradle_producer_and_native_intervals(tmp_path):
     repository = tmp_path / "repository"
     _write_local_maven_repository(repository)
     _prepare_gradle_project(root, source, repository)
-    owned = root / ".mm-gradle-inventory"
-    script = owned / "gradle-report.gradle"
+    output = mm_home / "gradle-report-integration"
+    output.mkdir(parents=True)
+    script = Path(
+        str(files("maintenance_man.resources").joinpath("gradle-report.gradle"))
+    )
     command = [
         str(root / "gradlew"),
         "mmGradleReport",
         "--init-script",
         str(script),
+        f"-Pmm.reportDirectory={output}",
         "--no-daemon",
         "--console=plain",
         "--rerun-tasks",
@@ -200,125 +216,68 @@ def test_real_gradle_producer_and_native_intervals(tmp_path):
     subprocess.run(
         command, cwd=root, check=True, capture_output=True, text=True, timeout=900
     )
-    report = json.loads((owned / "report.json").read_text())
+    report = json.loads((output / "report.json").read_text())
     assert report["schema_version"] == 1
     assert report["selection_errors"] == []
     assert {
         "project_path": ":app",
         "module": {"group": "fixture", "artifact": "app", "version": "unspecified"},
     } in report["local_projects"]
-    from maintenance_man.gradle_inventory import bind_inventory, parse_inventory_text
-    from maintenance_man.gradle_resolution import parse_resolution_report
 
-    inventory = (owned / "bom.json").read_bytes()
-    assert "project_path=%3Aapp" in inventory.decode()
-    coverage = bind_inventory(
-        parse_inventory_text(inventory.decode(), source="real-bom"),
-        parse_resolution_report(json.dumps(report)).report,
+    assert "project_path=%3Aapp" in (output / "bom.json").read_text()
+    scopes = inventory_scopes(
+        load_inventory(output / "bom.json"),
+        parse_resolution_report((output / "report.json").read_text()),
     )
-    assert [(m.coordinate, m.version) for m in coverage.modules] == [("g:a", "1.0")]
+    assert [(module.coordinate, module.version) for module in scopes] == [
+        ("g:a", "1.0")
+    ]
     assert any(
         component["module"] == {"group": "g", "artifact": "a", "version": "1.0"}
         for scope in report["scopes"]
         for component in scope["components"]
     )
+
     requests = [
         {
             "request_id": str(index),
-            "group_key": "ref:a",
-            "alias": "a",
-            "project_path": ":",
-            "kind": "library",
-            "coordinate": "g:a",
-            "installed_version": old,
+            "group_key": "plugin:fixture" if kind == "plugin" else "ref:a",
+            "alias": "fixture" if kind == "plugin" else "a",
+            "project_path": path,
+            "kind": kind,
+            "coordinate": _PLUGIN_ID if kind == "plugin" else "g:a",
+            "installed_version": installed,
             "candidate_version": candidate,
         }
-        for index, (old, candidate) in enumerate(
-            (("1.0", "2.0"), ("2.0", "1.0"), ("1.0", "1.0"))
+        for index, (kind, path, installed, candidate, _, _) in enumerate(
+            _VALIDATION_REQUESTS
         )
     ]
-    requests.append(
-        {
-            "request_id": "3",
-            "group_key": "plugin:fixture",
-            "alias": "fixture",
-            "project_path": ":",
-            "kind": "plugin",
-            "coordinate": _PLUGIN_ID,
-            "installed_version": "1.0",
-            "candidate_version": "2.0",
-        }
-    )
-    requests.append(
-        {
-            "request_id": "4",
-            "group_key": "ref:a",
-            "alias": "a",
-            "project_path": ":",
-            "kind": "library",
-            "coordinate": "g:a",
-            "installed_version": "1.0",
-            "candidate_version": "2.5",
-        }
-    )
-    requests.append(
-        {
-            "request_id": "5",
-            "group_key": "ref:a",
-            "alias": "a",
-            "project_path": ":app",
-            "kind": "library",
-            "coordinate": "g:a",
-            "installed_version": "1.0",
-            "candidate_version": "2.0",
-        }
-    )
-    requests.extend(
-        [
-            {**requests[5], "request_id": "6", "project_path": ":missing"},
-            {**requests[3], "request_id": "7", "project_path": ":app"},
-        ]
-    )
-    (owned / "candidate-requests.json").write_text(
+    (output / "candidate-requests.json").write_text(
         json.dumps({"schema_version": 1, "requests": requests})
     )
     command[1] = "mmGradleValidateCandidates"
     subprocess.run(
         command, cwd=root, check=True, capture_output=True, text=True, timeout=900
     )
-    from maintenance_man.models.gradle import CandidateValidationBatch
-
     batch = CandidateValidationBatch.model_validate_json(
-        (owned / "candidate-validation.json").read_text()
+        (output / "candidate-validation.json").read_text()
     )
-    assert [row.kind for row in batch.results] == [
-        "library",
-        "library",
-        "library",
-        "plugin",
-        "library",
-        "library",
-        "library",
-        "plugin",
-    ]
-    results = {
-        row["request_id"]: row
-        for row in json.loads((owned / "candidate-validation.json").read_text())[
-            "results"
-        ]
-    }
-    assert results["0"]["selected_version"] == "2.0" and results["0"]["reason"] is None
-    assert results["1"]["reason"] is not None
-    assert results["2"]["reason"] is not None
-    assert results["3"]["selected_version"] == "2.0" and results["3"][
-        "implementation"
-    ] == {"group": "g", "artifact": "a", "version": "1.0"}
-    assert results["4"]["selected_version"] is None
-    assert results["4"]["reason"] is not None
-    assert results["5"]["selected_version"] == "2.0"
-    assert results["5"]["reason"] is None
+    results = {row.request_id: row for row in batch.results}
+
     assert len(results) == len(requests)
-    assert results["6"]["selected_version"] is None
-    assert results["6"]["reason"] is not None
-    assert results["7"]["selected_version"] is None
-    assert results["7"]["reason"] is not None
+    for index, (*_, selected, reason) in enumerate(_VALIDATION_REQUESTS):
+        result = results[str(index)]
+        assert result.selected_version == selected
+        assert (result.reason is None) is (reason is None)
+        if reason is not None:
+            assert result.reason is not None and result.reason.startswith(reason)
+    assert results["3"].implementation == ModuleId(
+        group="g", artifact="a", version="1.0"
+    )
+    assert not (root / ".mm-gradle-inventory").exists()
+    assert [
+        path
+        for path in root.rglob("*")
+        if path.suffix in {".json", ".xml"} and ".gradle" not in path.parts
+    ] == []

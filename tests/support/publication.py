@@ -5,11 +5,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.gradle import (
-    CompleteResolution,
-    RepositoryDeclaration,
-    ResolutionReport,
-)
+from maintenance_man.models.gradle import RepositoryDeclaration, ResolutionReport
 from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
@@ -17,6 +13,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
 )
 from tests.support.findings import make_update
+from tests.support.gradle import make_resolution_report
 
 DEFAULT_GRADLE_MEMBER_SPECS = (("library", "one", "g:one"),)
 DEFAULT_GRADLE_REPOSITORY_SPECS = (
@@ -30,8 +27,8 @@ def scan_age_inputs(
     *,
     member_specs=DEFAULT_GRADLE_MEMBER_SPECS,
     repository_specs=DEFAULT_GRADLE_REPOSITORY_SPECS,
-) -> tuple[UpdateFinding, ProjectConfig, CompleteResolution]:
-    """A Gradle update with its project and a resolution declaring the repositories."""
+) -> tuple[UpdateFinding, ProjectConfig, ResolutionReport]:
+    """A Gradle update with its project and a report declaring the repositories."""
     target = GradleUpdateTarget(
         version_ref="shared",
         target_version="2",
@@ -53,21 +50,14 @@ def scan_age_inputs(
         package_manager="gradle",
         gradle_repository_routing="standard-public",
     )
-    resolution = CompleteResolution(
-        report=ResolutionReport(
-            schema_version=1,
-            root_project=":",
-            producer_versions={"gradle": "9", "cyclonedx": "3", "report": "1"},
-            catalogue_digest="catalogue",
-            repositories=tuple(
-                RepositoryDeclaration(project_path=":", domain=domain, url=url)
-                for domain, url in repository_specs
-            ),
-            selected_scopes=(),
-            scopes=(),
-        )
+    report = make_resolution_report(
+        scopes={},
+        repositories=[
+            RepositoryDeclaration(project_path=":", domain=domain, url=url)
+            for domain, url in repository_specs
+        ],
     )
-    return update, project, resolution
+    return update, project, report
 
 
 def pypi_body(

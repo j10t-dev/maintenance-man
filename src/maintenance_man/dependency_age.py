@@ -56,7 +56,6 @@ class PublicationLookupContext:
         self.lock = threading.Lock()
         self.maven: dict[_CacheKey, Future[PublicationFact | AgeBlock | None]] = {}
         self.registry: dict[_CacheKey, Future[RegistryFact | AgeBlock | None]] = {}
-        self.results: dict[str, PublicationEvidence] = {}
 
     def __enter__(self) -> Self:
         return self
@@ -271,7 +270,8 @@ def publication_request(module, repositories, *, implementation=None):
 
 
 def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
-    """Return an ``AgeBlock`` unless every publication request is proven old enough.
+    """Return an ``AgeBlock`` unless every publication request is proven old enough,
+    else the youngest evidence timestamp across the requests.
 
     Exact-artifact evidence is required even when ``minimum_age_days`` is zero:
     an unresolved lookup withholds the candidate rather than passing it.
@@ -279,7 +279,7 @@ def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
     requests = candidate.publication_requests
     if not requests:
         return AgeBlock(reason="candidate has no publication requests")
-    context.prefetch(requests)
+    timestamps = []
     for request in requests:
         result = lookup_gradle_publication(request, context)
         if isinstance(result, AgeBlock):
@@ -290,7 +290,8 @@ def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
             return AgeBlock(
                 reason=f"publication younger than required {minimum_age_days} days"
             )
-    return None
+        timestamps.append(result.timestamp)
+    return max(timestamps)
 
 
 def member_module(member: GradleMember, version: str) -> ModuleId | None:
@@ -343,9 +344,7 @@ def lookup_gradle_publication(request, context):
                     f"{module.coordinate}:{module.version}"
                 )
             )
-    result = PublicationEvidence(facts=tuple(facts))
-    context.results[request.model_dump_json()] = result
-    return result
+    return PublicationEvidence(facts=tuple(facts))
 
 
 def trusted_repository(url):

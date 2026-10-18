@@ -3,91 +3,80 @@ import json
 import pytest
 
 from maintenance_man.gradle import GradleError
-from maintenance_man.gradle_inventory import (
-    bind_inventory,
-    load_inventory,
-    parse_inventory_text,
-)
-from maintenance_man.models.gradle import (
-    LocalProjectIdentity,
-    ModuleId,
-    ResolutionReport,
-    ResolvedComponent,
-    ScopeId,
-    ScopeResolution,
-)
-from tests.support.gradle import GRADLE_FIXTURES
+from maintenance_man.gradle_inventory import inventory_scopes, load_inventory
+from maintenance_man.models.gradle import LocalProjectIdentity, ModuleId, ScopeId
+from tests.support.gradle import GRADLE_FIXTURES, make_resolution_report
 
 SCOPE = ScopeId(project_path=":", domain="project", configuration="runtimeClasspath")
-OTHER_SCOPE = ScopeId(project_path=":app", domain="project", configuration="compile")
+APP_SCOPE = ScopeId(
+    project_path=":app", domain="project", configuration="runtimeClasspath"
+)
+LIB = "group='g' artifact='lib' version='1'"
 
 
 def _module(artifact: str, version: str = "1", group: str = "g") -> ModuleId:
     return ModuleId(group=group, artifact=artifact, version=version)
 
 
-def _report(
-    scopes: dict[ScopeId, list[ModuleId]],
-    local_projects: tuple[LocalProjectIdentity, ...] = (),
-) -> ResolutionReport:
-    return ResolutionReport(
-        schema_version=1,
-        root_project=":",
-        producer_versions={"gradle": "8", "cyclonedx": "3.4.1", "report": "1"},
-        catalogue_digest="digest",
-        repositories=(),
-        selected_scopes=tuple(scopes),
-        scopes=tuple(
-            ScopeResolution(
-                scope=scope,
-                components=(
-                    ResolvedComponent(id="root", kind="root", module=None, variants=()),
-                    *(
-                        ResolvedComponent(
-                            id=str(index), kind="module", module=module, variants=()
-                        )
-                        for index, module in enumerate(modules)
-                    ),
-                ),
-                edges=(),
-                unresolved=(),
-            )
-            for scope, modules in scopes.items()
-        ),
-        local_projects=local_projects,
-    )
-
-
-def _inventory(*purls: str):
-    document = {
-        "bomFormat": "CycloneDX",
-        "specVersion": "1.6",
-        "components": [{"type": "library", "purl": purl} for purl in purls],
-    }
-    return parse_inventory_text(json.dumps(document), source="memory-bom")
+def _components(*purls: str) -> list[dict[str, object]]:
+    return [{"type": "library", "purl": purl} for purl in purls]
 
 
 class TestLoadInventory:
     @pytest.mark.parametrize(
-        "fixture, expected",
+        "payload, message",
         [
-            (None, "produced no inventory"),
-            ("bom-empty.json", "no components"),
-            ("bom-non-maven.json", "no Maven components"),
+            pytest.param(
+                None, "cyclonedxBom produced no inventory at {bom};", id="absent"
+            ),
+            pytest.param(
+                (GRADLE_FIXTURES / "bom-empty.json").read_bytes(),
+                "CycloneDX inventory {bom} has no components;",
+                id="empty",
+            ),
+            pytest.param(
+                (GRADLE_FIXTURES / "bom-non-maven.json").read_bytes(),
+                "CycloneDX inventory {bom} has no Maven components;",
+                id="non-maven",
+            ),
+            pytest.param(
+                b'{"bomFormat": "other"}',
+                "{bom} is not a CycloneDX document",
+                id="other-format",
+            ),
+            pytest.param(
+                b"{not json", "malformed CycloneDX inventory {bom}:", id="invalid-json"
+            ),
+            pytest.param(
+                b"\xff\xfe", "malformed CycloneDX inventory {bom}:", id="undecodable"
+            ),
+            pytest.param(b"[]", "malformed CycloneDX inventory {bom}:", id="array"),
+            pytest.param(b"null", "malformed CycloneDX inventory {bom}:", id="null"),
+            pytest.param(
+                b'{"bomFormat": "CycloneDX", "specVersion": "1.6", '
+                b'"components": [null]}',
+                "malformed CycloneDX inventory {bom}:",
+                id="null-component",
+            ),
+            pytest.param(
+                b'{"bomFormat": "CycloneDX", "specVersion": "1.6", '
+                b'"components": {"purl": "pkg:maven/g/a@1"}}',
+                "malformed CycloneDX inventory {bom}:",
+                id="components-not-an-array",
+            ),
         ],
     )
     def test_unusable_inventory_is_an_error_not_a_clean_scan(
-        self, tmp_path, fixture, expected
+        self, tmp_path, payload, message
     ):
         bom = tmp_path / "bom.json"
-        if fixture is not None:
-            bom.write_text(
-                (GRADLE_FIXTURES / fixture).read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
+        if payload is not None:
+            bom.write_bytes(payload)
 
-        with pytest.raises(GradleError, match=expected):
+        with pytest.raises(GradleError) as caught:
             load_inventory(bom)
+
+        assert str(caught.value).startswith(message.format(bom=bom))
 
     @pytest.mark.parametrize(
         "spec, accepted",
@@ -106,105 +95,74 @@ class TestLoadInventory:
             with pytest.raises(GradleError, match=r"1.5 or later"):
                 load_inventory(bom)
 
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            b"{not json",
-            b"\xff\xfe",
-            b"[]",
-            b"null",
-            b'{"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [null]}',
-            b'{"bomFormat": "CycloneDX", "specVersion": "1.6", '
-            b'"components": {"purl": "pkg:maven/g/a@1"}}',
-        ],
-        ids=[
-            "invalid-json",
-            "undecodable-bytes",
-            "array",
-            "null",
-            "null-component",
-            "components-not-an-array",
-        ],
-    )
-    def test_malformed_inventory_structure_is_a_gradle_error(self, tmp_path, payload):
-        bom = tmp_path / "bom.json"
-        bom.write_bytes(payload)
 
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            load_inventory(bom)
+def test_inventory_scopes_report_extra_modules_sorted_then_missing_modules():
+    report = make_resolution_report(scopes={":": ["g:lib:1"]})
 
+    with pytest.raises(GradleError) as caught:
+        inventory_scopes(
+            _components(
+                "pkg:maven/g/zeta@1", "pkg:maven/g/alpha@2", "pkg:maven/a/beta@1"
+            ),
+            report,
+        )
 
-def test_load_inventory_returns_the_original_bytes(tmp_path):
-    bom = tmp_path / "bom.json"
-    payload = (GRADLE_FIXTURES / "bom.json").read_bytes()
-    bom.write_bytes(payload)
-
-    loaded, inventory = load_inventory(bom)
-
-    assert loaded == payload
-    assert inventory.components
-
-
-def test_parse_inventory_text_labels_errors_with_its_source():
-    with pytest.raises(GradleError, match="memory-bom is not a CycloneDX document"):
-        parse_inventory_text('{"bomFormat": "other"}', source="memory-bom")
-
-
-def test_bind_reports_missing_and_extra_modules_in_order():
-    coverage = bind_inventory(
-        _inventory("pkg:maven/g/extra@1"), _report({SCOPE: [_module("lib")]})
-    )
-
-    assert coverage.errors == (
-        f"Inventory module has no selected resolution identity: {_module('extra')}",
-        f"resolved module missing from inventory: {_module('lib')}",
+    assert str(caught.value) == (
+        "Incomplete Gradle inventory: "
+        "Inventory module has no selected resolution identity: "
+        "group='a' artifact='beta' version='1'; "
+        "Inventory module has no selected resolution identity: "
+        "group='g' artifact='alpha' version='2'; "
+        "Inventory module has no selected resolution identity: "
+        "group='g' artifact='zeta' version='1'; "
+        f"resolved module missing from inventory: {LIB}"
     )
 
 
-def test_bind_matches_modules_and_collects_their_scopes():
-    report = _report({SCOPE: [_module("lib")], OTHER_SCOPE: [_module("lib")]})
+def test_inventory_scopes_collect_the_scopes_of_each_module():
+    report = make_resolution_report(scopes={":": ["g:lib:1"], ":app": ["g:lib:1"]})
 
-    coverage = bind_inventory(_inventory("pkg:maven/g/lib@1"), report)
+    scopes = inventory_scopes(_components("pkg:maven/g/lib@1"), report)
 
-    assert coverage.errors == ()
-    assert coverage.modules == (_module("lib"),)
-    assert coverage.scopes == {_module("lib"): frozenset({SCOPE, OTHER_SCOPE})}
+    assert scopes == {_module("lib"): frozenset({SCOPE, APP_SCOPE})}
 
 
-def test_bind_dedupes_sorts_and_decodes_modules():
-    report = _report(
-        {SCOPE: [_module("b"), _module("a b", "2"), _module("a b", "1", group="a")]}
-    )
+def test_inventory_scopes_dedupe_and_decode_inventory_modules():
+    report = make_resolution_report(scopes={":": ["g:b:1", "g:a+b:2", "a:a+b:1"]})
 
-    coverage = bind_inventory(
-        _inventory(
+    scopes = inventory_scopes(
+        _components(
             "pkg:maven/g/b@1",
-            "pkg:maven/g/a%20b@2",
+            "pkg:maven/g/a%2Bb@2",
             "pkg:maven/g/b@1?type=jar",
-            "pkg:maven/a/a%20b@1#sub",
+            "pkg:maven/a/a%2Bb@1#sub",
         ),
         report,
     )
 
-    assert coverage.modules == (
-        _module("a b", "1", group="a"),
-        _module("a b", "2"),
-        _module("b"),
-    )
-    assert coverage.errors == ()
+    assert scopes == {
+        _module("b"): frozenset({SCOPE}),
+        _module("a+b", "2"): frozenset({SCOPE}),
+        _module("a+b", "1", group="a"): frozenset({SCOPE}),
+    }
 
 
-def test_bind_excludes_verified_local_projects():
-    local = LocalProjectIdentity(project_path=":app", module=_module("app"))
-    report = _report({SCOPE: [_module("lib")], OTHER_SCOPE: []}, (local,))
-
-    coverage = bind_inventory(
-        _inventory("pkg:maven/g/lib@1", "pkg:maven/g/app@1?project_path=%3Aapp"),
-        report,
+def _report_with_local_project():
+    return make_resolution_report(
+        scopes={":": ["g:lib:1"], ":app": []},
+        local_projects=[
+            LocalProjectIdentity(project_path=":app", module=_module("app"))
+        ],
     )
 
-    assert coverage.modules == (_module("lib"),)
-    assert coverage.errors == ()
+
+def test_inventory_scopes_exclude_verified_local_projects():
+    scopes = inventory_scopes(
+        _components("pkg:maven/g/lib@1", "pkg:maven/g/app@1?project_path=%3Aapp"),
+        _report_with_local_project(),
+    )
+
+    assert scopes == {_module("lib"): frozenset({SCOPE})}
 
 
 @pytest.mark.parametrize(
@@ -215,48 +173,64 @@ def test_bind_excludes_verified_local_projects():
         "pkg:maven/g/app@1?project_path=%3Aapp&project_path=%3Aapp",
     ],
 )
-def test_bind_refuses_unverified_local_identity(purl):
-    local = LocalProjectIdentity(project_path=":app", module=_module("app"))
-    report = _report({SCOPE: [_module("lib")], OTHER_SCOPE: []}, (local,))
+def test_inventory_scopes_refuse_unverified_local_identity(purl):
+    with pytest.raises(GradleError) as caught:
+        inventory_scopes(
+            _components("pkg:maven/g/lib@1", purl), _report_with_local_project()
+        )
 
-    with pytest.raises(GradleError, match="unverified local project identity"):
-        bind_inventory(_inventory("pkg:maven/g/lib@1", purl), report)
+    assert str(caught.value) == (
+        "Malformed CycloneDX inventory: unverified local project identity"
+    )
 
 
 @pytest.mark.parametrize(
     "component, message",
     [
-        ({"type": "library", "purl": 42}, "purl must be a string"),
-        ({"type": "library", "purl": "pkg:maven/g/lib"}, "malformed Maven purl"),
-        ({"type": "library"}, "no package identity"),
-        (
-            {"purl": "pkg:maven/g/lib@1", "components": {}},
-            "components must be an array",
+        pytest.param(
+            {"type": "library", "purl": 42},
+            "purl\n  Input should be a valid string",
+            id="purl-not-a-string",
         ),
-        ({"purl": "pkg:maven/g/lib@1", "components": [3]}, "must be an object"),
-        (
+        pytest.param(
+            {"type": "library", "purl": "pkg:maven/g/lib"},
+            "malformed Maven purl",
+            id="purl-without-version",
+        ),
+        pytest.param(
+            {"type": "library"},
+            "library component has no package identity",
+            id="no-purl",
+        ),
+        pytest.param(
+            {"purl": "pkg:maven/g/lib@1", "components": {}},
+            "components\n  Input should be a valid tuple",
+            id="components-not-an-array",
+        ),
+        pytest.param(
+            {"purl": "pkg:maven/g/lib@1", "components": [3]},
+            "Input should be a valid dictionary or instance of _Component",
+            id="nested-component-not-an-object",
+        ),
+        pytest.param(
             {
                 "type": "library",
                 "purl": "pkg:maven/g/lib@1",
                 "components": [{"purl": 42}],
             },
-            "purl must be a string",
+            "Input should be a valid string",
+            id="nested-purl-not-a-string",
         ),
     ],
 )
-def test_bind_rejects_malformed_nested_identity(component, message):
-    inventory = parse_inventory_text(
-        json.dumps(
-            {
-                "bomFormat": "CycloneDX",
-                "specVersion": "1.6",
-                "components": [
-                    {"type": "library", "purl": "pkg:maven/g/lib@1"},
-                    component,
-                ],
-            }
-        ),
-        source="memory-bom",
-    )
-    with pytest.raises(GradleError, match=f"Malformed CycloneDX inventory.*{message}"):
-        bind_inventory(inventory, _report({SCOPE: [_module("lib")]}))
+def test_inventory_scopes_reject_malformed_nested_identity(component, message):
+    components: list[dict[str, object]] = [
+        {"type": "library", "purl": "pkg:maven/g/lib@1"},
+        component,
+    ]
+
+    with pytest.raises(GradleError) as caught:
+        inventory_scopes(components, make_resolution_report(scopes={":": ["g:lib:1"]}))
+
+    assert str(caught.value).startswith("Malformed CycloneDX inventory: ")
+    assert message in str(caught.value)

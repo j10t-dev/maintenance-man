@@ -136,31 +136,13 @@ healthcheck_url = "http://healthchecker:8080" # the URL of your healthchecker se
 
 ### Required project setup
 
-The project must apply these two plugins, pinned to these versions, in its root build script:
+The project must apply these two plugins, pinned to these versions, in its root build script. mm sets the CycloneDX output locations itself, so the project configures none:
 
 ```kotlin
-import org.cyclonedx.gradle.CyclonedxDirectTask
-import org.gradle.api.file.RegularFile
-
 plugins {
     id("nl.littlerobots.version-catalog-update") version "1.1.1"
     id("org.cyclonedx.bom") version "3.4.1"
     // Retain the project's existing plugins.
-}
-
-allprojects {
-    tasks.named<CyclonedxDirectTask>("cyclonedxDirectBom") {
-        val relative = if (project.path == ":") "root" else
-            "projects/" + project.path.removePrefix(":").replace(':', '/')
-        jsonOutput = rootProject.layout.projectDirectory.file(
-            ".mm-gradle-inventory/direct/$relative.json"
-        )
-        xmlOutput.convention(null as RegularFile?)
-    }
-}
-tasks.cyclonedxBom {
-    jsonOutput = layout.projectDirectory.file(".mm-gradle-inventory/bom.json")
-    xmlOutput.convention(null as RegularFile?)
 }
 ```
 
@@ -178,12 +160,12 @@ Because the workspace is created fresh and deleted after every run, each `mm upd
 | --- | --- |
 | Discovery | `./gradlew versionCatalogUpdate --interactive --no-daemon --console=plain` |
 | Application | `./gradlew versionCatalogApplyUpdates --no-daemon --console=plain` |
-| Inventory + resolution | `./gradlew mmGradleReport --init-script <packaged script> --no-daemon --console=plain --rerun-tasks --no-build-cache` |
-| Vulnerabilities | `trivy sbom --format json --scanners vuln .mm-gradle-inventory/bom.json` |
+| Inventory + resolution | `./gradlew mmGradleReport --init-script <packaged script> -Pmm.reportDirectory=<report directory> --no-daemon --console=plain --rerun-tasks --no-build-cache` |
+| Vulnerabilities | `trivy sbom --format json --scanners vuln <report directory>/bom.json` |
 
 `mmGradleReport` is mm's own packaged task, added through an init script rather than a project plugin. It depends on `cyclonedxBom` for the inventory and additionally records, for every selected configuration, the resolved modules, variants and dependency edges Gradle's public resolution APIs report. mm reads both the inventory and this resolution report before removing its owned output, and every vulnerability finding is checked against a module the resolution actually selected.
 
-Each Gradle command runs from the project root with a 900-second timeout, closed standard input and the project environment. mm strips `VIRTUAL_ENV` and inherits the remaining environment. mm owns exactly two temporary paths, `gradle/libs.versions.updates.toml` and `.mm-gradle-inventory/`, and removes both before tests, change detection or a commit. mm reclaims leftovers from interrupted runs only when their ownership markers are intact. It rejects unmarked paths and symlinks and preserves their contents. It never touches your `build` directories.
+Each Gradle command runs from the project root with a 900-second timeout, closed standard input and the project environment. mm strips `VIRTUAL_ENV` and inherits the remaining environment. mm owns one temporary path in the project, `gradle/libs.versions.updates.toml`, and removes it before tests, change detection or a commit; it reclaims a leftover report from an interrupted run only when its ownership marker is intact. The inventory, the resolution report and the packaged init script go to a fresh directory under `~/.mm` that mm passes to Gradle as `-Pmm.reportDirectory` and removes after each task. It rejects unmarked paths and symlinks and preserves their contents. It never touches your `build` directories.
 
 ### What mm changes
 

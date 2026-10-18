@@ -237,6 +237,32 @@ def test_given_redirect_target_when_pinned_then_only_trusted_exact_path_passes(
             _public_url(url, repository, "a/b/2/b-2.pom")
 
 
+def test_given_two_requests_when_aged_then_youngest_timestamp_returned(tmp_path):
+    other = ModuleId(group="org.example", artifact="lib2", version="2.0")
+    requests = (
+        PublicationRequest(
+            module=_LIB, repositories=("central",), routing_supported=True
+        ),
+        PublicationRequest(
+            module=other, repositories=("google",), routing_supported=True
+        ),
+    )
+    responses = {
+        "central": (_pom(_LIB), {"Last-Modified": "Sat, 05 Sep 2026 00:00:00 GMT"}),
+        "google": (_pom(other), _SEPTEMBER_1),
+    }
+
+    def transport(url, repository, suffix):
+        return (*responses[repository], url)
+
+    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
+        result = evaluate_gradle_candidate_age(
+            make_gradle_candidate(publication_requests=requests), 0, context, _PUB_NOW
+        )
+
+    assert result == datetime(2026, 9, 5, tzinfo=UTC)
+
+
 @pytest.mark.parametrize(
     ("repositories", "routing", "response", "days", "expected", "expected_calls"),
     [
@@ -268,14 +294,20 @@ def test_given_redirect_target_when_pinned_then_only_trusted_exact_path_passes(
             id="no-requests",
         ),
         pytest.param(
-            ("google",), True, _SEPTEMBER_1, 7, None, [_GOOGLE_POM_URL], id="old"
+            ("google",),
+            True,
+            _SEPTEMBER_1,
+            7,
+            datetime(2026, 9, 1, tzinfo=UTC),
+            [_GOOGLE_POM_URL],
+            id="old",
         ),
         pytest.param(
             ("google",),
             True,
             {"Last-Modified": "Fri, 11 Sep 2026 00:00:00 GMT"},
             7,
-            None,
+            datetime(2026, 9, 11, tzinfo=UTC),
             [_GOOGLE_POM_URL],
             id="exactly-seven-days",
         ),
@@ -293,7 +325,7 @@ def test_given_redirect_target_when_pinned_then_only_trusted_exact_path_passes(
             True,
             {"Last-Modified": "Thu, 17 Sep 2026 00:00:00 GMT"},
             0,
-            None,
+            datetime(2026, 9, 17, tzinfo=UTC),
             [_GOOGLE_POM_URL],
             id="zero-days-accepts-past",
         ),
@@ -1087,7 +1119,7 @@ def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown, reaso
             for candidate in candidates
         ]
 
-    assert blocks == [None, AgeBlock(reason=reason)]
+    assert blocks == [datetime(2026, 9, 1, tzinfo=UTC), AgeBlock(reason=reason)]
 
 
 def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeypatch):

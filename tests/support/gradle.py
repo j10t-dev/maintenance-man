@@ -1,19 +1,24 @@
 """Gradle report fixtures and a runner that writes their owned outputs."""
 
-import hashlib
 import json
 import tomllib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
 
-from maintenance_man.gradle import (
-    GRADLE_INVENTORY_BOM_RELPATH,
-    GRADLE_INVENTORY_MARKER_RELPATH,
-    GRADLE_INVENTORY_RELPATH,
-    GRADLE_UPDATE_REPORT_RELPATH,
-    GradleError,
+from maintenance_man.gradle import GRADLE_UPDATE_REPORT_RELPATH, GradleError
+from maintenance_man.gradle_resolution import GRADLE_REPORT_DIRECTORY_PROPERTY
+from maintenance_man.models.gradle import (
+    GradleCandidate,
+    LocalProjectIdentity,
+    ModuleId,
+    PublicationRequest,
+    RepositoryDeclaration,
+    ResolutionEdge,
+    ResolutionReport,
+    ResolvedComponent,
+    ScopeId,
+    ScopeResolution,
 )
-from maintenance_man.models.gradle import GradleCandidate, PublicationRequest
 from maintenance_man.models.scan import GradleUpdateTarget
 from tests.support.findings import make_gradle_target
 from tests.support.process import completed
@@ -22,16 +27,62 @@ from tests.support.projects import FIXTURES_DIR
 
 def make_gradle_candidate(
     target: GradleUpdateTarget | None = None,
-    origins: frozenset[Literal["ordinary", "security"]] = frozenset({"ordinary"}),
     vulnerability_indices: tuple[int, ...] = (),
     publication_requests: tuple[PublicationRequest, ...] = (),
 ) -> GradleCandidate:
     """Build an ordinary candidate for *target*, with scenario-specific overrides."""
     return GradleCandidate(
         target=target or make_gradle_target(),
-        origins=origins,
         vulnerability_indices=vulnerability_indices,
         publication_requests=publication_requests,
+    )
+
+
+def make_resolution_report(
+    *,
+    scopes: Mapping[str, Sequence[str]],
+    repositories: Sequence[RepositoryDeclaration] = (),
+    local_projects: Sequence[LocalProjectIdentity] = (),
+) -> ResolutionReport:
+    """A complete report with one runtime scope per project path in *scopes*; each
+    listed ``group:artifact:version`` is resolved directly from that scope's root."""
+    results = []
+    for project_path, coordinates in scopes.items():
+        components = [ResolvedComponent(id="root", kind="root", module=None)]
+        edges = []
+        for number, coordinate in enumerate(coordinates):
+            group, artifact, version = coordinate.split(":")
+            module = ModuleId(group=group, artifact=artifact, version=version)
+            components.append(
+                ResolvedComponent(id=str(number), kind="module", module=module)
+            )
+            edges.append(
+                ResolutionEdge(
+                    source="root",
+                    target=str(number),
+                    requested=coordinate,
+                    constraint=False,
+                )
+            )
+        scope = ScopeId(
+            project_path=project_path,
+            domain="project",
+            configuration="runtimeClasspath",
+        )
+        results.append(
+            ScopeResolution(
+                scope=scope,
+                components=tuple(components),
+                edges=tuple(edges),
+                unresolved=(),
+            )
+        )
+    return ResolutionReport(
+        schema_version=1,
+        repositories=tuple(repositories),
+        selected_scopes=tuple(result.scope for result in results),
+        scopes=tuple(results),
+        local_projects=tuple(local_projects),
     )
 
 
@@ -40,14 +91,21 @@ def report_payload():
     return json.loads(FIXTURE.read_text())
 
 
+def report_directory(args: Sequence[str]) -> Path:
+    """The report directory an init-script task received as its Gradle property."""
+    prefix = f"-P{GRADLE_REPORT_DIRECTORY_PROPERTY}="
+    return Path(
+        next(arg.removeprefix(prefix) for arg in args if arg.startswith(prefix))
+    )
+
+
 def fixture_runner(root, args, *, label):
-    """Write the report and inventory expected from an owned Gradle report command."""
+    """Write the report and inventory expected from a Gradle report command."""
     assert args[0] == "mmGradleReport"
     assert "--rerun-tasks" in args and "--no-build-cache" in args
-    owned = root / GRADLE_INVENTORY_RELPATH
-    assert (root / GRADLE_INVENTORY_MARKER_RELPATH).is_file()
-    assert (owned / "gradle-report.gradle").read_text().startswith("import ")
-    (root / GRADLE_INVENTORY_BOM_RELPATH).write_text(
+    directory = report_directory(args)
+    assert (directory / "gradle-report.gradle").read_text().startswith("import ")
+    (directory / "bom.json").write_text(
         '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[{"group":"g","name":"a","version":"1.0","purl":"pkg:maven/g/a@1.0"}]}'
     )
     value = report_payload()
@@ -56,16 +114,12 @@ def fixture_runner(root, args, *, label):
             "id": "a",
             "kind": "module",
             "module": {"group": "g", "artifact": "a", "version": "1.0"},
-            "variants": ["runtime"],
         }
     )
     value["scopes"][0]["edges"].append(
         {"source": "root", "target": "a", "requested": "g:a:1.0", "constraint": False}
     )
-    value["catalogue_digest"] = hashlib.sha256(
-        (root / "gradle/libs.versions.toml").read_bytes()
-    ).hexdigest()
-    (owned / "report.json").write_text(json.dumps(value))
+    (directory / "report.json").write_text(json.dumps(value))
     return completed(tuple(args))
 
 
