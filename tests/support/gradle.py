@@ -2,11 +2,15 @@
 
 import hashlib
 import json
+import tomllib
+from pathlib import Path
 
 from maintenance_man.gradle import (
     GRADLE_INVENTORY_BOM_RELPATH,
     GRADLE_INVENTORY_MARKER_RELPATH,
     GRADLE_INVENTORY_RELPATH,
+    GRADLE_UPDATE_REPORT_RELPATH,
+    GradleError,
 )
 from tests.support.process import completed
 from tests.support.projects import FIXTURES_DIR
@@ -44,6 +48,41 @@ def fixture_runner(root, args, *, label):
     ).hexdigest()
     (owned / "report.json").write_text(json.dumps(value))
     return completed(tuple(args))
+
+
+def catalogue_apply_runner(edits: dict[str, str] | None = None, *, returncode: int = 0):
+    """Stand in for versionCatalogApplyUpdates: apply the given literal catalogue
+    edits, or with no edits, move every version reference the selected update
+    report names to its proposed version."""
+
+    def _run(cmd, cwd, **kwargs):
+        root = Path(cwd)
+        catalogue = root / "gradle" / "libs.versions.toml"
+        text = catalogue.read_text(encoding="utf-8")
+        if edits is None:
+            text = _apply_report(root / GRADLE_UPDATE_REPORT_RELPATH, text)
+        else:
+            for old, new in edits.items():
+                text = text.replace(old, new, 1)
+        catalogue.write_text(text, encoding="utf-8")
+        if returncode:
+            msg = f"{kwargs['label']} failed (exit {returncode})"
+            raise GradleError(msg)
+        return completed(cmd, returncode=0, stdout="", stderr="")
+
+    return _run
+
+
+def _apply_report(report: Path, text: str) -> str:
+    updates = tomllib.loads(report.read_text(encoding="utf-8"))
+    catalogue = tomllib.loads(text)
+    for section in ("libraries", "plugins"):
+        for alias, notation in updates.get(section, {}).items():
+            ref = catalogue[section][alias]["version"]["ref"]
+            old = catalogue["versions"][ref]
+            new = notation.rsplit(":", 1)[1]
+            text = text.replace(f'{ref} = "{old}"', f'{ref} = "{new}"', 1)
+    return text
 
 
 GRADLE_FIXTURES = FIXTURES_DIR / "gradle"

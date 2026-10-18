@@ -6,6 +6,7 @@ from maintenance_man.models.events import (
     BlockersStillFailing,
     FindingPassed,
     FindingsBlocked,
+    MissingTestConfig,
     Operation,
     OperationFailed,
     Outcome,
@@ -656,3 +657,18 @@ def test_bookmark_move_failure_saves_before_refusal(
     saved = load_scan_results("api").vulnerabilities[0]
     assert saved.update_status is UpdateStatus.FAILED
     assert saved.failed_phase == "unit"
+
+
+def test_given_no_test_phase_when_resolving_then_project_fails_before_effects(
+    tmp_path: Path,
+) -> None:
+    state, project = seed_project(tmp_path, "api", make_scan_result(), test_unit=None)
+    emit = RecordingEmit()
+
+    outcome = resolve_service.resolve_project(
+        "api", project, continue_=False, vcs=state.services(), emit=emit
+    )
+
+    assert outcome is Outcome.FAILED
+    assert emit.events == [MissingTestConfig("api")]
+    assert state.effects == []

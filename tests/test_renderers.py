@@ -140,7 +140,8 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
             MissingTestConfig("api"),
             "update",
             "",
-            "warning: api · no test configuration · test phases skipped\n",
+            "error: api · no test configuration · automatic updates need "
+            "test_unit, test_integration or test_component\n",
         ),
         (
             ResolvePaused("api"),
@@ -151,7 +152,7 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
         (
             FindingsBlocked((("pkg", "no fix"),)),
             "update",
-            "api\tresolve\tblocked\tpkg\t-\t-\tno fix\n",
+            "api\tupdate\tblocked\tpkg\t-\t-\tno fix\n",
             "",
         ),
         (

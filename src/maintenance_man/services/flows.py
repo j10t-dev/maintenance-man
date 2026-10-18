@@ -13,9 +13,7 @@ from maintenance_man.models.events import (
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     ScanResult,
-    UpdateFinding,
     UpdateStatus,
-    VulnFinding,
     Workflow,
 )
 from maintenance_man.services import WorkflowError
@@ -24,12 +22,7 @@ from maintenance_man.storage import (
     load_scan_results,
     save_scan_results,
 )
-from maintenance_man.updater import (
-    Finding,
-    consolidate_vulns,
-    remove_completed_findings,
-    sort_updates_by_risk,
-)
+from maintenance_man.updater import Finding, remove_completed_findings
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import VcsServices, refresh_working_copy_from_main
 
@@ -57,16 +50,18 @@ def load_validated_scan(
     if not scan_result.has_actionable_vulns and not scan_result.updates:
         emit(ProjectSkipped(project, SkipReason.NOTHING_TO_DO, workflow.value))
         return None
-    if not project_config.test_phases:
-        emit(MissingTestConfig(project))
     return scan_result
 
 
-def ordered_findings(
-    vulns: list[VulnFinding], updates: list[UpdateFinding]
-) -> list[Finding]:
-    """Return consolidated vulns then risk-ordered updates, retaining source refs."""
-    return [*consolidate_vulns(vulns), *sort_updates_by_risk(updates)]
+def report_missing_test_config(
+    name: str, project: ProjectConfig, *, emit: Emit
+) -> bool:
+    """Emit MissingTestConfig and return True when the project has no configured
+    test phase."""
+    if project.test_phases:
+        return False
+    emit(MissingTestConfig(name))
+    return True
 
 
 def complete_ready_findings(

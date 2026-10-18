@@ -23,6 +23,7 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    GradleUpdateTarget,
     ScanResult,
     UpdateFinding,
     UpdateResult,
@@ -32,7 +33,7 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.services import WorkflowError, flows
 from maintenance_man.services.flows import FlowConflictError
-from maintenance_man.updater import Finding, process_findings
+from maintenance_man.updater import group_findings, is_eligible, process_findings
 from maintenance_man.vcs import Repository, RevisionError, workspace_path_for_project
 from maintenance_man.vcs_workflow import (
     VcsServices,
@@ -84,6 +85,8 @@ def update_project(
     scan_result = flows.load_validated_scan(name, project, Workflow.UPDATE, emit=emit)
     if scan_result is None:
         return ProjectUpdate(name, Outcome.SUCCEEDED, ())
+    if flows.report_missing_test_config(name, project, emit=emit):
+        return ProjectUpdate(name, Outcome.FAILED, ())
     try:
         workspace = _enter_update_workspace(name, project, scan_result, vcs=vcs)
     except RevisionError as exc:
@@ -241,8 +244,8 @@ def _require_sdk_in_workspace(
         raise UpdateSetupError(reason)
 
 
-def _is_selectable(finding: Finding) -> bool:
-    return (not isinstance(finding, VulnFinding) or finding.actionable) and (
+def _is_selectable(finding: VulnFinding | UpdateFinding) -> bool:
+    return is_eligible(finding) and (
         finding.update_status is None
         or (
             finding.update_status is UpdateStatus.FAILED
@@ -267,11 +270,20 @@ def _process_selected(
     ]
     if choose is not None and (selectable_vulns or selectable_updates):
         selected_vulns, selected_updates = choose(selectable_vulns, selectable_updates)
+        targets = [
+            row.gradle_target
+            for row in (*selected_vulns, *selected_updates)
+            if row.gradle_target is not None
+        ]
+        selected_vulns = _with_shared_targets(selected_vulns, selectable_vulns, targets)
+        selected_updates = _with_shared_targets(
+            selected_updates, selectable_updates, targets
+        )
     else:
         selected_vulns, selected_updates = selectable_vulns, selectable_updates
 
     emit(ProcessingStarted(len(selected_vulns), len(selected_updates)))
-    findings = flows.ordered_findings(selected_vulns, selected_updates)
+    findings = group_findings([*selected_vulns, *selected_updates])
     results = (
         process_findings(
             findings,
@@ -287,3 +299,17 @@ def _process_selected(
     result_tuple = tuple(results)
     emit(FindingsProcessed(result_tuple, len(scan_result.blocked_findings)))
     return result_tuple
+
+
+def _with_shared_targets[F: VulnFinding | UpdateFinding](
+    selected: list[F], selectable: list[F], targets: list[GradleUpdateTarget]
+) -> list[F]:
+    chosen = {id(row) for row in selected}
+    return [
+        *selected,
+        *(
+            row
+            for row in selectable
+            if id(row) not in chosen and row.gradle_target in targets
+        ),
+    ]

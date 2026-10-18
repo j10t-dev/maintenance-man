@@ -24,13 +24,18 @@ from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import RevisionError
 from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor, RecordingEmit, pick_findings
-from tests.support.findings import make_scan_result, make_update, make_vuln
+from tests.support.findings import (
+    make_gradle_target,
+    make_scan_result,
+    make_update,
+    make_vuln,
+)
 from tests.support.projects import make_config, make_project, seed_project
 
 
 def test_update_processes_in_managed_workspace(tmp_path: Path, monkeypatch) -> None:
     state = FakeJjState()
-    project = make_project(tmp_path / "api")
+    project = make_project(tmp_path / "api", test_unit="pytest")
     state.seed_repository(project.path, files={"dep.txt": "version=1\n"})
     state.register_files(project.path, "mm-fixture-pkg-a.txt")
     original = project.model_copy(deep=True)
@@ -229,8 +234,8 @@ def test_update_nothing_actionable_is_a_success(tmp_path: Path) -> None:
     assert emit.events == [ProjectSkipped("api", SkipReason.NOTHING_TO_DO, "update")]
 
 
-def test_missing_test_config_is_reported_before_workspace_setup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_given_no_test_phase_when_updating_then_project_fails_before_effects(
+    tmp_path: Path,
 ) -> None:
     state, project = seed_project(
         tmp_path,
@@ -238,29 +243,50 @@ def test_missing_test_config_is_reported_before_workspace_setup(
         make_scan_result(vulns=[], updates=[make_update()]),
         test_unit=None,
     )
+    emit = RecordingEmit()
+
+    result = update_service.update_project(
+        "api", project, choose=None, vcs=state.services(), emit=emit
+    )
+
+    assert result == update_service.ProjectUpdate("api", Outcome.FAILED, ())
+    assert emit.events == [MissingTestConfig("api")]
+    assert state.effects == []
+
+
+def test_given_one_row_of_a_shared_target_chosen_when_updating_then_both_rows_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = make_gradle_target()
+    scan = make_scan_result(
+        vulns=[
+            make_vuln(
+                vuln_id="CVE-1",
+                pkg_name="androidx.room:room-runtime",
+                fixed_version="2.8.5",
+                gradle_target=target,
+            )
+        ],
+        updates=[make_update(pkg_name="room", gradle_target=target)],
+    )
+    state, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(
         update_service,
         "process_findings",
-        FakeFindingProcessor({"pkg-a": (True, None)}),
-    )
-    emit = RecordingEmit()
-    observed: list[object] = []
-    state.hook(
-        "add_workspace",
-        phase="before",
-        path=project.path,
-        action=lambda: observed.extend(emit.events),
+        FakeFindingProcessor({"room": (True, None)}),
     )
 
-    update_service.update_project(
+    result = update_service.update_project(
         "api",
         project,
-        choose=None,
+        choose=pick_findings("room"),
         vcs=state.services(),
-        emit=emit,
+        emit=RecordingEmit(),
     )
 
-    assert observed == [MissingTestConfig("api")]
+    assert result.results == (UpdateResult("room", "vuln", True),)
+    saved = load_scan_results("api")
+    assert (saved.vulnerabilities, saved.updates) == ([], [])
 
 
 def test_update_rejects_findings_owned_by_resolve(tmp_path: Path) -> None:

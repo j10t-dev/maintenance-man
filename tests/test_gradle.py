@@ -33,7 +33,11 @@ from maintenance_man.models.scan import (
     SemverTier,
 )
 from tests.support.findings import make_gradle_target
-from tests.support.gradle import GRADLE_FIXTURES, fixture_runner
+from tests.support.gradle import (
+    GRADLE_FIXTURES,
+    catalogue_apply_runner,
+    fixture_runner,
+)
 from tests.support.process import completed
 
 
@@ -778,24 +782,6 @@ def test_inventory_cleanup_failure_is_an_error(gradle_project, monkeypatch):
         assert generated.bom_path.is_file()
 
 
-def _apply_wrapper(edits: dict[str, str] | None = None, *, returncode: int = 0):
-    """Substitute that performs the plugin's catalogue edit from the report."""
-
-    def _run(cmd, cwd, **kwargs):
-        root = Path(cwd)
-        catalogue = root / "gradle" / "libs.versions.toml"
-        text = catalogue.read_text(encoding="utf-8")
-        for old, new in (edits or {}).items():
-            text = text.replace(old, new, 1)
-        catalogue.write_text(text, encoding="utf-8")
-        if returncode:
-            msg = f"{kwargs['label']} failed (exit {returncode})"
-            raise GradleError(msg)
-        return completed(cmd, returncode=0, stdout="", stderr="")
-
-    return _run
-
-
 class TestRenderSelectedReport:
     def test_renders_only_the_selected_group_with_quoted_keys(self):
         target = GradleUpdateTarget(
@@ -986,7 +972,7 @@ class TestApplyGradleUpdate:
     ):
         catalogue = Path(gradle_project.path) / "gradle" / "libs.versions.toml"
         reports: list[str] = []
-        applier = _apply_wrapper({'room = "2.8.4"': 'room = "2.8.5"'})
+        applier = catalogue_apply_runner({'room = "2.8.4"': 'room = "2.8.5"'})
 
         def _run(cmd, cwd, **kwargs):
             report = Path(cwd) / GRADLE_UPDATE_REPORT_RELPATH
@@ -1073,7 +1059,7 @@ class TestApplyGradleUpdate:
     ):
         monkeypatch.setattr(
             "maintenance_man.gradle.run_logged",
-            _apply_wrapper(edits, returncode=returncode),
+            catalogue_apply_runner(edits, returncode=returncode),
         )
 
         with pytest.raises(GradleError, match=expected):
@@ -1083,7 +1069,7 @@ class TestApplyGradleUpdate:
 
     def test_invokes_the_approved_apply_arguments(self, gradle_project, monkeypatch):
         calls: list[list[str]] = []
-        applier = _apply_wrapper({'room = "2.8.4"': 'room = "2.8.5"'})
+        applier = catalogue_apply_runner({'room = "2.8.4"': 'room = "2.8.5"'})
 
         def _run(cmd, cwd, **kwargs):
             calls.append(cmd)
@@ -1168,7 +1154,7 @@ def test_application_preserves_bundles_and_rich_declarations(
     )
     monkeypatch.setattr(
         "maintenance_man.gradle.run_logged",
-        _apply_wrapper({'room = "2.8.4"': 'room = "2.8.5"', old: new}),
+        catalogue_apply_runner({'room = "2.8.4"': 'room = "2.8.5"', old: new}),
     )
     with pytest.raises(GradleError):
         apply_gradle_update(gradle_project, make_gradle_target())

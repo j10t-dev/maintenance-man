@@ -291,7 +291,7 @@ def test_given_opposite_workflow_when_run_then_flow_conflict_is_reported(
 
 
 @pytest.mark.parametrize("command,deps_fixture", _COMMAND_FIXTURES)
-def test_given_missing_test_config_when_run_then_warns_and_succeeds(
+def test_given_missing_test_config_when_run_then_fails_before_effects(
     mm_home_with_projects: Path,
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
@@ -307,12 +307,15 @@ def test_given_missing_test_config_when_run_then_warns_and_succeeds(
             finding.flow = None
         save_scan_results("no-tests", deps.scan_result)
     monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
+    deps.vcs_state.clear_calls()
 
-    assert run_mm(command, "no-tests") == ExitCode.OK
+    assert run_mm(command, "no-tests") == ExitCode.UPDATE_FAILED
     assert (
-        "warning: no-tests · no test configuration · test phases skipped"
+        "error: no-tests · no test configuration · automatic updates need "
+        "test_unit, test_integration or test_component"
         in capsys.readouterr().err.splitlines()
     )
+    assert deps.vcs_state.effects == []
 
 
 def test_given_missing_update_bookmark_when_run_then_exits_one_with_error(
@@ -716,16 +719,16 @@ class TestUpdateResume:
 class TestUpdateAll:
     """Batch mode: `mm update` with no project argument."""
 
-    def test_processes_all_projects(
+    def test_given_project_without_tests_when_batch_updated_then_only_it_keeps_findings(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: CliDeps,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        assert run_mm("update") == 0
+        assert run_mm("update") == ExitCode.UPDATE_FAILED
         for project in mock_update_cli_deps.project_paths:
             saved = load_scan_results(project)
-            assert not saved.findings
+            assert bool(saved.findings) is (project == "no-tests")
 
     def test_any_failure_exits_4(
         self,

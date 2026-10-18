@@ -194,7 +194,9 @@ class _Renderer:
     @__call__.register
     def _render_missing_test_config(self, event: MissingTestConfig) -> None:
         output.diagnostic(
-            "warning", f"{event.project} · no test configuration · test phases skipped"
+            "error",
+            f"{event.project} · no test configuration · automatic updates need "
+            "test_unit, test_integration or test_component",
         )
 
     @__call__.register
@@ -222,7 +224,7 @@ class _Renderer:
         if self.project:
             output.heading(self.project)
         for package, reason in event.findings:
-            output.outcome(self.project, "resolve", "blocked", package, reason=reason)
+            output.outcome(self.project, self.flow, "blocked", package, reason=reason)
 
     @__call__.register
     def _render_blockers_still_failing(self, event: BlockersStillFailing) -> None:

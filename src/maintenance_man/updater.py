@@ -7,11 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
+from maintenance_man import gradle
+from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Emit,
     FindingFailed,
     FindingPassed,
+    FindingsBlocked,
     FindingStarted,
     FindingStepFailed,
     FindingStepKind,
@@ -19,6 +22,7 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    GradleUpdateTarget,
     ScanResult,
     SemverTier,
     UpdateFinding,
@@ -78,6 +82,8 @@ class Finding(Protocol):
     update_status: UpdateStatus | None
     failed_phase: str | None
     flow: Workflow | None
+    gradle_target: GradleUpdateTarget | None
+    blocked_reason: str | None
 
     @property
     def target_version(self) -> str: ...
@@ -140,23 +146,21 @@ def _consolidated_lifecycle_state(
 
 
 @dataclass
-class _ConsolidatedVuln:
-    """Proxy that groups several vulns for the same package into one finding.
-
-    Satisfies the :class:`Finding` protocol so it can be used in the update
-    processing flows.  Writes to :attr:`update_status`, :attr:`failed_phase`
-    and :attr:`flow` are fanned out to every original :class:`VulnFinding` so
-    that serialisation (which works on the originals) stays consistent.
-    """
+class _FindingGroup:
+    """Saved rows applied, tested and committed as one change; lifecycle and
+    blocked-reason writes fan out to every original row."""
 
     pkg_name: str
     installed_version: str
     _target_version: str
     _detail: str
-    _originals: list[VulnFinding] = field(repr=False)
+    _originals: Sequence[VulnFinding | UpdateFinding] = field(repr=False)
+    kind: UpdateKind = "vuln"
+    gradle_target: GradleUpdateTarget | None = None
     _update_status: UpdateStatus | None = None
     _failed_phase: str | None = None
     _flow: Workflow | None = None
+    _blocked_reason: str | None = None
 
     def __post_init__(self) -> None:
         self.update_status = self._update_status
@@ -201,22 +205,32 @@ class _ConsolidatedVuln:
         for orig in self._originals:
             orig.flow = value
 
+    @property
+    def blocked_reason(self) -> str | None:
+        return self._blocked_reason
+
+    @blocked_reason.setter
+    def blocked_reason(self, value: str | None) -> None:
+        self._blocked_reason = value
+        for orig in self._originals:
+            orig.blocked_reason = value
+
 
 def consolidate_vulns(
     vulns: list[VulnFinding],
-) -> list[_ConsolidatedVuln]:
+) -> list[_FindingGroup]:
     """Group actionable vulns by package and pick the highest fix version."""
     by_pkg: dict[str, list[VulnFinding]] = {}
     for v in vulns:
         by_pkg.setdefault(v.pkg_name, []).append(v)
 
-    consolidated: list[_ConsolidatedVuln] = []
+    consolidated: list[_FindingGroup] = []
     for pkg, group in by_pkg.items():
         best_version = highest_fix_version(group)
         detail = ", ".join(v.vuln_id for v in group)
         update_status, failed_phase, flow = _consolidated_lifecycle_state(group)
         consolidated.append(
-            _ConsolidatedVuln(
+            _FindingGroup(
                 pkg_name=pkg,
                 installed_version=group[0].installed_version,
                 _target_version=best_version,
@@ -264,6 +278,85 @@ def run_test_phases(
     return None
 
 
+def is_eligible(finding: VulnFinding | UpdateFinding) -> bool:
+    """Whether a saved row can be applied: not blocked, and with a version to apply."""
+    if finding.blocked_reason is not None:
+        return False
+    return (
+        not isinstance(finding, VulnFinding)
+        or finding.actionable
+        or finding.gradle_target is not None
+    )
+
+
+def group_findings(findings: Sequence[VulnFinding | UpdateFinding]) -> list[Finding]:
+    """Group eligible rows into one change each: rows sharing a saved catalogue
+    target, other vulnerabilities by package, then other updates risk-ascending.
+    Ineligible rows are left out."""
+    eligible = [finding for finding in findings if is_eligible(finding)]
+    targets: dict[
+        str, tuple[GradleUpdateTarget, list[VulnFinding | UpdateFinding]]
+    ] = {}
+    for finding in eligible:
+        if finding.gradle_target is not None:
+            key = finding.gradle_target.model_dump_json()
+            targets.setdefault(key, (finding.gradle_target, []))[1].append(finding)
+    return [
+        *consolidate_vulns(
+            [
+                f
+                for f in eligible
+                if isinstance(f, VulnFinding) and f.gradle_target is None
+            ]
+        ),
+        *(_target_group(target, rows) for target, rows in targets.values()),
+        *sort_updates_by_risk(
+            [
+                f
+                for f in eligible
+                if isinstance(f, UpdateFinding) and f.gradle_target is None
+            ]
+        ),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class Applied:
+    """The change is in the working copy, or was already there."""
+
+
+@dataclass(frozen=True, slots=True)
+class Blocked:
+    """The saved target no longer matches the catalogue; nothing changed."""
+
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyFailed:
+    """Application failed and was reported; partial changes may remain."""
+
+
+type ApplyOutcome = Applied | Blocked | ApplyFailed
+
+
+def apply_finding(
+    project: ProjectConfig, finding: Finding, *, emit: Emit
+) -> ApplyOutcome:
+    """Apply one finding in the project directory; Blocked means nothing changed,
+    ApplyFailed means the failure was emitted and partial changes may remain."""
+    if finding.gradle_target is None:
+        applied = _apply_update(
+            project.package_manager,
+            finding.pkg_name,
+            finding.target_version,
+            project.path,
+            emit=emit,
+        )
+        return Applied() if applied else ApplyFailed()
+    return _apply_gradle_target(project, finding.gradle_target, emit=emit)
+
+
 def process_findings(
     findings: Sequence[Finding],
     project_config: ProjectConfig,
@@ -295,7 +388,15 @@ def process_findings(
                 finding.target_version,
             )
         )
-        step = _attempt_finding(finding, kind, project_config, repo, flow, emit)
+        outcome = apply_finding(project_config, finding, emit=emit)
+        if isinstance(outcome, Blocked):
+            _block(finding, outcome.reason, scan_result, emit)
+            continue
+        step = (
+            FindingStep("apply")
+            if isinstance(outcome, ApplyFailed)
+            else _test_and_commit(finding, kind, project_config, repo, flow, emit)
+        )
         if step.failed_phase is not None:
             emit(
                 FindingFailed(
@@ -319,10 +420,52 @@ def process_findings(
 
 
 def _kind(finding: Finding) -> UpdateKind:
-    return "vuln" if isinstance(finding, (VulnFinding, _ConsolidatedVuln)) else "update"
+    if isinstance(finding, _FindingGroup):
+        return finding.kind
+    return "vuln" if isinstance(finding, VulnFinding) else "update"
 
 
-def _attempt_finding(
+def _target_group(
+    target: GradleUpdateTarget, rows: list[VulnFinding | UpdateFinding]
+) -> _FindingGroup:
+    update_status, failed_phase, flow = _consolidated_lifecycle_state(rows)
+    return _FindingGroup(
+        pkg_name=target.display_name,
+        installed_version=target.members[0].installed_version,
+        _target_version=target.target_version,
+        _detail=", ".join(dict.fromkeys(row.detail for row in rows)),
+        _originals=rows,
+        kind="vuln" if any(isinstance(row, VulnFinding) for row in rows) else "update",
+        gradle_target=target,
+        _update_status=update_status,
+        _failed_phase=failed_phase,
+        _flow=flow,
+    )
+
+
+def _apply_gradle_target(
+    project: ProjectConfig, target: GradleUpdateTarget, *, emit: Emit
+) -> ApplyOutcome:
+    try:
+        if gradle.validate_gradle_recovery(project, target) is None:
+            return Applied()
+        block = gradle.apply_gradle_update(project, target)
+    except GradleError as exc:
+        emit(FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, str(exc)))
+        return ApplyFailed()
+    return Applied() if block is None else Blocked(block.reason)
+
+
+def _block(finding: Finding, reason: str, scan_result: ScanResult, emit: Emit) -> None:
+    finding.blocked_reason = reason
+    finding.update_status = None
+    finding.failed_phase = None
+    finding.flow = None
+    save_scan_results(scan_result.project, scan_result)
+    emit(FindingsBlocked(((finding.pkg_name, reason),)))
+
+
+def _test_and_commit(
     finding: Finding,
     kind: UpdateKind,
     project_config: ProjectConfig,
@@ -331,15 +474,6 @@ def _attempt_finding(
     emit: Emit,
 ) -> FindingStep:
     project_path = Path(project_config.path)
-    if not _apply_update(
-        project_config.package_manager,
-        finding.pkg_name,
-        finding.target_version,
-        project_path,
-        emit=emit,
-    ):
-        return FindingStep("apply")
-
     failed_phase = run_test_phases(project_config, project_path, emit=emit)
     if failed_phase is not None:
         return FindingStep(failed_phase)

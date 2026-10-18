@@ -14,6 +14,7 @@ from maintenance_man.models.events import (
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     ScanResult,
+    UpdateFinding,
     UpdateStatus,
     VulnFinding,
     Workflow,
@@ -22,6 +23,8 @@ from maintenance_man.services import WorkflowError, flows
 from maintenance_man.storage import save_scan_results
 from maintenance_man.updater import (
     Finding,
+    group_findings,
+    is_eligible,
     process_findings,
     run_test_phases,
 )
@@ -40,6 +43,8 @@ def resolve_project(
     scan_result = flows.load_validated_scan(name, project, Workflow.RESOLVE, emit=emit)
     if scan_result is None:
         return Outcome.SUCCEEDED
+    if flows.report_missing_test_config(name, project, emit=emit):
+        return Outcome.FAILED
     if continue_:
         return _handle_continue(name, project, scan_result, vcs=vcs, emit=emit)
 
@@ -74,13 +79,11 @@ def _select_resolve_candidates(scan_result: ScanResult) -> list[Finding]:
     updates = [
         finding for finding in scan_result.updates if _is_resolve_candidate(finding)
     ]
-    return flows.ordered_findings(vulns, updates)
+    return group_findings([*vulns, *updates])
 
 
-def _is_resolve_candidate(finding: Finding) -> bool:
-    if isinstance(finding, VulnFinding) and not finding.actionable:
-        return False
-    return (
+def _is_resolve_candidate(finding: VulnFinding | UpdateFinding) -> bool:
+    return is_eligible(finding) and (
         (finding.flow is None and finding.update_status is None)
         or (
             finding.flow is Workflow.RESOLVE
@@ -266,17 +269,12 @@ def _handle_continue(
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
     repo = vcs.repository(project.path)
     _check_resumable(repo, bookmark)
-    failed = flows.ordered_findings(
+    failed = group_findings(
         [
             finding
-            for finding in scan_result.vulnerabilities
+            for finding in scan_result.findings
             if _is_failed_resolve_finding(finding)
-        ],
-        [
-            finding
-            for finding in scan_result.updates
-            if _is_failed_resolve_finding(finding)
-        ],
+        ]
     )
     if failed and not _retest_blockers(
         name, project, scan_result, failed, repo=repo, emit=emit

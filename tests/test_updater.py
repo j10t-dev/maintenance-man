@@ -16,6 +16,7 @@ from maintenance_man.gradle import (
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     FindingFailed,
+    FindingsBlocked,
     FindingStepFailed,
     FindingStepKind,
 )
@@ -26,6 +27,7 @@ from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,
     UpdateFinding,
+    UpdateResult,
     UpdateStatus,
     Workflow,
 )
@@ -33,10 +35,15 @@ from maintenance_man.package_managers import package_manager_ops
 from maintenance_man.process import ProcessError
 from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
+    Applied,
+    ApplyFailed,
+    Blocked,
     FindingStep,
     _apply_update,
+    apply_finding,
     consolidate_vulns,
     finding_transition,
+    group_findings,
     process_findings,
     remove_completed_findings,
     run_test_phases,
@@ -51,8 +58,34 @@ from maintenance_man.uv_dependencies import (
 from maintenance_man.vcs_workflow import VcsServices
 from tests.fake_vcs import FakeJj, FakeJjState
 from tests.fakes import RecordingEmit
-from tests.support.findings import make_gradle_target, make_update, make_vuln
+from tests.support.findings import (
+    make_gradle_member,
+    make_gradle_target,
+    make_scan_result,
+    make_update,
+    make_vuln,
+)
+from tests.support.gradle import catalogue_apply_runner
 from tests.support.process import completed
+
+_ROOM = make_gradle_target()
+_KSP = make_gradle_target(
+    version_ref="ksp",
+    members=[
+        make_gradle_member(
+            kind="plugin",
+            alias="ksp",
+            coordinate="com.google.devtools.ksp",
+            installed_version="2.3.10",
+        )
+    ],
+    target_version="2.3.12",
+)
+_DRIFT_REASON = (
+    "'room-runtime' is at 2.8.7, expected 2.8.4; the catalogue no longer matches "
+    "the scan; note that an uncommitted catalogue edit is not visible in the "
+    "update workspace. Rescan required"
+)
 
 PASSED = FindingStep(None)
 FAILED = FindingStep("unit")
@@ -967,30 +1000,6 @@ def test_given_failing_package_command_when_processed_then_apply_failure_emitted
     assert len(emit.of_type(FindingFailed)) == 1
 
 
-@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
-def test_no_test_config_skips_tests_and_commits(
-    flow: Workflow,
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    config = project_config.model_copy(update={"test_unit": None})
-    update = make_update()
-
-    results = process_findings(
-        [update],
-        config,
-        flow=flow,
-        on_failure="stop" if flow == Workflow.RESOLVE else "continue",
-        scan_result=_scan_result_for(config, [update]),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert results[0].passed is True
-    processor_vcs["phase"].assert_not_called()
-    assert any(call.method == "commit" for call in processor_vcs["state"].effects)
-
-
 def test_empty_findings_have_no_repository_effects(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
@@ -1167,7 +1176,7 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
     )
 
     results = process_findings(
-        consolidate_vulns(vulns),
+        group_findings(vulns),
         project_config,
         flow=Workflow.UPDATE,
         scan_result=scan,
@@ -1253,3 +1262,297 @@ def test_bun_update_without_a_manifest_runs_no_command(tmp_path, monkeypatch):
     assert _apply_update("bun", "zod", "4.6.5", tmp_path, emit=emit) is False
     assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PREPARE
     assert "package.json" in emit.of_type(FindingStepFailed)[0].error
+
+
+def _group_summary(findings):
+    return [
+        (f.pkg_name, f.installed_version, f.target_version, f.detail) for f in findings
+    ]
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        pytest.param(
+            [
+                make_vuln(
+                    vuln_id="CVE-1",
+                    pkg_name="androidx.room:room-runtime",
+                    fixed_version="2.8.5",
+                    gradle_target=_ROOM,
+                ),
+                make_update(pkg_name="room", gradle_target=_ROOM),
+            ],
+            [("room", "2.8.4", "2.8.5", "CVE-1, patch")],
+            id="ordinary-and-security-rows-share-a-target",
+        ),
+        pytest.param(
+            [
+                make_vuln(vuln_id="CVE-1", gradle_target=_ROOM),
+                make_vuln(vuln_id="CVE-2", gradle_target=_ROOM),
+            ],
+            [("room", "2.8.4", "2.8.5", "CVE-1, CVE-2")],
+            id="two-security-rows-share-a-target",
+        ),
+        pytest.param(
+            [
+                make_vuln(vuln_id="CVE-1", gradle_target=_ROOM),
+                make_vuln(vuln_id="CVE-1", gradle_target=_KSP),
+            ],
+            [
+                ("room", "2.8.4", "2.8.5", "CVE-1"),
+                ("ksp", "2.3.10", "2.3.12", "CVE-1"),
+            ],
+            id="one-advisory-with-two-owner-targets",
+        ),
+        pytest.param(
+            [
+                make_update(
+                    pkg_name="room",
+                    gradle_target=_ROOM,
+                    blocked_reason="publication younger than required 7 days",
+                )
+            ],
+            [],
+            id="blocked-row",
+        ),
+        pytest.param([make_vuln(fixed_version=None)], [], id="no-fix-and-no-target"),
+        pytest.param(
+            [
+                make_vuln(
+                    fixed_version=None,
+                    gradle_target=_ROOM,
+                    blocked_reason="no published fix",
+                )
+            ],
+            [],
+            id="no-fix-blocked-with-target",
+        ),
+        pytest.param(
+            [
+                make_update(SemverTier.MAJOR),
+                make_vuln(vuln_id="CVE-1"),
+                make_vuln(vuln_id="CVE-2"),
+                make_update(),
+            ],
+            [
+                ("some-pkg", "1.0.0", "1.0.1", "CVE-1, CVE-2"),
+                ("pkg-a", "1.0.0", "1.0.1", "patch"),
+                ("pkg-c", "1.0.0", "2.0.0", "major"),
+            ],
+            id="native-rows-by-package-then-risk",
+        ),
+    ],
+)
+def test_given_saved_rows_when_grouped_then_one_change_per_target_or_package(
+    rows, expected
+):
+    assert _group_summary(group_findings(rows)) == expected
+
+
+@pytest.mark.parametrize(
+    ("catalogue_room", "edits", "returncode", "expected", "commands", "step_failures"),
+    [
+        pytest.param("2.8.4", None, 0, Applied(), 1, [], id="report-driven-apply"),
+        pytest.param("2.8.5", {}, 0, Applied(), 0, [], id="already-applied"),
+        pytest.param(
+            "2.8.7", {}, 0, Blocked(_DRIFT_REASON), 0, [], id="drifted-catalogue"
+        ),
+        pytest.param(
+            "2.8.4",
+            {},
+            1,
+            ApplyFailed(),
+            1,
+            [
+                FindingStepFailed(
+                    FindingStepKind.PACKAGE_COMMAND,
+                    "./gradlew versionCatalogApplyUpdates failed (exit 1)",
+                )
+            ],
+            id="gradle-command-fails",
+        ),
+    ],
+)
+def test_given_saved_target_when_applied_then_outcome_matches_catalogue_state(
+    gradle_project,
+    monkeypatch,
+    catalogue_room,
+    edits,
+    returncode,
+    expected,
+    commands,
+    step_failures,
+):
+    catalogue = Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
+    catalogue.write_text(
+        catalogue.read_text(encoding="utf-8").replace(
+            'room = "2.8.4"', f'room = "{catalogue_room}"'
+        ),
+        encoding="utf-8",
+    )
+    runner = MagicMock(side_effect=catalogue_apply_runner(edits, returncode=returncode))
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", runner)
+    emit = RecordingEmit()
+
+    outcome = apply_finding(
+        gradle_project,
+        make_update(pkg_name="room", gradle_target=_ROOM),
+        emit=emit,
+    )
+
+    assert outcome == expected
+    assert runner.call_count == commands
+    assert emit.of_type(FindingStepFailed) == step_failures
+
+
+@pytest.fixture()
+def gradle_processor(
+    monkeypatch: pytest.MonkeyPatch, gradle_project: ProjectConfig
+) -> ProcessorDeps:
+    """A seeded Gradle repository whose wrapper applies the selected report."""
+    root = Path(gradle_project.path)
+    state = FakeJjState()
+    repo = state.seed_repository(
+        root,
+        files={
+            name: (root / name).read_text(encoding="utf-8")
+            for name in ("gradlew", GRADLE_CATALOGUE_RELPATH)
+        },
+    )
+    package = MagicMock(side_effect=catalogue_apply_runner())
+    phase = MagicMock()
+    monkeypatch.setattr("maintenance_man.gradle.run_logged", package)
+    monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
+    return {
+        "state": state,
+        "repo": repo,
+        "services": state.services(),
+        "package": package,
+        "phase": phase,
+    }
+
+
+def test_given_rows_of_one_target_when_processed_then_one_change_marks_both_ready(
+    gradle_processor: ProcessorDeps, gradle_project: ProjectConfig
+):
+    vuln = make_vuln(
+        vuln_id="CVE-1",
+        pkg_name="androidx.room:room-runtime",
+        fixed_version="2.8.5",
+        gradle_target=_ROOM,
+    )
+    update = make_update(pkg_name="room", gradle_target=_ROOM)
+    rows = [vuln, update]
+    scan = make_scan_result(vulns=[vuln], updates=[update])
+    scan.project = "demo"
+
+    results = process_findings(
+        group_findings(rows),
+        gradle_project,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        vcs=gradle_processor["services"],
+        emit=RecordingEmit(),
+    )
+
+    state = gradle_processor["state"]
+    assert results == [UpdateResult("room", "vuln", True)]
+    assert gradle_processor["package"].call_count == 1
+    assert gradle_processor["phase"].call_count == 1
+    assert [call.method for call in state.effects] == ["commit", "set_bookmark"]
+    assert dict(state.effects[0].arguments) == {
+        "message": "fix: upgrade room 2.8.4 -> 2.8.5 for CVE-1, patch"
+    }
+    assert 'room = "2.8.5"' in (
+        Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
+    ).read_text(encoding="utf-8")
+    saved = load_scan_results("demo")
+    assert [
+        (row.update_status, row.failed_phase, row.flow)
+        for row in (*saved.vulnerabilities, *saved.updates)
+    ] == [(UpdateStatus.READY, None, Workflow.UPDATE)] * 2
+
+
+def test_given_two_owner_targets_when_one_fails_then_statuses_stay_independent(
+    gradle_processor: ProcessorDeps, gradle_project: ProjectConfig
+):
+    advisory = make_vuln(
+        vuln_id="CVE-1",
+        pkg_name="androidx.room:room-runtime",
+        installed_version="2.8.4",
+        fixed_version="2.8.5",
+    )
+    rows = [
+        advisory.model_copy(update={"gradle_target": _ROOM}),
+        advisory.model_copy(update={"gradle_target": _KSP}),
+    ]
+    gradle_processor["phase"].side_effect = [None, ProcessError("unit failed")]
+    scan = make_scan_result(vulns=rows, updates=[])
+    scan.project = "demo"
+
+    process_findings(
+        group_findings(rows),
+        gradle_project,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        vcs=gradle_processor["services"],
+        emit=RecordingEmit(),
+    )
+
+    catalogue = (Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH).read_text(
+        encoding="utf-8"
+    )
+    saved = load_scan_results("demo")
+    assert gradle_processor["package"].call_count == 2
+    assert [(row.update_status, row.failed_phase) for row in saved.vulnerabilities] == [
+        (UpdateStatus.READY, None),
+        (UpdateStatus.FAILED, "unit"),
+    ]
+    assert 'room = "2.8.5"' in catalogue
+    assert 'ksp = "2.3.10"' in catalogue
+
+
+def test_given_drifted_target_when_processed_then_rows_are_blocked_without_effects(
+    gradle_processor: ProcessorDeps, gradle_project: ProjectConfig
+):
+    catalogue = Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
+    catalogue.write_text(
+        catalogue.read_text(encoding="utf-8").replace(
+            'room = "2.8.4"', 'room = "2.8.7"'
+        ),
+        encoding="utf-8",
+    )
+    row = make_update(
+        pkg_name="room",
+        gradle_target=_ROOM,
+        update_status=UpdateStatus.FAILED,
+        failed_phase="unit",
+        flow=Workflow.UPDATE,
+    )
+    scan = make_scan_result(vulns=[], updates=[row])
+    scan.project = "demo"
+    emit = RecordingEmit()
+
+    results = process_findings(
+        group_findings([row]),
+        gradle_project,
+        flow=Workflow.UPDATE,
+        scan_result=scan,
+        vcs=gradle_processor["services"],
+        emit=emit,
+    )
+
+    saved = load_scan_results("demo").updates[0]
+    assert results == []
+    assert gradle_processor["state"].effects == []
+    assert gradle_processor["phase"].call_count == 0
+    assert (
+        saved.blocked_reason,
+        saved.update_status,
+        saved.failed_phase,
+        saved.flow,
+    ) == (_DRIFT_REASON, None, None, None)
+    assert emit.of_type(FindingsBlocked) == [
+        FindingsBlocked((("room", _DRIFT_REASON),))
+    ]
