@@ -53,7 +53,6 @@ def make_scan_result(
     return ScanResult(
         project="vulnerable",
         scanned_at=datetime.now(tz=UTC),
-        trivy_target="tests/fixtures/vulnerable-project",
         vulnerabilities=vulns if vulns is not None else [make_vuln()],
         updates=updates if updates is not None else [make_update()],
     )

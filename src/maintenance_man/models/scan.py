@@ -2,7 +2,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum, auto
-from typing import Any, Literal
+from typing import Literal
 
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
@@ -53,7 +53,6 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
 class UpdateStatus(StrEnum):
     FAILED = "failed"
     READY = "ready"
-    COMPLETED = "completed"
 
 
 class Workflow(StrEnum):
@@ -130,16 +129,11 @@ class GradleBlock(BaseModel):
     reason: str
 
 
-class VulnFinding(BaseModel):
-    vuln_id: str
+class _FindingBase(BaseModel):
+    """Fields shared by vulnerability and update findings."""
+
     pkg_name: str
     installed_version: str
-    fixed_version: str | None = None
-    severity: Severity
-    title: str
-    description: str
-    status: str
-    primary_url: str | None = None
     published_date: datetime | None = None
     update_status: UpdateStatus | None = None
     failed_phase: str | None = None
@@ -147,6 +141,16 @@ class VulnFinding(BaseModel):
     gradle_target: GradleUpdateTarget | None = None
     blocked_reason: str | None = None
     gradle_block_kind: GradleBlockKind | None = None
+
+
+class VulnFinding(_FindingBase):
+    vuln_id: str
+    fixed_version: str | None = None
+    severity: Severity
+    title: str
+    description: str
+    status: str
+    primary_url: str | None = None
     gradle_scopes: tuple[str, ...] = ()
 
     @property
@@ -177,18 +181,9 @@ class SecretFinding(BaseModel):
     severity: Severity
 
 
-class UpdateFinding(BaseModel):
-    pkg_name: str
-    installed_version: str
+class UpdateFinding(_FindingBase):
     latest_version: str
     semver_tier: SemverTier
-    published_date: datetime | None = None
-    update_status: UpdateStatus | None = None
-    failed_phase: str | None = None
-    flow: Workflow | None = None
-    gradle_target: GradleUpdateTarget | None = None
-    blocked_reason: str | None = None
-    gradle_block_kind: GradleBlockKind | None = None
 
     @property
     def target_version(self) -> str:
@@ -206,20 +201,14 @@ class ScanResult(BaseModel):
 
     project: str
     scanned_at: datetime
-    trivy_target: str
     vulnerabilities: list[VulnFinding] = []
     secrets: list[SecretFinding] = []
     updates: list[UpdateFinding] = []
-    gradle_resolution: dict[str, Any] | None = None
     resolve_repair_base: str | None = None
 
     @property
     def has_actionable_vulns(self) -> bool:
         return any(v.actionable for v in self.vulnerabilities)
-
-    @property
-    def has_updates(self) -> bool:
-        return bool(self.updates)
 
     @property
     def has_findings(self) -> bool:

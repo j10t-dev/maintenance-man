@@ -419,7 +419,14 @@ def scan(
             minimum_age_days=cfg.defaults.min_version_age_days,
             emit=_Renderer(batch=False, project=project, flow="scan"),
         )
-        sys.exit(_scan_exit_code(ScanSummary.of(result)))
+        sys.exit(
+            _scan_exit_code(
+                ScanSummary(
+                    has_vulns=result.has_actionable_vulns,
+                    has_updates=bool(result.updates),
+                )
+            )
+        )
 
     started = time.monotonic()
     summary = scan_service.scan_all(cfg, emit=_Renderer(batch=True, flow="scan"))

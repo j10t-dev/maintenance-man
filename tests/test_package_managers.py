@@ -1,61 +1,13 @@
 from pathlib import Path
-from typing import cast, get_args
 
 import pytest
 
-from maintenance_man.models.config import ProjectConfig
-from maintenance_man.outdated import bun_outdated, mvn_outdated, uv_outdated
-from maintenance_man.package_managers import (
-    PACKAGE_MANAGERS,
-    PackageManagerOps,
-    UnsupportedPackageManagerError,
-    UpdateCommandError,
-    package_manager_ops,
-)
-
-
-def test_table_covers_every_configurable_manager_except_gradle():
-    annotation = ProjectConfig.model_fields["package_manager"].annotation
-    assert set(PACKAGE_MANAGERS) == set(get_args(annotation)) - {"gradle"}
-
-
-def test_table_is_read_only():
-    with pytest.raises(TypeError):
-        cast("dict[str, PackageManagerOps]", PACKAGE_MANAGERS)["pip"] = (
-            PACKAGE_MANAGERS["uv"]
-        )
-
-
-@pytest.mark.parametrize(
-    ("name", "source", "outdated", "publication"),
-    [
-        ("bun", "trivy", bun_outdated, "npm"),
-        ("uv", "uv-audit", uv_outdated, "pypi"),
-        ("mvn", "trivy", mvn_outdated, "central"),
-    ],
-)
-def test_entry_scan_operations(name, source, outdated, publication):
-    ops = package_manager_ops(name)
-    assert ops.vulnerability_source == source
-    assert ops.outdated is outdated
-    assert ops.publication_source == publication
-
-
-@pytest.mark.parametrize(
-    ("name", "message"),
-    [
-        ("gradle", "Gradle updates are applied through the Gradle adapter"),
-        ("npm", "Unsupported package manager: npm"),
-    ],
-)
-def test_managers_outside_the_table_are_unsupported(name, message):
-    with pytest.raises(UnsupportedPackageManagerError, match=message):
-        package_manager_ops(name)
+from maintenance_man.package_managers import UpdateCommandError, update_commands
 
 
 def test_bun_update_refuses_a_workspace_without_a_manifest(tmp_path: Path):
     with pytest.raises(UpdateCommandError, match=r"package.json"):
-        package_manager_ops("bun").update_commands("zod", "4.6.5", tmp_path)
+        update_commands("bun", "zod", "4.6.5", tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -111,7 +63,7 @@ def test_given_uv_declaration_when_commands_built_then_matching_commands_returne
 ):
     (tmp_path / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
 
-    commands = package_manager_ops("uv").update_commands(pkg, version, tmp_path)
+    commands = update_commands("uv", pkg, version, tmp_path)
 
     assert commands == expected_commands
 
@@ -121,7 +73,7 @@ def test_given_bun_dependency_when_update_commands_are_built_then_bun_add_is_ret
 ):
     (tmp_path / "package.json").write_text('{"dependencies":{"axios":"1.6.0"}}')
 
-    commands = package_manager_ops("bun").update_commands("axios", "1.7.0", tmp_path)
+    commands = update_commands("bun", "axios", "1.7.0", tmp_path)
 
     assert commands == [["bun", "add", "axios@1.7.0"]]
 
@@ -129,9 +81,7 @@ def test_given_bun_dependency_when_update_commands_are_built_then_bun_add_is_ret
 def test_given_maven_dependency_when_commands_built_then_versions_commands_returned(
     tmp_path: Path,
 ):
-    commands = package_manager_ops("mvn").update_commands(
-        "org.example:lib", "3.0.0", tmp_path
-    )
+    commands = update_commands("mvn", "org.example:lib", "3.0.0", tmp_path)
 
     assert commands == [
         [
@@ -148,4 +98,14 @@ def test_given_unreadable_pyproject_when_uv_commands_built_then_error_raised(
     tmp_path: Path,
 ):
     with pytest.raises(UpdateCommandError, match="Failed to read"):
-        package_manager_ops("uv").update_commands("pytest", "9.0.3", tmp_path)
+        update_commands("uv", "pytest", "9.0.3", tmp_path)
+
+
+def test_given_gradle_when_update_commands_are_built_then_error_points_to_the_adapter(
+    tmp_path: Path,
+):
+    with pytest.raises(
+        UpdateCommandError,
+        match="Gradle updates are applied through the Gradle adapter",
+    ):
+        update_commands("gradle", "room", "2.8.5", tmp_path)

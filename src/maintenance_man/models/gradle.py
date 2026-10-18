@@ -1,12 +1,29 @@
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
-from maintenance_man.models.publication import UtcDatetime
 from maintenance_man.models.scan import (
     GradleKind,
     GradleUpdateTarget,
 )
+
+
+def _utc_date(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        msg = "publication dates require a timezone"
+        raise ValueError(msg)
+    return value.astimezone(UTC)
+
+
+type UtcDatetime = Annotated[datetime, AfterValidator(_utc_date)]
 
 
 class GradleRecord(BaseModel):
@@ -159,8 +176,6 @@ class AgeBlock(GradleRecord):
 class PublicationFact(GradleRecord):
     repository: RepositoryId
     module: ModuleId
-    source_url: str
-    method: Literal["last_modified", "central_timestamp"]
     artifact_digest: str
     timestamp: UtcDatetime
     checked_at: UtcDatetime

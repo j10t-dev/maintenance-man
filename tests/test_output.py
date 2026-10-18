@@ -28,7 +28,6 @@ def _scanned_result(**overrides: object) -> ScanResult:
         {
             "project": _LONG_NAME,
             "scanned_at": datetime(2026, 1, 15, 12, tzinfo=UTC),
-            "trivy_target": ".",
         }
         | overrides
     )

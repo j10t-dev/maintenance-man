@@ -1,102 +1,62 @@
-"""Operations that differ between the uv, bun and mvn package managers."""
+"""Update commands for the uv, bun and mvn package managers."""
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
-from typing import Literal
 
-from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.publication import PublicationSource
-from maintenance_man.models.scan import UpdateFinding
-from maintenance_man.outdated import bun_outdated, mvn_outdated, uv_outdated
-from maintenance_man.uv_dependencies import (
-    UvDependencyError,
-    UvDependencyLocation,
-    UvGroupLocation,
-    get_uv_dependency_locations,
-)
-
-type VulnerabilitySource = Literal["uv-audit", "trivy"]
-
-
-class UnsupportedPackageManagerError(Exception):
-    """The package manager has no entry in the operations table."""
+from maintenance_man.models.config import PackageManager
+from maintenance_man.uv_dependencies import UvDependencyError, declaring_groups
 
 
 class UpdateCommandError(Exception):
     """The update workspace cannot produce commands for a package update."""
 
 
-@dataclass(frozen=True, slots=True)
-class PackageManagerOps:
-    vulnerability_source: VulnerabilitySource
-    outdated: Callable[[ProjectConfig], list[UpdateFinding]]
-    publication_source: PublicationSource
-    update_commands: Callable[[str, str, Path], list[list[str]]]
+def update_commands(
+    manager: PackageManager, pkg: str, version: str, workspace: Path
+) -> list[list[str]]:
+    """The commands that move *pkg* to *version* in *workspace*, in run order.
 
-
-def package_manager_ops(name: str) -> PackageManagerOps:
-    """Return the operations for a non-Gradle package manager."""
-    if name == "gradle":
-        msg = (
-            "Gradle updates are applied through the Gradle adapter, not a "
-            "package-manager command"
-        )
-        raise UnsupportedPackageManagerError(msg)
-    try:
-        return PACKAGE_MANAGERS[name]
-    except KeyError:
-        msg = f"Unsupported package manager: {name}"
-        raise UnsupportedPackageManagerError(msg) from None
-
-
-def _bun_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
-    if not (workspace / "package.json").is_file():
-        msg = (
-            "package.json is missing from the update workspace; "
-            "check that the project exists on main and rescan"
-        )
-        raise UpdateCommandError(msg)
-    return [["bun", "add", f"{pkg}@{version}"]]
+    Raises UpdateCommandError for Gradle, whose saved targets go through the
+    Gradle adapter, and for a workspace whose manifest cannot be read.
+    """
+    match manager:
+        case "uv":
+            return _uv_update_commands(pkg, version, workspace)
+        case "bun":
+            if not (workspace / "package.json").is_file():
+                msg = (
+                    "package.json is missing from the update workspace; "
+                    "check that the project exists on main and rescan"
+                )
+                raise UpdateCommandError(msg)
+            return [["bun", "add", f"{pkg}@{version}"]]
+        case "mvn":
+            return [
+                [
+                    "mvn",
+                    "versions:use-dep-version",
+                    f"-Dincludes={pkg}",
+                    f"-DdepVersion={version}",
+                ],
+                ["mvn", "versions:commit"],
+            ]
+        case "gradle":
+            msg = (
+                "Gradle updates are applied through the Gradle adapter, not a "
+                "package-manager command"
+            )
+            raise UpdateCommandError(msg)
 
 
 def _uv_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
     try:
-        locations = get_uv_dependency_locations(workspace, pkg)
+        groups = declaring_groups(workspace, pkg)
     except UvDependencyError as e:
         raise UpdateCommandError(str(e)) from e
-    return [_uv_update_command(pkg, version, location) for location in locations]
-
-
-def _uv_update_command(
-    pkg: str, version: str, location: UvDependencyLocation
-) -> list[str]:
-    if isinstance(location, UvGroupLocation):
-        return ["uv", "add", "--group", location.group, f"{pkg}=={version}"]
-    if location.kind == "transitive":
-        return ["uv", "lock", "--upgrade-package", pkg]
-    return ["uv", "add", f"{pkg}=={version}"]
-
-
-def _mvn_update_commands(pkg: str, version: str, workspace: Path) -> list[list[str]]:
+    if not groups:
+        return [["uv", "lock", "--upgrade-package", pkg]]
     return [
-        [
-            "mvn",
-            "versions:use-dep-version",
-            f"-Dincludes={pkg}",
-            f"-DdepVersion={version}",
-        ],
-        ["mvn", "versions:commit"],
+        ["uv", "add", f"{pkg}=={version}"]
+        if group is None
+        else ["uv", "add", "--group", group, f"{pkg}=={version}"]
+        for group in groups
     ]
-
-
-PACKAGE_MANAGERS: Mapping[str, PackageManagerOps] = MappingProxyType(
-    {
-        "bun": PackageManagerOps("trivy", bun_outdated, "npm", _bun_update_commands),
-        "uv": PackageManagerOps("uv-audit", uv_outdated, "pypi", _uv_update_commands),
-        "mvn": PackageManagerOps(
-            "trivy", mvn_outdated, "central", _mvn_update_commands
-        ),
-    }
-)

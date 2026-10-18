@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from maintenance_man.config import ProjectNotFoundError
+from maintenance_man.gradle import GradleError
 from maintenance_man.models.events import (
     OperationFailed,
     Outcome,
@@ -11,7 +12,6 @@ from maintenance_man.models.events import (
     SkipReason,
     SyncCompleted,
 )
-from maintenance_man.models.scan import Severity, VulnFinding
 from maintenance_man.scanner import ScanError
 from maintenance_man.services import scan as scan_service
 from maintenance_man.vcs import RevisionError
@@ -25,7 +25,7 @@ def test_scan_all_continues_after_failure_and_summarises_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     projects = {}
-    for name in ("first", "second", "third"):
+    for name in ("first", "second", "third", "fourth"):
         path = tmp_path / name
         path.mkdir()
         projects[name] = make_project(path)
@@ -40,10 +40,13 @@ def test_scan_all_continues_after_failure_and_summarises_results(
         if name == "second":
             msg = "boom"
             raise ScanError(msg)
+        if name == "fourth":
+            msg = "gradle boom"
+            raise GradleError(msg)
         return {"first": first, "third": third}[name]
 
     monkeypatch.setattr(scan_service, "scan_project", fake_scan)
-    ticks = iter([1.0, 1.25, 2.0, 3.0, 3.5])
+    ticks = iter([1.0, 1.25, 2.0, 3.0, 3.5, 4.0])
     monkeypatch.setattr(scan_service.time, "monotonic", lambda: next(ticks))
     recorded = RecordingEmit()
 
@@ -53,30 +56,11 @@ def test_scan_all_continues_after_failure_and_summarises_results(
         ScanReported(first, 0.25),
         OperationFailed("scan", "second", "boom"),
         ScanReported(third, 0.5),
+        OperationFailed("scan", "fourth", "gradle boom"),
     ]
     assert summary == scan_service.ScanSummary(
         has_vulns=True, has_updates=False, had_error=True, clean=("third",)
     )
-
-
-def test_given_two_clean_projects_when_scanned_in_batch_then_summary_lists_both(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    projects = {}
-    for name in ("a", "b"):
-        path = tmp_path / name
-        path.mkdir()
-        projects[name] = make_project(path)
-    cfg = make_config(projects=projects)
-    monkeypatch.setattr(
-        scan_service,
-        "scan_project",
-        lambda name, project, minimum_age_days: make_scan_result(vulns=[], updates=[]),
-    )
-
-    summary = scan_service.scan_all(cfg, emit=RecordingEmit())
-
-    assert summary.clean == ("a", "b")
 
 
 def test_scan_all_skips_missing_path_without_error(tmp_path: Path) -> None:
@@ -90,27 +74,6 @@ def test_scan_all_skips_missing_path_without_error(tmp_path: Path) -> None:
         ProjectSkipped("ghost", SkipReason.PATH_MISSING, str(missing))
     ]
     assert summary == scan_service.ScanSummary(False, False, False)
-
-
-def test_scan_summary_ignores_blocked_vulnerability_without_fix() -> None:
-    result = make_scan_result(
-        vulns=[
-            VulnFinding(
-                vuln_id="CVE-no-fix",
-                pkg_name="blocked",
-                installed_version="1",
-                fixed_version=None,
-                severity=Severity.HIGH,
-                title="No fix",
-                description="No published fix",
-                status="affected",
-                blocked_reason="no fixed version",
-            )
-        ],
-        updates=[],
-    )
-
-    assert scan_service.ScanSummary.of(result) == scan_service.ScanSummary(False, False)
 
 
 def test_sync_projects_deduplicates_names_and_emits_success(

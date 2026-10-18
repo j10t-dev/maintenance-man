@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from maintenance_man.config import ConfigError, load_config
 from maintenance_man.models.config import ProjectConfig
+from tests.support.projects import write_config
 
 
 @pytest.mark.parametrize(
@@ -74,3 +76,12 @@ def test_given_routing_declaration_when_validated_then_it_is_kept(
     )
 
     assert project.gradle_repository_routing == expected
+
+
+def test_given_negative_minimum_age_when_config_loaded_then_config_error(
+    tmp_path: Path,
+) -> None:
+    config_path = write_config(tmp_path, "[defaults]\nmin_version_age_days = -1\n")
+
+    with pytest.raises(ConfigError, match="min_version_age_days"):
+        load_config(config_path)

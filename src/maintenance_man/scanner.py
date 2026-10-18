@@ -1,10 +1,10 @@
 import contextlib
 import re
 import subprocess
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, assert_never
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
@@ -12,6 +12,7 @@ from maintenance_man import paths
 from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
+    PublicationSource,
     filter_registry_updates_by_age,
 )
 from maintenance_man.gradle import (
@@ -40,7 +41,7 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     VulnFinding,
 )
-from maintenance_man.package_managers import PackageManagerOps, package_manager_ops
+from maintenance_man.outdated import bun_outdated, mvn_outdated, uv_outdated
 from maintenance_man.process import require_tool, run_captured
 from maintenance_man.storage import save_scan_results
 
@@ -70,60 +71,44 @@ def scan_project(
     if not project_path.exists():
         msg = f"Project path does not exist: {project_path}"
         raise FileNotFoundError(msg)
-    resolution = None
     with PublicationLookupContext(paths.publications_dir(), clock=clock) as publication:
-        if project.package_manager == "gradle":
-            vulns, updates, secrets, resolution = _scan_gradle_project(
-                project, min_version_age_days, publication
-            )
-        else:
-            ops = package_manager_ops(project.package_manager)
-            match ops.vulnerability_source:
-                case "uv-audit":
-                    vulns = _run_uv_audit(project_path)
-                    secrets = _requested_secrets(project)
-                case "trivy":
-                    vulns, secrets = _run_trivy_scan(
-                        project_path,
-                        project.scan_skip_dirs,
-                        scanners="vuln,secret" if project.scan_secrets else "vuln",
-                    )
-                case unreachable:
-                    assert_never(unreachable)
-            updates = _check_outdated(
-                project, ops, vulns, min_version_age_days, publication
-            )
+        match project.package_manager:
+            case "gradle":
+                vulns, resolution = scan_gradle(project)
+                vulns, updates = _prepare_gradle_scan_findings(
+                    project,
+                    vulns,
+                    resolution,
+                    discover_gradle_updates(project),
+                    min_version_age_days,
+                    publication,
+                )
+                secrets = _requested_secrets(project)
+            case "uv":
+                vulns = _run_uv_audit(project_path)
+                secrets = _requested_secrets(project)
+                updates = _check_outdated(
+                    project, vulns, min_version_age_days, publication
+                )
+            case "bun" | "mvn":
+                vulns, secrets = _run_trivy_scan(
+                    project_path,
+                    project.scan_skip_dirs,
+                    scanners="vuln,secret" if project.scan_secrets else "vuln",
+                )
+                updates = _check_outdated(
+                    project, vulns, min_version_age_days, publication
+                )
 
     scan_result = ScanResult(
         project=name,
         scanned_at=utc_now(),
-        trivy_target=str(project_path),
         vulnerabilities=vulns,
         secrets=secrets,
         updates=updates,
-        gradle_resolution=(
-            resolution.report.model_dump(mode="json")
-            if resolution is not None
-            else None
-        ),
     )
     save_scan_results(name, scan_result)
     return scan_result
-
-
-def _scan_gradle_project(
-    project: ProjectConfig,
-    min_version_age_days: int,
-    publication: PublicationLookupContext,
-) -> tuple[
-    list[VulnFinding], list[UpdateFinding], list[SecretFinding], CompleteResolution
-]:
-    vulns, resolution = scan_gradle(project)
-    updates = discover_gradle_updates(project)
-    vulns, updates = _prepare_gradle_scan_findings(
-        project, vulns, resolution, updates, min_version_age_days, publication
-    )
-    return vulns, updates, _requested_secrets(project), resolution
 
 
 def _requested_secrets(project: ProjectConfig) -> list[SecretFinding]:
@@ -218,22 +203,30 @@ def _prepared_update(
 
 def _check_outdated(
     project: ProjectConfig,
-    ops: PackageManagerOps,
     vulns: list[VulnFinding],
     min_version_age_days: int,
     publication: PublicationLookupContext,
 ) -> list[UpdateFinding]:
-    """Run the table's outdated check and return aged, de-duplicated findings."""
-    raw_updates = ops.outdated(project)
+    """Run the manager's outdated check and return aged, de-duplicated findings."""
+    outdated, source = _OUTDATED[project.package_manager]
     vuln_pkgs = {v.pkg_name for v in vulns}
-    eligible_updates = [u for u in raw_updates if u.pkg_name not in vuln_pkgs]
+    eligible_updates = [u for u in outdated(project) if u.pkg_name not in vuln_pkgs]
     return filter_registry_updates_by_age(
         eligible_updates,
-        ops.publication_source,
+        source,
         project.path,
         min_age_days=min_version_age_days,
         context=publication,
     )
+
+
+_OUTDATED: dict[
+    str, tuple[Callable[[ProjectConfig], list[UpdateFinding]], PublicationSource]
+] = {
+    "uv": (uv_outdated, "pypi"),
+    "bun": (bun_outdated, "npm"),
+    "mvn": (mvn_outdated, "central"),
+}
 
 
 def scan_gradle(
@@ -448,11 +441,8 @@ def _parse_vulns(results: list[_TrivyLanguageResult]) -> list[VulnFinding]:
     findings: list[VulnFinding] = []
     for result in results:
         for vulnerability in result.vulnerabilities or []:
-            severity_raw = vulnerability.severity.upper()
-            try:
-                severity = Severity(severity_raw)
-            except ValueError:
-                severity = Severity.UNKNOWN
+            raw = vulnerability.severity.upper()
+            severity = Severity(raw) if raw in Severity else Severity.UNKNOWN
 
             published = None
             if vulnerability.published_date:

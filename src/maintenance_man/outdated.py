@@ -1,4 +1,6 @@
 import re
+import subprocess
+from collections.abc import Collection
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
@@ -16,24 +18,12 @@ class OutdatedCheckError(Exception):
 
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `uv pip list --outdated --format json` and parse results."""
-    run_captured(
-        ["uv", "sync", "--locked"],
-        project.path,
-        timeout=300,
-        label="uv sync --locked",
-        error=OutdatedCheckError,
-    )
+    _run(["uv", "sync", "--locked"], project, timeout=300, label="uv sync --locked")
     venv_python = Path(project.path) / ".venv" / "bin" / "python"
     cmd = ["uv", "pip", "list", "--outdated", "--format", "json"]
     if venv_python.exists():
         cmd += ["--python", str(venv_python)]
-    completed = run_captured(
-        cmd,
-        project.path,
-        timeout=120,
-        label="uv pip list --outdated",
-        error=OutdatedCheckError,
-    )
+    completed = _run(cmd, project, timeout=120, label="uv pip list --outdated")
 
     try:
         entries = TypeAdapter(list[_UvRow]).validate_json(completed.stdout)
@@ -62,14 +52,7 @@ class _UvRow(BaseModel):
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `bun outdated` without progress output and parse the table output."""
     cmd = ["bun", "outdated", "--no-progress"]
-    completed = run_captured(
-        cmd,
-        project.path,
-        timeout=120,
-        label="bun outdated",
-        error=OutdatedCheckError,
-        ok_codes=None,
-    )
+    completed = _run(cmd, project, timeout=120, label="bun outdated", ok_codes=None)
 
     if completed.returncode != 0 and not completed.stdout.strip():
         msg = (
@@ -94,12 +77,8 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         "versions:display-dependency-updates",
         "-DprocessDependencyManagement=false",
     ]
-    completed = run_captured(
-        cmd,
-        project.path,
-        timeout=300,
-        label="mvn versions:display-dependency-updates",
-        error=OutdatedCheckError,
+    completed = _run(
+        cmd, project, timeout=300, label="mvn versions:display-dependency-updates"
     )
 
     return [
@@ -107,6 +86,24 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         for line in completed.stdout.splitlines()
         if (match := _MVN_UPDATE_RE.match(line))
     ]
+
+
+def _run(
+    cmd: list[str],
+    project: ProjectConfig,
+    *,
+    timeout: int,
+    label: str,
+    **options: Collection[int] | None,
+) -> subprocess.CompletedProcess[str]:
+    return run_captured(
+        cmd,
+        project.path,
+        timeout=timeout,
+        label=label,
+        error=OutdatedCheckError,
+        **options,
+    )
 
 
 def _finding(name: str, installed: str, latest: str) -> UpdateFinding:

@@ -16,37 +16,21 @@ class NoScanResultsError(Exception):
     """Raised when no scan results exist for a project."""
 
 
-def atomic_write_text(
-    path: Path, text: str, *, durable: bool = False, mode: int = 0o666
-) -> None:
+def atomic_write_text(path: Path, text: str) -> None:
     """Replace *path* with *text* atomically.
 
     Raises OSError. Never leaves a temporary file behind and never removes
-    *path*. With *durable*, fsyncs the file before and the directory after
-    the replace; a directory fsync failure leaves *path* already replaced.
+    *path*.
     """
     temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
-            if durable:
-                stream.flush()
-                os.fsync(stream.fileno())
         temporary.replace(path)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
-    if durable:
-        fsync_dir(path.parent)
-
-
-def fsync_dir(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def load_scan_results(project_name: str) -> ScanResult:

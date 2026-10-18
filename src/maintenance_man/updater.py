@@ -7,7 +7,7 @@ from typing import Protocol
 
 from maintenance_man import gradle
 from maintenance_man.gradle import GradleError
-from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.config import PackageManager, ProjectConfig
 from maintenance_man.models.events import (
     Emit,
     FindingFailed,
@@ -31,11 +31,7 @@ from maintenance_man.models.scan import (
     Workflow,
     highest_fix_version,
 )
-from maintenance_man.package_managers import (
-    UnsupportedPackageManagerError,
-    UpdateCommandError,
-    package_manager_ops,
-)
+from maintenance_man.package_managers import UpdateCommandError, update_commands
 from maintenance_man.process import ProcessError, run_logged, run_shell_command
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import JjRepository, RevisionError
@@ -445,7 +441,7 @@ def _discard(repo: JjRepository, emit: Emit) -> bool:
 
 
 def _apply_update(
-    package_manager: str,
+    package_manager: PackageManager,
     pkg_name: str,
     version: str,
     project_path: Path,
@@ -454,10 +450,8 @@ def _apply_update(
 ) -> bool:
     """Apply a single package update. Returns True on success."""
     try:
-        commands = package_manager_ops(package_manager).update_commands(
-            pkg_name, version, project_path
-        )
-    except (UnsupportedPackageManagerError, UpdateCommandError) as e:
+        commands = update_commands(package_manager, pkg_name, version, project_path)
+    except UpdateCommandError as e:
         emit(FindingStepFailed(FindingStepKind.PREPARE, str(e)))
         return False
 

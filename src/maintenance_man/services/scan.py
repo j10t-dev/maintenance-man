@@ -24,7 +24,6 @@ from maintenance_man.vcs_workflow import sync_main
 SCAN_ERRORS = (
     ScanError,
     GradleError,
-    RevisionError,
     OutdatedCheckError,
     ToolNotFoundError,
 )
@@ -36,13 +35,6 @@ class ScanSummary:
     has_updates: bool
     had_error: bool = False
     clean: tuple[str, ...] = ()
-
-    @classmethod
-    def of(cls, result: ScanResult) -> ScanSummary:
-        return cls(
-            has_vulns=result.has_actionable_vulns,
-            has_updates=result.has_updates,
-        )
 
 
 def scan_one(
@@ -82,7 +74,7 @@ def scan_all(cfg: MmConfig, *, emit: Emit) -> ScanSummary:
             clean.append(name)
     return ScanSummary(
         any(result.has_actionable_vulns for result in results),
-        any(result.has_updates for result in results),
+        any(result.updates for result in results),
         had_error,
         tuple(clean),
     )

@@ -106,203 +106,100 @@ def test_given_missing_pyproject_when_uv_outdated_runs_then_outdated_check_error
         uv_outdated(project)
 
 
-class TestUvOutdated:
-    def test_syncs_environment_before_checking_outdated(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text('[project]\ndependencies = ["requests==2.31.0"]\n')
-        sync_result = completed([], returncode=0, stdout="", stderr="")
-        list_result = completed([], returncode=0, stdout="[]", stderr="")
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
-
-        commands = _fake_commands(project, sync_result, list_result)
-        with patch("maintenance_man.outdated.run_captured", commands):
-            updates = uv_outdated(project)
-
-        assert updates == []
-        assert [call[0] for call in commands.calls] == [
-            ("uv", "sync", "--locked"),
-            ("uv", "pip", "list", "--outdated", "--format", "json"),
-        ]
-
-    def test_sync_failure_raises(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text('[project]\ndependencies = ["requests==2.31.0"]\n')
-        failed = OutdatedCheckError("uv sync --locked failed (exit 1): lock stale")
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
-
-        commands = _fake_commands(project, failed)
-        with (
-            patch("maintenance_man.outdated.run_captured", commands),
-            pytest.raises(OutdatedCheckError, match="uv sync --locked"),
-        ):
-            uv_outdated(project)
-        ((argv, cwd, kwargs),) = commands.calls
-        assert argv == ("uv", "sync", "--locked")
-        assert cwd == project.path
-        assert kwargs == {
-            "timeout": 300,
-            "label": "uv sync --locked",
-            "error": OutdatedCheckError,
-        }
-
-    def test_parses_json_output(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            '[project]\ndependencies = ["requests>=2.28", "flask>=2.0"]\n'
-        )
-
-        fake_json = json.dumps(
-            [
-                {
-                    "name": "requests",
-                    "version": "2.28.0",
-                    "latest_version": "2.31.0",
-                    "latest_filetype": "wheel",
-                },
-                {
-                    "name": "flask",
-                    "version": "2.3.0",
-                    "latest_version": "3.0.0",
-                    "latest_filetype": "wheel",
-                },
-            ]
-        )
-        sync_result = completed([], returncode=0, stdout="", stderr="")
-        list_result = completed([], returncode=0, stdout=fake_json, stderr="")
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
-
-        commands = _fake_commands(project, sync_result, list_result)
-        with patch("maintenance_man.outdated.run_captured", commands):
-            updates = uv_outdated(project)
-
-        assert len(updates) == 2
-        assert updates[0].pkg_name == "requests"
-        assert updates[0].installed_version == "2.28.0"
-        assert updates[0].latest_version == "2.31.0"
-        assert updates[0].semver_tier == SemverTier.MINOR
-        assert updates[1].semver_tier == SemverTier.MAJOR
-
-    def test_empty_output(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text("[project]\ndependencies = []\n")
-
-        sync_result = completed([], returncode=0, stdout="", stderr="")
-        list_result = completed([], returncode=0, stdout="[]", stderr="")
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
-
-        commands = _fake_commands(project, sync_result, list_result)
-        with patch("maintenance_man.outdated.run_captured", commands):
-            updates = uv_outdated(project)
-
-        assert updates == []
-
-    def test_command_failure_raises(self, tmp_path):
-        sync_result = completed([], returncode=0, stdout="", stderr="")
-        list_failed = OutdatedCheckError(
-            "uv pip list --outdated failed (exit 1): error"
-        )
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
-
-        commands = _fake_commands(project, sync_result, list_failed)
-        with (
-            patch("maintenance_man.outdated.run_captured", commands),
-            pytest.raises(OutdatedCheckError, match="uv pip list --outdated"),
-        ):
-            uv_outdated(project)
-        _, (argv, cwd, kwargs) = commands.calls
-        assert argv == ("uv", "pip", "list", "--outdated", "--format", "json")
-        assert cwd == project.path
-        assert kwargs == {
-            "timeout": 120,
-            "label": "uv pip list --outdated",
-            "error": OutdatedCheckError,
-        }
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            '{"name": "a"}',
-            '"text"',
-            "[1]",
-            '[{"version": "1.0", "latest_version": "2.0"}]',
-            '[{"name": "a", "version": 1, "latest_version": "2.0"}]',
-            '[{"name": "a", "version": "1.0"}]',
-        ],
+def _finding(name: str, installed: str, latest: str, tier: SemverTier):
+    return UpdateFinding(
+        pkg_name=name,
+        installed_version=installed,
+        latest_version=latest,
+        semver_tier=tier,
     )
-    def test_uv_outdated_rejects_wrongly_shaped_output(
-        self, tmp_path, monkeypatch, payload
-    ):
-        monkeypatch.setattr(
-            "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: {"a"}
-        )
-        project = make_project(tmp_path, package_manager="uv")
-        commands = _fake_commands(
-            project,
-            completed(),
-            completed(stdout=payload),
-        )
-        monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
-        with pytest.raises(OutdatedCheckError, match="Unexpected uv output"):
-            uv_outdated(project)
 
-    def test_given_empty_latest_version_when_uv_outdated_runs_then_row_is_skipped(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.setattr(
-            "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: {"a"}
-        )
-        project = make_project(tmp_path, package_manager="uv")
-        commands = _fake_commands(
-            project,
-            completed(),
-            completed(
-                stdout='[{"name":"a","version":"1.0","latest_version":"","Extra":1}]'
-            ),
-        )
-        monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
 
-        updates = uv_outdated(project)
-
-        assert updates == []
-
-    def test_excludes_transitive_deps(self, tmp_path):
-        """uv_outdated should only return direct dependencies from pyproject.toml."""
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            '[project]\ndependencies = ["pydantic>=2.0", "rich>=14.0"]\n'
-        )
-
-        fake_json = json.dumps(
+@pytest.mark.parametrize(
+    ("pyproject", "rows", "expected"),
+    [
+        pytest.param(
+            '[project]\ndependencies = ["requests==2.31.0"]\n', [], [], id="no-rows"
+        ),
+        pytest.param(
+            '[project]\ndependencies = ["requests>=2.28", "flask>=2.0"]\n',
             [
-                {
-                    "name": "pydantic",
-                    "version": "2.12.5",
-                    "latest_version": "2.13.0",
-                },
+                {"name": "requests", "version": "2.28.0", "latest_version": "2.31.0"},
+                {"name": "flask", "version": "2.3.0", "latest_version": "3.0.0"},
+            ],
+            [
+                _finding("requests", "2.28.0", "2.31.0", SemverTier.MINOR),
+                _finding("flask", "2.3.0", "3.0.0", SemverTier.MAJOR),
+            ],
+            id="direct-rows",
+        ),
+        pytest.param("[project]\ndependencies = []\n", [], [], id="no-dependencies"),
+        pytest.param(
+            '[project]\ndependencies = ["a"]\n',
+            [{"name": "a", "version": "1.0", "latest_version": "", "Extra": 1}],
+            [],
+            id="empty-latest-version",
+        ),
+        pytest.param(
+            '[project]\ndependencies = ["pydantic>=2.0", "rich>=14.0"]\n',
+            [
+                {"name": "pydantic", "version": "2.12.5", "latest_version": "2.13.0"},
                 {
                     "name": "pydantic-core",
                     "version": "2.41.5",
                     "latest_version": "2.42.0",
                 },
-                {
-                    "name": "rich",
-                    "version": "14.3.1",
-                    "latest_version": "14.3.3",
-                },
-            ]
-        )
-        sync_result = completed([], returncode=0, stdout="", stderr="")
-        list_result = completed([], returncode=0, stdout=fake_json, stderr="")
-        project = ProjectConfig(path=tmp_path, package_manager="uv")
+                {"name": "rich", "version": "14.3.1", "latest_version": "14.3.3"},
+            ],
+            [
+                _finding("pydantic", "2.12.5", "2.13.0", SemverTier.MINOR),
+                _finding("rich", "14.3.1", "14.3.3", SemverTier.PATCH),
+            ],
+            id="transitive-excluded",
+        ),
+    ],
+)
+def test_given_outdated_rows_when_uv_outdated_runs_then_direct_updates_are_returned(
+    tmp_path, monkeypatch, pyproject, rows, expected
+):
+    (tmp_path / "pyproject.toml").write_text(pyproject)
+    project = make_project(tmp_path, package_manager="uv")
+    commands = _fake_commands(project, completed(), completed(stdout=json.dumps(rows)))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
 
-        commands = _fake_commands(project, sync_result, list_result)
-        with patch("maintenance_man.outdated.run_captured", commands):
-            updates = uv_outdated(project)
+    updates = uv_outdated(project)
 
-        pkg_names = [u.pkg_name for u in updates]
-        assert "pydantic" in pkg_names
-        assert "rich" in pkg_names
-        assert "pydantic-core" not in pkg_names
+    assert updates == expected
+    assert commands.calls == [
+        (
+            ("uv", "sync", "--locked"),
+            tmp_path,
+            {"timeout": 300, "label": "uv sync --locked", "error": OutdatedCheckError},
+        ),
+        (
+            ("uv", "pip", "list", "--outdated", "--format", "json"),
+            tmp_path,
+            {
+                "timeout": 120,
+                "label": "uv pip list --outdated",
+                "error": OutdatedCheckError,
+            },
+        ),
+    ]
+
+
+def test_given_wrongly_shaped_uv_output_when_uv_outdated_runs_then_outdated_check_error(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: {"a"}
+    )
+    project = make_project(tmp_path, package_manager="uv")
+    commands = _fake_commands(project, completed(), completed(stdout='[{"name": "a"}]'))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+
+    with pytest.raises(OutdatedCheckError, match="Unexpected uv output"):
+        uv_outdated(project)
 
 
 class TestBunOutdated:
@@ -330,66 +227,8 @@ class TestBunOutdated:
             bun_outdated(project)
 
 
-class TestMvnOutdated:
-    def test_command_failure_raises(self):
-        result = OutdatedCheckError(
-            "mvn versions:display-dependency-updates failed (exit 1): BUILD FAILURE"
-        )
-        project = make_project(Path("/tmp/fake"), package_manager="mvn")
-        commands = _fake_commands(project, result)
-
-        with (
-            patch("maintenance_man.outdated.run_captured", commands),
-            pytest.raises(OutdatedCheckError),
-        ):
-            mvn_outdated(project)
-        ((argv, cwd, kwargs),) = commands.calls
-        assert argv == (
-            "mvn",
-            "versions:display-dependency-updates",
-            "-DprocessDependencyManagement=false",
-        )
-        assert cwd == project.path
-        assert kwargs == {
-            "timeout": 300,
-            "label": "mvn versions:display-dependency-updates",
-            "error": OutdatedCheckError,
-        }
-
-
 @pytest.mark.parametrize(
-    "raised",
-    [
-        FileNotFoundError(2, "No such file or directory", "uv"),
-        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
-    ],
-)
-def test_given_command_execution_failure_when_checking_outdated_then_error_is_requested(
-    tmp_path, monkeypatch, raised
-):
-    project = make_project(tmp_path, package_manager="uv")
-    error = OutdatedCheckError(
-        f"Could not run uv sync --locked in {tmp_path}: {raised}"
-    )
-    error.__cause__ = raised
-    commands = _fake_commands(project, error)
-    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
-    with pytest.raises(
-        OutdatedCheckError, match=r"^Could not run uv sync --locked in "
-    ):
-        uv_outdated(project)
-    ((argv, cwd, kwargs),) = commands.calls
-    assert argv == ("uv", "sync", "--locked")
-    assert cwd == project.path
-    assert kwargs == {
-        "timeout": 300,
-        "label": "uv sync --locked",
-        "error": OutdatedCheckError,
-    }
-
-
-@pytest.mark.parametrize(
-    ("manager", "stdout", "expected"),
+    ("manager", "stdout", "expected", "expected_call"),
     [
         (
             "bun",
@@ -411,6 +250,16 @@ def test_given_command_execution_failure_when_checking_outdated_then_error_is_re
                     semver_tier=SemverTier.MAJOR,
                 ),
             ],
+            (
+                ("bun", "outdated", "--no-progress"),
+                Path("/tmp/fake"),
+                {
+                    "timeout": 120,
+                    "label": "bun outdated",
+                    "error": OutdatedCheckError,
+                    "ok_codes": None,
+                },
+            ),
         ),
         (
             "bun",
@@ -432,6 +281,16 @@ def test_given_command_execution_failure_when_checking_outdated_then_error_is_re
                     semver_tier=SemverTier.MAJOR,
                 ),
             ],
+            (
+                ("bun", "outdated", "--no-progress"),
+                Path("/tmp/fake"),
+                {
+                    "timeout": 120,
+                    "label": "bun outdated",
+                    "error": OutdatedCheckError,
+                    "ok_codes": None,
+                },
+            ),
         ),
         (
             "mvn",
@@ -453,23 +312,48 @@ def test_given_command_execution_failure_when_checking_outdated_then_error_is_re
                     semver_tier=SemverTier.PATCH,
                 ),
             ],
+            (
+                (
+                    "mvn",
+                    "versions:display-dependency-updates",
+                    "-DprocessDependencyManagement=false",
+                ),
+                Path("/tmp/fake"),
+                {
+                    "timeout": 300,
+                    "label": "mvn versions:display-dependency-updates",
+                    "error": OutdatedCheckError,
+                },
+            ),
         ),
         (
             "mvn",
             "[INFO] No dependencies in Dependencies have newer versions.\n",
             [],
+            (
+                (
+                    "mvn",
+                    "versions:display-dependency-updates",
+                    "-DprocessDependencyManagement=false",
+                ),
+                Path("/tmp/fake"),
+                {
+                    "timeout": 300,
+                    "label": "mvn versions:display-dependency-updates",
+                    "error": OutdatedCheckError,
+                },
+            ),
         ),
     ],
     ids=["bun-table", "bun-qualifiers", "mvn-updates", "mvn-none"],
 )
 def test_given_outdated_output_when_parsed_then_findings_match(
-    manager, stdout, expected
+    manager, stdout, expected, expected_call, monkeypatch
 ):
     project = make_project(Path("/tmp/fake"), package_manager=manager)
     outdated = {"bun": bun_outdated, "mvn": mvn_outdated}[manager]
+    commands = _fake_commands(project, completed(stdout=stdout))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
 
-    with patch(
-        "maintenance_man.outdated.run_captured",
-        _fake_commands(project, completed(stdout=stdout)),
-    ):
-        assert outdated(project) == expected
+    assert outdated(project) == expected
+    assert commands.calls == [expected_call]

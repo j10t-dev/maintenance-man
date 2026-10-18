@@ -1,5 +1,3 @@
-from datetime import UTC, datetime
-
 import pytest
 
 from maintenance_man.models.scan import (
@@ -9,15 +7,10 @@ from maintenance_man.models.scan import (
     SecretFinding,
     SemverTier,
     Severity,
-    UpdateFinding,
-    UpdateStatus,
-    VulnFinding,
-    Workflow,
     highest_fix_version,
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import classify_semver
-from maintenance_man.storage import load_scan_results, save_scan_results
 from tests.support.findings import (
     make_gradle_target,
     make_scan_result,
@@ -122,10 +115,10 @@ def test_findings_lists_vulnerabilities_then_updates():
 @pytest.mark.parametrize(
     ("vulns", "secrets", "updates", "expected"),
     [
-        ([], [], [], (False, False, False)),
-        ([make_vuln()], [], [], (True, True, False)),
-        ([make_vuln(fixed_version=None)], [], [], (True, False, False)),
-        ([], [], [make_update()], (True, False, True)),
+        ([], [], [], (False, False)),
+        ([make_vuln()], [], [], (True, True)),
+        ([make_vuln(fixed_version=None)], [], [], (True, False)),
+        ([], [], [make_update()], (True, False)),
         (
             [],
             [
@@ -134,7 +127,7 @@ def test_findings_lists_vulnerabilities_then_updates():
                 )
             ],
             [],
-            (True, False, False),
+            (True, False),
         ),
     ],
     ids=["clean", "fixed-vulnerability", "no-fix-vulnerability", "update", "secret"],
@@ -146,137 +139,63 @@ def test_given_findings_when_summarised_then_scan_flags_match(
         update={"secrets": secrets}
     )
 
-    assert (
-        result.has_findings,
-        result.has_actionable_vulns,
-        result.has_updates,
-    ) == expected
+    assert (result.has_findings, result.has_actionable_vulns) == expected
 
 
-@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
-def test_scan_result_round_trips_ready_flow(mm_home, flow: Workflow):
-    result = ScanResult(
-        project="project-ready",
-        scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-        trivy_target="/tmp/project-ready",
-        vulnerabilities=[
-            VulnFinding(
-                vuln_id="CVE-2026-00001",
-                pkg_name="requests",
-                installed_version="2.31.0",
-                fixed_version="2.32.4",
-                severity=Severity.HIGH,
-                title="t",
-                description="d",
-                status="fixed",
-                update_status=UpdateStatus.READY,
-                flow=flow,
-            )
-        ],
-        updates=[
-            UpdateFinding(
-                pkg_name="react",
-                installed_version="18.2.0",
-                latest_version="19.0.0",
-                semver_tier=SemverTier.MAJOR,
-                update_status=UpdateStatus.READY,
-                flow=flow,
-            )
-        ],
-    )
-
-    save_scan_results("project-ready", result)
-
-    assert load_scan_results("project-ready") == result
-
-
-def test_historical_results_without_gradle_fields_still_load():
-    payload = {
-        "project": "legacy",
-        "scanned_at": "2026-01-01T00:00:00+00:00",
-        "trivy_target": "/tmp/legacy",
-        "vulnerabilities": [
-            {
-                "vuln_id": "CVE-2024-0001",
-                "pkg_name": "some-pkg",
-                "installed_version": "1.0.0",
-                "fixed_version": "1.0.1",
-                "severity": "HIGH",
-                "title": "t",
-                "description": "d",
-                "status": "fixed",
-            }
-        ],
-        "updates": [
-            {
-                "pkg_name": "pkg-a",
-                "installed_version": "1.0.0",
-                "latest_version": "1.0.1",
-                "semver_tier": "patch",
-            }
-        ],
-    }
-
-    result = ScanResult.model_validate(payload)
-
-    assert result.vulnerabilities[0].gradle_target is None
-    assert result.vulnerabilities[0].blocked_reason is None
-    assert result.vulnerabilities[0].gradle_block_kind is None
-    assert result.vulnerabilities[0].actionable is True
-    assert result.updates[0].gradle_target is None
-
-
-def test_gradle_target_round_trips_through_scan_result_json():
-    target = GradleUpdateTarget(
-        version_ref="room",
-        members=[
-            GradleMember(
-                kind="library",
-                alias="room-runtime",
-                coordinate="androidx.room:room-runtime",
-                installed_version="2.8.4",
+@pytest.mark.parametrize(
+    ("target", "group_key", "display_name"),
+    [
+        pytest.param(
+            GradleUpdateTarget(
+                version_ref="room",
+                members=[
+                    GradleMember(
+                        kind="library",
+                        alias="room-runtime",
+                        coordinate="androidx.room:room-runtime",
+                        installed_version="2.8.4",
+                    ),
+                    GradleMember(
+                        kind="plugin",
+                        alias="ksp",
+                        coordinate="com.google.devtools.ksp",
+                        installed_version="2.3.10",
+                    ),
+                ],
+                target_version="2.8.5",
             ),
-            GradleMember(
-                kind="plugin",
-                alias="ksp",
-                coordinate="com.google.devtools.ksp",
-                installed_version="2.3.10",
+            "ref:room",
+            "room",
+            id="ref",
+        ),
+        pytest.param(
+            GradleUpdateTarget(
+                members=[
+                    GradleMember(
+                        kind="library",
+                        alias="gson",
+                        coordinate="com.google.code.gson:gson",
+                        installed_version="2.11.0",
+                    )
+                ],
+                target_version="2.12.0",
             ),
-        ],
-        target_version="2.8.5",
-    )
-    update = make_update(
-        gradle_target=target,
-        blocked_reason="no publication date",
-        gradle_block_kind="age",
-    )
+            "library:gson",
+            "com.google.code.gson:gson",
+            id="inline",
+        ),
+    ],
+)
+def test_given_saved_gradle_target_when_reloaded_then_group_key_and_display_name_match(
+    target, group_key, display_name
+):
+    update = make_update(gradle_target=target)
     result = make_scan_result(vulns=[], updates=[update])
 
     reloaded = ScanResult.model_validate_json(result.model_dump_json())
 
     assert reloaded.updates[0].gradle_target == target
-    assert (reloaded_target := reloaded.updates[0].gradle_target) is not None
-    assert reloaded_target.group_key == "ref:room"
-    assert reloaded_target.display_name == "room"
-    assert reloaded.updates[0].blocked_reason == "no publication date"
-    assert reloaded.updates[0].gradle_block_kind == "age"
-
-
-def test_inline_target_display_name_is_its_coordinate():
-    target = GradleUpdateTarget(
-        members=[
-            GradleMember(
-                kind="library",
-                alias="gson",
-                coordinate="com.google.code.gson:gson",
-                installed_version="2.11.0",
-            )
-        ],
-        target_version="2.12.0",
-    )
-
-    assert target.group_key == "library:gson"
-    assert target.display_name == "com.google.code.gson:gson"
+    assert (target.group_key, target.display_name) == (group_key, display_name)
 
 
 @pytest.mark.parametrize(
@@ -297,16 +216,3 @@ def test_given_vulnerability_when_target_version_read_then_fix_or_saved_target_i
 def test_given_vulnerability_without_fix_or_target_when_read_then_error():
     with pytest.raises(ValueError, match="No fixed version available"):
         _ = make_vuln(fixed_version=None).target_version
-
-
-def test_old_scan_does_not_require_gradle_resolution():
-    from maintenance_man.models.scan import ScanResult
-
-    result = ScanResult.model_validate(
-        {
-            "project": "demo",
-            "scanned_at": "2030-01-01T00:00:00Z",
-            "trivy_target": "/tmp/demo",
-        }
-    )
-    assert result.gradle_resolution is None

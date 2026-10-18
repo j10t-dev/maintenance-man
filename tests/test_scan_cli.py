@@ -27,7 +27,6 @@ from tests.support.findings import (
     make_update,
     make_vuln,
 )
-from tests.support.package_managers import ops_with_outdated
 from tests.support.process import missing_tool
 from tests.support.projects import write_config
 
@@ -126,7 +125,6 @@ def _make_vulnerable_result() -> ScanResult:
     return ScanResult(
         project="vulnerable",
         scanned_at=datetime.now(tz=UTC),
-        trivy_target="tests/fixtures/vulnerable-project",
         vulnerabilities=[
             VulnFinding(
                 vuln_id="CVE-2024-0001",
@@ -146,7 +144,6 @@ def _make_clean_result() -> ScanResult:
     return ScanResult(
         project="clean",
         scanned_at=datetime.now(tz=UTC),
-        trivy_target="tests/fixtures/clean-project",
     )
 
 
@@ -154,7 +151,6 @@ def _make_updates_only_result() -> ScanResult:
     return ScanResult(
         project="outdated",
         scanned_at=datetime.now(tz=UTC),
-        trivy_target="tests/fixtures/clean-project",
         updates=[
             UpdateFinding(
                 pkg_name="axios",
@@ -221,7 +217,6 @@ def test_given_two_clean_projects_when_batch_scanned_then_one_notice_names_both(
         lambda name, project, days: ScanResult(
             project=name,
             scanned_at=datetime(2026, 1, 15, 12, tzinfo=UTC),
-            trivy_target=".",
         ),
     )
 
@@ -265,10 +260,8 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
     )
     monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
     monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
-    monkeypatch.setattr(
-        "maintenance_man.scanner.package_manager_ops",
-        ops_with_outdated(lambda project: []),
-    )
+    for name, (_, source) in scanner._OUTDATED.items():
+        monkeypatch.setitem(scanner._OUTDATED, name, (lambda project: [], source))
     assert run_mm("scan") == ExitCode.ERROR
     assert not (results / "first.json").exists()
     assert (results / "second.json").is_file()
@@ -540,7 +533,6 @@ def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_pat
     result = ScanResult(
         project="android",
         scanned_at=datetime.now(UTC),
-        trivy_target="/fixture",
         vulnerabilities=findings,
     )
     monkeypatch.setattr(scan_service, "scan_project", lambda *args, **kwargs: result)
@@ -568,7 +560,6 @@ def test_gradle_advisories_keep_installed_versions_separate(capsys):
     result = ScanResult(
         project="android",
         scanned_at=datetime.now(UTC),
-        trivy_target="/fixture",
         vulnerabilities=[
             VulnFinding(
                 vuln_id="CVE-A",

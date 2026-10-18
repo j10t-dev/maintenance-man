@@ -11,7 +11,3 @@ build/
 .serena/
 TODO
 TODO.md
-
-# Test fixture installed deps
-tests/fixtures/projects/dirty-bun/node_modules/
-tests/fixtures/projects/dirty-uv/.venv/

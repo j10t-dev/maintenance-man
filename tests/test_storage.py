@@ -1,16 +1,11 @@
-import json
 import os
 import stat
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from maintenance_man import paths, storage
 from maintenance_man.models.scan import (
-    ScanResult,
-    SemverTier,
-    UpdateFinding,
     UpdateStatus,
     Workflow,
 )
@@ -52,36 +47,34 @@ def test_failed_replace_keeps_old_content(tmp_path, monkeypatch):
     assert _temporaries(tmp_path) == []
 
 
-@pytest.mark.parametrize("durable, expected", [(False, []), (True, [False, True])])
-def test_fsync_only_when_durable(tmp_path, monkeypatch, durable, expected):
-    synced: list[bool] = []
-    real_fsync = os.fsync
-
-    def record(fd):
-        synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
-        real_fsync(fd)
-
-    monkeypatch.setattr(storage.os, "fsync", record)
-    atomic_write_text(tmp_path / "ledger.json", "{}", durable=durable)
-    assert synced == expected
-
-
-@pytest.mark.parametrize("kwargs, expected", [({}, 0o644), ({"mode": 0o600}, 0o600)])
-def test_new_file_mode_follows_umask(tmp_path, kwargs, expected):
-    previous = os.umask(0o022)
-    try:
-        atomic_write_text(tmp_path / "state.json", "x", **kwargs)
-    finally:
-        os.umask(previous)
-    assert stat.S_IMODE((tmp_path / "state.json").stat().st_mode) == expected
-
-
 def test_save_creates_directory_and_round_trips():
     result = make_scan_result(
         updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)]
     )
     save_scan_results("vulnerable", result)
     assert load_scan_results("vulnerable") == result
+
+
+def test_given_ready_update_row_when_saved_then_json_text_names_status_and_flow():
+    result = make_scan_result(
+        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)]
+    )
+
+    save_scan_results("vulnerable", result)
+
+    text = (paths.scan_results_dir() / "vulnerable.json").read_text(encoding="utf-8")
+    assert '"update_status": "ready"' in text
+    assert '"flow": "update"' in text
+
+
+def test_given_umask_when_new_file_written_then_mode_follows_it(tmp_path):
+    previous = os.umask(0o022)
+    try:
+        atomic_write_text(tmp_path / "state.json", "x")
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE((tmp_path / "state.json").stat().st_mode) == 0o644
 
 
 def test_scan_results_reject_empty_name():
@@ -157,33 +150,6 @@ def test_given_invalid_fields_when_activity_is_loaded_then_empty_data_is_returne
     path.write_text('{"x": {"last_build": {"timestamp": "invalid"}}}', encoding="utf-8")
 
     assert load_activity(path) == {}
-
-
-# -- save_scan_results --
-
-
-class TestSaveScanResults:
-    def test_preserves_update_status(self, scan_results_dir: Path):
-        result = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-            updates=[
-                UpdateFinding(
-                    pkg_name="pkg-a",
-                    installed_version="1.0.0",
-                    latest_version="1.0.1",
-                    semver_tier=SemverTier.PATCH,
-                    update_status=UpdateStatus.COMPLETED,
-                    flow=Workflow.UPDATE,
-                ),
-            ],
-        )
-        save_scan_results("myapp", result)
-
-        data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
-        assert data["updates"][0]["update_status"] == "completed"
-        assert data["updates"][0]["flow"] == "update"
 
 
 # -- load_scan_results --

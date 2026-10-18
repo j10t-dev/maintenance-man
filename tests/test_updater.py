@@ -10,7 +10,7 @@ import pytest
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
 )
-from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.config import PackageManager, ProjectConfig
 from maintenance_man.models.events import (
     FindingFailed,
     FindingsBlocked,
@@ -90,7 +90,6 @@ def _scan_result_for(
     return ScanResult(
         project="demo",
         scanned_at=datetime.now(tz=UTC),
-        trivy_target=str(project_config.path),
         updates=updates,
     )
 
@@ -218,7 +217,7 @@ _PYTEST_IN_THREE_TABLES = (
     ],
 )
 def test_given_package_commands_when_applied_then_first_failure_stops_and_is_reported(
-    manager: str,
+    manager: PackageManager,
     pkg: str,
     version: str,
     failing_call: int | None,
@@ -258,7 +257,7 @@ def test_given_package_commands_when_applied_then_first_failure_stops_and_is_rep
     ],
 )
 def test_given_unpreparable_update_when_applied_then_prepare_failure_and_no_command(
-    package_manager: str,
+    package_manager: PackageManager,
     message: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

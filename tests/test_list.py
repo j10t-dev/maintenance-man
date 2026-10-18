@@ -137,7 +137,6 @@ class TestListCommand:
 _COUNTS_SCAN = ScanResult(
     project="app",
     scanned_at=datetime(2026, 3, 20, tzinfo=UTC),
-    trivy_target=".",
     vulnerabilities=[_VULN, _VULN],
     updates=[_UPDATE, _UPDATE, _UPDATE],
     secrets=[_SECRET],
@@ -231,7 +230,6 @@ class TestListFindings:
         result = ScanResult(
             project="myapp",
             scanned_at=_NOW,
-            trivy_target=".",
             vulnerabilities=[_VULN],
         )
         save_scan_results("myapp", result)
@@ -254,7 +252,6 @@ class TestListFindings:
         result = ScanResult(
             project="myapp",
             scanned_at=_NOW,
-            trivy_target=".",
             vulnerabilities=vulns,
         )
         save_scan_results("myapp", result)
@@ -305,7 +302,6 @@ class TestListFindings:
         result = ScanResult(
             project="myapp",
             scanned_at=_NOW,
-            trivy_target=".",
             vulnerabilities=vulns,
         )
         save_scan_results("myapp", result)
@@ -329,7 +325,6 @@ class TestListFindings:
         result = ScanResult(
             project="myapp",
             scanned_at=_NOW,
-            trivy_target=".",
             vulnerabilities=[_VULN],
         )
         save_scan_results("myapp", result)
