@@ -5,9 +5,8 @@ import shutil
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import datetime
-from threading import Lock, Timer
+from threading import Timer
 from typing import Literal, TextIO
 
 from cyclopts.help import HelpPanel, PlainFormatter
@@ -23,19 +22,21 @@ from maintenance_man.models.events import Status
 
 def reset_invocation_output(*, verbose: bool) -> None:
     """Reset headings and consoles and set the invocation's child-log policy."""
-    _verbose.set(verbose)
-    _last_heading.set(None)
-    _consoles.set({})
+    global _verbose, _last_heading
+    _verbose = verbose
+    _last_heading = None
+    _consoles.clear()
 
 
 def heading(name: str, metadata: str = "") -> None:
+    global _last_heading
     if terminal():
-        previous = _last_heading.get()
+        previous = _last_heading
         if previous is not None and previous[0] is sys.stdout:
             if previous[1] == name and not metadata:
                 return
             console().print()
-        _last_heading.set((sys.stdout, name))
+        _last_heading = (sys.stdout, name)
         text = literal(name, "bold")
         if metadata:
             text.append_text(literal(f" · {metadata}", "dim"))
@@ -80,29 +81,15 @@ def records(
         screen.print(literal(footer, "dim"))
 
 
-def table_width(headers: Sequence[str], rows: Sequence[Sequence[str | Text]]) -> int:
-    """Measure a table before terminal truncation, including padding and separators."""
-    widths = _column_widths(headers, rows)
-    return sum(widths) + _table_spacing(len(widths)) if widths else 0
-
-
-def _column_widths(
-    headers: Sequence[str], rows: Sequence[Sequence[str | Text]]
-) -> list[int]:
-    if not rows:
-        return []
+def _column_widths(headers: Sequence[str], rows: Sequence[Sequence[Text]]) -> list[int]:
     widths = [
         max(
             cell_len(headers[index]) if headers else 0,
-            *(_cell_width(row[index]) for row in rows),
+            *(row[index].cell_len for row in rows),
         )
         for index in range(len(rows[0]))
     ]
     return [min(width, _MAX_FIXED_COLUMN_WIDTH) for width in widths[:-1]] + widths[-1:]
-
-
-def _cell_width(cell: str | Text) -> int:
-    return cell.cell_len if isinstance(cell, Text) else cell_len(cell)
 
 
 def _table_spacing(columns: int) -> int:
@@ -139,6 +126,7 @@ def outcome(
     target: str = "-",
     reason: str = "",
 ) -> None:
+    """Print one outcome; on a terminal it follows the project's heading."""
     if not terminal():
         sys.stdout.write(
             _pipe_line(
@@ -146,6 +134,8 @@ def outcome(
             )
         )
         return
+    if project:
+        heading(project)
     symbol, style = _STATES[status]
     versions = f"{installed} → {target}" if installed != "-" or target != "-" else ""
     text = Text("  ")
@@ -216,7 +206,7 @@ def prompt(message: str, *, default: str) -> str:
 
 
 def is_verbose() -> bool:
-    return _verbose.get()
+    return _verbose
 
 
 @contextmanager
@@ -236,23 +226,14 @@ def progress(message: str) -> Iterator[None]:
         redirect_stdout=False,
         redirect_stderr=False,
     )
-    lock = Lock()
-    finished = False
-
-    def start() -> None:
-        with lock:
-            if not finished:
-                status.start()
-
-    timer = Timer(_PROGRESS_DELAY_SECONDS, start)
+    timer = Timer(_PROGRESS_DELAY_SECONDS, status.start)
     timer.start()
     try:
         yield
     finally:
         timer.cancel()
-        with lock:
-            finished = True
-            status.stop()
+        timer.join()
+        status.stop()
 
 
 def terminal() -> bool:
@@ -265,12 +246,8 @@ def stderr_terminal() -> bool:
 
 def console(*, stderr: bool = False) -> Console:
     stream = sys.stderr if stderr else sys.stdout
-    cache = _consoles.get()
-    if cache is None:
-        cache = {}
-        _consoles.set(cache)
-    if stderr in cache and cache[stderr][0] is stream:
-        return cache[stderr][1]
+    if stream in _consoles:
+        return _consoles[stream]
     try:
         size = os.get_terminal_size(stream.fileno())
     except OSError, ValueError:
@@ -290,13 +267,13 @@ def console(*, stderr: bool = False) -> Console:
         highlight=False,
         emoji=False,
     )
-    cache[stderr] = (stream, screen)
+    _consoles[stream] = screen
     return screen
 
 
 def literal(value: str, style: str = "") -> Text:
     """Render data without interpreting markup or terminal controls."""
-    return Text(_escape(value.expandtabs(), backslash=False), style=style)
+    return Text(value.expandtabs().translate(_TERMINAL_ESCAPES), style=style)
 
 
 def timestamp(value: datetime | None) -> str:
@@ -320,24 +297,7 @@ def relative_time(value: datetime, now: datetime | None = None) -> str:
 
 
 def _pipe_line(fields: Sequence[str]) -> str:
-    return "\t".join(_escape(field) for field in fields) + "\n"
-
-
-def _escape(value: str, *, backslash: bool = True) -> str:
-    escapes = {"\t": "\\t", "\n": "\\n", "\r": "\\r"}
-    if backslash:
-        escapes["\\"] = "\\\\"
-    return "".join(
-        escapes.get(
-            char,
-            f"\\x{ord(char):02x}"
-            if ord(char) < 32 or 127 <= ord(char) <= 159
-            else f"\\u{ord(char):04x}"
-            if char in "\u2028\u2029"
-            else char,
-        )
-        for char in value
-    )
+    return "\t".join(field.translate(_PIPE_ESCAPES) for field in fields) + "\n"
 
 
 class HelpFormatter(PlainFormatter):
@@ -358,13 +318,18 @@ class HelpFormatter(PlainFormatter):
         super().__call__(console, options, panel)
 
 
-_consoles: ContextVar[dict[bool, tuple[TextIO, Console]] | None] = ContextVar(
-    "mm_consoles", default=None
-)
-_last_heading: ContextVar[tuple[TextIO, str] | None] = ContextVar(
-    "mm_heading", default=None
-)
-_verbose: ContextVar[bool] = ContextVar("mm_verbose", default=False)
+_consoles: dict[TextIO, Console] = {}
+_last_heading: tuple[TextIO, str] | None = None
+_verbose = False
+_TERMINAL_ESCAPES = {
+    **{code: f"\\x{code:02x}" for code in (*range(32), *range(127, 160))},
+    ord("\t"): "\\t",
+    ord("\n"): "\\n",
+    ord("\r"): "\\r",
+    0x2028: "\\u2028",
+    0x2029: "\\u2029",
+}
+_PIPE_ESCAPES = {**_TERMINAL_ESCAPES, ord("\\"): "\\\\"}
 _PROGRESS_DELAY_SECONDS = 0.5
 _STATES: dict[Status, tuple[str, str]] = {
     "passed": ("✓", "green"),

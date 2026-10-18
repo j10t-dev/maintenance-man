@@ -1,9 +1,10 @@
 import functools
 import sys
 import time
-from collections import Counter
-from collections.abc import Callable, Sequence
+from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Annotated, Literal, NoReturn, get_args
 
@@ -21,24 +22,20 @@ from maintenance_man.config import (
     resolve_project,
 )
 from maintenance_man.deployer import BuildError
-from maintenance_man.exit_codes import ExitCode
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
     BlockersStillFailing,
     DeployStep,
-    DeployStepFailed,
-    DeployStepSucceeded,
+    DeployStepFinished,
     Event,
     FindingFailed,
     FindingPassed,
     FindingsBlocked,
-    FindingsProcessed,
     FindingStarted,
     FindingStepFailed,
     HealthChecked,
-    HealthcheckUnconfigured,
     MissingTestConfig,
     OperationFailed,
     Outcome,
@@ -80,6 +77,19 @@ from maintenance_man.storage import (
 from maintenance_man.updater import run_test_phases
 from maintenance_man.vcs import JJ_INSTALL_HINT, RevisionError
 
+
+class ExitCode(IntEnum):
+    OK = 0
+    ERROR = 1
+    VULNS_FOUND = 2
+    UPDATES_FOUND = 3
+    UPDATE_FAILED = 4
+    TEST_FAILED = 5
+    BUILD_FAILED = 6
+    DEPLOY_FAILED = 7
+    SYNC_FAILED = 8
+
+
 _HANDLED_ERRORS = (
     WorkflowError,
     ConfigError,
@@ -102,27 +112,8 @@ _OVERVIEW_HEADERS = (
     "built",
     "deployed",
 )
-_NARROW_DROP_ORDER = (
-    "scanned",
-    "built",
-    "deployed",
-    "type",
-    "secrets",
-    "updates",
-    "vulns",
-)
-
-
-def _command[**P](function: Callable[P, None]) -> Callable[P, None]:
-    @functools.wraps(function)
-    def mapped_command(*args: P.args, **kwargs: P.kwargs) -> None:
-        try:
-            function(*args, **kwargs)
-        except _HANDLED_ERRORS as exc:
-            hint = "mm list" if isinstance(exc, UnknownProjectError) else None
-            _fatal(str(exc), hint=hint)
-
-    return mapped_command
+_NARROW_OVERVIEW = ("project", "vulns", "updates", "secrets")
+_NARROW_TERMINAL_WIDTH = 70
 
 
 type _Flow = Literal["scan", "update", "resolve", "deploy"]
@@ -142,16 +133,16 @@ class _Renderer:
     def _render_project_skipped(self, event: ProjectSkipped) -> None:
         if event.reason in _DEPLOY_SKIPS:
             status, reason = _DEPLOY_SKIPS[event.reason]
-            _project_outcome(event.project, "deploy", status, "deploy", reason)
+            output.outcome(event.project, "deploy", status, "deploy", reason=reason)
             return
         match event.reason:
             case SkipReason.PATH_MISSING if self.flow == "deploy":
-                _project_outcome(
+                output.outcome(
                     event.project,
                     "deploy",
                     "failed",
                     "deploy",
-                    f"path does not exist: {event.detail}",
+                    reason=f"path does not exist: {event.detail}",
                 )
             case SkipReason.PATH_MISSING:
                 output.diagnostic(
@@ -171,10 +162,14 @@ class _Renderer:
         )
 
     @__call__.register
-    def _render_promotion_failed(self, event: PromotionFailed) -> None:
-        output.outcome(
-            event.project, "promotion", "failed", _LOCAL_MAIN, reason=event.error
-        )
+    def _render_promotion(self, event: Promoted | PromotionFailed) -> None:
+        match event:
+            case PromotionFailed(project=project, error=error):
+                output.outcome(
+                    project, "promotion", "failed", _LOCAL_MAIN, reason=error
+                )
+            case Promoted():
+                output.outcome(self.project, "promotion", "passed", _LOCAL_MAIN)
 
     @__call__.register
     def _render_scan_reported(self, event: ScanReported) -> None:
@@ -207,23 +202,12 @@ class _Renderer:
         )
 
     @__call__.register
-    def _render_findings_processed(self, event: FindingsProcessed) -> None:
-        if not self.batch:
-            _print_result_totals(event.results, event.blocked)
-
-    @__call__.register
-    def _render_promoted(self, event: Promoted) -> None:
-        output.outcome(self.project, "promotion", "passed", _LOCAL_MAIN)
-
-    @__call__.register
     def _render_resolve_paused(self, event: ResolvePaused) -> None:
         output.notice("Resolve paused")
         output.diagnostic("hint", f"mm resolve {event.project} --continue")
 
     @__call__.register
     def _render_findings_blocked(self, event: FindingsBlocked) -> None:
-        if self.project:
-            output.heading(self.project)
         for package, reason in event.findings:
             output.outcome(self.project, self.flow, "blocked", package, reason=reason)
 
@@ -236,9 +220,9 @@ class _Renderer:
     @__call__.register
     def _render_sync_completed(self, event: SyncCompleted) -> None:
         if event.action == vcs_workflow.SyncAction.UNCHANGED:
-            _project_outcome(event.project, "sync", "unchanged", "main")
+            output.outcome(event.project, "sync", "unchanged", "main")
         else:
-            _project_outcome(event.project, "sync", "passed", "main", event.action)
+            output.outcome(event.project, "sync", "passed", "main", reason=event.action)
 
     @__call__.register
     def _render_project_started(self, event: ProjectStarted) -> None:
@@ -258,68 +242,50 @@ class _Renderer:
 
     @__call__.register
     def _render_finding_step_failed(self, event: FindingStepFailed) -> None:
-        words = event.step.value.replace("_", " ")
         prefix = f"{self.project} · " if self.project else ""
-        output.diagnostic("error", f"{prefix}{words} · {event.error}")
+        output.diagnostic("error", f"{prefix}{event.step} · {event.error}")
 
     @__call__.register
-    def _render_finding_passed(self, event: FindingPassed) -> None:
-        if self.project:
-            output.heading(self.project)
+    def _render_finding_outcome(self, event: FindingPassed | FindingFailed) -> None:
+        match event:
+            case FindingFailed(phase=phase):
+                status, reason = "failed", f"{phase} failed"
+            case FindingPassed(already_applied=applied):
+                status, reason = "passed", "already applied" if applied else ""
         output.outcome(
             self.project,
             self.flow,
-            "passed",
+            status,
             event.pkg,
             installed=event.installed,
             target=event.target,
-            reason="already applied" if event.already_applied else "",
+            reason=reason,
         )
 
     @__call__.register
-    def _render_finding_failed(self, event: FindingFailed) -> None:
-        if self.project:
-            output.heading(self.project)
-        output.outcome(
-            self.project,
-            self.flow,
-            "failed",
-            event.pkg,
-            installed=event.installed,
-            target=event.target,
-            reason=f"{event.phase} failed",
-        )
-
-    @__call__.register
-    def _render_deploy_step_succeeded(self, event: DeployStepSucceeded) -> None:
+    def _render_deploy_step_finished(self, event: DeployStepFinished) -> None:
         word = event.step.value
-        _project_outcome(event.project, word, "passed", word)
-
-    @__call__.register
-    def _render_deploy_step_failed(self, event: DeployStepFailed) -> None:
-        word = event.step.value
-        _project_outcome(event.project, word, "failed", word, event.error)
+        if event.error is None:
+            output.outcome(event.project, word, "passed", word)
+            return
+        output.outcome(event.project, word, "failed", word, reason=event.error)
         if event.step is DeployStep.BUILD:
-            _project_outcome(
-                event.project, "deploy", "skipped", "deploy", "build failed"
+            output.outcome(
+                event.project, "deploy", "skipped", "deploy", reason="build failed"
             )
 
     @__call__.register
     def _render_health_checked(self, event: HealthChecked) -> None:
         if event.is_up:
-            _project_outcome(event.project, "health", "passed", "healthcheck")
+            output.outcome(event.project, "health", "passed", "healthcheck")
         else:
-            _project_outcome(
+            output.outcome(
                 event.project,
                 "health",
                 "failed",
                 "healthcheck",
-                event.error or "not healthy",
+                reason=event.error or "not healthy",
             )
-
-    @__call__.register
-    def _render_healthcheck_unconfigured(self, event: HealthcheckUnconfigured) -> None:
-        output.notice("--check: no healthcheck_url configured in [defaults]")
 
 
 _DEPLOY_SKIPS: dict[SkipReason, tuple[Status, str]] = {
@@ -335,14 +301,7 @@ _DEPLOY_SKIPS: dict[SkipReason, tuple[Status, str]] = {
 }
 _STATUS_ORDER: tuple[Status, ...] = get_args(Status.__value__)
 _LOCAL_MAIN = "local main"
-
-
-def _project_outcome(
-    project: str, operation: str, status: Status, subject: str, reason: str = ""
-) -> None:
-    """Print an outcome under the project's heading, which prints once."""
-    output.heading(project)
-    output.outcome(project, operation, status, subject, reason=reason)
+_HEALTHCHECK_UNCONFIGURED = "--check: no healthcheck_url configured in [defaults]"
 
 
 app = cyclopts.App(
@@ -356,11 +315,17 @@ app = cyclopts.App(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Usage errors exit with ExitCode.ERROR; cyclopts would exit 2 on its own."""
+    """Usage errors and handled service errors exit with ExitCode.ERROR.
+
+    Cyclopts would exit 2 on its own for usage errors.
+    """
     try:
         app(argv, exit_on_error=False)
     except cyclopts.CycloptsError:
         sys.exit(ExitCode.ERROR)
+    except _HANDLED_ERRORS as exc:
+        hint = "mm list" if isinstance(exc, UnknownProjectError) else None
+        _fatal(str(exc), hint=hint)
 
 
 type ConfigOption = Annotated[
@@ -376,14 +341,16 @@ type VerboseOption = Annotated[
 
 
 def _reset_output_and_load_config(
-    config: Path | None, *, verbose: bool = False
+    config: Path | None, *, verbose: bool = False, require_projects: bool = False
 ) -> MmConfig:
     output.reset_invocation_output(verbose=verbose)
-    return load_config(config)
+    cfg = load_config(config)
+    if require_projects and not cfg.projects:
+        _exit_without_projects(config)
+    return cfg
 
 
 @app.command
-@_command
 def init() -> None:
     """Initialise the ~/.mm directory and skeleton config."""
     output.reset_invocation_output(verbose=False)
@@ -393,7 +360,6 @@ def init() -> None:
 
 
 @app.command
-@_command
 def scan(
     project: str | None = None,
     *,
@@ -406,10 +372,7 @@ def scan(
     project: str | None
         Project name to scan. Scans all if omitted.
     """
-    cfg = _reset_output_and_load_config(config)
-
-    if not cfg.projects:
-        _exit_without_projects(config)
+    cfg = _reset_output_and_load_config(config, require_projects=True)
 
     if project:
         proj_config = resolve_project(cfg, project)
@@ -430,28 +393,15 @@ def scan(
 
     started = time.monotonic()
     summary = scan_service.scan_all(cfg, emit=_Renderer(batch=True, flow="scan"))
-    if summary.clean:
-        elapsed = time.monotonic() - started
-        output.notice(
-            f"{len(summary.clean)} projects have no findings: "
-            f"{', '.join(summary.clean)} · scanned in {elapsed:.1f}s"
-        )
+    _notice_projects(
+        summary.clean,
+        "findings",
+        suffix=f" · scanned in {time.monotonic() - started:.1f}s",
+    )
     sys.exit(_scan_exit_code(summary))
 
 
-def _exit_if_no_update_targets(
-    cfg: MmConfig, target_names: list[str], config: Path | None
-) -> None:
-    if not cfg.projects:
-        _exit_without_projects(config)
-
-    if not target_names:
-        output.notice("No target projects")
-        sys.exit(ExitCode.OK)
-
-
 @app.command
-@_command
 def update(
     *projects: str,
     negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
@@ -469,10 +419,12 @@ def update(
     negate: bool
         Treat all positional project names as exclusions.
     """
-    cfg = _reset_output_and_load_config(config, verbose=verbose)
+    cfg = _reset_output_and_load_config(config, verbose=verbose, require_projects=True)
     mode, targets = update_service.resolve_update_targets(cfg, projects, negate=negate)
 
-    _exit_if_no_update_targets(cfg, targets, config)
+    if not targets:
+        output.notice("No target projects")
+        sys.exit(ExitCode.OK)
 
     require_tool("jj", JJ_INSTALL_HINT)
 
@@ -485,6 +437,7 @@ def update(
             choose=_choose_findings,
             emit=_Renderer(batch=False, project=name),
         )
+        _print_result_totals(result.results, result.blocked)
         sys.exit(
             ExitCode.OK
             if result.outcome is Outcome.SUCCEEDED
@@ -502,7 +455,6 @@ def update(
 
 
 @app.command
-@_command
 def sync(
     *projects: str,
     config: ConfigOption = None,
@@ -514,11 +466,7 @@ def sync(
     projects: str
         Project names to sync. No names syncs all configured projects.
     """
-    cfg = _reset_output_and_load_config(config)
-
-    if not cfg.projects:
-        _exit_without_projects(config)
-
+    cfg = _reset_output_and_load_config(config, require_projects=True)
     outcome = scan_service.sync_projects(cfg, projects, emit=_Renderer(batch=True))
     sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
@@ -544,7 +492,6 @@ def _print_deploy_summary(results: Sequence[deploy_service.DeployResult]) -> Non
 
 
 @app.command
-@_command
 def deploy(
     project: str | None = None,
     *,
@@ -575,7 +522,7 @@ def deploy(
 
     if batch:
         if check and not cfg.defaults.healthcheck_url:
-            renderer(HealthcheckUnconfigured())
+            output.notice(_HEALTHCHECK_UNCONFIGURED)
         if not cfg.projects:
             _exit_without_projects(config)
         results = deploy_service.deploy_all(
@@ -596,12 +543,13 @@ def deploy(
     result = deploy_service.deploy_project(
         project,
         proj_config,
-        healthcheck_url=cfg.defaults.healthcheck_url,
+        healthcheck_url=cfg.defaults.healthcheck_url if check else None,
         build=build,
-        check=check,
         force=force,
         emit=renderer,
     )
+    if check and not cfg.defaults.healthcheck_url and result.deploy_status == "passed":
+        output.notice(_HEALTHCHECK_UNCONFIGURED)
     if result.build_status == "failed":
         sys.exit(ExitCode.BUILD_FAILED)
     if result.deploy_status == "failed":
@@ -610,7 +558,6 @@ def deploy(
 
 
 @app.command
-@_command
 def test(
     project: str,
     *,
@@ -629,10 +576,13 @@ def test(
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
     proj_config = resolve_project(cfg, project)
-    _require_test_config(project, proj_config, config)
+    if not proj_config.test_phases:
+        _fatal(
+            f"No test configuration for {project}",
+            hint=f"add test_unit to [projects.{project}] in {_config_file(config)}",
+        )
 
     output.heading(project)
-
     failed_phase = run_test_phases(
         proj_config, proj_config.path, emit=_Renderer(batch=False)
     )
@@ -645,7 +595,6 @@ def test(
 
 
 @app.command
-@_command
 def build(
     project: str,
     *,
@@ -681,7 +630,6 @@ def build(
 
 
 @app.command(name=("list", "status", "st"))
-@_command
 def list_projects(
     *,
     detail: Annotated[bool, cyclopts.Parameter(name=("--detail", "-d"))] = False,
@@ -694,10 +642,7 @@ def list_projects(
     detail: bool
         Show full findings detail for each project.
     """
-    cfg = _reset_output_and_load_config(config)
-
-    if not cfg.projects:
-        _exit_without_projects(config)
+    cfg = _reset_output_and_load_config(config, require_projects=True)
 
     scan_results: dict[str, ScanResult] = {}
     for name in cfg.projects:
@@ -726,12 +671,8 @@ def _print_project_detail(cfg: MmConfig, scan_results: dict[str, ScanResult]) ->
             _print_scan_result(result)
         else:
             clean.append(name)
-    if clean:
-        output.notice(f"{len(clean)} projects have no findings: {', '.join(clean)}")
-    if unscanned:
-        output.notice(
-            f"{len(unscanned)} projects have no saved scan: {', '.join(unscanned)}"
-        )
+    _notice_projects(clean, "findings")
+    _notice_projects(unscanned, "saved scan")
 
 
 def _print_project_overview(
@@ -749,9 +690,15 @@ def _print_project_overview(
         pipe_rows.append(pipe_row)
 
     visible, footer_parts = _hidden_columns(_OVERVIEW_HEADERS, rows)
-    visible, narrow = _fit_columns(_OVERVIEW_HEADERS, rows, visible)
-    if narrow:
-        footer_parts.append("hidden: " + ", ".join(narrow))
+    if output.terminal() and output.console().width < _NARROW_TERMINAL_WIDTH:
+        hidden = [
+            _OVERVIEW_HEADERS[i]
+            for i in visible
+            if _OVERVIEW_HEADERS[i] not in _NARROW_OVERVIEW
+        ]
+        visible = [i for i in visible if _OVERVIEW_HEADERS[i] in _NARROW_OVERVIEW]
+        if hidden:
+            footer_parts.append("hidden: " + ", ".join(hidden))
     output.heading("projects", f"{len(rows)} configured")
     output.project_records(
         [_OVERVIEW_HEADERS[index] for index in visible],
@@ -839,31 +786,7 @@ def _hidden_columns(
     return visible, footer_parts
 
 
-def _fit_columns(
-    headers: Sequence[str], rows: Sequence[Sequence[str]], visible: Sequence[int]
-) -> tuple[list[int], list[str]]:
-    """Visible column indexes that fit the terminal, plus the names dropped."""
-    fitting = list(visible)
-    if not output.terminal():
-        return fitting, []
-    width = output.console().width
-    dropped = []
-    for name in _NARROW_DROP_ORDER:
-        required = output.table_width(
-            [headers[column] for column in fitting],
-            [[row[column] for column in fitting] for row in rows],
-        )
-        if required <= width:
-            break
-        index = headers.index(name)
-        if index in fitting:
-            fitting.remove(index)
-            dropped.append(name)
-    return fitting, dropped
-
-
 @app.command
-@_command
 def todo(
     project: str | None = None,
     *,
@@ -888,8 +811,7 @@ def todo(
 
     todos = {name: _read_todo(cfg.projects[name].path) for name in sorted(cfg.projects)}
     empty = [name for name, content in todos.items() if not content.strip()]
-    if empty:
-        output.notice(f"{len(empty)} projects have no TODO items: {', '.join(empty)}")
+    _notice_projects(empty, "TODO items")
     for name, content in todos.items():
         if content.strip():
             _print_project_todo(name, content)
@@ -921,6 +843,13 @@ def _exit_without_projects(config: Path | None) -> NoReturn:
     sys.exit(ExitCode.OK)
 
 
+def _notice_projects(names: Sequence[str], what: str, suffix: str = "") -> None:
+    if names:
+        output.notice(
+            f"{len(names)} projects have no {what}: {', '.join(names)}{suffix}"
+        )
+
+
 def _config_file(config: Path | None) -> Path:
     """The file `load_config` reads for this `--config` value."""
     return config or paths.config_path()
@@ -933,16 +862,6 @@ def _fatal(
     if hint:
         output.diagnostic("hint", hint)
     sys.exit(code)
-
-
-def _require_test_config(
-    project: str, proj_config: ProjectConfig, config: Path | None
-) -> None:
-    if not proj_config.test_phases:
-        _fatal(
-            f"No test configuration for {project}",
-            hint=(f"add test_unit to [projects.{project}] in {_config_file(config)}"),
-        )
 
 
 def _scan_exit_code(summary: ScanSummary) -> ExitCode:
@@ -991,54 +910,29 @@ def _print_numbered_findings(
     return numbered
 
 
-type _KeywordSelection = Literal["all", "none", "vulns", "updates"]
-type _Selection = _KeywordSelection | tuple[int, ...]
-
-_KEYWORD_SELECTIONS: dict[str, _KeywordSelection] = {
-    "all": "all",
-    "none": "none",
-    "vulns": "vulns",
-    "updates": "updates",
-}
-
-
-def _parse_selection(text: str, count: int) -> _Selection | None:
+def _parse_selection(
+    text: str,
+    numbered: list[VulnFinding | UpdateFinding],
+    vulns: list[VulnFinding],
+    updates: list[UpdateFinding],
+) -> tuple[list[VulnFinding], list[UpdateFinding]] | None:
+    """The chosen findings for a keyword or comma-separated numbers, else None."""
     choice = text.strip().lower()
-    if selection := _KEYWORD_SELECTIONS.get(choice):
-        return selection
+    keywords = {
+        "all": (vulns, updates),
+        "none": ([], []),
+        "vulns": (vulns, []),
+        "updates": ([], updates),
+    }
+    if choice in keywords:
+        return keywords[choice]
     try:
         indices = [int(part) for part in choice.split(",")]
     except ValueError:
         return None
-    if not all(1 <= index <= count for index in indices):
+    if not all(1 <= index <= len(numbered) for index in indices):
         return None
-    return tuple(dict.fromkeys(indices))
-
-
-def _prompt_selection(message: str, count: int) -> _Selection:
-    while True:
-        text = output.prompt(message, default="all")
-        selection = _parse_selection(text, count)
-        if selection is not None:
-            return selection
-        output.diagnostic("error", f"Invalid selection: {text}")
-
-
-def _selected_findings(
-    selection: _Selection,
-    numbered: list[VulnFinding | UpdateFinding],
-    selectable_vulns: list[VulnFinding],
-    selectable_updates: list[UpdateFinding],
-) -> tuple[list[VulnFinding], list[UpdateFinding]]:
-    if selection == "all":
-        return selectable_vulns, selectable_updates
-    if selection == "vulns":
-        return selectable_vulns, []
-    if selection == "updates":
-        return [], selectable_updates
-    if selection == "none":
-        return [], []
-    selected = [numbered[index - 1] for index in selection]
+    selected = [numbered[index - 1] for index in dict.fromkeys(indices)]
     return (
         [finding for finding in selected if isinstance(finding, VulnFinding)],
         [finding for finding in selected if isinstance(finding, UpdateFinding)],
@@ -1050,20 +944,25 @@ def _choose_findings(
     selectable_updates: list[UpdateFinding],
 ) -> tuple[list[VulnFinding], list[UpdateFinding]]:
     numbered = _print_numbered_findings(selectable_vulns, selectable_updates)
-    parts = ["all"]
-    if selectable_vulns:
-        parts.append("vulns")
-    if selectable_updates:
-        parts.append("updates")
-    parts.extend(["1,2,...", "none"])
-    choices = "/".join(parts)
-
-    selection = _prompt_selection(f"Select updates [{choices}]", len(numbered))
-    return _selected_findings(selection, numbered, selectable_vulns, selectable_updates)
+    parts = [
+        "all",
+        *(["vulns"] if selectable_vulns else []),
+        *(["updates"] if selectable_updates else []),
+        "1,2,...",
+        "none",
+    ]
+    message = f"Select updates [{'/'.join(parts)}]"
+    while True:
+        text = output.prompt(message, default="all")
+        selection = _parse_selection(
+            text, numbered, selectable_vulns, selectable_updates
+        )
+        if selection is not None:
+            return selection
+        output.diagnostic("error", f"Invalid selection: {text}")
 
 
 @app.command
-@_command
 def resolve(
     project: str,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
@@ -1097,23 +996,24 @@ def resolve(
     sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)
 
 
-type _FindingRows = tuple[list[list[str | Text]], list[list[str]]]
-
-
 def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
     wins = _selected_fix_versions(result.vulnerabilities)
-    rows, pipe_rows = _vulnerability_rows(result.vulnerabilities, wins)
-    for found_rows, found_pipe_rows in (
-        _secret_rows(result.secrets),
-        _update_rows(result.updates),
-    ):
-        rows += found_rows
-        pipe_rows += found_pipe_rows
-    if not rows:
+    found = [
+        *(
+            _vulnerability_row(vuln, wins)
+            for vuln in sort_vulns_by_severity(result.vulnerabilities)
+        ),
+        *map(_secret_row, result.secrets),
+        *map(_update_row, result.updates),
+    ]
+    if not found:
         return
+    rows, pipe_rows = zip(*found, strict=True)
     output.heading(result.project, f"{len(rows)} findings")
     headers = ["kind", "severity", "versions", "package / detail"]
-    visible = [0, 1, 2, 3] if output.console().width >= 70 else [0, 3]
+    visible = (
+        [0, 1, 2, 3] if output.console().width >= _NARROW_TERMINAL_WIDTH else [0, 3]
+    )
     output.records(
         result.project,
         [headers[index] for index in visible],
@@ -1129,117 +1029,101 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
 
 def _selected_fix_versions(vulnerabilities: list[VulnFinding]) -> dict[str, str]:
     """For packages with several actionable fixes, the one version that fixes all."""
-    wins = {}
-    for package in {v.pkg_name for v in vulnerabilities if v.actionable}:
-        group = [v for v in vulnerabilities if v.pkg_name == package and v.actionable]
-        if len(group) > 1:
-            wins[package] = highest_fix_version(group)
-    return wins
+    groups = defaultdict(list)
+    for vuln in vulnerabilities:
+        if vuln.actionable:
+            groups[vuln.pkg_name].append(vuln)
+    return {
+        package: highest_fix_version(group)
+        for package, group in groups.items()
+        if len(group) > 1
+    }
 
 
-def _vulnerability_rows(
-    vulnerabilities: list[VulnFinding], wins: dict[str, str]
-) -> _FindingRows:
-    rows: list[list[str | Text]] = []
-    pipe_rows: list[list[str]] = []
-    for vuln in sort_vulns_by_severity(vulnerabilities):
-        kind = "vuln" if vuln.actionable else "advisory"
-        reason = vuln.blocked_reason or ""
-        if vuln.fixed_version and wins.get(vuln.pkg_name) == vuln.fixed_version:
-            reason = " · ".join(filter(None, ["selected fix", reason]))
-        versions = (
-            f"{vuln.installed_version} → {vuln.fixed_version}"
-            if vuln.fixed_version
-            else "no fix"
-        )
-        rows.append(
-            [
-                output.literal(
-                    "! blocked" if vuln.blocked_reason else f"! {kind}",
-                    "yellow" if kind == "advisory" or vuln.blocked_reason else "red",
-                ),
-                vuln.severity.value.lower(),
-                versions,
-                " · ".join(filter(None, [vuln.pkg_name, vuln.vuln_id, reason])),
-            ]
-        )
-        pipe_rows.append(
-            [
-                kind,
-                vuln.pkg_name,
-                vuln.installed_version,
-                vuln.fixed_version or "-",
-                vuln.severity.value,
-                vuln.vuln_id,
-                vuln.published_date.isoformat() if vuln.published_date else "-",
-                "blocked" if vuln.blocked_reason else vuln.status,
-                reason or "-",
-            ]
-        )
-    return rows, pipe_rows
+type _FindingRow = tuple[list[str | Text], list[str]]
 
 
-def _secret_rows(secrets: list[SecretFinding]) -> _FindingRows:
-    rows: list[list[str | Text]] = [
-        [
-            output.literal("! secret", "yellow"),
-            secret.severity.value.lower(),
-            "-",
-            f"{secret.file} · {secret.title}",
-        ]
-        for secret in secrets
+def _vulnerability_row(vuln: VulnFinding, wins: dict[str, str]) -> _FindingRow:
+    kind = "vuln" if vuln.actionable else "advisory"
+    reason = vuln.blocked_reason or ""
+    if vuln.fixed_version and wins.get(vuln.pkg_name) == vuln.fixed_version:
+        reason = " · ".join(filter(None, ["selected fix", reason]))
+    versions = (
+        f"{vuln.installed_version} → {vuln.fixed_version}"
+        if vuln.fixed_version
+        else "no fix"
+    )
+    row = [
+        output.literal(
+            "! blocked" if vuln.blocked_reason else f"! {kind}",
+            "yellow" if kind == "advisory" or vuln.blocked_reason else "red",
+        ),
+        vuln.severity.value.lower(),
+        versions,
+        " · ".join(filter(None, [vuln.pkg_name, vuln.vuln_id, reason])),
     ]
-    pipe_rows = [
-        [
-            "secret",
-            secret.file,
-            "-",
-            "-",
-            secret.severity.value,
-            secret.rule_id,
-            "-",
-            "found",
-            secret.title,
-        ]
-        for secret in secrets
+    pipe_row = [
+        kind,
+        vuln.pkg_name,
+        vuln.installed_version,
+        vuln.fixed_version or "-",
+        vuln.severity.value,
+        vuln.vuln_id,
+        vuln.published_date.isoformat() if vuln.published_date else "-",
+        "blocked" if vuln.blocked_reason else vuln.status,
+        reason or "-",
     ]
-    return rows, pipe_rows
+    return row, pipe_row
 
 
-def _update_rows(updates: list[UpdateFinding]) -> _FindingRows:
-    rows: list[list[str | Text]] = []
-    pipe_rows: list[list[str]] = []
-    for update in updates:
-        reason = update.blocked_reason or ""
-        age = (
-            f"{(utc_now() - update.published_date).days}d old"
-            if update.published_date
-            else ""
-        )
-        rows.append(
-            [
-                output.literal(
-                    "! blocked" if reason else "~ update", "yellow" if reason else ""
-                ),
-                update.semver_tier.value,
-                f"{update.installed_version} → {update.latest_version}",
-                " · ".join(filter(None, [update.pkg_name, age, reason])),
-            ]
-        )
-        pipe_rows.append(
-            [
-                "update",
-                update.pkg_name,
-                update.installed_version,
-                update.latest_version,
-                update.semver_tier.value,
-                "-",
-                update.published_date.isoformat() if update.published_date else "-",
-                "blocked" if reason else "available",
-                reason or "-",
-            ]
-        )
-    return rows, pipe_rows
+def _secret_row(secret: SecretFinding) -> _FindingRow:
+    row = [
+        output.literal("! secret", "yellow"),
+        secret.severity.value.lower(),
+        "-",
+        f"{secret.file} · {secret.title}",
+    ]
+    pipe_row = [
+        "secret",
+        secret.file,
+        "-",
+        "-",
+        secret.severity.value,
+        secret.rule_id,
+        "-",
+        "found",
+        secret.title,
+    ]
+    return row, pipe_row
+
+
+def _update_row(update: UpdateFinding) -> _FindingRow:
+    reason = update.blocked_reason or ""
+    age = (
+        f"{(utc_now() - update.published_date).days}d old"
+        if update.published_date
+        else ""
+    )
+    row = [
+        output.literal(
+            "! blocked" if reason else "~ update", "yellow" if reason else ""
+        ),
+        update.semver_tier.value,
+        f"{update.installed_version} → {update.latest_version}",
+        " · ".join(filter(None, [update.pkg_name, age, reason])),
+    ]
+    pipe_row = [
+        "update",
+        update.pkg_name,
+        update.installed_version,
+        update.latest_version,
+        update.semver_tier.value,
+        "-",
+        update.published_date.isoformat() if update.published_date else "-",
+        "blocked" if reason else "available",
+        reason or "-",
+    ]
+    return row, pipe_row
 
 
 def _print_blocked_findings(result: ScanResult, flow: str) -> None:

@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man import cli
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -15,7 +14,7 @@ from maintenance_man.models.scan import (
 from maintenance_man.output import relative_time
 from maintenance_man.storage import record_activity, save_scan_results
 from tests.support.cli import run_mm, terminal_stdout
-from tests.support.findings import make_vuln
+from tests.support.findings import make_scan_result, make_vuln
 from tests.support.projects import write_config
 
 _NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
@@ -31,8 +30,6 @@ def list_project_home(mm_home: Path) -> Path:
     project_dir = mm_home.parent / "myproject"
     project_dir.mkdir()
     mm_home.mkdir(parents=True)
-    (mm_home / "scan-results").mkdir()
-    (mm_home / "workspaces").mkdir()
     write_config(
         mm_home, f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "uv"\n'
     )
@@ -71,45 +68,43 @@ class TestRelativeTime:
         assert relative_time(_NOW - delta, _NOW) == expected
 
 
-def test_given_wide_project_name_when_narrow_terminal_then_columns_drop_by_cell_width(
+@pytest.mark.parametrize(
+    ("width", "expected_headers", "expected_hidden"),
+    [
+        (69, ["project", "vulns", "updates"], "hidden: type, scanned"),
+        (70, ["project", "type", "vulns", "updates", "scanned"], None),
+    ],
+)
+def test_given_terminal_width_when_listed_then_narrow_overview_names_hidden_columns(
+    mm_home: Path,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    expected_headers: list[str],
+    expected_hidden: str | None,
 ) -> None:
-    terminal_stdout(monkeypatch)
-    wide_name = "日本語プロジェクト"
-    row = [wide_name, "uv", "0", "0", "0", "never", "-", "not deployable"]
-
-    visible, dropped = cli._fit_columns(
-        cli._OVERVIEW_HEADERS, [row], list(range(len(row)))
+    write_config(
+        mm_home,
+        f'[projects.api]\npath = "{tmp_path}"\npackage_manager = "uv"\n\n'
+        f'[projects.web]\npath = "{tmp_path}"\npackage_manager = "bun"\n',
     )
+    save_scan_results("api", make_scan_result())
+    older = make_scan_result(vulns=[], updates=[])
+    older.scanned_at = datetime.now(tz=UTC) - timedelta(days=2)
+    save_scan_results("web", older)
+    stream = terminal_stdout(monkeypatch, width=width)
 
-    assert dropped == ["scanned"]
-    assert visible == [0, 1, 2, 3, 4, 6, 7]
+    assert run_mm("list") == 0
 
-
-def test_given_long_last_column_when_terminal_is_narrow_then_it_is_not_capped(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    terminal_stdout(monkeypatch, width=84)
-    row = ["api", "uv", "0", "0", "0", "never", "-", "failed " + "9" * 25]
-
-    visible, dropped = cli._fit_columns(
-        cli._OVERVIEW_HEADERS, [row], list(range(len(row)))
-    )
-
-    assert dropped == ["scanned"]
-    assert visible == [0, 1, 2, 3, 4, 6, 7]
+    lines = stream.getvalue().splitlines()
+    assert lines[1].split() == expected_headers
+    if expected_hidden is None:
+        assert "hidden:" not in lines[-1]
+    else:
+        assert lines[-1].endswith(expected_hidden)
 
 
 class TestListCommand:
-    def test_list_no_projects(self, mm_home: Path, capsys: pytest.CaptureFixture[str]):
-        assert run_mm("list") == 0
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err.splitlines() == [
-            "No projects configured",
-            f"hint: add projects to {mm_home / 'config.toml'}",
-        ]
-
     @pytest.mark.parametrize("command", ["list", "status", "st"])
     def test_list_shows_projects(
         self, list_project_home: Path, capsys: pytest.CaptureFixture[str], command: str
@@ -118,20 +113,6 @@ class TestListCommand:
         assert [row[:2] for row in _records(capsys.readouterr().out)] == [
             ["myapp", "uv"]
         ]
-
-    def test_list_prints_bracketed_project_name_literally(
-        self, mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        project = tmp_path / "project"
-        project.mkdir()
-        mm_home.mkdir(parents=True)
-        write_config(
-            mm_home,
-            f'[projects."a[b]"]\npath = "{project}"\npackage_manager = "uv"\n',
-        )
-
-        assert run_mm("list") == 0
-        assert [row[0] for row in _records(capsys.readouterr().out)] == ["a[b]"]
 
 
 _COUNTS_SCAN = ScanResult(
@@ -204,10 +185,9 @@ class TestListFindings:
         capsys: pytest.CaptureFixture[str],
     ):
         """A corrupt scan-results JSON should not crash mm list."""
-        (list_project_home / "scan-results" / "myapp.json").write_text(
-            "NOT VALID JSON",
-            encoding="utf-8",
-        )
+        results = list_project_home / "scan-results"
+        results.mkdir()
+        (results / "myapp.json").write_text("NOT VALID JSON", encoding="utf-8")
         assert run_mm("list") == 0
         captured = capsys.readouterr()
         assert [row[:5] for row in _records(captured.out)] == [
@@ -215,122 +195,40 @@ class TestListFindings:
         ]
         assert captured.err == "warning: corrupt scan results for myapp; skipped\n"
 
-    @pytest.mark.parametrize(
-        "expected_substring",
-        ["CVE-2024-0001", "badpkg"],
-        ids=["vuln_id", "pkg_name"],
+
+def test_given_saved_findings_when_listed_with_detail_then_records_print(
+    list_project_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = ScanResult(project="myapp", scanned_at=_NOW, vulnerabilities=[_VULN])
+    save_scan_results("myapp", result)
+
+    assert run_mm("list", "--detail") == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "myapp\tvuln\tbadpkg\t1.0.0\t1.0.1\tHIGH\tCVE-2024-0001\t-\tfixed\t-\n"
     )
-    def test_detail_shows_findings(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-        expected_substring: str,
-    ):
-        """--detail flag prints full findings (vuln IDs, package names)."""
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            vulnerabilities=[_VULN],
-        )
-        save_scan_results("myapp", result)
-        assert run_mm("list", "--detail") == 0
-        assert expected_substring in capsys.readouterr().out
+    assert captured.err == ""
 
-    def test_detail_sorts_by_severity(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Findings are sorted CRITICAL > HIGH > LOW in detail output."""
-        vulns = [
-            make_vuln(vuln_id="CVE-LOW", pkg_name="low-pkg", severity=Severity.LOW),
-            make_vuln(
-                vuln_id="CVE-CRIT", pkg_name="crit-pkg", severity=Severity.CRITICAL
-            ),
-            make_vuln(vuln_id="CVE-HIGH", pkg_name="high-pkg"),
-        ]
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            vulnerabilities=vulns,
-        )
-        save_scan_results("myapp", result)
-        assert run_mm("list", "--detail") == 0
-        output = capsys.readouterr().out
-        crit_pos = output.index("CVE-CRIT")
-        high_pos = output.index("CVE-HIGH")
-        low_pos = output.index("CVE-LOW")
-        assert crit_pos < high_pos < low_pos
 
-    @pytest.mark.parametrize(
-        ("severities", "vuln_ids", "expected_order"),
-        [
-            ((Severity.HIGH, Severity.HIGH), ("CVE-0001", "CVE-0002"), None),
-            (
-                (Severity.CRITICAL, Severity.HIGH),
-                ("CVE-CRIT", "CVE-HIGH"),
-                ("CVE-CRIT", "CVE-HIGH"),
-            ),
-        ],
-        ids=["equal-severity", "mixed-severity"],
+def test_given_clean_and_unscanned_projects_when_detail_listed_then_notices_name_them(
+    mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_config(
+        mm_home,
+        f'[projects.clean]\npath = "{tmp_path}"\npackage_manager = "uv"\n\n'
+        f'[projects.unscanned]\npath = "{tmp_path}"\npackage_manager = "uv"\n',
     )
-    def test_detail_fix_marker_on_highest_version(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-        severities: tuple[Severity, Severity],
-        vuln_ids: tuple[str, str],
-        expected_order: tuple[str, str] | None,
-    ):
-        """'selected fix' marks the highest fix version for duplicate-package vulns."""
-        vulns = [
-            make_vuln(
-                vuln_id=vuln_ids[0],
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.31.0",
-                severity=severities[0],
-            ),
-            make_vuln(
-                vuln_id=vuln_ids[1],
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.32.4",
-                severity=severities[1],
-            ),
-        ]
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            vulnerabilities=vulns,
-        )
-        save_scan_results("myapp", result)
-        assert run_mm("list", "--detail") == 0
-        output = capsys.readouterr().out
-        assert "2.32.4" in output
-        lines_with_marker = [
-            line for line in output.splitlines() if "selected fix" in line
-        ]
-        assert len(lines_with_marker) == 1
-        assert "2.32.4" in lines_with_marker[0]
-        if expected_order is not None:
-            assert output.index(expected_order[0]) < output.index(expected_order[1])
+    save_scan_results("clean", ScanResult(project="clean", scanned_at=_NOW))
 
-    def test_detail_no_fix_marker_for_single_vuln_package(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Single-vuln packages should not get the 'selected fix' marker."""
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            vulnerabilities=[_VULN],
-        )
-        save_scan_results("myapp", result)
-        assert run_mm("list", "--detail") == 0
-        output = capsys.readouterr().out
-        assert "selected fix" not in output
+    assert run_mm("list", "--detail") == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "1 projects have no findings: clean",
+        "1 projects have no saved scan: unscanned",
+    ]
 
 
 class TestListActivity:

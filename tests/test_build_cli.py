@@ -50,98 +50,58 @@ def test_label_failure_does_not_block_persisted_build_activity(
     assert recorded.branch == "unknown"
 
 
-class TestBuildCommand:
-    def test_no_build_config(
-        self, mm_home_with_projects: Path, _build_repositories: dict[str, Path]
-    ) -> None:
-        """Error when project has no build_command configured."""
-        assert run_mm("build", "no-deploy") == ExitCode.ERROR
-
-    def test_no_build_config_deploy_only_project(
-        self, mm_home_with_projects: Path, _build_repositories: dict[str, Path]
-    ) -> None:
-        """Error when project has deploy_command but no build_command."""
-        assert run_mm("build", "deploy-only") == ExitCode.ERROR
-
-    @patch("maintenance_man.services.deploy.run_shell_command")
-    def test_successful_build(
-        self,
-        mock_build: MagicMock,
-        _build_repositories: dict[str, Path],
-    ) -> None:
-        """Exit 0 on successful build, recording the activity on main."""
-        assert run_mm("build", "deployable") == ExitCode.OK
-        mock_build.assert_called_once()
-        recorded = load_activity(paths.activity_path())["deployable"].last_build
-        assert recorded is not None
-        assert recorded.success is True
-        assert recorded.branch == "main"
-
-    @patch(
-        "maintenance_man.services.deploy.run_shell_command",
-        side_effect=BuildError("build failed"),
-    )
-    def test_failed_build(
-        self,
-        mock_build: MagicMock,
-        _build_repositories: dict[str, Path],
-    ) -> None:
-        """Exit BUILD_FAILED on build failure, still recording the activity."""
-        assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
-        recorded = load_activity(paths.activity_path())["deployable"].last_build
-        assert recorded is not None
-        assert recorded.success is False
-        assert recorded.branch == "main"
-
-    def test_unknown_project(
-        self, mm_home_with_projects: Path, _build_repositories: dict[str, Path]
-    ) -> None:
-        """Error when project doesn't exist."""
-        assert run_mm("build", "nonexistent") == ExitCode.ERROR
-
-    @patch("maintenance_man.services.deploy.run_shell_command")
-    def test_given_verbose_build_when_a_later_command_runs_then_verbosity_does_not_leak(
-        self,
-        mock_build: MagicMock,
-        mm_home_with_projects: Path,
-        _build_repositories: dict[str, Path],
-    ) -> None:
-        assert run_mm("build", "deployable", "--verbose") == ExitCode.OK
-        assert output.is_verbose() is True
-
-        assert run_mm("list") == ExitCode.OK
-        assert output.is_verbose() is False
-
-    @patch("maintenance_man.services.deploy.run_shell_command")
-    def test_given_successful_build_when_piped_then_one_passed_record(
-        self,
-        mock_build: MagicMock,
-        mm_home_with_projects: Path,
-        _build_repositories: dict[str, Path],
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        assert run_mm("build", "deployable") == ExitCode.OK
-
-        captured = capsys.readouterr()
-        assert captured.out == "deployable\tbuild\tpassed\tbuild\t-\t-\t-\n"
-        assert captured.err == ""
-
-    @patch(
-        "maintenance_man.services.deploy.run_shell_command",
-        side_effect=BuildError("Build for deployable failed (exit 2)"),
-    )
-    def test_given_failed_build_when_piped_then_failed_record_and_build_exit_code(
-        self,
-        mock_build: MagicMock,
-        mm_home_with_projects: Path,
-        _build_repositories: dict[str, Path],
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
-
-        captured = capsys.readouterr()
-        assert captured.out == (
+@pytest.mark.parametrize(
+    ("error", "expected_code", "expected_record", "expected_success"),
+    [
+        pytest.param(
+            None,
+            ExitCode.OK,
+            "deployable\tbuild\tpassed\tbuild\t-\t-\t-\n",
+            True,
+            id="passed",
+        ),
+        pytest.param(
+            BuildError("Build for deployable failed (exit 2)"),
+            ExitCode.BUILD_FAILED,
             "deployable\tbuild\tfailed\tbuild\t-\t-\t"
-            "Build for deployable failed (exit 2)\n"
-        )
-        assert captured.err == ""
+            "Build for deployable failed (exit 2)\n",
+            False,
+            id="failed",
+        ),
+    ],
+)
+def test_given_build_outcome_when_run_then_record_exit_code_and_activity_agree(
+    error: BuildError | None,
+    expected_code: ExitCode,
+    expected_record: str,
+    expected_success: bool,
+    mm_home_with_projects: Path,
+    _build_repositories: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "maintenance_man.services.deploy.run_shell_command",
+        MagicMock(side_effect=error),
+    )
+
+    assert run_mm("build", "deployable") == expected_code
+
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == (expected_record, "")
+    recorded = load_activity(paths.activity_path())["deployable"].last_build
+    assert recorded is not None
+    assert (recorded.success, recorded.branch) == (expected_success, "main")
+
+
+@patch("maintenance_man.services.deploy.run_shell_command")
+def test_given_verbose_build_when_a_later_command_runs_then_verbosity_does_not_leak(
+    mock_build: MagicMock,
+    mm_home_with_projects: Path,
+    _build_repositories: dict[str, Path],
+) -> None:
+    assert run_mm("build", "deployable", "--verbose") == ExitCode.OK
+    assert output.is_verbose() is True
+
+    assert run_mm("list") == ExitCode.OK
+    assert output.is_verbose() is False

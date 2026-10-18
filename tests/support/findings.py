@@ -7,6 +7,7 @@ from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
     ScanResult,
+    SecretFinding,
     SemverTier,
     Severity,
     UpdateFinding,
@@ -48,13 +49,17 @@ def make_update(tier: SemverTier = SemverTier.PATCH, **overrides: Any) -> Update
 def make_scan_result(
     vulns: list[VulnFinding] | None = None,
     updates: list[UpdateFinding] | None = None,
+    secrets: list[SecretFinding] | None = None,
 ) -> ScanResult:
-    """Build a saved scan containing the supplied findings or one of each by default."""
+    """Build a saved scan with the supplied findings, or one vulnerability and one
+    update by default and no secrets.
+    """
     return ScanResult(
         project="vulnerable",
         scanned_at=datetime.now(tz=UTC),
         vulnerabilities=vulns if vulns is not None else [make_vuln()],
         updates=updates if updates is not None else [make_update()],
+        secrets=secrets if secrets is not None else [],
     )
 
 

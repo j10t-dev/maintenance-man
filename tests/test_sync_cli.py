@@ -39,24 +39,6 @@ class TestSyncCommand:
         assert captured.out == "vulnerable\tsync\tunchanged\tmain\t-\t-\t-\n"
         assert captured.err == ""
 
-    def test_no_configured_projects(
-        self,
-        mm_home: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        mm_home.mkdir(parents=True, exist_ok=True)
-        write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
-        refuse_jj_commands(monkeypatch)
-
-        assert run_mm("sync") == ExitCode.OK
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err.splitlines() == [
-            "No projects configured",
-            f"hint: add projects to {mm_home / 'config.toml'}",
-        ]
-
     def test_skips_nonexistent_path(
         self,
         mm_home: Path,

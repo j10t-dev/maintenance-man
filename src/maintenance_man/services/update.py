@@ -11,7 +11,6 @@ from maintenance_man.gradle import (
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
     Emit,
-    FindingsProcessed,
     OperationFailed,
     Outcome,
     ProcessingStarted,
@@ -258,9 +257,7 @@ def _process_selected(
         if findings
         else []
     )
-    result_tuple = tuple(results)
-    emit(FindingsProcessed(result_tuple, len(scan_result.blocked_findings)))
-    return result_tuple
+    return tuple(results)
 
 
 def _with_shared_targets[F: VulnFinding | UpdateFinding](

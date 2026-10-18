@@ -68,14 +68,9 @@ def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
 
 def ordered_unique_project_names(config: MmConfig, names: Sequence[str]) -> list[str]:
     """Return configured project names once each, in their requested order."""
-    seen: set[str] = set()
-    ordered: list[str] = []
     for name in names:
         _configured_project(config, name)
-        if name not in seen:
-            seen.add(name)
-            ordered.append(name)
-    return ordered
+    return list(dict.fromkeys(names))
 
 
 def _configured_project(config: MmConfig, name: str) -> ProjectConfig:
@@ -90,10 +85,8 @@ def _configured_project(config: MmConfig, name: str) -> ProjectConfig:
 
 
 def ensure_mm_home() -> None:
-    """Create ~/.mm/ directory structure and skeleton config if missing."""
+    """Create ~/.mm/ and its skeleton config if missing."""
     paths.mm_home().mkdir(parents=True, exist_ok=True)
-    paths.scan_results_dir().mkdir(exist_ok=True)
-    paths.workspaces_dir().mkdir(exist_ok=True)
 
     config_path = paths.config_path()
     if not config_path.exists():

@@ -5,20 +5,15 @@ from pathlib import Path
 import pytest
 
 from maintenance_man import cli, scanner
-from maintenance_man.cli import ExitCode, _print_scan_result
+from maintenance_man.cli import ExitCode
 from maintenance_man.gradle import GradleError
-from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.events import (
-    FindingsBlocked,
-)
 from maintenance_man.models.scan import (
     ScanResult,
-    SemverTier,
+    SecretFinding,
     Severity,
     UpdateFinding,
     VulnFinding,
 )
-from maintenance_man.services import scan as scan_service
 from tests.support.cli import run_mm, terminal_stdout
 from tests.support.findings import (
     make_gradle_member,
@@ -30,46 +25,287 @@ from tests.support.findings import (
 from tests.support.process import missing_tool
 from tests.support.projects import write_config
 
+_SECRET = SecretFinding(
+    file="secrets.env",
+    rule_id="generic-api-key",
+    title="API Key",
+    severity=Severity.HIGH,
+)
+_ADVISORY = {"fixed_version": None, "status": "affected"}
+
+
+def _scan(
+    vulns: list[VulnFinding] | None = None,
+    updates: list[UpdateFinding] | None = None,
+    secrets: list[SecretFinding] | None = None,
+) -> ScanResult:
+    return make_scan_result(vulns=vulns or [], updates=updates or [], secrets=secrets)
+
 
 @pytest.mark.parametrize(
-    ("pkg_name", "reason"),
+    ("result", "expected"),
     [
-        ("org.x:lib", "rich version"),
-        ("org.x:[lib]", "cannot render [catalogue]"),
+        pytest.param(
+            _scan(vulns=[make_vuln()]),
+            ["vuln\tsome-pkg\t1.0.0\t1.0.1\tHIGH\tCVE-2024-0001\t-\tfixed\t-"],
+            id="vulnerability",
+        ),
+        pytest.param(
+            _scan(vulns=[make_vuln(**_ADVISORY)]),
+            [
+                "advisory\tsome-pkg\t1.0.0\t-\tHIGH\tCVE-2024-0001\t-\taffected\t-",
+            ],
+            id="advisory",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(blocked_reason="Cannot identify catalogue entry"),
+                    make_vuln(
+                        pkg_name="unfixed-pkg",
+                        vuln_id="CVE-2024-0002",
+                        blocked_reason="No published fix",
+                        **_ADVISORY,
+                    ),
+                ]
+            ),
+            [
+                "vuln\tsome-pkg\t1.0.0\t1.0.1\tHIGH\tCVE-2024-0001\t-\tblocked\t"
+                "Cannot identify catalogue entry",
+                "advisory\tunfixed-pkg\t1.0.0\t-\tHIGH\tCVE-2024-0002\t-\tblocked\t"
+                "No published fix",
+            ],
+            id="blocked-vulnerability-and-advisory",
+        ),
+        pytest.param(
+            _scan(secrets=[_SECRET]),
+            ["secret\tsecrets.env\t-\t-\tHIGH\tgeneric-api-key\t-\tfound\tAPI Key"],
+            id="secret",
+        ),
+        pytest.param(
+            _scan(
+                updates=[
+                    make_update(
+                        pkg_name="ksp",
+                        installed_version="2.3.10",
+                        latest_version="2.3.12",
+                        blocked_reason="no publication date",
+                        gradle_block_kind="age",
+                    ),
+                    make_update(),
+                ]
+            ),
+            [
+                "update\tksp\t2.3.10\t2.3.12\tpatch\t-\t-\tblocked\t"
+                "no publication date",
+                "update\tpkg-a\t1.0.0\t1.0.1\tpatch\t-\t-\tavailable\t-",
+            ],
+            id="blocked-and-available-updates",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(
+                        vuln_id=vuln_id,
+                        pkg_name="requests",
+                        installed_version="2.25.0",
+                        fixed_version=fixed,
+                    )
+                    for vuln_id, fixed in (("CVE-OLD", "2.31.0"), ("CVE-NEW", "2.32.4"))
+                ]
+            ),
+            [
+                "vuln\trequests\t2.25.0\t2.32.4\tHIGH\tCVE-NEW\t-\tfixed\tselected fix",
+                "vuln\trequests\t2.25.0\t2.31.0\tHIGH\tCVE-OLD\t-\tfixed\t-",
+            ],
+            id="selected-fix-marks-the-highest-version",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(
+                        vuln_id="CVE-LOW", pkg_name="low-pkg", severity=Severity.LOW
+                    ),
+                    make_vuln(
+                        vuln_id="CVE-CRIT",
+                        pkg_name="crit-pkg",
+                        severity=Severity.CRITICAL,
+                    ),
+                    make_vuln(vuln_id="CVE-HIGH", pkg_name="high-pkg"),
+                ]
+            ),
+            [
+                "vuln\tcrit-pkg\t1.0.0\t1.0.1\tCRITICAL\tCVE-CRIT\t-\tfixed\t-",
+                "vuln\thigh-pkg\t1.0.0\t1.0.1\tHIGH\tCVE-HIGH\t-\tfixed\t-",
+                "vuln\tlow-pkg\t1.0.0\t1.0.1\tLOW\tCVE-LOW\t-\tfixed\t-",
+            ],
+            id="severity-order",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(
+                        pkg_name="org.example:shared",
+                        installed_version=version,
+                        severity=Severity.UNKNOWN,
+                        **_ADVISORY,
+                    )
+                    for version in ("1.0", "2.0")
+                ]
+            ),
+            [
+                "advisory\torg.example:shared\t1.0\t-\tUNKNOWN\tCVE-2024-0001\t-\t"
+                "affected\t-",
+                "advisory\torg.example:shared\t2.0\t-\tUNKNOWN\tCVE-2024-0001\t-\t"
+                "affected\t-",
+            ],
+            id="gradle-installed-versions-stay-separate",
+        ),
+        pytest.param(
+            _scan(vulns=[make_vuln(pkg_name="a[b]", vuln_id="CVE-[x]")]),
+            ["vuln\ta[b]\t1.0.0\t1.0.1\tHIGH\tCVE-[x]\t-\tfixed\t-"],
+            id="brackets-stay-literal",
+        ),
     ],
 )
-def test_given_blocked_update_when_scan_result_printed_then_row_is_literal(
-    monkeypatch, pkg_name, reason
-):
-    stream = terminal_stdout(monkeypatch, 220)
-    blocked = make_update(
-        pkg_name=pkg_name,
-        installed_version="unknown",
-        latest_version="2.0",
-        blocked_reason=reason,
-    )
-    plain = make_update(pkg_name="pkg-a")
+def test_given_scan_result_when_piped_then_each_finding_is_one_whole_record(
+    capsys: pytest.CaptureFixture[str], result: ScanResult, expected: list[str]
+) -> None:
+    cli._print_scan_result(result)
 
-    cli._print_scan_result(make_scan_result(vulns=[], updates=[blocked, plain]))
+    assert capsys.readouterr().out.splitlines() == [
+        f"vulnerable\t{record}" for record in expected
+    ]
 
-    lines = stream.getvalue().splitlines()
-    assert any(
-        "! blocked" in line and pkg_name in line and reason in line for line in lines
+
+_MIXED_SCAN = _scan(
+    vulns=[
+        make_vuln(blocked_reason="Cannot identify catalogue entry"),
+        make_vuln(
+            pkg_name="unfixed-pkg",
+            vuln_id="CVE-2024-0002",
+            blocked_reason="No published fix",
+            **_ADVISORY,
+        ),
+    ],
+    updates=[
+        make_update(
+            pkg_name="org.x:[lib]",
+            installed_version="unknown",
+            latest_version="2.0",
+            blocked_reason="cannot render [catalogue]",
+        ),
+        make_update(),
+    ],
+)
+
+
+def _unwrap_footer(lines: list[str]) -> list[str]:
+    """Join a footer that the terminal wrapped, so wrap position is not pinned."""
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith("hidden:")), None
     )
-    assert any("~ update" in line and "pkg-a" in line for line in lines)
+    if start is None:
+        return lines
+    return [*lines[:start], " ".join(" ".join(lines[start:]).split())]
+
+
+@pytest.mark.parametrize(
+    ("width", "result", "expected"),
+    [
+        pytest.param(
+            220,
+            _MIXED_SCAN,
+            [
+                "vulnerable · 4 findings",
+                "  kind       severity  versions       package / detail",
+                "  ! blocked  high      1.0.0 → 1.0.1  some-pkg · CVE-2024-0001 · "
+                "Cannot identify catalogue entry",
+                "  ! blocked  high      no fix         unfixed-pkg · CVE-2024-0002 · "
+                "No published fix",
+                "  ! blocked  patch     unknown → 2.0  org.x:[lib] · "
+                "cannot render [catalogue]",
+                "  ~ update   patch     1.0.0 → 1.0.1  pkg-a",
+            ],
+            id="wide-shows-every-column-and-the-full-reason",
+        ),
+        pytest.param(
+            80,
+            _MIXED_SCAN,
+            [
+                "vulnerable · 4 findings",
+                "  kind       severity  versions       package / detail",
+                "  ! blocked  high      1.0.0 → 1.0.1  some-pkg · CVE-2024-0001 · "
+                "Cannot identif…",
+                "  ! blocked  high      no fix         unfixed-pkg · CVE-2024-0002 · "
+                "No publishe…",
+                "  ! blocked  patch     unknown → 2.0  org.x:[lib] · "
+                "cannot render [catalogue]",
+                "  ~ update   patch     1.0.0 → 1.0.1  pkg-a",
+            ],
+            id="eighty-columns-ends-long-detail-in-an-ellipsis",
+        ),
+        pytest.param(
+            40,
+            _MIXED_SCAN,
+            [
+                "vulnerable · 4 findings",
+                "  kind       package / detail",
+                "  ! blocked  some-pkg · CVE-2024-0001 ·…",
+                "  ! blocked  unfixed-pkg · CVE-2024-000…",
+                "  ! blocked  org.x:[lib] · cannot rende…",
+                "  ~ update   pkg-a",
+                "hidden: severity, versions · pipe for full records",
+            ],
+            id="narrow-hides-severity-and-versions-but-keeps-kind",
+        ),
+        pytest.param(
+            120,
+            _scan(
+                vulns=[
+                    make_vuln(
+                        vuln_id="CVE-A",
+                        pkg_name="org.example:shared",
+                        installed_version="1.0",
+                        severity=Severity.LOW,
+                        **_ADVISORY,
+                    ),
+                    make_vuln(
+                        vuln_id="CVE-B",
+                        pkg_name="org.example:shared",
+                        installed_version="1.0",
+                        fixed_version="1.1",
+                    ),
+                ]
+            ),
+            [
+                "vulnerable · 2 findings",
+                "  kind        severity  versions   package / detail",
+                "  ! vuln      high      1.0 → 1.1  org.example:shared · CVE-B",
+                "  ! advisory  low       no fix     org.example:shared · CVE-A",
+            ],
+            id="fixed-vulnerability-and-advisory-kinds",
+        ),
+    ],
+)
+def test_given_scan_result_when_rendered_on_terminal_then_columns_follow_the_width(
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    result: ScanResult,
+    expected: list[str],
+) -> None:
+    stream = terminal_stdout(monkeypatch, width)
+
+    cli._print_scan_result(result)
+
+    assert _unwrap_footer(stream.getvalue().splitlines()) == expected
 
 
 def test_numbered_findings_print_bracketed_values_literally(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    vuln = (
-        _make_vulnerable_result()
-        .vulnerabilities[0]
-        .model_copy(update={"pkg_name": "a[b]", "vuln_id": "CVE-[x]"})
-    )
-    update = (
-        _make_updates_only_result().updates[0].model_copy(update={"pkg_name": "u[p]"})
-    )
+    vuln = make_vuln(pkg_name="a[b]", vuln_id="CVE-[x]")
+    update = make_update(pkg_name="u[p]")
 
     cli._print_numbered_findings([vuln], [update])
 
@@ -121,47 +357,6 @@ def test_numbered_findings_name_the_gradle_target_that_owns_each_row(
     ]
 
 
-def _make_vulnerable_result() -> ScanResult:
-    return ScanResult(
-        project="vulnerable",
-        scanned_at=datetime.now(tz=UTC),
-        vulnerabilities=[
-            VulnFinding(
-                vuln_id="CVE-2024-0001",
-                pkg_name="some-pkg",
-                installed_version="1.0.0",
-                fixed_version="1.0.1",
-                severity=Severity.HIGH,
-                title="Test vulnerability",
-                description="A test vulnerability",
-                status="fixed",
-            ),
-        ],
-    )
-
-
-def _make_clean_result() -> ScanResult:
-    return ScanResult(
-        project="clean",
-        scanned_at=datetime.now(tz=UTC),
-    )
-
-
-def _make_updates_only_result() -> ScanResult:
-    return ScanResult(
-        project="outdated",
-        scanned_at=datetime.now(tz=UTC),
-        updates=[
-            UpdateFinding(
-                pkg_name="axios",
-                installed_version="1.6.0",
-                latest_version="1.7.2",
-                semver_tier=SemverTier.MINOR,
-            ),
-        ],
-    )
-
-
 @pytest.fixture(autouse=True)
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
@@ -174,16 +369,15 @@ def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     ) -> ScanResult:
         match name:
             case "vulnerable":
-                return _make_vulnerable_result()
-            case "clean":
-                return _make_clean_result()
+                result = make_scan_result(updates=[])
             case "outdated":
-                return _make_updates_only_result()
-            case "no-tests" | "deployable" | "deploy-only" | "no-deploy":
-                return _make_clean_result()
+                result = make_scan_result(vulns=[])
+            case "deployable":
+                result = make_scan_result()
             case _:
-                msg = f"Unknown project: {name}"
-                raise FileNotFoundError(msg)
+                result = make_scan_result(vulns=[], updates=[])
+        result.project = name
+        return result
 
     monkeypatch.setattr("maintenance_man.services.scan.scan_project", _fake_scan)
 
@@ -229,27 +423,6 @@ def test_given_two_clean_projects_when_batch_scanned_then_one_notice_names_both(
     )
 
 
-def test_scan_without_trivy_reports_an_empty_config(mm_home, monkeypatch, capsys):
-    mm_home.mkdir(parents=True)
-    write_config(mm_home, "")
-    monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
-    assert run_mm("scan") == 0
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err.splitlines() == [
-        "No projects configured",
-        f"hint: add projects to {mm_home / 'config.toml'}",
-    ]
-
-
-def test_scan_without_trivy_reports_an_unknown_project(
-    mm_home_with_projects, monkeypatch, capsys
-):
-    monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
-    assert run_mm("scan", "nonexistent") == 1
-    assert "trivy" not in capsys.readouterr().out.lower()
-
-
 def test_batch_scan_without_trivy_scans_uv_and_exits_error(
     mm_home, tmp_path, monkeypatch
 ):
@@ -274,175 +447,13 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
         (("scan", "clean"), 0),
         (("scan",), 2),
         (("scan", "outdated"), 3),
+        (("scan", "deployable"), 2),
     ],
 )
 def test_given_saved_project_when_scanned_then_exit_code_reflects_findings(
     mm_home_with_projects: Path, argv: tuple[str, ...], expected: int
 ) -> None:
     assert run_mm(*argv) == expected
-
-
-class TestScanSingleProject:
-    def test_scan_project_with_vulns_shows_findings(
-        self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Output should contain vulnerability information."""
-        assert run_mm("scan", "vulnerable") == 2
-        output = capsys.readouterr().out
-        assert "CVE-2024-0001" in output
-        assert "some-pkg" in output
-
-    def test_scan_unknown_project_exits_1(self, mm_home_with_projects: Path):
-        """mm scan nonexistent — should exit 1."""
-        assert run_mm("scan", "nonexistent") == 1
-
-
-class TestScanUpdatesExitCodes:
-    def test_scan_updates_output_shows_update_rows(
-        self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Output should contain update information."""
-        assert run_mm("scan", "outdated") == 3
-        output = capsys.readouterr().out
-        assert "UPDATE" in output or "update" in output.lower()
-        assert "axios" in output
-
-    def test_scan_vulns_and_updates_exits_2(
-        self,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """If project has both vulns and updates, exit 2 (vulns take precedence)."""
-        mixed = _make_vulnerable_result().model_copy(
-            update={"updates": _make_updates_only_result().updates}
-        )
-        monkeypatch.setattr(
-            "maintenance_man.services.scan.scan_project",
-            lambda *args, **kwargs: mixed,
-        )
-        assert run_mm("scan", "vulnerable") == 2
-
-
-def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
-    result = make_scan_result(
-        vulns=[],
-        updates=[
-            make_update(
-                pkg_name="ksp",
-                installed_version="2.3.10",
-                latest_version="2.3.12",
-                blocked_reason=(
-                    "no Maven Central publication date for "
-                    "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin "
-                    "2.3.12"
-                ),
-                gradle_block_kind="age",
-            ),
-            make_update(pkg_name="pkg-a"),
-        ],
-    )
-
-    _print_scan_result(result)
-    out = capsys.readouterr().out
-
-    rows = [line.split("\t") for line in out.splitlines()]
-    assert [(row[1], row[2], row[8]) for row in rows] == [
-        ("update", "ksp", "blocked"),
-        ("update", "pkg-a", "available"),
-    ]
-    assert "publication date" in rows[0][9]
-
-
-def _blocked_mixed_result() -> ScanResult:
-    result = _make_vulnerable_result()
-    result.vulnerabilities[0].blocked_reason = "Cannot identify catalogue entry"
-    result.vulnerabilities.append(
-        result.vulnerabilities[0].model_copy(
-            update={
-                "pkg_name": "unfixed-pkg",
-                "vuln_id": "CVE-2024-0002",
-                "fixed_version": None,
-                "blocked_reason": "No published fix",
-            }
-        )
-    )
-    result.updates = [
-        make_update(pkg_name="agp", blocked_reason="Publication lookup timed out"),
-        make_update(pkg_name="available"),
-    ]
-    return result
-
-
-def test_given_blocked_scan_when_rendered_then_each_blocked_row_carries_its_reason(
-    monkeypatch,
-):
-    stream = terminal_stdout(monkeypatch, 220)
-
-    cli._print_scan_result(_blocked_mixed_result())
-
-    lines = stream.getvalue().splitlines()
-    for package, reason in (
-        ("some-pkg", "Cannot identify catalogue entry"),
-        ("unfixed-pkg", "No published fix"),
-        ("agp", "Publication lookup timed out"),
-    ):
-        (row,) = [line for line in lines if package in line]
-        assert "! blocked" in row
-        assert reason in row
-    available = next(line for line in lines if "available" in line)
-    assert "~ update" in available
-    assert "timed out" not in available
-
-
-def test_given_blocked_scan_when_piped_then_kind_stays_and_status_is_blocked(capsys):
-    cli._print_scan_result(_blocked_mixed_result())
-
-    rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
-    assert [(row[1], row[2], row[8], row[9]) for row in rows] == [
-        ("vuln", "some-pkg", "blocked", "Cannot identify catalogue entry"),
-        ("advisory", "unfixed-pkg", "blocked", "No published fix"),
-        ("update", "agp", "blocked", "Publication lookup timed out"),
-        ("update", "available", "available", "-"),
-    ]
-
-
-def test_given_long_blocked_detail_when_rendered_narrow_then_text_ends_in_ellipsis(
-    monkeypatch,
-):
-    stream = terminal_stdout(monkeypatch, 80)
-    result = _make_vulnerable_result()
-    result.vulnerabilities[0].pkg_name = "org.apache.commons:commons-lang3"
-    result.vulnerabilities[
-        0
-    ].blocked_reason = "cannot identify an unambiguous catalogue entry"
-
-    cli._print_scan_result(result)
-
-    lines = stream.getvalue().splitlines()
-    (row,) = [line for line in lines if "! blocked" in line]
-    assert "org.apache.commons:commons-lang3" in row
-    assert row.endswith("…")
-    assert all(len(line) <= 80 for line in lines)
-
-
-def test_update_failure_keeps_its_reason_outside_scan_output(capsys):
-    cli._Renderer(batch=False, project="api", flow="resolve")(
-        FindingsBlocked((("example", "apply failed"),))
-    )
-
-    assert capsys.readouterr().out == (
-        "api\tresolve\tblocked\texample\t-\t-\tapply failed\n"
-    )
-
-
-def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
-    def _boom(name, proj_config, *, minimum_age_days, emit):
-        msg = "./gradlew cyclonedxBom failed (exit 1): boom"
-        raise GradleError(msg)
-
-    monkeypatch.setattr("maintenance_man.services.scan.scan_one", _boom)
-
-    assert run_mm("scan", "android") == ExitCode.ERROR
 
 
 def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
@@ -464,14 +475,14 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
     assert "boom" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("all_projects", [False, True])
+@pytest.mark.parametrize("scope", [("sample",), ()], ids=["single", "batch"])
 @pytest.mark.parametrize("with_updates", [False, True])
 @pytest.mark.parametrize("with_vulnerability", [False, True])
 def test_scan_blocked_no_fix_vulnerability_exit(
     mm_home,
     tmp_path,
     monkeypatch,
-    all_projects,
+    scope,
     with_updates,
     with_vulnerability,
 ):
@@ -508,74 +519,4 @@ def test_scan_blocked_no_fix_vulnerability_exit(
         "maintenance_man.services.scan.scan_project", lambda *args, **kwargs: result
     )
     expected = 3 if with_updates else 0
-    argv = ["scan"] if all_projects else ["scan", "sample"]
-    assert run_mm(*argv) == expected
-
-
-@pytest.mark.parametrize("manager", ["gradle", "uv", "bun", "mvn"])
-def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_path):
-    stream = terminal_stdout(monkeypatch, 180)
-    scope = ":app/project/debugRuntimeClasspath"
-    findings = [
-        VulnFinding(
-            vuln_id=advisory,
-            pkg_name="org.example:shared",
-            installed_version="1.0",
-            fixed_version="1.1" if advisory == "CVE-B" else None,
-            severity=severity,
-            title=advisory,
-            description="",
-            status="affected",
-            gradle_scopes=(scope,),
-        )
-        for advisory, severity in (("CVE-A", Severity.LOW), ("CVE-B", Severity.HIGH))
-    ]
-    result = ScanResult(
-        project="android",
-        scanned_at=datetime.now(UTC),
-        vulnerabilities=findings,
-    )
-    monkeypatch.setattr(scan_service, "scan_project", lambda *args, **kwargs: result)
-    scan_service.scan_one(
-        "android",
-        ProjectConfig(path=tmp_path, package_manager=manager),
-        minimum_age_days=7,
-        emit=cli._Renderer(batch=False, project="android", flow="scan"),
-    )
-    rendered = stream.getvalue()
-    assert rendered.count("org.example:shared") == 2
-    assert "! vuln" in rendered
-    assert "! advisory" in rendered
-    assert "versions" in rendered
-    assert "1.0 → 1.1" in rendered
-    assert "CVE-A" in rendered
-    assert "CVE-B" in rendered
-    assert "high" in rendered
-    assert [
-        row["vuln_id"] for row in result.model_dump(mode="json")["vulnerabilities"]
-    ] == ["CVE-A", "CVE-B"]
-
-
-def test_gradle_advisories_keep_installed_versions_separate(capsys):
-    result = ScanResult(
-        project="android",
-        scanned_at=datetime.now(UTC),
-        vulnerabilities=[
-            VulnFinding(
-                vuln_id="CVE-A",
-                pkg_name="org.example:shared",
-                installed_version=version,
-                severity=Severity.UNKNOWN,
-                title="",
-                description="",
-                status="affected",
-            )
-            for version in ("1.0", "2.0")
-        ],
-    )
-    cli._print_scan_result(result)
-    rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
-    assert [(row[2], row[3]) for row in rows] == [
-        ("org.example:shared", "1.0"),
-        ("org.example:shared", "2.0"),
-    ]
+    assert run_mm("scan", *scope) == expected

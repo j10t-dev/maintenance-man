@@ -9,12 +9,10 @@ class ActivityEvent(BaseModel):
     branch: str
     commit_id: str | None = None
 
-    @field_validator("timestamp", mode="before")
+    @field_validator("timestamp", mode="after")
     @classmethod
     def _truncate_to_minutes(cls, v: datetime) -> datetime:
-        if isinstance(v, datetime):
-            return v.replace(second=0, microsecond=0)
-        return v
+        return v.replace(second=0, microsecond=0)
 
 
 class ProjectActivity(BaseModel):

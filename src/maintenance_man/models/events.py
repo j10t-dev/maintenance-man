@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
-from maintenance_man.models.scan import ScanResult, UpdateResult
+from maintenance_man.models.scan import ScanResult
 
 type Status = Literal["passed", "failed", "blocked", "skipped", "unchanged"]
 
@@ -26,16 +26,6 @@ class SkipReason(StrEnum):
 class DeployStep(StrEnum):
     BUILD = "build"
     DEPLOY = "deploy"
-
-
-class FindingStepKind(StrEnum):
-    PREPARE = "prepare"
-    PACKAGE_COMMAND = "package_command"
-    TEST = "test"
-    INSPECT = "inspect"
-    COMMIT = "commit"
-    BOOKMARK = "bookmark"
-    DISCARD = "discard"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,12 +78,6 @@ class ProcessingStarted(Event):
 
 
 @dataclass(frozen=True, slots=True)
-class FindingsProcessed(Event):
-    results: tuple[UpdateResult, ...]
-    blocked: int
-
-
-@dataclass(frozen=True, slots=True)
 class Promoted(Event):
     """A workflow bookmark has been promoted to local main."""
 
@@ -121,16 +105,12 @@ class SyncCompleted(Event):
 
 
 @dataclass(frozen=True, slots=True)
-class DeployStepSucceeded(Event):
+class DeployStepFinished(Event):
+    """A build or deploy step ended; an error means it failed."""
+
     project: str
     step: DeployStep
-
-
-@dataclass(frozen=True, slots=True)
-class DeployStepFailed(Event):
-    project: str
-    step: DeployStep
-    error: str
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,11 +118,6 @@ class HealthChecked(Event):
     project: str
     is_up: bool
     error: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class HealthcheckUnconfigured(Event):
-    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +136,9 @@ class TestCommandStarted(Event):
 
 @dataclass(frozen=True, slots=True)
 class FindingStepFailed(Event):
-    step: FindingStepKind
+    step: str
+    """The step that failed, in the reader's words, such as 'package command'."""
+
     error: str
 
 

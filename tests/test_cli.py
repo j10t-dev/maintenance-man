@@ -4,15 +4,16 @@ from unittest.mock import MagicMock
 import pytest
 
 from maintenance_man import __version__, cli
+from maintenance_man.cli import ExitCode
 from maintenance_man.config import ConfigError
-from maintenance_man.exit_codes import ExitCode
 from maintenance_man.gradle import GradleError
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.scanner import ScanError
 from maintenance_man.services import WorkflowError
 from maintenance_man.services.update import UpdateSetupError
 from maintenance_man.vcs import RevisionError
-from tests.support.cli import run_mm
+from tests.support.cli import refuse_jj_commands, run_mm, terminal_stdout
+from tests.support.process import missing_tool
 from tests.support.projects import write_config
 from tests.support.repository import configure_jj_projects
 
@@ -89,6 +90,97 @@ def test_given_a_service_refusal_when_a_command_runs_then_it_maps_to_one_error_l
         expected_code,
         "",
         [f"error: {error}"],
+    )
+
+
+_NO_PROJECTS = ["No projects configured", "hint: add projects to {home}/config.toml"]
+_UNKNOWN_PROJECT = [
+    "error: Unknown project 'missing'. Known projects: api",
+    "hint: mm list",
+]
+_NO_PROJECTS_CONFIG = "[defaults]\n"
+_ONE_PROJECT_CONFIG = '[projects.api]\npath = "{path}"\npackage_manager = "uv"\n'
+
+
+@pytest.mark.parametrize(
+    ("argv", "config", "expected_code", "expected_stderr"),
+    [
+        *[
+            pytest.param(
+                (command,),
+                _NO_PROJECTS_CONFIG,
+                ExitCode.OK,
+                _NO_PROJECTS,
+                id=f"{command}-empty",
+            )
+            for command in ("list", "scan", "update", "sync", "todo")
+        ],
+        pytest.param(
+            ("list", "--config", "{elsewhere}"),
+            _NO_PROJECTS_CONFIG,
+            ExitCode.OK,
+            ["No projects configured", "hint: add projects to {elsewhere}"],
+            id="list-empty-config-flag",
+        ),
+        pytest.param(
+            ("update", "missing"),
+            _NO_PROJECTS_CONFIG,
+            ExitCode.OK,
+            _NO_PROJECTS,
+            id="update-named-empty",
+        ),
+        *[
+            pytest.param(
+                (command, "missing"),
+                _ONE_PROJECT_CONFIG,
+                ExitCode.ERROR,
+                _UNKNOWN_PROJECT,
+                id=f"{command}-unknown",
+            )
+            for command in (
+                "scan",
+                "update",
+                "resolve",
+                "deploy",
+                "build",
+                "test",
+                "todo",
+            )
+        ],
+        pytest.param(
+            ("update", "-n", "missing"),
+            _ONE_PROJECT_CONFIG,
+            ExitCode.ERROR,
+            _UNKNOWN_PROJECT,
+            id="update-negated-unknown",
+        ),
+    ],
+)
+def test_given_missing_project_when_a_command_runs_then_it_stops_before_any_tool(
+    mm_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+    config: str,
+    expected_code: ExitCode,
+    expected_stderr: list[str],
+) -> None:
+    elsewhere = tmp_path / "elsewhere.toml"
+    text = config.format(path=tmp_path)
+    write_config(mm_home, text)
+    elsewhere.write_text(text, encoding="utf-8")
+    monkeypatch.setattr("maintenance_man.cli.require_tool", missing_tool("jj"))
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
+    refuse_jj_commands(monkeypatch)
+
+    code = run_mm(*(part.format(elsewhere=elsewhere) for part in argv))
+
+    captured = capsys.readouterr()
+    assert (code, captured.out, captured.err.splitlines()) == (
+        expected_code,
+        "",
+        [line.format(home=mm_home, elsewhere=elsewhere) for line in expected_stderr],
     )
 
 
@@ -193,22 +285,6 @@ def test_given_unresolvable_project_when_build_runs_then_only_unknown_name_hints
     assert ("hint: mm list" in captured.err.splitlines()) is expects_hint
 
 
-def test_given_empty_config_when_listed_then_notice_and_hint_use_stderr_exit_zero(
-    mm_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    mm_home.mkdir(parents=True)
-    write_config(mm_home, "[defaults]\n")
-
-    assert run_mm("list") == ExitCode.OK
-
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err.splitlines() == [
-        "No projects configured",
-        f"hint: add projects to {mm_home / 'config.toml'}",
-    ]
-
-
 def test_config_validation_error_keeps_pydantic_type_suffix(
     mm_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -261,145 +337,105 @@ def test_missing_command_error_keeps_config_table_literal(
     assert expected.format(config=config) in " ".join(captured.err.split())
 
 
-def test_given_empty_config_flag_when_listed_then_hint_names_that_file(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    config = write_config(tmp_path, "[defaults]\n", filename="elsewhere.toml")
-
-    assert run_mm("list", "--config", str(config)) == ExitCode.OK
-
-    assert capsys.readouterr().err.splitlines() == [
-        "No projects configured",
-        f"hint: add projects to {config}",
-    ]
-
-
-def test_deploy_check_hint_keeps_defaults_table_literal(
-    mm_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    mm_home.mkdir(parents=True)
-    write_config(mm_home, "[defaults]\n")
-
-    assert run_mm("deploy", "--check") == 0
-
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "configured in [defaults]" in captured.err
-
-
 class TestDeployCommand:
     def test_deploy_no_project_is_mass_mode(self, mm_home: Path):
         """Deploy with no project triggers mass mode (exits OK with no projects)."""
         mm_home.mkdir(parents=True, exist_ok=True)
-        (mm_home / "scan-results").mkdir()
-        (mm_home / "workspaces").mkdir()
         write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
         assert run_mm("deploy") == 0
 
-    def test_deploy_unknown_project_exits_error(self, mm_home):
-        """Deploy with unknown project exits with ERROR."""
-        assert run_mm("deploy", "project-alpha") == 1
+
+_ITEMS = "- Fix the widget\n"
 
 
-class TestTodoCommand:
-    """Tests for mm todo."""
-
-    @pytest.fixture()
-    def mm_home_with_todos(self, mm_home: Path) -> Path:
-        """mm_home with two projects: 'alpha' has a TODO.md, 'beta' does not."""
-        alpha_dir = mm_home.parent / "alpha"
-        alpha_dir.mkdir()
-        (alpha_dir / "TODO.md").write_text("- Fix the widget\n- Refactor utils\n")
-
-        beta_dir = mm_home.parent / "beta"
-        beta_dir.mkdir()
-
-        mm_home.mkdir(parents=True)
-        (mm_home / "scan-results").mkdir()
-        (mm_home / "workspaces").mkdir()
-        write_config(
-            mm_home,
-            f'[projects.alpha]\npath = "{alpha_dir}"\npackage_manager = "uv"\n\n'
-            f'[projects.beta]\npath = "{beta_dir}"\npackage_manager = "uv"\n',
-        )
-        return mm_home
-
-    def test_todo_all_shows_content_and_missing_file(
-        self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """mm todo pipes items for alpha and notices that beta has none."""
-        assert run_mm("todo") == 0
-        captured = capsys.readouterr()
-        assert captured.out.splitlines() == [
-            "alpha\t1\t- Fix the widget",
-            "alpha\t2\t- Refactor utils",
-        ]
-        assert captured.err == "1 projects have no TODO items: beta\n"
-
-    def test_todo_all_shows_empty_message(
-        self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """mm todo collapses blank and missing TODO.md files into one notice."""
-        alpha_dir = mm_home_with_todos.parent / "alpha"
-        (alpha_dir / "TODO.md").write_text("   \n\n  ")
-        assert run_mm("todo") == 0
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err == "2 projects have no TODO items: alpha, beta\n"
-
-    def test_todo_single_project_shows_content(
-        self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """mm todo <project> shows that project's TODO.md."""
-        assert run_mm("todo", "alpha") == 0
-        captured = capsys.readouterr()
-        assert captured.out.splitlines() == [
-            "alpha\t1\t- Fix the widget",
-            "alpha\t2\t- Refactor utils",
-        ]
-        assert captured.err == ""
-
-    def test_todo_single_project_no_file(
-        self, mm_home_with_todos: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """mm todo <project> with no TODO.md notices on stderr, exits 0."""
-        assert run_mm("todo", "beta") == 0
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err == "No TODO items in beta\n"
-
-    def test_todo_unknown_project_exits_error(self, mm_home_with_todos: Path):
-        """mm todo <unknown> exits with error (config error, not missing file)."""
-        assert run_mm("todo", "nonexistent") == 1
-
-    def test_todo_no_projects_configured(
-        self, mm_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """mm todo with no projects configured notices with a hint and exits 0."""
-        mm_home.mkdir(parents=True)
-        (mm_home / "scan-results").mkdir()
-        (mm_home / "workspaces").mkdir()
-        write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
-        assert run_mm("todo") == 0
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err.splitlines() == [
-            "No projects configured",
-            f"hint: add projects to {mm_home / 'config.toml'}",
-        ]
-
-    def test_given_bracketed_name_and_markdown_when_todo_runs_then_both_print_literally(
-        self, mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        project = tmp_path / "project"
+@pytest.mark.parametrize(
+    ("argv", "files", "terminal", "expected_stdout", "expected_stderr"),
+    [
+        (
+            ("todo", "alpha"),
+            {"alpha": _ITEMS},
+            False,
+            ["alpha\t1\t- Fix the widget"],
+            "",
+        ),
+        (
+            ("todo",),
+            {"alpha": _ITEMS, "beta": None},
+            False,
+            ["alpha\t1\t- Fix the widget"],
+            "1 projects have no TODO items: beta\n",
+        ),
+        (
+            ("todo",),
+            {"alpha": "   \n\n  ", "beta": None},
+            False,
+            [],
+            "2 projects have no TODO items: alpha, beta\n",
+        ),
+        (("todo", "beta"), {"beta": None}, False, [], "No TODO items in beta\n"),
+        (
+            ("todo", "api"),
+            {"api": "\n  - [ ] literal[red]\n\n"},
+            False,
+            ["api\t1\t", "api\t2\t  - [ ] literal[red]", "api\t3\t"],
+            "",
+        ),
+        (
+            ("todo",),
+            {"api": "- item\n\tindented\n"},
+            False,
+            ["api\t1\t- item", "api\t2\t\\tindented"],
+            "",
+        ),
+        (
+            ("todo", "api"),
+            {"api": "- item\n\t- nested\n"},
+            True,
+            ["api · TODO.md", "  - item", "          - nested"],
+            "",
+        ),
+        (
+            ("todo", "a[b]"),
+            {"a[b]": "# Keep *Markdown*\n"},
+            False,
+            ["a[b]\t1\t# Keep *Markdown*"],
+            "",
+        ),
+    ],
+    ids=[
+        "single",
+        "all-with-a-missing-file",
+        "blank-and-missing-collapse-to-one-notice",
+        "single-missing-file",
+        "pipe-keeps-source-lines",
+        "pipe-escapes-tabs",
+        "terminal-expands-tabs",
+        "bracketed-name-and-markdown-stay-literal",
+    ],
+)
+def test_given_todo_files_when_todo_runs_then_items_and_notices_split_by_stream(
+    mm_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+    files: dict[str, str | None],
+    terminal: bool,
+    expected_stdout: list[str],
+    expected_stderr: str,
+) -> None:
+    config = ""
+    for name, content in files.items():
+        project = tmp_path / name
         project.mkdir()
-        (project / "TODO.md").write_text("# Keep *Markdown*\n", encoding="utf-8")
-        mm_home.mkdir(parents=True)
-        write_config(
-            mm_home,
-            f'[projects."a[b]"]\npath = "{project}"\npackage_manager = "uv"\n',
-        )
+        if content is not None:
+            (project / "TODO.md").write_text(content, encoding="utf-8")
+        config += f'[projects."{name}"]\npath = "{project}"\npackage_manager = "uv"\n'
+    write_config(mm_home, config)
+    stream = terminal_stdout(monkeypatch) if terminal else None
 
-        assert run_mm("todo", "a[b]") == 0
+    assert run_mm(*argv) == ExitCode.OK
 
-        assert capsys.readouterr().out == "a[b]\t1\t# Keep *Markdown*\n"
+    captured = capsys.readouterr()
+    stdout = stream.getvalue() if stream else captured.out
+    assert (stdout.splitlines(), captured.err) == (expected_stdout, expected_stderr)

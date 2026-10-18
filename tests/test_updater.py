@@ -15,7 +15,6 @@ from maintenance_man.models.events import (
     FindingFailed,
     FindingsBlocked,
     FindingStepFailed,
-    FindingStepKind,
 )
 from maintenance_man.models.events import (
     TestCommandStarted as CommandStartedEvent,
@@ -245,7 +244,7 @@ def test_given_package_commands_when_applied_then_first_failure_stops_and_is_rep
     assert calls == expected_calls
     failures = emit.of_type(FindingStepFailed)
     assert [failure.error for failure in failures] == expected_errors
-    assert {failure.step for failure in failures} <= {FindingStepKind.PACKAGE_COMMAND}
+    assert {failure.step for failure in failures} <= {"package command"}
 
 
 @pytest.mark.parametrize(
@@ -272,7 +271,7 @@ def test_given_unpreparable_update_when_applied_then_prepare_failure_and_no_comm
 
     assert applied is False
     failures = emit.of_type(FindingStepFailed)
-    assert [failure.step for failure in failures] == [FindingStepKind.PREPARE]
+    assert [failure.step for failure in failures] == ["prepare"]
     assert message in failures[0].error
 
 
@@ -356,7 +355,7 @@ def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
     emit = RecordingEmit()
     assert run_test_phases(config, tmp_path / "missing", emit=emit) == "unit"
     assert emit.events[0] == CommandStartedEvent("true")
-    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.TEST
+    assert emit.of_type(FindingStepFailed)[0].step == "test"
     assert "Could not run unit tests" in emit.of_type(FindingStepFailed)[0].error
 
 
@@ -643,7 +642,7 @@ def test_given_failing_package_command_when_processed_then_apply_failure_emitted
     _process([make_update()], project_config, processor_vcs, emit=emit)
 
     assert emit.events[-2:] == [
-        FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, "package failed"),
+        FindingStepFailed("package command", "package failed"),
         FindingFailed("pkg-a", "apply", "1.0.0", "1.0.1"),
     ]
     assert len(emit.of_type(FindingFailed)) == 1
@@ -696,7 +695,7 @@ def test_failed_discard_persists_original_failure_and_stops(
     assert saved.updates[0].failed_phase == "unit"
     assert saved.updates[0].update_status == UpdateStatus.FAILED
     assert emit.of_type(FindingStepFailed)[-1] == FindingStepFailed(
-        FindingStepKind.DISCARD, "cannot discard"
+        "discard", "cannot discard"
     )
 
 
@@ -884,7 +883,7 @@ def test_given_saved_rows_when_grouped_then_one_change_per_target_or_package(
             1,
             [
                 FindingStepFailed(
-                    FindingStepKind.PACKAGE_COMMAND,
+                    "package command",
                     "./gradlew versionCatalogApplyUpdates failed (exit 1)",
                 )
             ],

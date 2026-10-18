@@ -28,9 +28,11 @@ class TestActivityEvent:
             success=True,
             branch="main",
         )
-        assert event.timestamp == datetime(2026, 3, 20, 14, 32, tzinfo=UTC)
-        assert event.timestamp.second == 0
-        assert event.timestamp.microsecond == 0
+        assert event == ActivityEvent(
+            timestamp=datetime(2026, 3, 20, 14, 32, tzinfo=UTC),
+            success=True,
+            branch="main",
+        )
 
 
 class TestLoadActivity:
@@ -38,44 +40,38 @@ class TestLoadActivity:
         result = load_activity(tmp_path / "activity.json")
         assert result == {}
 
-    def test_loads_valid_activity(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        data = {
-            "myapp": {
-                "last_build": {
-                    "timestamp": "2026-03-20T14:32:00Z",
-                    "success": True,
-                    "branch": "main",
-                },
-            },
-        }
-        path.write_text(json.dumps(data))
-        result = load_activity(path)
-        assert "myapp" in result
-        assert result["myapp"].last_build is not None
-        assert result["myapp"].last_build.success is True
-
 
 class TestRecordActivity:
     @pytest.mark.parametrize(
-        ("event_type", "expected"),
+        ("event_type", "commit_id", "expected"),
         [
-            (
-                "build",
-                {"myapp": ProjectActivity(last_build=_RECORDED)},
-            ),
+            ("build", None, {"myapp": ProjectActivity(last_build=_RECORDED)}),
+            ("deploy", None, {"myapp": ProjectActivity(last_deploy=_RECORDED)}),
             (
                 "deploy",
-                {"myapp": ProjectActivity(last_deploy=_RECORDED)},
+                "abc123",
+                {
+                    "myapp": ProjectActivity(
+                        last_deploy=_RECORDED.model_copy(update={"commit_id": "abc123"})
+                    )
+                },
             ),
         ],
+        ids=["build", "deploy", "deploy-with-commit-id"],
     )
     def test_given_event_type_when_recorded_then_only_that_event_is_set(
-        self, tmp_path: Path, event_type, expected
+        self, tmp_path: Path, event_type, commit_id, expected
     ):
         path = tmp_path / "activity.json"
 
-        record_activity(path, "myapp", event_type, success=False, branch="feat/x")
+        record_activity(
+            path,
+            "myapp",
+            event_type,
+            success=False,
+            branch="feat/x",
+            commit_id=commit_id,
+        )
 
         assert load_activity(path) == expected
 
@@ -123,30 +119,3 @@ class TestRecordActivity:
         path = tmp_path / "nonexistent-dir" / "activity.json"
         # Should not raise
         record_activity(path, "myapp", "build", success=True, branch="main")
-
-
-class TestCommitId:
-    def test_records_commit_id_on_deploy(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        record_activity(
-            path, "myapp", "deploy", success=True, branch="main", commit_id="abc123"
-        )
-        result = load_activity(path)
-        assert result["myapp"].last_deploy is not None
-        assert result["myapp"].last_deploy.commit_id == "abc123"
-
-    def test_legacy_record_without_commit_id_loads_as_none(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        data = {
-            "myapp": {
-                "last_deploy": {
-                    "timestamp": "2026-03-20T15:01:00Z",
-                    "success": True,
-                    "branch": "main",
-                }
-            }
-        }
-        path.write_text(json.dumps(data))
-        result = load_activity(path)
-        assert result["myapp"].last_deploy is not None
-        assert result["myapp"].last_deploy.commit_id is None

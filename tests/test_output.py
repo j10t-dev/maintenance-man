@@ -12,8 +12,7 @@ import pytest
 from rich.cells import cell_len
 
 from maintenance_man import output
-from maintenance_man.cli import _print_scan_result
-from maintenance_man.exit_codes import ExitCode
+from maintenance_man.cli import ExitCode, _print_scan_result
 from maintenance_man.models.scan import ScanResult
 from maintenance_man.storage import save_scan_results
 from tests.support.cli import TerminalStream, run_mm, terminal_stdout
@@ -37,7 +36,6 @@ def _scanned_result(**overrides: object) -> ScanResult:
 def output_home(mm_home: Path, tmp_path: Path) -> Path:
     project = tmp_path / "project"
     project.mkdir()
-    (mm_home / "scan-results").mkdir(parents=True)
     write_config(
         mm_home,
         f'[projects.{_LONG_NAME}]\npath = "{project}"\n'
@@ -174,42 +172,6 @@ def test_given_clean_and_unscanned_projects_when_listed_then_counts_stay_distinc
     assert lines[3].split()[1:4] == ["-", "-", "-"]
 
 
-def _write_api_todo(mm_home: Path, tmp_path: Path, text: str) -> None:
-    project = tmp_path / "api"
-    project.mkdir()
-    (project / "TODO.md").write_text(text)
-    write_config(
-        mm_home, f'[projects.api]\npath = "{project}"\npackage_manager = "uv"\n'
-    )
-
-
-def test_given_indented_todo_when_piped_then_source_lines_are_preserved(
-    mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _write_api_todo(mm_home, tmp_path, "\n  - [ ] literal[red]\n\n")
-
-    assert run_mm("todo", "api") == 0
-
-    assert capsys.readouterr().out == (
-        "api\t1\t\napi\t2\t  - [ ] literal[red]\napi\t3\t\n"
-    )
-
-
-def test_given_tab_indented_todo_when_terminal_renders_then_tabs_expand_to_spaces(
-    mm_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stream = terminal_stdout(monkeypatch)
-    _write_api_todo(mm_home, tmp_path, "- item\n\t- nested\n")
-
-    assert run_mm("todo", "api") == 0
-
-    assert stream.getvalue().splitlines() == [
-        "api · TODO.md",
-        "  - item",
-        "          - nested",
-    ]
-
-
 def test_given_terminal_stderr_when_stdout_is_piped_then_width_uses_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -235,7 +197,10 @@ def test_given_short_success_when_narrow_then_padding_does_not_create_ellipsis(
         "api", "update", "passed", "http-client", installed="1.0.0", target="1.0.1"
     )
 
-    assert stream.getvalue().strip() == "✓ passed    http-client  1.0.0 → 1.0.1"
+    assert stream.getvalue().splitlines() == [
+        "api",
+        "  ✓ passed    http-client  1.0.0 → 1.0.1",
+    ]
 
 
 @pytest.mark.parametrize("width", [40, 80, 120])
@@ -250,53 +215,6 @@ def test_given_maven_finding_when_terminal_renders_then_kind_remains_visible(
     lines = stream.getvalue().splitlines()
     assert any("! vuln" in line and "org." in line for line in lines)
     assert all(cell_len(line) <= width for line in lines)
-
-
-def test_given_tab_indented_todo_when_todo_is_piped_then_tab_is_escaped_in_text(
-    mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "TODO.md").write_text("- item\n\tindented\n", encoding="utf-8")
-    write_config(
-        mm_home, f'[projects.project]\npath = "{project}"\npackage_manager = "uv"\n'
-    )
-
-    assert run_mm("todo") == 0
-
-    assert capsys.readouterr().out.splitlines() == [
-        "project\t1\t- item",
-        "project\t2\t\\tindented",
-    ]
-
-
-def test_given_one_clean_project_when_batch_scanned_then_notice_names_only_it(
-    mm_home: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    for name in ("first", "second"):
-        (tmp_path / name).mkdir()
-    write_config(
-        mm_home,
-        f'[projects.first]\npath = "{tmp_path / "first"}"\npackage_manager = "uv"\n'
-        f'[projects.second]\npath = "{tmp_path / "second"}"\npackage_manager = "uv"\n',
-    )
-    monkeypatch.setattr(
-        "maintenance_man.services.scan.scan_project",
-        lambda name, project, days: _scanned_result(
-            project=name, updates=[make_update()] if name == "second" else []
-        ),
-    )
-
-    assert run_mm("scan") == ExitCode.UPDATES_FOUND
-
-    assert (
-        capsys.readouterr()
-        .err.splitlines()[-1]
-        .startswith("1 projects have no findings: first · scanned in ")
-    )
 
 
 def test_given_closed_input_when_prompt_runs_then_eof_does_not_accept_all(

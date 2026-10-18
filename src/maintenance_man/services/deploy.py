@@ -13,11 +13,9 @@ from maintenance_man.models.activity import ProjectActivity
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
     DeployStep,
-    DeployStepFailed,
-    DeployStepSucceeded,
+    DeployStepFinished,
     Emit,
     HealthChecked,
-    HealthcheckUnconfigured,
     ProjectSkipped,
     ProjectStarted,
     SkipReason,
@@ -43,7 +41,6 @@ def deploy_project(
     *,
     healthcheck_url: str | None,
     build: bool,
-    check: bool,
     force: bool,
     emit: Emit,
 ) -> DeployResult:
@@ -74,17 +71,14 @@ def deploy_project(
         raise WorkflowError(msg)
 
     emit(ProjectStarted(name))
-    result = _run_steps(
+    return _run_steps(
         name,
         project,
         current_id,
         build=build,
-        healthcheck_url=healthcheck_url if check else None,
+        healthcheck_url=healthcheck_url,
         emit=emit,
     )
-    if result.deploy_status == "passed" and check and not healthcheck_url:
-        emit(HealthcheckUnconfigured())
-    return result
 
 
 def deploy_all(
@@ -209,17 +203,17 @@ def _run_steps(
         try:
             build_project(name, project)
         except BuildError as exc:
-            emit(DeployStepFailed(name, DeployStep.BUILD, str(exc)))
+            emit(DeployStepFinished(name, DeployStep.BUILD, str(exc)))
             return DeployResult(name, "failed", "skipped")
         build_status = "passed"
-        emit(DeployStepSucceeded(name, DeployStep.BUILD))
+        emit(DeployStepFinished(name, DeployStep.BUILD))
 
     try:
         _run_recorded(name, project, DeployStep.DEPLOY, commit_id)
     except DeployError as exc:
-        emit(DeployStepFailed(name, DeployStep.DEPLOY, str(exc)))
+        emit(DeployStepFinished(name, DeployStep.DEPLOY, str(exc)))
         return DeployResult(name, build_status, "failed")
-    emit(DeployStepSucceeded(name, DeployStep.DEPLOY))
+    emit(DeployStepFinished(name, DeployStep.DEPLOY))
 
     if healthcheck_url:
         result = check_health(healthcheck_url, name)

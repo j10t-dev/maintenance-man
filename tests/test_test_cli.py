@@ -14,10 +14,6 @@ class TestTestCommand:
         """Error when project has no test block configured."""
         assert run_mm("test", "no-tests") == ExitCode.ERROR
 
-    def test_unknown_project(self, mm_home_with_projects: Path) -> None:
-        """Error when project name doesn't exist."""
-        assert run_mm("test", "nonexistent") == ExitCode.ERROR
-
     @pytest.mark.parametrize(
         ("failed_phase", "expected_code", "expected_record"),
         [

@@ -7,7 +7,6 @@ from maintenance_man.gradle import GRADLE_CATALOGUE_RELPATH
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Emit,
-    FindingsProcessed,
     OperationFailed,
     Outcome,
     ProcessingStarted,
@@ -123,7 +122,6 @@ def test_update_emits_processing_result_and_promotion_events(
     assert isinstance(emit.events[0], ScanReported)
     assert emit.events[1:] == [
         ProcessingStarted(0, 1),
-        FindingsProcessed((expected_result,), blocked=0),
         Promoted(),
     ]
     assert [item.pkg_name for item in load_scan_results("api").updates] == ["pkg-a"]
@@ -159,7 +157,6 @@ def test_given_blocked_and_passing_rows_when_updating_then_passing_rows_promote(
     assert result == update_service.ProjectUpdate(
         "api", Outcome.SUCCEEDED, (passed,), blocked=1
     )
-    assert emit.of_type(FindingsProcessed) == [FindingsProcessed((passed,), blocked=1)]
     assert emit.of_type(Promoted) == [Promoted()]
     assert [row.pkg_name for row in load_scan_results("api").updates] == ["stuck"]
     assert repo.same_revision(left="main", right="@-")

@@ -15,7 +15,6 @@ from maintenance_man.models.events import (
     FindingsBlocked,
     FindingStarted,
     FindingStepFailed,
-    FindingStepKind,
     TestCommandStarted,
 )
 from maintenance_man.models.scan import (
@@ -159,7 +158,7 @@ def run_test_phases(
                 command, project_path, timeout=600, label=f"{phase_name} tests"
             )
         except ProcessError as exc:
-            emit(FindingStepFailed(FindingStepKind.TEST, str(exc)))
+            emit(FindingStepFailed("test", str(exc)))
             return phase_name
     return None
 
@@ -354,7 +353,7 @@ def _apply_gradle_target(
             return Applied()
         block = gradle.apply_gradle_update(project, target)
     except GradleError as exc:
-        emit(FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, str(exc)))
+        emit(FindingStepFailed("package command", str(exc)))
         return ApplyFailed()
     return Applied() if block is None else Blocked(block.reason)
 
@@ -384,7 +383,7 @@ def _test_and_commit(
     try:
         has_changes = repo.has_changes()
     except RevisionError as exc:
-        emit(FindingStepFailed(FindingStepKind.INSPECT, str(exc)))
+        emit(FindingStepFailed("inspect", str(exc)))
         return FindingStep("commit", discardable=False)
     if not has_changes:
         emit(
@@ -416,12 +415,12 @@ def _commit_finding(
     try:
         repo.commit(message=message)
     except RevisionError as exc:
-        emit(FindingStepFailed(FindingStepKind.COMMIT, str(exc)))
+        emit(FindingStepFailed("commit", str(exc)))
         return FindingStep("commit")
     try:
         repo.set_bookmark(bookmark=WORKFLOW_BOOKMARKS[flow], revision="@-")
     except RevisionError as exc:
-        emit(FindingStepFailed(FindingStepKind.BOOKMARK, str(exc)))
+        emit(FindingStepFailed("bookmark", str(exc)))
         return FindingStep("commit", discardable=False)
     emit(
         FindingPassed(
@@ -435,7 +434,7 @@ def _discard(repo: JjRepository, emit: Emit) -> bool:
     try:
         repo.discard()
     except RevisionError as exc:
-        emit(FindingStepFailed(FindingStepKind.DISCARD, str(exc)))
+        emit(FindingStepFailed("discard", str(exc)))
         return False
     return True
 
@@ -452,7 +451,7 @@ def _apply_update(
     try:
         commands = update_commands(package_manager, pkg_name, version, project_path)
     except UpdateCommandError as e:
-        emit(FindingStepFailed(FindingStepKind.PREPARE, str(e)))
+        emit(FindingStepFailed("prepare", str(e)))
         return False
 
     for cmd in commands:
@@ -465,6 +464,6 @@ def _apply_update(
                 stdin=subprocess.DEVNULL,
             )
         except ProcessError as e:
-            emit(FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, str(e)))
+            emit(FindingStepFailed("package command", str(e)))
             return False
     return True

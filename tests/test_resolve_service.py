@@ -10,7 +10,6 @@ from maintenance_man.models.events import (
     FindingPassed,
     FindingsBlocked,
     FindingStepFailed,
-    FindingStepKind,
     OperationFailed,
     Outcome,
     Promoted,
@@ -797,7 +796,7 @@ def test_given_repair_missing_saved_target_when_continuing_then_bookmark_stays(
     assert outcome is Outcome.FAILED
     assert emit.of_type(FindingStepFailed) == [
         FindingStepFailed(
-            FindingStepKind.PREPARE,
+            "prepare",
             "The committed repair does not set the saved catalogue target: "
             "'room-runtime' is at 2.8.4, expected 2.8.5; the catalogue no longer "
             "matches the scan; note that an uncommitted catalogue edit is not "

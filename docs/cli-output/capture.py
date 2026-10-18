@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.text import Text
 
 from maintenance_man import cli, paths
-from maintenance_man.exit_codes import ExitCode
+from maintenance_man.cli import ExitCode
 from maintenance_man.models.scan import (
     ScanResult,
     SemverTier,

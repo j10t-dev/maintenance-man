@@ -8,10 +8,8 @@ from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.models.config import DefaultsConfig, MmConfig
 from maintenance_man.models.events import (
     DeployStep,
-    DeployStepFailed,
-    DeployStepSucceeded,
+    DeployStepFinished,
     HealthChecked,
-    HealthcheckUnconfigured,
     ProjectSkipped,
     ProjectStarted,
     SkipReason,
@@ -164,8 +162,8 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
     ]
     assert emit.events == [
         ProjectStarted("deployed"),
-        DeployStepSucceeded("deployed", DeployStep.BUILD),
-        DeployStepSucceeded("deployed", DeployStep.DEPLOY),
+        DeployStepFinished("deployed", DeployStep.BUILD),
+        DeployStepFinished("deployed", DeployStep.DEPLOY),
         ProjectSkipped("disabled", SkipReason.NOT_DEPLOYABLE),
         ProjectSkipped(
             "missing_path", SkipReason.PATH_MISSING, str(projects["missing_path"].path)
@@ -204,7 +202,7 @@ def test_deploy_all_checks_health_after_success(tmp_path, monkeypatch) -> None:
 
     assert result == (deploy_service.DeployResult("a", "skipped", "passed"),)
     assert emit.events[-2:] == [
-        DeployStepSucceeded("a", DeployStep.DEPLOY),
+        DeployStepFinished("a", DeployStep.DEPLOY),
         HealthChecked("a", True, None),
     ]
 
@@ -236,7 +234,7 @@ def test_deploy_all_build_failure_stops_project_and_records_failure(
 
     assert results == (deploy_service.DeployResult("a", "failed", "skipped"),)
     assert deployed == []
-    assert emit.events[-1] == DeployStepFailed("a", DeployStep.BUILD, "build failed")
+    assert emit.events[-1] == DeployStepFinished("a", DeployStep.BUILD, "build failed")
     recorded = load_activity(paths.activity_path())["a"].last_build
     assert recorded is not None
     assert recorded.success is False
@@ -255,7 +253,6 @@ def test_deploy_project_refuses_missing_command(tmp_path) -> None:
             project,
             healthcheck_url=None,
             build=False,
-            check=False,
             force=False,
             emit=RecordingEmit(),
         )
@@ -286,7 +283,6 @@ def test_deploy_project_refuses_unresolvable_main_without_force(
             project,
             healthcheck_url=None,
             build=False,
-            check=False,
             force=False,
             emit=RecordingEmit(),
         )
@@ -311,7 +307,6 @@ def test_deploy_project_force_allows_unresolvable_main(tmp_path, monkeypatch) ->
         project,
         healthcheck_url=None,
         build=False,
-        check=False,
         force=True,
         emit=RecordingEmit(),
     )
@@ -332,7 +327,6 @@ def test_deploy_project_skips_not_deployable(tmp_path) -> None:
         project,
         healthcheck_url=None,
         build=False,
-        check=False,
         force=False,
         emit=emit,
     )
@@ -342,7 +336,7 @@ def test_deploy_project_skips_not_deployable(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("healthcheck_url", [None, ""])
-def test_deploy_project_reports_unconfigured_health_after_success(
+def test_deploy_project_without_healthcheck_url_runs_no_health_check(
     tmp_path, monkeypatch, healthcheck_url
 ) -> None:
     project = make_project(tmp_path / "api", deploy_command="deploy")
@@ -364,15 +358,11 @@ def test_deploy_project_reports_unconfigured_health_after_success(
         project,
         healthcheck_url=healthcheck_url,
         build=False,
-        check=True,
         force=False,
         emit=emit,
     )
 
     assert result == deploy_service.DeployResult("api", "skipped", "passed")
-    assert emit.events[-2:] == [
-        DeployStepSucceeded("api", DeployStep.DEPLOY),
-        HealthcheckUnconfigured(),
-    ]
+    assert emit.events[-1] == DeployStepFinished("api", DeployStep.DEPLOY)
     assert health_checks == []
     assert not emit.of_type(HealthChecked)

@@ -6,7 +6,6 @@ from maintenance_man.models.events import (
     FindingPassed,
     FindingsBlocked,
     FindingStepFailed,
-    FindingStepKind,
     OperationFailed,
     Outcome,
     ResolvePaused,
@@ -359,7 +358,7 @@ def _repair_sets_saved_targets(
         if block is not None:
             emit(
                 FindingStepFailed(
-                    FindingStepKind.PREPARE,
+                    "prepare",
                     "The committed repair does not set the saved catalogue "
                     f"target: {block.reason}",
                 )
