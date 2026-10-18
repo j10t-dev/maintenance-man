@@ -13,6 +13,7 @@ from tests.support.repository import (
     conflict_bookmark,
     describe,
     push_peer_main,
+    remote_bookmark_target,
     track_main,
     write_file,
 )
@@ -36,6 +37,13 @@ def test_given_missing_bookmark_when_inspecting_conflict_then_revision_error_is_
         RevisionError, match="Cannot inspect bookmark conflict for main"
     ):
         repository_case.repo.bookmark_conflicted(bookmark="main")
+
+
+def test_given_invalid_bookmark_name_when_reading_remote_target_then_jj_error_is_raised(
+    repository_case: RepositoryCase,
+) -> None:
+    with pytest.raises(AssertionError, match="Failed to parse revset"):
+        remote_bookmark_target(repository_case.repo, "not a bookmark")
 
 
 def test_given_amended_main_when_resolved_then_commit_identity_changes(

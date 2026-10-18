@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 PACKAGE = "maintenance_man"
@@ -132,9 +134,26 @@ def _absolute_import_module(
     return ".".join([PACKAGE, *package_parts, *suffix])
 
 
-def test_given_relative_private_import_when_scanned_then_it_is_reported() -> None:
-    source = "from ._x import y\n"
-    violations = _private_import_violations(
-        "probe", "src/maintenance_man/probe.py", source
-    )
-    assert violations == ["src/maintenance_man/probe.py:1 imports maintenance_man._x.y"]
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from ._x import y\n", ["maintenance_man._x.y"]),
+        ("from maintenance_man.vcs import _run\n", ["maintenance_man.vcs._run"]),
+        ("from maintenance_man.vcs import JjRepository\n", []),
+        ("from os import _exit\n", []),
+    ],
+    ids=[
+        "relative private module",
+        "absolute private name",
+        "public import between modules",
+        "private name of external package",
+    ],
+)
+def test_given_import_when_scanned_then_only_private_package_imports_are_reported(
+    source: str, expected: list[str]
+) -> None:
+    path = "src/maintenance_man/probe.py"
+
+    violations = _private_import_violations("probe", path, source)
+
+    assert violations == [f"{path}:1 imports {imported}" for imported in expected]

@@ -38,13 +38,19 @@ def _scratch_root() -> Path:
 
 @cache
 def jj_environment() -> dict[str, str]:
-    """Identity, empty user config and non-interactive editor and pager for jj."""
+    """Identity, empty user config and non-interactive editor and pager for jj.
+
+    Also points git's global config at /dev/null and disables the system config, so
+    the git subprocess jj runs for fetch and push never reads the machine's gitconfig.
+    """
     return {
         "JJ_USER": "MM Tests",
         "JJ_EMAIL": "mm@example.invalid",
         "JJ_CONFIG": str(_scratch_root() / "jj-config.toml"),
         "JJ_EDITOR": "true",
         "JJ_PAGER": "cat",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
     }
 
 
@@ -198,19 +204,20 @@ def push_peer_main(peer: JjRepository) -> None:
 def remote_bookmark_target(repo: JjRepository, bookmark: str) -> str | None:
     """Fetch in *repo*, then return origin's target for *bookmark*; None when absent.
 
+    A jj failure fails the test, so absence is never inferred from an error.
     Pass the peer to leave the repository under test untouched.
     """
     _jj(repo.path, "git", "fetch", "--remote", "origin")
-    result = run_jj(
+    target = _jj(
         repo.path,
         "log",
         "-r",
-        f"{bookmark}@origin",
+        f"present({bookmark}@origin)",
         "--no-graph",
         "-T",
         'commit_id ++ "\\n"',
-    )
-    return result.stdout.strip() if result.returncode == 0 else None
+    ).strip()
+    return target or None
 
 
 def commit_descriptions(repo: JjRepository, revset: str) -> list[str]:

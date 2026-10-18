@@ -110,6 +110,8 @@ def test_given_main_moved_sideways_when_promoting_then_work_stays_pending_until_
 
     assert third.outcome is Outcome.SUCCEEDED
     assert applied == applications
+    assert load_scan_results("api").updates == []
+    assert not repo.bookmark_exists(bookmark=MANAGED)
     assert {"unrelated.txt", "deps/pkg-a", "deps/pkg-b", "deps/pkg-c"} <= _files(
         path, "main"
     )

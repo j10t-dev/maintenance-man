@@ -4,7 +4,7 @@ import hashlib
 import json
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Literal
 
 from maintenance_man.gradle import (
     GRADLE_INVENTORY_BOM_RELPATH,
@@ -13,7 +13,7 @@ from maintenance_man.gradle import (
     GRADLE_UPDATE_REPORT_RELPATH,
     GradleError,
 )
-from maintenance_man.models.gradle import GradleCandidate
+from maintenance_man.models.gradle import GradleCandidate, PublicationRequest
 from maintenance_man.models.scan import GradleUpdateTarget
 from tests.support.findings import make_gradle_target
 from tests.support.process import completed
@@ -21,14 +21,18 @@ from tests.support.projects import FIXTURES_DIR
 
 
 def make_gradle_candidate(
-    target: GradleUpdateTarget | None = None, **overrides: Any
+    target: GradleUpdateTarget | None = None,
+    origins: frozenset[Literal["ordinary", "security"]] = frozenset({"ordinary"}),
+    vulnerability_indices: tuple[int, ...] = (),
+    publication_requests: tuple[PublicationRequest, ...] = (),
 ) -> GradleCandidate:
     """Build an ordinary candidate for *target*, with scenario-specific overrides."""
-    defaults = {
-        "target": target or make_gradle_target(),
-        "origins": frozenset({"ordinary"}),
-    }
-    return GradleCandidate(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
+    return GradleCandidate(
+        target=target or make_gradle_target(),
+        origins=origins,
+        vulnerability_indices=vulnerability_indices,
+        publication_requests=publication_requests,
+    )
 
 
 def report_payload():

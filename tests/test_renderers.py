@@ -35,7 +35,7 @@ from maintenance_man.models.events import (
     SyncCompleted,
 )
 from maintenance_man.models.scan import ScanResult, UpdateResult
-from tests.support.cli import TerminalStream
+from tests.support.cli import TerminalStream, terminal_stdout
 from tests.support.findings import make_scan_result, make_update
 
 
@@ -291,8 +291,7 @@ def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
 def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
     monkeypatch: pytest.MonkeyPatch, event: Event, expected: str
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
+    stream = terminal_stdout(monkeypatch)
 
     cli._Renderer(batch=False, project="api")(event)
 
@@ -302,8 +301,7 @@ def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
 def test_given_processing_heading_when_finding_rendered_then_heading_is_not_repeated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
+    stream = terminal_stdout(monkeypatch)
 
     renderer = cli._Renderer(batch=False, project="api")
     renderer(ProcessingStarted(2, 1))
@@ -318,8 +316,7 @@ def test_given_processing_heading_when_finding_rendered_then_heading_is_not_repe
 def test_given_no_project_when_finding_rendered_on_terminal_then_no_heading_prints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
+    stream = terminal_stdout(monkeypatch)
 
     cli._Renderer(batch=False)(FindingPassed("pkg", False, "1.0", "1.1"))
 
@@ -391,9 +388,7 @@ def test_given_blocked_findings_when_saved_scan_reported_in_pipe_then_one_outcom
 def test_given_update_flow_when_saved_scan_reported_on_terminal_then_findings_print(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("NO_COLOR", "1")
+    stream = terminal_stdout(monkeypatch)
 
     cli._Renderer(batch=False)(ScanReported(_blocked_scan()))
 
@@ -650,9 +645,7 @@ def test_given_project_events_when_rendered_on_terminal_then_one_heading_per_pro
     steps: list[Event],
     expected: list[str],
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("COLUMNS", "120")
+    stream = terminal_stdout(monkeypatch, width=120)
 
     renderer = cli._Renderer(batch=True)
     for step in steps:
@@ -665,8 +658,7 @@ def test_given_project_events_when_rendered_on_terminal_then_one_heading_per_pro
 def test_given_terminal_when_project_starts_then_only_deploy_prints_heading(
     monkeypatch: pytest.MonkeyPatch, flow: cli._Flow, expected: list[str]
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
+    stream = terminal_stdout(monkeypatch)
 
     cli._Renderer(batch=True, flow=flow)(ProjectStarted("api"))
 
@@ -691,8 +683,7 @@ def test_given_terminal_when_project_starts_then_only_deploy_prints_heading(
 def test_given_unchanged_outcome_when_rendered_on_terminal_then_subject_is_separated(
     monkeypatch: pytest.MonkeyPatch, event: Event, expected: list[str]
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
+    stream = terminal_stdout(monkeypatch)
 
     cli._Renderer(batch=True)(event)
 

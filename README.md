@@ -249,7 +249,9 @@ Put bluntly - I probably don't want your contribution. This is primarily a perso
 ### Development checks
 
 Run the default test suite and each static check directly before submitting a
-change:
+change. The default suite runs against real jj repositories, so it requires `jj`
+0.45.1 and `git` on `PATH` (jj shells out to git for fetch and push). It needs no
+network.
 
 ```sh
 uv run pytest -q
@@ -269,13 +271,7 @@ TRY300, and TRY301 stay off because they would change established exception
 boundaries and message contracts. Ruff preview rules are disabled. Deptry is
 deferred until dependency ownership policy is designed.
 
-The local real-jj contract can be checked separately:
-
-```sh
-uv run pytest tests/test_repository_contract.py tests/test_jj_integration.py -m integration -q
-```
-
-The real-Gradle producer test is also separate from the default suite. It is
+The real-Gradle producer test is separate from the default suite. It is
 skipped unless `MM_GRADLE_WRAPPER` points to an executable `gradlew` whose
 directory also contains `gradle/wrapper`. It needs JDK 21 and network access to
 the Gradle plugin portal:

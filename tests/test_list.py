@@ -14,7 +14,7 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.output import relative_time
 from maintenance_man.storage import record_activity, save_scan_results
-from tests.support.cli import TerminalStream, run_mm
+from tests.support.cli import run_mm, terminal_stdout
 from tests.support.findings import make_vuln
 from tests.support.projects import write_config
 
@@ -74,7 +74,7 @@ class TestRelativeTime:
 def test_given_wide_project_name_when_narrow_terminal_then_columns_drop_by_cell_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("sys.stdout", TerminalStream())
+    terminal_stdout(monkeypatch)
     wide_name = "日本語プロジェクト"
     row = [wide_name, "uv", "0", "0", "0", "never", "-", "not deployable"]
 
@@ -89,8 +89,7 @@ def test_given_wide_project_name_when_narrow_terminal_then_columns_drop_by_cell_
 def test_given_long_last_column_when_terminal_is_narrow_then_it_is_not_capped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("sys.stdout", TerminalStream())
-    monkeypatch.setenv("COLUMNS", "84")
+    terminal_stdout(monkeypatch, width=84)
     row = ["api", "uv", "0", "0", "0", "never", "-", "failed " + "9" * 25]
 
     visible, dropped = cli._fit_columns(
@@ -348,8 +347,6 @@ class TestListActivity:
         """On a terminal a failed build reads 'failed just now'."""
         activity_path = list_project_home / "activity.json"
         record_activity(activity_path, "myapp", "build", success=False, branch="main")
-        stream = TerminalStream()
-        monkeypatch.setattr("sys.stdout", stream)
-        monkeypatch.setenv("NO_COLOR", "1")
+        stream = terminal_stdout(monkeypatch)
         assert run_mm("list") == 0
         assert "failed just now" in stream.getvalue()
