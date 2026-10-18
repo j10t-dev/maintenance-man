@@ -1,229 +1,151 @@
-"""The same repository scenarios against real jj and its in-memory fake."""
+"""Disposable real jj repositories copied from one template built per test process."""
 
+import atexit
+import json
 import os
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
+from functools import cache
 from pathlib import Path
 
 import pytest
 
 from maintenance_man import vcs
-from maintenance_man.vcs import Repository
-from tests.fake_vcs import FakeCall, FakeJjState
+from maintenance_man.config import load_config
+from maintenance_man.vcs import JjRepository
 
 MANAGED = "mm/update-dependencies"
 
 
-@dataclass
-class OriginPeer:
-    """A second checkout sharing the repository origin."""
-
-    repo: Repository
-    commit_file: Callable[[str, str, str], str]
-    push_main: Callable[[], None]
-    remote_bookmark_targets: Callable[[str], tuple[str, ...]]
-
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class RepositoryCase:
-    """The same scenario controls for real jj and its in-memory fake."""
+    """A repository with its origin, and a second checkout of that origin."""
 
-    repo: Repository
-    bind: Callable[[Path], Repository]
-    register_file: Callable[[str], None]
-    write_file: Callable[[str, str | None], None]
-    commit_file: Callable[[str, str, str], str]
-    describe: Callable[[str], None]
-    conflict_bookmark: Callable[[str, str, str], None]
-    origin_peer: OriginPeer
-    track_main: Callable[[bool], None]
-    after_push: Callable[[Callable[[], None]], None]
-    attempts: list[FakeCall] | None
-    commands: list[tuple[str, ...]] | None
+    repo: JjRepository
+    peer: JjRepository
 
 
-def real_repository_case(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch | None = None
-) -> RepositoryCase:
-    """Create isolated jj checkouts and an origin, with optional operation hooks."""
-    repo, origin_git = _initialize_real_repository(tmp_path)
-    pending_after_push: list[Callable[[], None]] = []
-    commands: list[tuple[str, ...]] = []
-    _install_real_postcheck_interceptor(
-        repo.path, monkeypatch, pending_after_push, commands
-    )
-    repo.push_bookmark(bookmark="main")
-    origin_peer = _initialize_real_peer(tmp_path, origin_git)
-
-    def register_file(_filename: str) -> None:
-        return None
-
-    def track_main(enabled: bool) -> None:
-        action = "track" if enabled else "untrack"
-        result = run_jj(repo.path, "bookmark", action, "main@origin")
-        assert result.returncode == 0, result.stderr
-
-    def after_push(action: Callable[[], None]) -> None:
-        assert not pending_after_push, "only one pending push action is supported"
-        pending_after_push.append(action)
-
-    return RepositoryCase(
-        repo=repo,
-        bind=_bind_real_repository,
-        register_file=register_file,
-        write_file=partial(_write_repository_file, repo),
-        commit_file=partial(_commit_repository_file, repo, register_file),
-        describe=partial(_describe_real_repository, repo),
-        conflict_bookmark=partial(_conflict_real_bookmark, repo),
-        origin_peer=origin_peer,
-        track_main=track_main,
-        after_push=after_push,
-        attempts=None,
-        commands=commands,
-    )
+@cache
+def _scratch_root() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="mm-tests-jj-"))
+    atexit.register(shutil.rmtree, root, True)
+    (root / "jj-config.toml").write_text("", encoding="utf-8")
+    return root
 
 
-def fake_repository_case(tmp_path: Path) -> RepositoryCase:
-    """Create the in-memory counterpart of the real repository scenario."""
-    state = FakeJjState()
-    path = tmp_path / "fake-repository"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    repo.push_bookmark(bookmark="main")
-    peer_path = tmp_path / "origin-peer"
-    peer_repo = state.seed_peer(peer_path, source=path, track_main=True)
-
-    register_file = partial(_register_fake_file, state, path)
-
-    def describe(message: str) -> None:
-        repo.describe(message=message)
-
-    def peer_push_main() -> None:
-        peer_repo.set_bookmark(bookmark="main", revision="@-")
-        peer_repo.push_bookmark(bookmark="main")
-
-    state.clear_calls()
-
-    return RepositoryCase(
-        repo=repo,
-        bind=state.repository,
-        register_file=register_file,
-        write_file=partial(_write_repository_file, repo),
-        commit_file=partial(_commit_repository_file, repo, register_file),
-        describe=describe,
-        conflict_bookmark=partial(_seed_fake_bookmark, state, path),
-        origin_peer=OriginPeer(
-            peer_repo,
-            partial(
-                _commit_repository_file,
-                peer_repo,
-                partial(_register_fake_file, state, peer_path),
-            ),
-            peer_push_main,
-            lambda bookmark: state.remote_bookmark_targets(
-                peer_path, bookmark=bookmark
-            ),
-        ),
-        track_main=partial(_track_fake_main, state, path),
-        after_push=partial(_install_fake_after_push, state, path),
-        attempts=state.attempts,
-        commands=None,
-    )
+@cache
+def jj_environment() -> dict[str, str]:
+    """Identity, empty user config and non-interactive editor and pager for jj."""
+    return {
+        "JJ_USER": "MM Tests",
+        "JJ_EMAIL": "mm@example.invalid",
+        "JJ_CONFIG": str(_scratch_root() / "jj-config.toml"),
+        "JJ_EDITOR": "true",
+        "JJ_PAGER": "cat",
+    }
 
 
 def run_jj(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    """Run jj in a disposable test repository with a fixed author identity."""
-    environment = os.environ.copy()
-    environment.update(JJ_USER="MM Tests", JJ_EMAIL="mm@example.invalid")
+    """Run jj in a disposable test repository; the caller checks the exit code."""
     return subprocess.run(
         ["jj", *arguments],
         cwd=path,
         check=False,
         capture_output=True,
         text=True,
-        env=environment,
+        env=os.environ | jj_environment(),
     )
 
 
-def _initialize_real_repository(tmp_path: Path) -> tuple[vcs.JjRepository, Path]:
-    path = tmp_path / "real-repository"
-    path.mkdir()
-    assert run_jj(path, "git", "init", "--colocate").returncode == 0
-    origin = tmp_path / "origin"
-    initialized = run_jj(tmp_path, "git", "init", "--no-colocate", str(origin))
-    assert initialized.returncode == 0, initialized.stderr
-    origin_git = origin / ".jj" / "repo" / "store" / "git"
-    added = run_jj(path, "git", "remote", "add", "origin", str(origin_git))
-    assert added.returncode == 0, added.stderr
-    (path / "dep.txt").write_text("version=1\n", encoding="utf-8")
-    assert run_jj(path, "commit", "-m", "baseline").returncode == 0
-    assert run_jj(path, "bookmark", "create", "main", "-r", "@-").returncode == 0
-    return vcs.JjRepository(path), origin_git
+def _jj(path: Path, *arguments: str) -> str:
+    result = run_jj(path, *arguments)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
 
 
-def _install_real_postcheck_interceptor(
-    path: Path,
-    monkeypatch: pytest.MonkeyPatch | None,
-    pending_after_push: list[Callable[[], None]],
-    commands: list[tuple[str, ...]],
-) -> None:
-    if monkeypatch is None:
-        return
-    captured_run = vcs.run_captured
+@cache
+def _template() -> Path:
+    root = _scratch_root() / "template"
+    root.mkdir()
+    repo, origin, peer = root / "repo", root / "origin", root / "peer"
+    _jj(root, "git", "init", "repo")
+    (repo / "dep.txt").write_text("version=1\n", encoding="utf-8")
+    _jj(repo, "commit", "-m", "baseline")
+    _jj(repo, "bookmark", "create", "main", "-r", "@-")
+    _jj(root, "git", "init", "--colocate", "origin")
+    _jj(origin, "new")
+    _jj(repo, "git", "remote", "add", "origin", str(origin))
+    _jj(repo, "git", "push", "--bookmark", "main")
+    _jj(root, "git", "init", "peer")
+    _jj(peer, "git", "remote", "add", "origin", str(origin))
+    _jj(peer, "git", "fetch", "--remote", "origin")
+    _jj(peer, "bookmark", "create", "main", "-r", "main@origin")
+    _jj(peer, "bookmark", "track", "main@origin")
+    _jj(peer, "new", "main")
+    return root
 
-    def intercept_push(command, cwd, **kwargs):
-        commands.append(tuple(command))
-        completed = captured_run(command, cwd, **kwargs)
-        is_push = list(command)[1:3] == ["git", "push"]
-        if is_push and pending_after_push and Path(cwd).resolve() == path.resolve():
-            pending_after_push.pop(0)()
-        return completed
 
-    monkeypatch.setattr(vcs, "run_captured", intercept_push)
+def _origin_of(path: Path) -> Path:
+    return path.with_name(f"{path.name}-origin")
 
 
-def _initialize_real_peer(tmp_path: Path, origin_git: Path) -> OriginPeer:
-    peer_path = tmp_path / "origin-peer"
-    peer_path.mkdir()
-    assert run_jj(peer_path, "git", "init", "--colocate").returncode == 0
-    added = run_jj(peer_path, "git", "remote", "add", "origin", str(origin_git))
-    assert added.returncode == 0, added.stderr
-    fetched = run_jj(peer_path, "git", "fetch", "--remote", "origin")
-    assert fetched.returncode == 0, fetched.stderr
-    created = run_jj(peer_path, "bookmark", "create", "main", "-r", "main@origin")
-    assert created.returncode == 0, created.stderr
-    tracked = run_jj(peer_path, "bookmark", "track", "main@origin")
-    assert tracked.returncode == 0, tracked.stderr
-    assert run_jj(peer_path, "new", "main").returncode == 0
-    peer_repo = vcs.JjRepository(peer_path)
+def copy_jj_repository(path: Path) -> JjRepository:
+    """Copy the template to *path*.
 
-    def remote_bookmark_targets(bookmark: str) -> tuple[str, ...]:
-        fetched = run_jj(peer_path, "git", "fetch", "--remote", "origin")
-        assert fetched.returncode == 0, fetched.stderr
-        result = run_jj(
-            peer_path,
-            "log",
-            "-r",
-            f"{bookmark}@origin",
-            "--no-graph",
-            "-T",
-            'commit_id ++ "\\n"',
-        )
-        return () if result.returncode != 0 else (result.stdout.strip(),)
+    Commit 'baseline' with dep.txt = 'version=1' is on main, pushed to its own origin
+    at <path>-origin; the working copy is an empty child.
+    """
+    origin = _origin_of(path)
+    shutil.copytree(_template() / "repo", path, symlinks=True, dirs_exist_ok=True)
+    shutil.copytree(_template() / "origin", origin, symlinks=True)
+    _jj(path, "git", "remote", "set-url", "origin", str(origin))
+    return JjRepository(path)
 
-    return OriginPeer(
-        peer_repo,
-        partial(_commit_repository_file, peer_repo, _skip_file_registration),
-        partial(_push_real_peer_main, peer_repo),
-        remote_bookmark_targets,
+
+def copy_jj_peer(repo: JjRepository) -> JjRepository:
+    """Copy the template's second checkout beside *repo*, pointed at *repo*'s origin."""
+    peer = repo.path.with_name(f"{repo.path.name}-peer")
+    shutil.copytree(_template() / "peer", peer, symlinks=True)
+    _jj(peer, "git", "remote", "set-url", "origin", str(_origin_of(repo.path)))
+    return JjRepository(peer)
+
+
+def configure_jj_projects(home: Path, tmp_path: Path) -> dict[str, Path]:
+    """Point each configured project at its own copied jj repository.
+
+    Projects that shared a path share one copy. Returns each project's repository path.
+    """
+    config_path = home / "config.toml"
+    configured = load_config(config_path)
+    copies: dict[Path, Path] = {}
+    tables = {"defaults": configured.defaults.model_dump(exclude_none=True)}
+    for name, project in configured.projects.items():
+        if project.path not in copies:
+            target = tmp_path / "repositories" / f"repo-{len(copies)}"
+            copy_jj_repository(target)
+            copies[project.path] = target
+        fields = project.model_dump(mode="json", exclude_none=True)
+        tables[f"projects.{json.dumps(name)}"] = fields | {
+            "path": str(copies[project.path])
+        }
+    config_path.write_text(
+        "".join(_toml_table(header, fields) for header, fields in tables.items()),
+        encoding="utf-8",
     )
+    return {name: copies[project.path] for name, project in configured.projects.items()}
 
 
-def _write_repository_file(
-    repository: Repository, filename: str, content: str | None
-) -> None:
-    target = repository.path / filename
+def _toml_table(header: str, fields: dict[str, object]) -> str:
+    lines = [f"[{header}]", *(f"{key} = {json.dumps(v)}" for key, v in fields.items())]
+    return "\n".join(lines) + "\n\n"
+
+
+def write_file(repo: JjRepository, filename: str, content: str | None) -> None:
+    """Write *content* to *filename* in the working copy, or delete it when None."""
+    target = repo.path / filename
     if content is None:
         target.unlink(missing_ok=True)
         return
@@ -231,90 +153,145 @@ def _write_repository_file(
     target.write_text(content, encoding="utf-8")
 
 
-def _commit_repository_file(
-    repository: Repository,
-    register_file: Callable[[str], None],
-    filename: str,
-    content: str,
-    message: str,
-) -> str:
-    register_file(filename)
-    _write_repository_file(repository, filename, content)
-    repository.commit(message=message)
-    return repository.resolve_revision(revision="@-")
+def commit_file(repo: JjRepository, filename: str, content: str, message: str) -> str:
+    """Commit *content* as *filename*; returns the new commit's id."""
+    write_file(repo, filename, content)
+    repo.commit(message=message)
+    return repo.resolve_revision(revision="@-")
 
 
-def _skip_file_registration(_filename: str) -> None:
-    return None
+def commit_to_main(repo: JjRepository, message: str) -> str:
+    """Commit the working copy, move main onto the commit and return its id."""
+    repo.commit(message=message)
+    repo.set_bookmark(bookmark="main", revision="@-")
+    return repo.resolve_revision(revision="@-")
 
 
-def _push_real_peer_main(repository: Repository) -> None:
-    repository.set_bookmark(bookmark="main", revision="@-")
-    repository.push_bookmark(bookmark="main")
+def describe(repo: JjRepository, message: str) -> None:
+    """Describe the working-copy change."""
+    _jj(repo.path, "describe", "-m", message)
 
 
-def _bind_real_repository(path: Path) -> Repository:
-    inspected = run_jj(path, "workspace", "root")
-    assert inspected.returncode == 0, f"unknown repository view: {path}"
-    return vcs.JjRepository(path)
-
-
-def _describe_real_repository(repository: Repository, message: str) -> None:
-    result = run_jj(repository.path, "describe", "-m", message)
-    assert result.returncode == 0, result.stderr
-
-
-def _conflict_real_bookmark(
-    repository: Repository, bookmark: str, left: str, right: str
-) -> None:
+def conflict_bookmark(repo: JjRepository, bookmark: str, left: str, right: str) -> None:
+    """Make *bookmark* a conflicted bookmark targeting both *left* and *right*."""
     if bookmark == "main":
-        untracked = run_jj(repository.path, "bookmark", "untrack", "main@origin")
-        assert untracked.returncode == 0, untracked.stderr
-    if repository.bookmark_exists(bookmark=bookmark):
-        deleted = run_jj(repository.path, "bookmark", "delete", bookmark)
-        assert deleted.returncode == 0, deleted.stderr
-    operation = run_jj(
-        repository.path, "op", "log", "--limit", "1", "--no-graph", "-T", "id"
-    ).stdout.strip()
-    created = run_jj(repository.path, "bookmark", "create", bookmark, "-r", left)
-    assert created.returncode == 0, created.stderr
-    conflicted = run_jj(
-        repository.path,
-        "--at-op",
-        operation,
-        "bookmark",
-        "create",
-        bookmark,
+        _jj(repo.path, "bookmark", "untrack", "main@origin")
+    if repo.bookmark_exists(bookmark=bookmark):
+        _jj(repo.path, "bookmark", "delete", bookmark)
+    operation = operation_id(repo)
+    _jj(repo.path, "bookmark", "create", bookmark, "-r", left)
+    _jj(repo.path, "--at-op", operation, "bookmark", "create", bookmark, "-r", right)
+    _jj(repo.path, "bookmark", "list", bookmark)
+
+
+def track_main(repo: JjRepository, *, enabled: bool) -> None:
+    """Track or untrack main@origin."""
+    _jj(repo.path, "bookmark", "track" if enabled else "untrack", "main@origin")
+
+
+def push_peer_main(peer: JjRepository) -> None:
+    """Move the peer's main onto its last commit and push it."""
+    peer.set_bookmark(bookmark="main", revision="@-")
+    peer.push_bookmark(bookmark="main")
+
+
+def remote_bookmark_target(repo: JjRepository, bookmark: str) -> str | None:
+    """Fetch in *repo*, then return origin's target for *bookmark*; None when absent.
+
+    Pass the peer to leave the repository under test untouched.
+    """
+    _jj(repo.path, "git", "fetch", "--remote", "origin")
+    result = run_jj(
+        repo.path,
+        "log",
         "-r",
-        right,
+        f"{bookmark}@origin",
+        "--no-graph",
+        "-T",
+        'commit_id ++ "\\n"',
     )
-    assert conflicted.returncode == 0, conflicted.stderr
-    assert run_jj(repository.path, "bookmark", "list", bookmark).returncode == 0
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
-def _register_fake_file(state: FakeJjState, path: Path, filename: str) -> None:
-    state.register_files(path, filename)
+def commit_descriptions(repo: JjRepository, revset: str) -> list[str]:
+    """First description lines of the commits in *revset*, oldest first."""
+    return _jj(
+        repo.path,
+        "log",
+        "-r",
+        revset,
+        "--no-graph",
+        "--reversed",
+        "-T",
+        'description.first_line() ++ "\\n"',
+    ).splitlines()
 
 
-def _seed_fake_bookmark(
-    state: FakeJjState,
+def operation_id(repo: JjRepository) -> str:
+    """Snapshot the working copy, then return the latest operation id.
+
+    The same id before and after an action means the action changed nothing.
+    """
+    _jj(repo.path, "status")
+    return _jj(
+        repo.path,
+        "op",
+        "log",
+        "--ignore-working-copy",
+        "--no-graph",
+        "--limit",
+        "1",
+        "-T",
+        'id ++ "\\n"',
+    ).strip()
+
+
+def fail_repository_method(
+    monkeypatch: pytest.MonkeyPatch,
     path: Path,
-    bookmark: str,
-    *targets: str,
+    method: str,
+    failure: Exception,
+    *,
+    call: int = 1,
 ) -> None:
-    state.seed_bookmark(path, bookmark=bookmark, targets=targets)
+    """Raise *failure* on the *call*-th use of ``JjRepository.<method>`` for *path*.
+
+    Methods that other methods call count those internal calls too.
+    """
+    original = getattr(JjRepository, method)
+    calls = 0
+
+    def fail(repository, *args, **kwargs):
+        nonlocal calls
+        if repository.path.resolve() == path.resolve():
+            calls += 1
+            if calls == call:
+                raise failure
+        return original(repository, *args, **kwargs)
+
+    monkeypatch.setattr(JjRepository, method, fail)
 
 
-def _track_fake_main(state: FakeJjState, path: Path, enabled: bool) -> None:
-    state.track_main(path, enabled=enabled)
-
-
-def _install_fake_after_push(
-    state: FakeJjState, path: Path, action: Callable[[], None]
+def run_after_jj_command(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    prefix: tuple[str, ...],
+    action: Callable[[], None],
 ) -> None:
-    state.hook(
-        "push_bookmark",
-        phase="postcheck",
-        action=action,
-        path=path,
-    )
+    """Run *action* once, right after the first jj command in *path* with *prefix*."""
+    original = vcs.run_captured
+    fired = False
+
+    def run(command, cwd, **kwargs):
+        nonlocal fired
+        completed = original(command, cwd, **kwargs)
+        if (
+            not fired
+            and Path(cwd).resolve() == path.resolve()
+            and tuple(command[1 : 1 + len(prefix)]) == prefix
+        ):
+            fired = True
+            action()
+        return completed
+
+    monkeypatch.setattr(vcs, "run_captured", run)

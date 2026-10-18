@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import hashlib
 import shutil
 from collections.abc import Callable
@@ -10,7 +8,6 @@ from typing import Literal
 from maintenance_man.vcs import (
     RevisionError,
     RevisionFile,
-    WorkingCopyState,
 )
 from maintenance_man.vcs_workflow import VcsServices
 
@@ -512,12 +509,6 @@ class FakeJj:
         data, _ = self._data()
         return dict(data.graph[commit_id].files)[filename].decode()
 
-    def tree_id(self, *, revision: str = "@") -> str:
-        self._state._begin(self.path, "tree_id", revision=revision)
-        commit_id = self.resolve_revision(revision=revision)
-        data, _ = self._data()
-        return data.graph[commit_id].tree_id
-
     def same_revision(self, *, left: str, right: str) -> bool:
         self._state._begin(self.path, "same_revision", left=left, right=right)
         return self.resolve_revision(revision=left) == self.resolve_revision(
@@ -549,14 +540,10 @@ class FakeJj:
         data, _ = self._data()
         return data.graph[commit_id].change_id
 
-    def working_copy_state(self) -> WorkingCopyState:
-        self._state._begin(self.path, "working_copy_state")
+    def is_blank_working_copy(self) -> bool:
+        self._state._begin(self.path, "is_blank_working_copy")
         current, has_changes, bookmarks = self._working_copy_details()
-        return WorkingCopyState(
-            has_changes=has_changes,
-            description=current.description,
-            bookmarks=bookmarks,
-        )
+        return not has_changes and not current.description and not bookmarks
 
     def has_changes(self) -> bool:
         self._state._begin(self.path, "has_changes")

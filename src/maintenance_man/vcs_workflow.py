@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -46,8 +44,7 @@ def ensure_main_bookmark(*, repo: Repository) -> None:
 def refresh_working_copy_from_main(*, repo: Repository) -> None:
     if repo.is_ancestor(ancestor="main", descendant="@"):
         return
-    state = repo.working_copy_state()
-    if not state.has_changes and not state.description and not state.bookmarks:
+    if repo.is_blank_working_copy():
         repo.rebase_working_copy(revision="main")
         return
     repo.new_change(revision="main")

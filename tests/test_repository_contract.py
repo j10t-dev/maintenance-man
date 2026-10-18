@@ -1,15 +1,20 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
 
-from maintenance_man.vcs import RevisionError
+from maintenance_man.config import load_config
+from maintenance_man.vcs import JjRepository, RevisionError
 from maintenance_man.vcs_workflow import refresh_working_copy_from_main
-from tests.fake_vcs import FakeJjState
 from tests.support.repository import (
     MANAGED,
     RepositoryCase,
+    commit_file,
+    configure_jj_projects,
+    conflict_bookmark,
+    describe,
+    push_peer_main,
+    track_main,
+    write_file,
 )
 
 
@@ -40,7 +45,7 @@ def test_given_amended_main_when_resolved_then_commit_identity_changes(
     c.repo.set_bookmark(bookmark="main", revision="@")
     before = c.repo.resolve_revision(revision="main")
 
-    c.describe("amended main")
+    describe(c.repo, "amended main")
     c.repo.set_bookmark(bookmark="main", revision="@")
 
     assert c.repo.resolve_revision(revision="main") != before
@@ -48,20 +53,37 @@ def test_given_amended_main_when_resolved_then_commit_identity_changes(
 
 def test_identity_tracks_content_and_metadata_separately(
     repository_case: RepositoryCase,
-):
+) -> None:
     c = repository_case
     original_commit = c.repo.resolve_revision(revision="@")
-    original_tree = c.repo.tree_id()
-    assert original_tree == c.repo.tree_id(revision="main")
-    c.describe("metadata only")
+
+    describe(c.repo, "metadata only")
     assert c.repo.resolve_revision(revision="@") != original_commit
-    assert c.repo.tree_id() == original_tree
-    c.register_file("dep.txt")
-    c.write_file("dep.txt", "version=2\n")
-    assert c.repo.tree_id() != original_tree
-    assert c.repo.tree_id(revision="main") == original_tree
-    c.write_file("dep.txt", "version=1\n")
-    assert c.repo.tree_id() == original_tree
+    assert c.repo.has_changes() is False
+
+    write_file(c.repo, "dep.txt", "version=2\n")
+    assert c.repo.has_changes() is True
+
+    write_file(c.repo, "dep.txt", "version=1\n")
+    assert c.repo.has_changes() is False
+
+
+@pytest.mark.parametrize(
+    "arrange, expected",
+    [("blank", True), ("dirty", False), ("described", False), ("bookmarked", False)],
+)
+def test_given_working_copy_when_inspected_then_only_a_blank_change_is_blank(
+    repository_case: RepositoryCase, arrange: str, expected: bool
+) -> None:
+    repo = repository_case.repo
+    if arrange == "dirty":
+        write_file(repo, "dep.txt", "local\n")
+    elif arrange == "described":
+        describe(repo, "work in progress")
+    elif arrange == "bookmarked":
+        repo.set_bookmark(bookmark="topic", revision="@")
+
+    assert repo.is_blank_working_copy() is expected
 
 
 def test_revision_relationship_methods_distinguish_parent_and_child(
@@ -70,7 +92,7 @@ def test_revision_relationship_methods_distinguish_parent_and_child(
     c = repository_case
     parent = c.repo.resolve_revision(revision="main")
     c.repo.new_change(revision="main")
-    c.describe("child")
+    describe(c.repo, "child")
     child = c.repo.resolve_revision(revision="@")
 
     assert c.repo.same_revision(left=parent, right=parent)
@@ -82,8 +104,7 @@ def test_revision_relationship_methods_distinguish_parent_and_child(
 def test_commit_then_advance_and_delete(repository_case: RepositoryCase):
     c = repository_case
     before = c.repo.resolve_revision(revision="main")
-    c.register_file("dep.txt")
-    c.write_file("dep.txt", "version=2\n")
+    write_file(c.repo, "dep.txt", "version=2\n")
     c.repo.commit(message="upgrade dependency")
     finished = c.repo.resolve_revision(revision="@-")
     assert finished != before
@@ -99,21 +120,19 @@ def test_commit_then_advance_and_delete(repository_case: RepositoryCase):
 
 def test_read_only_file_inspection_does_not_snapshot(repository_case: RepositoryCase):
     c = repository_case
-    c.commit_file("local.properties", "sdk.dir=/fixture\n", "sdk settings")
+    commit_file(c.repo, "local.properties", "sdk.dir=/fixture\n", "sdk settings")
     pinned = c.repo.resolve_revision(revision="@", read_only=True)
-    tree_before = c.repo.tree_id(revision=pinned)
-    c.write_file("local.properties", "sdk.dir=/changed\n")
+    write_file(c.repo, "local.properties", "sdk.dir=/changed\n")
     inspected = c.repo.revision_file(revision="@", filename="local.properties")
     assert inspected.commit_id == pinned
     assert inspected.is_regular is True
     assert c.repo.resolve_revision(revision="@", read_only=True) == pinned
-    assert c.repo.tree_id(revision=pinned) == tree_before
-    assert c.repo.tree_id() != tree_before
+    assert c.repo.resolve_revision(revision="@") != pinned
 
 
 def test_discard_restores_the_parent_tree(repository_case: RepositoryCase) -> None:
     c = repository_case
-    c.write_file("dep.txt", "dirty\n")
+    write_file(c.repo, "dep.txt", "dirty\n")
     assert c.repo.has_changes() is True
 
     c.repo.discard()
@@ -128,12 +147,12 @@ def test_given_conflicted_bookmark_when_resolving_then_raises_and_direct_id_reso
     c = repository_case
     assert c.repo.bookmark_exists(bookmark=MANAGED) is False
     c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "side=1\n")
+    write_file(c.repo, "dep.txt", "side=1\n")
     left = c.repo.resolve_revision(revision="@")
     c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "side=2\n")
+    write_file(c.repo, "dep.txt", "side=2\n")
     right = c.repo.resolve_revision(revision="@")
-    c.conflict_bookmark(MANAGED, left, right)
+    conflict_bookmark(c.repo, MANAGED, left, right)
     assert c.repo.bookmark_exists(bookmark=MANAGED) is True
     assert c.repo.bookmark_conflicted(bookmark=MANAGED) is True
     assert c.repo.resolve_revision(revision=left) == left
@@ -147,14 +166,13 @@ def test_given_conflicted_bookmark_when_inspected_then_topic_survives_refresh(
     c = repository_case
     original = c.repo.resolve_revision(revision="@")
     c.repo.new_change(revision="main")
-    c.write_file("dep.txt", "protected local change\n")
-    c.repo.working_copy_state()
+    write_file(c.repo, "dep.txt", "protected local change\n")
+    assert c.repo.has_changes() is True
     current = c.repo.resolve_revision(revision="@")
     change_id = c.repo.change_id()
-    c.conflict_bookmark("topic", current, original)
+    conflict_bookmark(c.repo, "topic", current, original)
 
-    state = c.repo.working_copy_state()
-    assert state.bookmarks == ("topic",)
+    assert c.repo.has_changes() is True
     assert c.repo.revision_bookmarks(revision="@") == ("topic",)
 
     refresh_working_copy_from_main(repo=c.repo)
@@ -167,38 +185,14 @@ def test_given_conflicted_bookmark_when_inspected_then_topic_survives_refresh(
     )
 
 
-def test_given_fake_conflicted_bookmark_when_inspected_then_one_attempt_is_recorded(
-    tmp_path: Path,
-) -> None:
-    state = FakeJjState()
-    path = tmp_path / "fake-repository"
-    repo = state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    current = repo.resolve_revision(revision="@")
-    main = repo.resolve_revision(revision="main")
-    sibling = state.seed_commit(
-        path,
-        parent=main,
-        files={"dep.txt": "sibling\n"},
-        description="sibling",
-    )
-    state.seed_bookmark(path, bookmark="topic", targets=(current, sibling))
-    state.clear_calls()
-
-    working_copy = repo.working_copy_state()
-
-    assert working_copy.bookmarks == ("topic",)
-    assert [call.method for call in state.attempts] == ["working_copy_state"]
-
-
 def test_workspace_views_isolate_files_and_share_bookmarks(
     repository_case: RepositoryCase, tmp_path: Path
 ):
     c = repository_case
     update_path = tmp_path / "update-workspace"
     c.repo.add_workspace(name="update", path=update_path, revision="main")
-    update = c.bind(update_path)
+    update = JjRepository(update_path)
     update.new_change(revision="main")
-    c.register_file("dep.txt")
     (update.path / "dep.txt").write_text("version=2\n", encoding="utf-8")
     update.commit(message="update dependency")
     update.set_bookmark(bookmark=MANAGED, revision="@-")
@@ -218,9 +212,8 @@ def test_promote_then_rebase_empty_source_child_projects_updated_files(
     source_change = c.repo.change_id()
     update_path = tmp_path / "promotion-workspace"
     c.repo.add_workspace(name="promotion", path=update_path, revision="main")
-    update = c.bind(update_path)
+    update = JjRepository(update_path)
     update.new_change(revision="main")
-    c.register_file("dep.txt")
     (update.path / "dep.txt").write_text("version=2\n", encoding="utf-8")
     update.commit(message="upgrade dependency")
     tip = update.resolve_revision(revision="@-")
@@ -243,7 +236,7 @@ def test_rebase_preserves_change_and_new_change_preserves_old_commit(
     c.repo.rebase_working_copy(revision="main")
     assert c.repo.change_id() == change_before
     assert "main" in c.repo.revision_bookmarks(revision="@-")
-    c.write_file("dep.txt", "dirty\n")
+    write_file(c.repo, "dep.txt", "dirty\n")
     old = c.repo.resolve_revision(revision="@")
     c.repo.new_change(revision="main")
     assert c.repo.resolve_revision(revision=old) == old
@@ -257,10 +250,10 @@ def test_initial_push_tracks_main_for_later_peer_advance(
     sender_tracking = c.repo.resolve_revision(revision="main@origin")
     assert sender_tracking == c.repo.resolve_revision(revision="main")
 
-    c.origin_peer.repo.fetch(main_only=True)
-    c.origin_peer.repo.rebase_working_copy(revision="main")
-    peer_tip = c.origin_peer.commit_file("dep.txt", "peer=2\n", "peer advance")
-    c.origin_peer.push_main()
+    c.peer.fetch(main_only=True)
+    c.peer.rebase_working_copy(revision="main")
+    peer_tip = commit_file(c.peer, "dep.txt", "peer=2\n", "peer advance")
+    push_peer_main(c.peer)
     assert c.repo.resolve_revision(revision="main@origin") == sender_tracking
     c.repo.fetch(main_only=True)
 
@@ -273,15 +266,45 @@ def test_push_rejects_existing_untracked_remote_without_remote_effect(
 ):
     c = repository_case
     base = c.repo.resolve_revision(revision="main")
-    c.track_main(False)
-    tip = c.commit_file("dep.txt", "sender=1\n", "sender advance")
+    track_main(c.repo, enabled=False)
+    tip = commit_file(c.repo, "dep.txt", "sender=1\n", "sender advance")
     c.repo.set_bookmark(bookmark="main", revision=tip)
-    push_effects: list[str] = []
-    c.after_push(lambda: push_effects.append("pushed"))
 
     with pytest.raises(RevisionError):
         c.repo.push_bookmark(bookmark="main")
 
-    c.origin_peer.repo.fetch(main_only=True)
-    assert c.origin_peer.repo.resolve_revision(revision="main") == base
-    assert push_effects == []
+    c.peer.fetch(main_only=True)
+    assert c.peer.resolve_revision(revision="main") == base
+
+
+def test_given_projects_with_prefix_paths_when_configured_then_each_gets_its_own_copy(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        f"""\
+[projects.api]
+path = "{tmp_path / "x" / "api"}"
+package_manager = "uv"
+test_unit = "pytest"
+
+[projects.web]
+path = "{tmp_path / "x" / "api-web"}"
+package_manager = "bun"
+""",
+        encoding="utf-8",
+    )
+
+    copies = configure_jj_projects(home, tmp_path)
+
+    expected = {
+        "api": tmp_path / "repositories" / "repo-0",
+        "web": tmp_path / "repositories" / "repo-1",
+    }
+    configured = load_config(home / "config.toml")
+    assert copies == expected
+    assert {name: project.path for name, project in configured.projects.items()} == (
+        expected
+    )
+    assert configured.projects["api"].test_unit == "pytest"

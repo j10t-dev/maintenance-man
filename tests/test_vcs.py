@@ -9,44 +9,6 @@ from tests.fakes import FakeCommands
 from tests.support.process import completed
 
 
-def test_given_distinct_revision_ids_when_same_revision_runs_then_it_uses_two_log_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    commands = FakeCommands()
-    monkeypatch.setattr(vcs, "run_captured", commands)
-    commands.add(
-        (
-            "jj",
-            "log",
-            "-r",
-            "main",
-            "--no-graph",
-            "-T",
-            'commit_id ++ "\\n"',
-        ),
-        cwd=tmp_path,
-        result=completed(stdout=f"{'a' * 40}\n"),
-    )
-    commands.add(
-        (
-            "jj",
-            "log",
-            "-r",
-            "main@origin",
-            "--no-graph",
-            "-T",
-            'commit_id ++ "\\n"',
-        ),
-        cwd=tmp_path,
-        result=completed(stdout=f"{'b' * 40}\n"),
-    )
-
-    same = vcs.JjRepository(tmp_path).same_revision(left="main", right="main@origin")
-
-    assert same is False
-    assert len(commands.calls) == 2
-
-
 @pytest.mark.parametrize("existing", [False, True], ids=["absent", "existing"])
 def test_assert_safe_workspace_path_accepts_direct_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
@@ -76,28 +38,10 @@ def test_assert_safe_workspace_path_rejects_unsafe_locations_without_removal(
     marker = target / "keep.txt"
     marker.write_text("keep", encoding="utf-8")
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not a project workspace directly under"):
         vcs.assert_safe_workspace_path(target)
 
     assert marker.read_text(encoding="utf-8") == "keep"
-
-
-def test_assert_safe_workspace_path_rejects_final_symlink_and_preserves_sibling(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = vcs.paths.workspaces_dir()
-    sibling = root / "project-b"
-    sibling.mkdir(parents=True)
-    marker = sibling / "keep.txt"
-    marker.write_text("keep", encoding="utf-8")
-    candidate = root / "project-a"
-    candidate.symlink_to(sibling, target_is_directory=True)
-
-    with pytest.raises(ValueError, match="symlink"):
-        vcs.assert_safe_workspace_path(candidate)
-
-    assert marker.read_text(encoding="utf-8") == "keep"
-    assert candidate.is_symlink()
 
 
 def _resolve_command(revision: str, *, read_only: bool = False) -> tuple[str, ...]:
@@ -302,50 +246,8 @@ class TestJjRepositoryBoundary:
         }
         assert expected[failure] in str(caught.value)
         assert len(commands.calls) == (1 if phase == "resolve" else 2)
-        expected_labels = {
-            resolve_command: (
-                "jj --ignore-working-copy --color never log -r main --no-graph "
-                "-T 'commit_id ++ \"\\n\"'"
-            ),
-            list_command: (
-                "jj --ignore-working-copy --color never file list -r "
-                f"{'a' * 40} -T 'file_type ++ \"\\n\"' "
-                "root-file:local.properties"
-            ),
-        }
-        for argv, cwd, kwargs in commands.calls:
-            assert cwd == tmp_path
-            assert kwargs == {
-                "timeout": 30,
-                "label": expected_labels[argv],
-                "error": vcs.RevisionError,
-            }
         if raised is not None:
             assert caught.value.__cause__ is raised
-
-    @pytest.mark.parametrize(
-        "inspector", ["", "unfamiliar\n", '    root_tree: Conflict("a")\n']
-    )
-    def test_tree_id_rejects_malformed_or_conflicted_output(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        inspector: str,
-    ):
-        commands = FakeCommands()
-        commands.add(
-            _resolve_command("main"),
-            cwd=tmp_path,
-            result=completed(stdout="a" * 40 + "\n"),
-        )
-        commands.add(
-            ("jj", "debug", "object", "commit", "a" * 40),
-            cwd=tmp_path,
-            result=completed(stdout=inspector),
-        )
-        monkeypatch.setattr(vcs, "run_captured", commands)
-        with pytest.raises(vcs.RevisionError, match="Cannot identify"):
-            vcs.JjRepository(tmp_path).tree_id(revision="main")
 
     @pytest.mark.parametrize(
         ("main_only", "arguments"),

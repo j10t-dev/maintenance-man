@@ -1,8 +1,5 @@
-from __future__ import annotations
-
 import re
 import shlex
-import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,17 +15,13 @@ class RevisionError(Exception):
     """A jj command could not run, or a revision could not be resolved."""
 
 
+_READ_ONLY = ("--ignore-working-copy", "--color", "never")
+
+
 @dataclass(frozen=True, slots=True)
 class RevisionFile:
     commit_id: str
     is_regular: bool
-
-
-@dataclass(frozen=True, slots=True)
-class WorkingCopyState:
-    has_changes: bool
-    description: str
-    bookmarks: tuple[str, ...]
 
 
 class Repository(Protocol):
@@ -39,12 +32,11 @@ class Repository(Protocol):
     def bookmark_conflicted(self, *, bookmark: str) -> bool: ...
     def resolve_revision(self, *, revision: str, read_only: bool = False) -> str: ...
     def revision_file(self, *, revision: str, filename: str) -> RevisionFile: ...
-    def tree_id(self, *, revision: str = "@") -> str: ...
     def same_revision(self, *, left: str, right: str) -> bool: ...
     def is_ancestor(self, *, ancestor: str, descendant: str) -> bool: ...
     def revision_bookmarks(self, *, revision: str) -> tuple[str, ...]: ...
     def change_id(self, *, revision: str = "@") -> str: ...
-    def working_copy_state(self) -> WorkingCopyState: ...
+    def is_blank_working_copy(self) -> bool: ...
     def has_changes(self) -> bool: ...
     def create_bookmark(self, *, bookmark: str, revision: str) -> None: ...
     def set_bookmark(self, *, bookmark: str, revision: str) -> None: ...
@@ -66,24 +58,17 @@ def workspace_path_for_project(project: str) -> Path:
 
 
 def assert_safe_workspace_path(path: Path) -> Path:
-    try:
-        path_status = path.lstat()
-    except FileNotFoundError:
-        path_status = None
-    if path_status is not None and stat.S_ISLNK(path_status.st_mode):
+    if path.is_symlink():
         msg = f"refusing to remove symlink workspace path: {path}"
         raise ValueError(msg)
 
     root = paths.workspaces_dir().resolve()
     target = path.resolve()
-    if target == root:
-        msg = "refusing to remove workspace root"
-        raise ValueError(msg)
-    if root not in target.parents:
-        msg = f"refusing to remove path outside {root}: {target}"
-        raise ValueError(msg)
     if target.parent != root:
-        msg = f"refusing to remove nested/non-project workspace path: {target}"
+        msg = (
+            f"refusing to remove {target}: "
+            f"not a project workspace directly under {root}"
+        )
         raise ValueError(msg)
     return target
 
@@ -133,12 +118,17 @@ class JjRepository:
             error=RevisionError,
         )
 
+    def _log(self, revision: str, template: str, *, read_only: bool = False) -> str:
+        """Render *template* for each commit in *revision*; returns jj's stdout."""
+        prefix = _READ_ONLY if read_only else ()
+        return self._run(
+            [*prefix, "log", "-r", revision, "--no-graph", "-T", template]
+        ).stdout
+
     def bookmark_exists(self, *, bookmark: str) -> bool:
         result = self._run(
             [
-                "--ignore-working-copy",
-                "--color",
-                "never",
+                *_READ_ONLY,
                 "bookmark",
                 "list",
                 "-T",
@@ -155,9 +145,7 @@ class JjRepository:
     def bookmark_conflicted(self, *, bookmark: str) -> bool:
         result = self._run(
             [
-                "--ignore-working-copy",
-                "--color",
-                "never",
+                *_READ_ONLY,
                 "bookmark",
                 "list",
                 "-T",
@@ -175,27 +163,14 @@ class JjRepository:
         return states == ["true"]
 
     def resolve_revision(self, *, revision: str, read_only: bool = False) -> str:
-        prefix = ["--ignore-working-copy", "--color", "never"] if read_only else []
-        result = self._run(
-            [
-                *prefix,
-                "log",
-                "-r",
-                revision,
-                "--no-graph",
-                "-T",
-                'commit_id ++ "\\n"',
-            ]
-        )
-        return _exact_commit(result.stdout, revision=revision)
+        output = self._log(revision, 'commit_id ++ "\\n"', read_only=read_only)
+        return _exact_commit(output, revision=revision)
 
     def revision_file(self, *, revision: str, filename: str) -> RevisionFile:
         commit_id = self.resolve_revision(revision=revision, read_only=True)
         result = self._run(
             [
-                "--ignore-working-copy",
-                "--color",
-                "never",
+                *_READ_ONLY,
                 "file",
                 "list",
                 "-r",
@@ -218,20 +193,6 @@ class JjRepository:
             raise RevisionError(msg)
         return RevisionFile(commit_id=commit_id, is_regular=kinds == ["file"])
 
-    def tree_id(self, *, revision: str = "@") -> str:
-        commit_id = self.resolve_revision(revision=revision)
-        result = self._run(["debug", "object", "commit", commit_id])
-        trees = re.findall(
-            r"^    root_tree: Resolved\(\s*TreeId\("
-            r'\s*"([0-9a-f]{40,64})",?\s*\),?\s*\),$',
-            result.stdout,
-            re.MULTILINE,
-        )
-        if len(trees) != 1:
-            msg = "Cannot identify the verified jj tree"
-            raise RevisionError(msg)
-        return trees[0]
-
     def same_revision(self, *, left: str, right: str) -> bool:
         return self.resolve_revision(revision=left) == self.resolve_revision(
             revision=right
@@ -240,17 +201,10 @@ class JjRepository:
     def is_ancestor(self, *, ancestor: str, descendant: str) -> bool:
         ancestor_id = self.resolve_revision(revision=ancestor)
         descendant_id = self.resolve_revision(revision=descendant)
-        result = self._run(
-            [
-                "log",
-                "-r",
-                f"{ancestor_id}::{descendant_id} & {descendant_id}",
-                "--no-graph",
-                "-T",
-                'commit_id ++ "\\n"',
-            ]
+        output = self._log(
+            f"{ancestor_id}::{descendant_id} & {descendant_id}", 'commit_id ++ "\\n"'
         )
-        values = _lines(result.stdout)
+        values = _lines(output)
         if values not in ([], [descendant_id]):
             msg = "Unexpected ancestry result"
             raise RevisionError(msg)
@@ -258,42 +212,24 @@ class JjRepository:
 
     def revision_bookmarks(self, *, revision: str) -> tuple[str, ...]:
         commit_id = self.resolve_revision(revision=revision)
-        result = self._run(
-            [
-                "log",
-                "-r",
-                commit_id,
-                "--no-graph",
-                "-T",
-                (
-                    "bookmarks.filter(|bookmark| !bookmark.remote()"
-                    ' || bookmark.remote() == "git")'
-                    '.map(|bookmark| bookmark.name()).join("\\n") ++ "\\n"'
-                ),
-            ]
+        output = self._log(
+            commit_id,
+            "bookmarks.filter(|bookmark| !bookmark.remote()"
+            ' || bookmark.remote() == "git")'
+            '.map(|bookmark| bookmark.name()).join("\\n") ++ "\\n"',
         )
-        return tuple(dict.fromkeys(_lines(result.stdout)))
+        return tuple(dict.fromkeys(_lines(output)))
 
     def change_id(self, *, revision: str = "@") -> str:
-        result = self._run(
-            [
-                "log",
-                "-r",
-                revision,
-                "--no-graph",
-                "-T",
-                'change_id ++ "\\n"',
-            ]
-        )
-        return _one_line(result.stdout, subject=f"change id for {revision}")
+        output = self._log(revision, 'change_id ++ "\\n"')
+        return _one_line(output, subject=f"change id for {revision}")
 
-    def working_copy_state(self) -> WorkingCopyState:
-        return WorkingCopyState(
-            has_changes=self.has_changes(),
-            description=self._run(
-                ["log", "-r", "@", "--no-graph", "-T", "description"]
-            ).stdout.rstrip("\n"),
-            bookmarks=self.revision_bookmarks(revision="@"),
+    def is_blank_working_copy(self) -> bool:
+        """Whether the working-copy change has no edits, description or bookmarks."""
+        return (
+            not self.has_changes()
+            and not self._log("@", "description").rstrip("\n")
+            and not self.revision_bookmarks(revision="@")
         )
 
     def has_changes(self) -> bool:

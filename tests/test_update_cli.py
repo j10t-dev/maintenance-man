@@ -808,7 +808,7 @@ class TestUpdateAll:
             "-d main, then rerun",
         ),
         (
-            "working_copy_state",
+            "is_blank_working_copy",
             "err",
             "error: vulnerable · workspace refresh · injected",
         ),
@@ -916,7 +916,6 @@ def test_update_end_to_end_uses_one_graph_and_persists_completion(
     saved = load_scan_results("vulnerable")
     assert [finding.pkg_name for finding in saved.findings] == ["unrelated"]
     effects = [call.method for call in state.effects]
-    assert any(call.method == "working_copy_state" for call in state.attempts)
     assert effects.index("forget_workspace") < effects.index("promote_bookmark_to_main")
     assert effects.index("promote_bookmark_to_main") < effects.index(
         "rebase_working_copy"

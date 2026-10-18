@@ -14,8 +14,9 @@ from tests.support.gradle import GRADLE_FIXTURES
 from tests.support.projects import FIXTURES_DIR, write_config
 from tests.support.repository import (
     RepositoryCase,
-    fake_repository_case,
-    real_repository_case,
+    copy_jj_peer,
+    copy_jj_repository,
+    jj_environment,
 )
 
 
@@ -170,14 +171,16 @@ def mm_home_with_gradle(
     return mm_home_with_projects
 
 
-@pytest.fixture(params=["fake", pytest.param("real", marks=pytest.mark.integration)])
-def repository_case(
-    request: pytest.FixtureRequest,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> RepositoryCase:
-    return (
-        fake_repository_case(tmp_path)
-        if request.param == "fake"
-        else real_repository_case(tmp_path, monkeypatch)
+@pytest.fixture(autouse=True)
+def _jj_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test runs jj with a fixed identity, empty config, no editor or pager."""
+    for name, value in jj_environment().items():
+        monkeypatch.setenv(name, value)
+
+
+@pytest.fixture()
+def repository_case(tmp_path: Path) -> RepositoryCase:
+    """A copied jj repository with its origin, and a peer checkout of that origin."""
+    return RepositoryCase(
+        repo := copy_jj_repository(tmp_path / "repository"), copy_jj_peer(repo)
     )
