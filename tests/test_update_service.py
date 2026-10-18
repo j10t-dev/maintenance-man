@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man import paths
+from maintenance_man import gradle, paths, updater
+from maintenance_man.gradle import GRADLE_CATALOGUE_RELPATH
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     FindingsProcessed,
@@ -30,6 +31,8 @@ from tests.support.findings import (
     make_update,
     make_vuln,
 )
+from tests.support.gradle import GRADLE_FIXTURES, catalogue_apply_task
+from tests.support.process import refuse_new_processes
 from tests.support.projects import make_config, make_project, seed_project
 
 
@@ -112,7 +115,7 @@ def test_update_emits_processing_result_and_promotion_events(
     assert "mm-api" not in repo.workspace_names()
 
 
-def test_update_reports_blocked_findings_in_the_project_result(
+def test_given_blocked_and_passing_rows_when_updating_then_passing_rows_promote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result(
@@ -138,10 +141,80 @@ def test_update_reports_blocked_findings_in_the_project_result(
         emit=emit,
     )
 
-    assert result.blocked == 1
-    assert emit.of_type(FindingsProcessed) == [
-        FindingsProcessed((UpdateResult("pkg-a", "update", True),), blocked=1)
+    passed = UpdateResult("pkg-a", "update", True)
+    assert result == update_service.ProjectUpdate(
+        "api", Outcome.SUCCEEDED, (passed,), blocked=1
+    )
+    assert emit.of_type(FindingsProcessed) == [FindingsProcessed((passed,), blocked=1)]
+    assert emit.of_type(Promoted) == [Promoted()]
+    assert [row.pkg_name for row in load_scan_results("api").updates] == ["stuck"]
+    assert (
+        state.services().repository(project.path).same_revision(left="main", right="@-")
+    )
+
+
+def test_given_only_blocked_rows_when_updating_then_success_without_workspace(
+    tmp_path: Path,
+) -> None:
+    scan = make_scan_result(vulns=[], updates=[make_update(blocked_reason="too young")])
+    state, project = seed_project(tmp_path, "api", scan, test_unit=None)
+    emit = RecordingEmit()
+
+    result = update_service.update_project(
+        "api", project, choose=None, vcs=state.services(), emit=emit
+    )
+
+    assert result == update_service.ProjectUpdate(
+        "api", Outcome.SUCCEEDED, (), blocked=1
+    )
+    assert emit.events == [ScanReported(load_scan_results("api"))]
+    assert not any(call.method == "add_workspace" for call in state.attempts)
+
+
+def test_given_failed_row_when_update_finishes_then_promotion_is_reported_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = make_scan_result(
+        vulns=[],
+        updates=[
+            make_update(
+                pkg_name="pkg-a",
+                update_status=UpdateStatus.READY,
+                flow=Workflow.UPDATE,
+            ),
+            make_update(
+                pkg_name="pkg-b",
+                update_status=UpdateStatus.FAILED,
+                flow=Workflow.UPDATE,
+                failed_phase="unit",
+            ),
+        ],
+    )
+    state, project = seed_project(tmp_path, "api", scan)
+    state.services().repository(project.path).set_bookmark(
+        bookmark="mm/update-dependencies", revision="main"
+    )
+    monkeypatch.setattr(
+        update_service,
+        "process_findings",
+        FakeFindingProcessor({"pkg-b": (False, "unit")}),
+    )
+    emit = RecordingEmit()
+
+    result = update_service.update_project(
+        "api", project, choose=None, vcs=state.services(), emit=emit
+    )
+
+    assert result.outcome is Outcome.FAILED
+    assert emit.of_type(OperationFailed) == [
+        OperationFailed(
+            Operation.PROMOTE,
+            "api",
+            "failed updates remain pending · rerun mm update api "
+            "or repair with mm resolve api",
+        )
     ]
+    assert not any(call.method == "promote_bookmark_to_main" for call in state.attempts)
 
 
 def test_resume_new_change_failure_removes_workspace(
@@ -556,3 +629,192 @@ def test_given_local_properties_when_update_starts_then_untracked_sdk_is_refused
             "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
         )
         assert result.outcome is Outcome.SUCCEEDED
+
+
+@pytest.mark.parametrize("flow", ["update"])
+def test_given_flow_when_run_then_no_scan_discovery_build_or_push_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flow: str
+) -> None:
+    state = FakeJjState()
+    project = _seed_gradle_project(
+        tmp_path, state, "api", build_command="./gradlew assembleDebug"
+    )
+    repo = state.services().repository(project.path)
+    before = repo.resolve_revision(revision="main")
+    commands: list[str] = []
+    refuse_new_processes(monkeypatch)
+    monkeypatch.setattr(gradle, "run_gradle", catalogue_apply_task())
+    monkeypatch.setattr(
+        updater, "run_shell_command", lambda command, *_, **__: commands.append(command)
+    )
+    run = {"update": update_service.update_project}[flow]
+
+    result = run(
+        "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
+    )
+
+    assert commands == ["./gradlew test"]
+    assert not any(call.method == "push_bookmark" for call in state.attempts)
+    assert result.outcome is Outcome.SUCCEEDED
+    assert repo.resolve_revision(revision="main") != before
+    assert repo.is_ancestor(ancestor=before, descendant="main")
+
+
+def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = FakeJjState()
+    android = _seed_gradle_project(tmp_path, state, "android")
+    web = make_project(tmp_path / "web", package_manager="bun", test_unit="true")
+    state.seed_repository(web.path, files={"package.json": "{}\n"})
+    state.register_files(web.path, "deps-pkg-a.txt")
+    scan = make_scan_result(vulns=[], updates=[make_update(pkg_name="pkg-a")])
+    scan.project = "web"
+    save_scan_results("web", scan)
+    monkeypatch.setattr(gradle, "run_gradle", catalogue_apply_task())
+    monkeypatch.setattr(updater, "run_shell_command", lambda *_, **__: None)
+    bun_commands: list[list[str]] = []
+
+    def run_bun(command: list[str], cwd: Path, **_: object) -> None:
+        bun_commands.append(command)
+        (cwd / "deps-pkg-a.txt").write_text(command[-1], encoding="utf-8")
+
+    monkeypatch.setattr(updater, "run_logged", run_bun)
+    emit = RecordingEmit()
+
+    batch = update_service.update_projects(
+        make_config(projects={"web": web, "android": android}),
+        ["web", "android"],
+        vcs=state.services(),
+        emit=emit,
+    )
+
+    assert [(item.project, item.outcome) for item in batch.projects] == [
+        ("web", Outcome.SUCCEEDED),
+        ("android", Outcome.SUCCEEDED),
+    ]
+    assert emit.of_type(Promoted) == [Promoted(), Promoted()]
+    assert bun_commands == [["bun", "add", "pkg-a@1.0.1"]]
+    catalogue = (GRADLE_FIXTURES / "libs.versions.toml").read_text(encoding="utf-8")
+    assert state.repository(android.path).file_text(
+        revision="main", filename=GRADLE_CATALOGUE_RELPATH
+    ) == catalogue.replace('room = "2.8.4"', 'room = "2.8.5"', 1)
+
+
+def test_given_cleanup_failure_when_batch_updated_then_next_project_still_promotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = FakeJjState()
+    projects = {
+        name: _seed_gradle_project(tmp_path, state, name) for name in ("api", "web")
+    }
+    state.fail(
+        "forget_workspace", error=RevisionError("busy"), path=projects["api"].path
+    )
+    monkeypatch.setattr(gradle, "run_gradle", catalogue_apply_task())
+    monkeypatch.setattr(updater, "run_shell_command", lambda *_, **__: None)
+    emit = RecordingEmit()
+
+    batch = update_service.update_projects(
+        make_config(projects=projects), ["api", "web"], vcs=state.services(), emit=emit
+    )
+
+    assert [(item.project, item.outcome) for item in batch.projects] == [
+        ("api", Outcome.FAILED),
+        ("web", Outcome.SUCCEEDED),
+    ]
+    assert OperationFailed(Operation.WORKSPACE_CLEANUP, "api", "busy") in emit.events
+    assert 'room = "2.8.5"' in _catalogue_text(projects["web"])
+
+
+def test_given_refresh_failure_when_rerun_then_promotion_completes_without_reapply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = make_scan_result(vulns=[], updates=[make_update(pkg_name="pkg-a")])
+    state, project = seed_project(tmp_path, "api", scan)
+    processor = FakeFindingProcessor({"pkg-a": (True, None)})
+    calls: list[list[str]] = []
+
+    def process(findings, work_config, **kwargs):
+        calls.append([finding.pkg_name for finding in findings])
+        return processor(findings, work_config, **kwargs)
+
+    monkeypatch.setattr(update_service, "process_findings", process)
+    state.fail("rebase_working_copy", error=RevisionError("locked"), path=project.path)
+    first_emit = RecordingEmit()
+
+    first = update_service.update_project(
+        "api", project, choose=None, vcs=state.services(), emit=first_emit
+    )
+
+    repo = state.services().repository(project.path)
+    assert first.outcome is Outcome.FAILED
+    assert OperationFailed(Operation.REFRESH, "api", "locked") in first_emit.events
+    assert [row.update_status for row in load_scan_results("api").updates] == [
+        UpdateStatus.READY
+    ]
+    assert repo.bookmark_exists(bookmark="mm/update-dependencies")
+
+    second = update_service.update_project(
+        "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
+    )
+
+    assert second.outcome is Outcome.SUCCEEDED
+    assert calls == [["pkg-a"]]
+    assert load_scan_results("api").updates == []
+    assert not repo.bookmark_exists(bookmark="mm/update-dependencies")
+
+
+def test_given_fresh_scan_and_stale_bookmark_when_updating_then_work_starts_from_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = make_scan_result(vulns=[], updates=[make_update(pkg_name="pkg-a")])
+    state, project = seed_project(tmp_path, "api", scan)
+    repo = state.services().repository(project.path)
+    state.register_files(project.path, "mm-fixture-stale.txt")
+    (project.path / "mm-fixture-stale.txt").write_text("old", encoding="utf-8")
+    repo.commit(message="stale update")
+    stale = repo.resolve_revision(revision="@-")
+    repo.set_bookmark(bookmark="mm/update-dependencies", revision=stale)
+    repo.new_change(revision="main")
+    monkeypatch.setattr(
+        update_service,
+        "process_findings",
+        FakeFindingProcessor({"pkg-a": (True, None)}),
+    )
+
+    result = update_service.update_project(
+        "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
+    )
+
+    assert result.outcome is Outcome.SUCCEEDED
+    assert not repo.is_ancestor(ancestor=stale, descendant="main")
+    assert (project.path / "mm-fixture-pkg-a.txt").is_file()
+    assert not (project.path / "mm-fixture-stale.txt").exists()
+
+
+def _seed_gradle_project(
+    tmp_path: Path, state: FakeJjState, name: str, **overrides: object
+) -> ProjectConfig:
+    project = make_project(
+        tmp_path / name,
+        package_manager="gradle",
+        test_unit="./gradlew test",
+        **overrides,
+    )
+    catalogue = (GRADLE_FIXTURES / "libs.versions.toml").read_text(encoding="utf-8")
+    state.seed_repository(
+        project.path,
+        files={"gradlew": "#!/bin/sh\nexit 0\n", GRADLE_CATALOGUE_RELPATH: catalogue},
+    )
+    scan = make_scan_result(
+        vulns=[],
+        updates=[make_update(pkg_name="room", gradle_target=make_gradle_target())],
+    )
+    scan.project = name
+    save_scan_results(name, scan)
+    return project
+
+
+def _catalogue_text(project: ProjectConfig) -> str:
+    return (project.path / GRADLE_CATALOGUE_RELPATH).read_text(encoding="utf-8")

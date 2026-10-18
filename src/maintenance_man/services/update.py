@@ -85,6 +85,11 @@ def update_project(
     scan_result = flows.load_validated_scan(name, project, Workflow.UPDATE, emit=emit)
     if scan_result is None:
         return ProjectUpdate(name, Outcome.SUCCEEDED, ())
+    if not _has_update_work(scan_result):
+        emit(ScanReported(scan_result))
+        return ProjectUpdate(
+            name, Outcome.SUCCEEDED, (), blocked=len(scan_result.blocked_findings)
+        )
     if flows.report_missing_test_config(name, project, emit=emit):
         return ProjectUpdate(name, Outcome.FAILED, ())
     try:
@@ -94,7 +99,6 @@ def update_project(
 
     work_config = project.model_copy(update={"path": workspace})
     results: tuple[UpdateResult, ...] = ()
-    may_finalise = False
     cleaned = True
     try:
         emit(ScanReported(scan_result))
@@ -105,11 +109,6 @@ def update_project(
             vcs=vcs,
             emit=emit,
         )
-        may_finalise = (
-            not any(not result.passed for result in results)
-            and not _has_update_state(scan_result, (UpdateStatus.FAILED,))
-            and not scan_result.blocked_findings
-        )
     finally:
         try:
             remove_workspace(repo=vcs.repository(project.path), project=name)
@@ -117,12 +116,10 @@ def update_project(
             emit(OperationFailed(Operation.WORKSPACE_CLEANUP, name, str(exc)))
             cleaned = False
 
-    finalised = may_finalise and flows.finalise_local_changes(
-        project.path, scan_result, name, Workflow.UPDATE, vcs=vcs, emit=emit
-    )
+    outcome = _finish_update(project.path, scan_result, name, vcs=vcs, emit=emit)
     return ProjectUpdate(
         name,
-        Outcome.SUCCEEDED if cleaned and finalised else Outcome.FAILED,
+        outcome if cleaned else Outcome.FAILED,
         results,
         blocked=len(scan_result.blocked_findings),
     )
@@ -178,6 +175,17 @@ def resolve_update_targets(
     if len(ordered) == 1:
         return "single", ordered
     return "batch", ordered
+
+
+def _has_update_work(scan_result: ScanResult) -> bool:
+    return any(
+        _is_selectable(finding)
+        or (
+            finding.update_status is UpdateStatus.READY
+            and finding.flow is Workflow.UPDATE
+        )
+        for finding in scan_result.findings
+    )
 
 
 def _has_update_state(
@@ -313,3 +321,29 @@ def _with_shared_targets[F: VulnFinding | UpdateFinding](
             if id(row) not in chosen and row.gradle_target in targets
         ),
     ]
+
+
+def _finish_update(
+    project_path: Path,
+    scan_result: ScanResult,
+    name: str,
+    *,
+    vcs: VcsServices,
+    emit: Emit,
+) -> Outcome:
+    if _has_update_state(scan_result, (UpdateStatus.FAILED,)):
+        emit(
+            OperationFailed(
+                Operation.PROMOTE,
+                name,
+                "failed updates remain pending · "
+                f"rerun mm update {name} or repair with mm resolve {name}",
+            )
+        )
+        return Outcome.FAILED
+    if not _has_update_state(scan_result, (UpdateStatus.READY,)):
+        return Outcome.SUCCEEDED
+    finalised = flows.finalise_local_changes(
+        project_path, scan_result, name, Workflow.UPDATE, vcs=vcs, emit=emit
+    )
+    return Outcome.SUCCEEDED if finalised else Outcome.FAILED

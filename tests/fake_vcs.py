@@ -507,6 +507,11 @@ class FakeJj:
             is_regular=filename in dict(data.graph[commit_id].files),
         )
 
+    def file_text(self, *, revision: str, filename: str) -> str:
+        commit_id = self.resolve_revision(revision=revision, read_only=True)
+        data, _ = self._data()
+        return dict(data.graph[commit_id].files)[filename].decode()
+
     def tree_id(self, *, revision: str = "@") -> str:
         self._state._begin(self.path, "tree_id", revision=revision)
         commit_id = self.resolve_revision(revision=revision)
@@ -688,7 +693,12 @@ class FakeJj:
         method = "promote_bookmark_to_main"
         self._state._begin(self.path, method, bookmark=bookmark)
         data, _ = self._data()
-        data.bookmarks["main"] = (self.resolve_revision(revision=bookmark),)
+        target = self.resolve_revision(revision=bookmark)
+        main = self.resolve_revision(revision="main")
+        if not self._state._is_ancestor(data, main, target):
+            msg = "Refusing to move bookmark backwards or sideways: main"
+            raise RevisionError(msg)
+        data.bookmarks["main"] = (target,)
         self._state._effect(self.path, method, bookmark=bookmark)
         self._state._run_hooks(self.path, method, "postcheck")
 

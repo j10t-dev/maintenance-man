@@ -73,6 +73,19 @@ def catalogue_apply_runner(edits: dict[str, str] | None = None, *, returncode: i
     return _run
 
 
+def catalogue_apply_task(edits: dict[str, str] | None = None):
+    """Stand in for run_gradle's versionCatalogApplyUpdates, editing the catalogue
+    as catalogue_apply_runner does."""
+    apply = catalogue_apply_runner(edits)
+
+    def run(root, args, *, label=None):
+        return apply(
+            [str(root / "gradlew"), *args], root, label=f"./gradlew {label or args[0]}"
+        )
+
+    return run
+
+
 def _apply_report(report: Path, text: str) -> str:
     updates = tomllib.loads(report.read_text(encoding="utf-8"))
     catalogue = tomllib.loads(text)

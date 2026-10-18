@@ -494,18 +494,22 @@ class TestUpdateCrossCategoryStops:
         mock_update_cli_deps: CliDeps,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        def fail_first(findings, *_, **__):
+            finding = findings[0]
+            finding.update_status = UpdateStatus.FAILED
+            finding.failed_phase = "unit"
+            finding.flow = Workflow.UPDATE
+            return [
+                UpdateResult(
+                    pkg_name=finding.pkg_name,
+                    kind="vuln",
+                    passed=False,
+                    failed_phase="unit",
+                )
+            ]
+
         monkeypatch.setattr(
-            "maintenance_man.services.update.process_findings",
-            MagicMock(
-                return_value=[
-                    UpdateResult(
-                        pkg_name="some-pkg",
-                        kind="vuln",
-                        passed=False,
-                        failed_phase="unit",
-                    )
-                ]
-            ),
+            "maintenance_man.services.update.process_findings", fail_first
         )
         monkeypatch.setattr(
             "maintenance_man.output.prompt", MagicMock(return_value="all")
@@ -533,7 +537,10 @@ class TestUpdateCrossCategoryStops:
 
         captured = capsys.readouterr()
         assert captured.out.splitlines() == [
-            "outdated\tupdate\tfailed\tsome-pkg\t1.0.0\t1.0.1\tcommit failed"
+            "outdated\tupdate\tfailed\tsome-pkg\t1.0.0\t1.0.1\tcommit failed",
+            "outdated\tpromotion\tfailed\tlocal main\t-\t-\t"
+            "failed updates remain pending · rerun mm update outdated "
+            "or repair with mm resolve outdated",
         ]
         assert "error: outdated · commit · cannot commit" in captured.err.splitlines()
         assert captured.err.splitlines()[-1] == "1 failed"
@@ -558,6 +565,9 @@ class TestUpdateOutcomeRecords:
         assert captured.out.splitlines() == [
             "outdated\tupdate\tpassed\tsome-pkg\t1.0.0\t1.0.1\t-",
             "outdated\tupdate\tfailed\tpkg-a\t1.0.0\t1.0.1\tunit failed",
+            "outdated\tpromotion\tfailed\tlocal main\t-\t-\t"
+            "failed updates remain pending · rerun mm update outdated "
+            "or repair with mm resolve outdated",
         ]
         assert captured.err.splitlines()[-1] == "1 passed · 1 failed"
 
@@ -582,7 +592,7 @@ class TestUpdateOutcomeRecords:
         ]
         assert captured.err.splitlines()[-1] == "2 passed"
 
-    def test_given_blocked_vulnerability_when_updated_then_it_is_recorded_unpromoted(
+    def test_given_blocked_vulnerability_when_updated_then_passing_rows_promote(
         self,
         mm_home_with_projects: Path,
         mock_update_cli_deps: CliDeps,
@@ -604,13 +614,14 @@ class TestUpdateOutcomeRecords:
         )
         save_scan_results("outdated", saved)
 
-        assert run_mm("update", "outdated") == ExitCode.UPDATE_FAILED
+        assert run_mm("update", "outdated") == ExitCode.OK
 
         captured = capsys.readouterr()
         assert captured.out.splitlines() == [
             "outdated\tupdate\tblocked\tstuck\t2.0\t-\tno fixed version",
             "outdated\tupdate\tpassed\tsome-pkg\t1.0.0\t1.0.1\t-",
             "outdated\tupdate\tpassed\tpkg-a\t1.0.0\t1.0.1\t-",
+            "outdated\tpromotion\tpassed\tlocal main\t-\t-\t-",
         ]
         assert captured.err.splitlines()[-1] == "2 passed · 1 blocked"
 

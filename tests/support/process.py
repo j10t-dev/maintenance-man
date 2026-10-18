@@ -4,6 +4,8 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
+
 from maintenance_man.process import ToolNotFoundError
 
 
@@ -28,3 +30,14 @@ def missing_tool(tool: str) -> Callable[[str, str], Path]:
         return Path("/usr/bin") / name
 
     return require
+
+
+def refuse_new_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test when anything starts a process; scanning, discovery, native
+    preparation, build_command and pushes all need one."""
+
+    def refuse(args, *_, **__):
+        msg = f"unexpected process: {args!r}"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
