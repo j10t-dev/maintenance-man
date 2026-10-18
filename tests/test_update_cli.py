@@ -258,13 +258,14 @@ def test_given_update_noop_when_command_runs_then_it_exits_zero_and_notices_on_s
             "resolve",
             "mock_resolve_cli_deps",
             Workflow.UPDATE,
-            "error: Cannot run resolve on vulnerable: 1 finding(s) owned by the "
-            "'update' flow. Complete or abandon that flow first.",
+            "error: Resolve cannot take over pending updates: bookmark "
+            "mm/update-dependencies is missing. Run mm scan vulnerable to start "
+            "again from main.",
             id="resolve",
         ),
     ],
 )
-def test_given_opposite_workflow_when_run_then_flow_conflict_is_reported(
+def test_given_opposite_workflow_when_run_then_it_is_refused(
     mm_home_with_projects: Path,
     request: pytest.FixtureRequest,
     capsys: pytest.CaptureFixture[str],

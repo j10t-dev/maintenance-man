@@ -19,6 +19,7 @@ from maintenance_man.models.events import (
     SkipReason,
 )
 from maintenance_man.models.scan import UpdateResult, UpdateStatus, Workflow
+from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import update as update_service
 from maintenance_man.services.flows import FlowConflictError
 from maintenance_man.storage import load_scan_results, save_scan_results
@@ -33,7 +34,12 @@ from tests.support.findings import (
 )
 from tests.support.gradle import GRADLE_FIXTURES, catalogue_apply_task
 from tests.support.process import refuse_new_processes
-from tests.support.projects import make_config, make_project, seed_project
+from tests.support.projects import (
+    make_config,
+    make_project,
+    seed_gradle_project,
+    seed_project,
+)
 
 
 def test_update_processes_in_managed_workspace(tmp_path: Path, monkeypatch) -> None:
@@ -631,12 +637,12 @@ def test_given_local_properties_when_update_starts_then_untracked_sdk_is_refused
         assert result.outcome is Outcome.SUCCEEDED
 
 
-@pytest.mark.parametrize("flow", ["update"])
+@pytest.mark.parametrize("flow", ["update", "resolve"])
 def test_given_flow_when_run_then_no_scan_discovery_build_or_push_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flow: str
 ) -> None:
     state = FakeJjState()
-    project = _seed_gradle_project(
+    project = seed_gradle_project(
         tmp_path, state, "api", build_command="./gradlew assembleDebug"
     )
     repo = state.services().repository(project.path)
@@ -647,15 +653,22 @@ def test_given_flow_when_run_then_no_scan_discovery_build_or_push_starts(
     monkeypatch.setattr(
         updater, "run_shell_command", lambda command, *_, **__: commands.append(command)
     )
-    run = {"update": update_service.update_project}[flow]
+    run = {
+        "update": lambda: (
+            update_service.update_project(
+                "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
+            ).outcome
+        ),
+        "resolve": lambda: resolve_service.resolve_project(
+            "api", project, continue_=False, vcs=state.services(), emit=RecordingEmit()
+        ),
+    }[flow]
 
-    result = run(
-        "api", project, choose=None, vcs=state.services(), emit=RecordingEmit()
-    )
+    outcome = run()
 
     assert commands == ["./gradlew test"]
     assert not any(call.method == "push_bookmark" for call in state.attempts)
-    assert result.outcome is Outcome.SUCCEEDED
+    assert outcome is Outcome.SUCCEEDED
     assert repo.resolve_revision(revision="main") != before
     assert repo.is_ancestor(ancestor=before, descendant="main")
 
@@ -664,7 +677,7 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = FakeJjState()
-    android = _seed_gradle_project(tmp_path, state, "android")
+    android = seed_gradle_project(tmp_path, state, "android")
     web = make_project(tmp_path / "web", package_manager="bun", test_unit="true")
     state.seed_repository(web.path, files={"package.json": "{}\n"})
     state.register_files(web.path, "deps-pkg-a.txt")
@@ -706,7 +719,7 @@ def test_given_cleanup_failure_when_batch_updated_then_next_project_still_promot
 ) -> None:
     state = FakeJjState()
     projects = {
-        name: _seed_gradle_project(tmp_path, state, name) for name in ("api", "web")
+        name: seed_gradle_project(tmp_path, state, name) for name in ("api", "web")
     }
     state.fail(
         "forget_workspace", error=RevisionError("busy"), path=projects["api"].path
@@ -791,29 +804,6 @@ def test_given_fresh_scan_and_stale_bookmark_when_updating_then_work_starts_from
     assert not repo.is_ancestor(ancestor=stale, descendant="main")
     assert (project.path / "mm-fixture-pkg-a.txt").is_file()
     assert not (project.path / "mm-fixture-stale.txt").exists()
-
-
-def _seed_gradle_project(
-    tmp_path: Path, state: FakeJjState, name: str, **overrides: object
-) -> ProjectConfig:
-    project = make_project(
-        tmp_path / name,
-        package_manager="gradle",
-        test_unit="./gradlew test",
-        **overrides,
-    )
-    catalogue = (GRADLE_FIXTURES / "libs.versions.toml").read_text(encoding="utf-8")
-    state.seed_repository(
-        project.path,
-        files={"gradlew": "#!/bin/sh\nexit 0\n", GRADLE_CATALOGUE_RELPATH: catalogue},
-    )
-    scan = make_scan_result(
-        vulns=[],
-        updates=[make_update(pkg_name="room", gradle_target=make_gradle_target())],
-    )
-    scan.project = name
-    save_scan_results(name, scan)
-    return project
 
 
 def _catalogue_text(project: ProjectConfig) -> str:

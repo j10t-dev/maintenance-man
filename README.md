@@ -38,7 +38,7 @@ mm update api -n worker   # same exclusion mode; flag position does not matter
 
 `mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed.
 
-If jj or gh is missing, `mm scan` warns and skips bookmark pruning; `mm update` and `mm resolve` still require both.
+`mm update` and `mm resolve` require jj.
 
 ```text
 Usage: mm COMMAND
@@ -213,11 +213,11 @@ Vulnerability scanning covers the project configurations your CycloneDX configur
 
 ## VCS workflow
 
-Configured projects are expected to be colocated jj/Git repositories with a GitHub `origin` remote and a `main` bookmark. Git detached HEAD is normal under jj and is not treated as an error.
+Configured projects are expected to be colocated jj/Git repositories with an `origin` remote and a `main` bookmark. Git detached HEAD is normal under jj and is not treated as an error.
 
 `mm update` uses the `mm/update-dependencies` bookmark and a temporary jj workspace under `~/.mm/workspaces/<project>`. Each eligible finding is applied, tested and committed there. A failed finding is discarded and retried by the next `mm update` against the same saved scan; passing ones are not reapplied. When no attempted finding is failing, the bookmark is promoted to local `main`; run `mm sync` to publish it. A successful `mm scan` replaces the saved findings and their pending statuses.
 
-`mm resolve` uses the `mm/resolve-dependencies` bookmark for manual fixes. When the findings are ready, the bookmark is pushed and a GitHub PR is opened from that bookmark.
+`mm resolve` takes over pending update work on `mm/resolve-dependencies` in the project directory, applies the next failed finding and stops at a failure with its changes in place. Commit the repair, then run `mm resolve PROJECT --continue` to test it without reapplying the update. When every finding passes, resolve promotes to local `main` like update.
 
 `mm sync` fetches and pushes the `main` bookmark directly. It does not switch branches or depend on Git checkout state.
 
@@ -225,7 +225,6 @@ Configured projects are expected to be colocated jj/Git repositories with a GitH
 
 * trivy, except for uv projects with `scan_secrets = false`
 * jj
-* gh
 * Python 3.14
 * JDK 21 and a project Gradle wrapper for `gradle` projects
 * uv

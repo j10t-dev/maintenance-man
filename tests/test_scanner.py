@@ -420,7 +420,7 @@ def test_given_pending_statuses_when_scan_succeeds_then_saved_rows_are_fresh(
                     flow=Workflow.UPDATE,
                 )
             ],
-        ),
+        ).model_copy(update={"resolve_repair_base": "abc"}),
     )
     _configure_update_scan(
         monkeypatch,
@@ -431,10 +431,12 @@ def test_given_pending_statuses_when_scan_succeeds_then_saved_rows_are_fresh(
 
     scan_project("demo", project)
 
+    saved = load_scan_results("demo")
     assert [
         (row.pkg_name, row.update_status, row.failed_phase, row.flow)
-        for row in load_scan_results("demo").findings
+        for row in saved.findings
     ] == [("some-pkg", None, None, None), ("pkg-a", None, None, None)]
+    assert saved.resolve_repair_base is None
 
 
 def test_given_outdated_packages_when_scanned_then_updates_are_returned(

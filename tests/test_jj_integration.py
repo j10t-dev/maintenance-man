@@ -8,7 +8,8 @@ import pytest
 from maintenance_man import updater, vcs_workflow
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import Operation, OperationFailed, Outcome
-from maintenance_man.models.scan import UpdateStatus
+from maintenance_man.models.scan import UpdateStatus, Workflow
+from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import update as update_service
 from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs_workflow import VcsServices
@@ -23,6 +24,7 @@ from tests.support.repository import (
 )
 
 FAILS_B = "test ! -e deps/pkg-b || test -e repair.txt"
+RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
 
 @pytest.fixture(autouse=True)
@@ -115,6 +117,46 @@ def test_given_main_moved_sideways_when_promoting_then_work_stays_pending_until_
     )
 
 
+def test_given_pending_stack_when_resolve_takes_over_and_repairs_then_main_gets_all(
+    tmp_path: Path, applied: list[str]
+) -> None:
+    case, project = _bun_project(tmp_path, "api", FAILS_B)
+    path = case.repo.path
+    _update(case, project)
+    update_tip = case.repo.resolve_revision(revision=MANAGED)
+
+    paused = _resolve(case, project, continue_=False)
+
+    assert paused is Outcome.FAILED
+    assert [
+        (row.flow, row.update_status) for row in load_scan_results("api").updates
+    ] == [
+        (Workflow.RESOLVE, UpdateStatus.READY),
+        (Workflow.RESOLVE, UpdateStatus.FAILED),
+        (Workflow.RESOLVE, UpdateStatus.READY),
+    ]
+    assert case.repo.resolve_revision(revision=RESOLVE_BOOKMARK) == update_tip
+    assert not case.repo.bookmark_exists(bookmark=MANAGED)
+    assert (path / "deps" / "pkg-b").is_file()
+
+    (path / "repair.txt").write_text("repaired\n", encoding="utf-8")
+    committed = run_jj(path, "commit", "-m", "repair pkg-b")
+    assert committed.returncode == 0, committed.stderr
+    applications = list(applied)
+
+    finished = _resolve(case, project, continue_=True)
+
+    assert finished is Outcome.SUCCEEDED
+    assert applied == applications == ["pkg-a", "pkg-b", "pkg-c", "pkg-b"]
+    assert {"deps/pkg-a", "deps/pkg-b", "deps/pkg-c", "repair.txt"} <= _files(
+        path, "main"
+    )
+    assert case.repo.is_ancestor(ancestor=update_tip, descendant="main")
+    assert load_scan_results("api").findings == ()
+    assert not case.repo.bookmark_exists(bookmark=MANAGED)
+    assert not case.repo.bookmark_exists(bookmark=RESOLVE_BOOKMARK)
+
+
 def test_given_cleanup_failure_when_batch_updated_then_next_project_promotes(
     tmp_path: Path, applied: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -180,6 +222,18 @@ def _update(
         choose=None,
         vcs=VcsServices(repository=case.bind),
         emit=emit or RecordingEmit(),
+    )
+
+
+def _resolve(
+    case: RepositoryCase, project: ProjectConfig, *, continue_: bool
+) -> Outcome:
+    return resolve_service.resolve_project(
+        "api",
+        project,
+        continue_=continue_,
+        vcs=VcsServices(repository=case.bind),
+        emit=RecordingEmit(),
     )
 
 

@@ -207,6 +207,10 @@ class UpdateFinding(BaseModel):
 
 
 class ScanResult(BaseModel):
+    """The last explicit scan's findings and their pending lifecycle;
+    resolve_repair_base holds the resolve tip a committed repair sits on until
+    that repair is saved READY."""
+
     project: str
     scanned_at: datetime
     trivy_target: str
@@ -214,6 +218,7 @@ class ScanResult(BaseModel):
     secrets: list[SecretFinding] = []
     updates: list[UpdateFinding] = []
     gradle_resolution: dict[str, Any] | None = None
+    resolve_repair_base: str | None = None
 
     @property
     def has_actionable_vulns(self) -> bool:

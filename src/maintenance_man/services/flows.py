@@ -22,7 +22,7 @@ from maintenance_man.storage import (
     load_scan_results,
     save_scan_results,
 )
-from maintenance_man.updater import Finding, remove_completed_findings
+from maintenance_man.updater import remove_completed_findings
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import VcsServices, refresh_working_copy_from_main
 
@@ -129,30 +129,20 @@ def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -
             raise FlowConflictError(msg)
 
 
-_RESOLVE_CLAIMABLE_TEST_PHASES = {"unit", "integration", "component"}
-
-
-def is_resolve_claimable_failure(finding: Finding, active_flow: Workflow) -> bool:
-    return (
-        active_flow is Workflow.RESOLVE
-        and finding.flow is Workflow.UPDATE
-        and finding.update_status is UpdateStatus.FAILED
-        and finding.failed_phase in _RESOLVE_CLAIMABLE_TEST_PHASES
-    )
-
-
 def _assert_no_conflicting_flow(
     scan_result: ScanResult,
     active_flow: Workflow,
     project: str,
 ) -> None:
+    """Update may not touch resolve-owned work; resolve takes over update-owned work."""
+    if active_flow is Workflow.RESOLVE:
+        return
     conflicts = [
         finding
         for finding in scan_result.findings
         if finding.update_status is not None
         and finding.flow is not None
         and finding.flow is not active_flow
-        and not is_resolve_claimable_failure(finding, active_flow)
     ]
     if conflicts:
         other_flow = conflicts[0].flow

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from maintenance_man.gradle import GRADLE_CATALOGUE_RELPATH
 from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.scan import (
@@ -11,6 +12,7 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.storage import save_scan_results
 from tests.fake_vcs import FakeJjState
+from tests.support.findings import make_gradle_target, make_scan_result, make_update
 
 
 def make_project(path: Path, **overrides: Any) -> ProjectConfig:
@@ -69,6 +71,32 @@ def seed_project(
     scan.project = name
     save_scan_results(name, scan)
     return state, project
+
+
+def seed_gradle_project(
+    tmp_path: Path, state: FakeJjState, name: str, **overrides: Any
+) -> ProjectConfig:
+    """Create a fake Gradle repository and save one shared-catalogue update."""
+    project = make_project(
+        tmp_path / name,
+        package_manager="gradle",
+        test_unit="./gradlew test",
+        **overrides,
+    )
+    catalogue = (FIXTURES_DIR / "gradle" / "libs.versions.toml").read_text(
+        encoding="utf-8"
+    )
+    state.seed_repository(
+        project.path,
+        files={"gradlew": "#!/bin/sh\nexit 0\n", GRADLE_CATALOGUE_RELPATH: catalogue},
+    )
+    scan = make_scan_result(
+        vulns=[],
+        updates=[make_update(pkg_name="room", gradle_target=make_gradle_target())],
+    )
+    scan.project = name
+    save_scan_results(name, scan)
+    return project
 
 
 FIXTURES_DIR = Path(__file__).parents[1] / "fixtures"

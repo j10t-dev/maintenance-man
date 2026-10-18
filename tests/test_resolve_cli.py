@@ -27,6 +27,12 @@ def _clear_resolve_progress(scan_result: ScanResult) -> None:
         f.flow = None
 
 
+def _commit_repair(deps: CliDeps) -> None:
+    path = deps.project_paths["vulnerable"]
+    (path / "dep.txt").write_text("repaired\n", encoding="utf-8")
+    deps.vcs_state.repository(path).commit(message="repair")
+
+
 @pytest.fixture()
 def mock_resolve_fresh(mock_resolve_cli_deps: CliDeps) -> CliDeps:
     """mock_resolve_cli_deps with all resolve progress cleared."""
@@ -139,6 +145,7 @@ class TestResolveContinue:
             )
         ]
         mock_resolve_cli_deps.save_scan()
+        _commit_repair(mock_resolve_cli_deps)
 
         assert run_mm("resolve", "vulnerable", "--continue") == 0
 
@@ -169,6 +176,7 @@ class TestResolveContinue:
             )
         ]
         mock_resolve_cli_deps.save_scan()
+        _commit_repair(mock_resolve_cli_deps)
 
         state = mock_resolve_cli_deps.vcs_state
         state.clear_calls()
@@ -234,6 +242,7 @@ class TestResolveContinue:
         monkeypatch.setattr(
             "maintenance_man.services.resolve.process_findings", mock_process
         )
+        _commit_repair(mock_resolve_cli_deps)
 
         assert run_mm("resolve", "vulnerable", "--continue") == 0
 
@@ -258,6 +267,7 @@ class TestResolveContinue:
         blocker = scan_result.vulnerabilities[0]
         blocker.failed_phase = "commit"
         mock_resolve_cli_deps.save_scan()
+        _commit_repair(mock_resolve_cli_deps)
 
         monkeypatch.setattr(
             "maintenance_man.services.resolve.process_findings",
@@ -268,11 +278,12 @@ class TestResolveContinue:
         saved = load_scan_results("vulnerable")
         assert saved.vulnerabilities == []
 
-    def test_continue_with_no_failed_blockers_exits_noop(
+    def test_continue_with_no_failed_blockers_refuses(
         self,
         mm_home_with_projects: Path,
         mock_resolve_cli_deps: CliDeps,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         scan_result: ScanResult = mock_resolve_cli_deps.scan_result
         for f in (*scan_result.vulnerabilities, *scan_result.updates):
@@ -284,17 +295,15 @@ class TestResolveContinue:
         monkeypatch.setattr(
             "maintenance_man.services.resolve.run_test_phases", mock_tests
         )
-        monkeypatch.setattr(
-            "maintenance_man.services.resolve.process_findings",
-            MagicMock(return_value=[]),
-        )
 
-        assert run_mm("resolve", "vulnerable", "--continue") == 0
+        assert run_mm("resolve", "vulnerable", "--continue") == ExitCode.ERROR
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines() == [
+            "error: No paused resolve failure is saved for vulnerable. "
+            "Run mm resolve vulnerable to start resolving."
+        ]
         mock_tests.assert_not_called()
-        assert not any(
-            call.method == "push_bookmark"
-            for call in mock_resolve_cli_deps.vcs_state.attempts
-        )
 
 
 class TestResolveCliSurface:
