@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
@@ -88,6 +89,47 @@ def test_numbered_findings_print_bracketed_values_literally(
     assert "a[b]" in captured.err
     assert "CVE-[x]" in captured.err
     assert "u[p]" in captured.err
+
+
+def test_numbered_findings_name_the_gradle_target_that_owns_each_row(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ksp = make_gradle_target(
+        version_ref="ksp",
+        members=[
+            make_gradle_member(
+                kind="plugin",
+                alias="ksp",
+                coordinate="com.google.devtools.ksp",
+                installed_version="2.3.10",
+            )
+        ],
+        target_version="2.3.12",
+    )
+    advisory = make_vuln(
+        vuln_id="CVE-1",
+        pkg_name="androidx.room:room-runtime",
+        installed_version="2.8.4",
+        fixed_version="2.8.5",
+    )
+
+    cli._print_numbered_findings(
+        [
+            advisory.model_copy(update={"gradle_target": make_gradle_target()}),
+            advisory.model_copy(update={"gradle_target": ksp}),
+        ],
+        [make_update(pkg_name="room", gradle_target=make_gradle_target())],
+    )
+
+    unwrapped = " ".join(capsys.readouterr().err.split())
+    rows = re.split(r" (?=\d+ [!~] )", unwrapped)
+    assert rows == [
+        "1 ! vuln high · CVE-1 2.8.4 → 2.8.5 androidx.room:room-runtime"
+        " via room 2.8.4 → 2.8.5",
+        "2 ! vuln high · CVE-1 2.8.4 → 2.8.5 androidx.room:room-runtime"
+        " via ksp 2.3.10 → 2.3.12",
+        "3 ~ update patch 1.0.0 → 1.0.1 room",
+    ]
 
 
 def _make_vulnerable_result() -> ScanResult:

@@ -77,7 +77,13 @@ When stdout is redirected, records are headerless TSV. Warnings, prompts, errors
 
 Timestamps use exact ISO 8601 in pipes and short relative values on a terminal. Unknown counts use `-`; known empty counts use `0`. Other absent values use `-`, with explicit reasons such as `never` or `not deployable` where relevant. TSV fields escape backslash, tab, carriage return and newline as `\\`, `\t`, `\r` and `\n`; other ASCII and C1 controls use `\xNN`, and Unicode line/paragraph separators use `\u2028`/`\u2029`. Bracketed text is literal. The reason field is human-readable explanation and may include `selected fix` for the chosen advisory fix.
 
-A passed package update and promotion to local main are separate outcomes. A failed build records deployment as skipped. Command exit codes and saved scan formats are unchanged.
+A passed package update and promotion to local main are separate outcomes. A failed build records deployment as skipped.
+
+## Breaking changes and upgrading
+
+`mm update` and `mm resolve` no longer open pull requests or need `gh`; resolve promotes to local `main`. A project without a configured test phase now fails `mm update` with exit code 4 instead of warning. `mm resolve --continue` with no saved failure exits 1. `mm scan` no longer prunes bookmarks. Saved scans gain `resolve_repair_base` and Gradle blocked rows.
+
+Before the first `mm update` after upgrading, run `mm scan` for every Gradle project, or delete its saved scan under `~/.mm/scan-results`. Scans saved by the previous engine hold Gradle targets that were never age-checked or validated, and Gradle advisories without targets. Resolve-owned READY findings left by the old pull-request flow are promoted to local `main` by the next `mm resolve`. If that pull request was already merged, run `mm scan PROJECT` instead, so local `main` does not diverge from `origin`. `~/.mm/gradle-runs` and `~/.mm/gradle-contexts` are unused and can be deleted.
 
 ## Application contract 
 
@@ -185,7 +191,7 @@ mm edits catalogue library and plugin versions through the update plugin. Every 
 
 Simple literal versions and simple `version.ref` declarations are supported. Rich or ambiguous declarations remain blocked. A library without a catalogue version stays under platform or BOM control and never acquires a version. SDK, compileSdk/targetSdk, Gradle-wrapper, dependency-override and hard-coded declaration changes require manual preparation.
 
-A direct security fix requires an exact advisory fix version, or one unambiguous version on the installed major/minor branch, followed by native Gradle validation. Transitive parent, BOM and plugin updates require an independently discovered catalogue proposal and unambiguous ownership in the covered resolution graph. Unsupported ownership remains visible as a prerequisite. Updating a parent or plugin does not by itself mark its child advisories fixed.
+A direct security fix requires an exact advisory fix version, or one unambiguous version on the installed major/minor branch, followed by native Gradle validation. Transitive parent, BOM and plugin updates require an independently discovered catalogue proposal and unambiguous ownership in the covered resolution graph. Unsupported ownership remains visible as a prerequisite. An advisory with a published fix is completed when the catalogue target that owns it is applied and tested; the next `mm scan` reports anything still open. An advisory without a published fix is saved as blocked and never applied.
 
 ### Release-age policy
 

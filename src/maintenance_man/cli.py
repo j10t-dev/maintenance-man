@@ -1032,9 +1032,16 @@ def _print_numbered_findings(
     ]
     rows = []
     for finding in numbered:
+        owner = ""
         if isinstance(finding, VulnFinding):
             kind = "! vuln"
             risk = f"{finding.severity.value.lower()} · {finding.vuln_id}"
+            if finding.gradle_target is not None:
+                target = finding.gradle_target
+                owner = (
+                    f" via {target.display_name} "
+                    f"{target.members[0].installed_version} → {target.target_version}"
+                )
         else:
             kind = "~ update"
             risk = finding.semver_tier.value
@@ -1043,7 +1050,7 @@ def _print_numbered_findings(
                 kind,
                 risk,
                 f"{finding.installed_version} → {finding.target_version}",
-                finding.pkg_name,
+                finding.pkg_name + owner,
             )
         )
     output.choices(rows)

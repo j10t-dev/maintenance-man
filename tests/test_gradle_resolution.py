@@ -741,6 +741,32 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
     assert selected.publication_requests == ()
 
 
+def test_given_no_fix_advisory_on_same_owner_when_selected_then_fixed_one_qualifies(
+    tmp_path,
+):
+    catalogue, resolution = ownership_graph(tmp_path)
+    advisories = [
+        VulnFinding(
+            vuln_id=vuln_id,
+            pkg_name="g:parent",
+            installed_version="1.0.0",
+            fixed_version=fixed_version,
+            severity=Severity.HIGH,
+            title="example",
+            description="example",
+            status="affected",
+        )
+        for vuln_id, fixed_version in (("CVE-2030-1", "1.0.1"), ("CVE-2030-2", None))
+    ]
+
+    result = select_gradle_candidates(catalogue, resolution, advisories, [])
+
+    assert result.withheld == ()
+    assert [
+        (c.target.group_key, c.vulnerability_indices) for c in result.candidates
+    ] == [("ref:a", (0,))]
+
+
 def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
     catalogue, resolution = ownership_graph(tmp_path)
     discovered = [

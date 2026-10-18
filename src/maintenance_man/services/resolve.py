@@ -225,6 +225,7 @@ def _run_candidates(
     vcs: VcsServices,
     emit: Emit,
 ) -> Outcome:
+    blocked_before_run = scan_result.blocked_findings
     results = process_findings(
         candidates,
         project,
@@ -240,13 +241,12 @@ def _run_candidates(
         emit(ResolvePaused(name))
         return Outcome.FAILED
 
-    blocked = scan_result.blocked_findings
-    if blocked:
+    if blocked_before_run:
         emit(
             FindingsBlocked(
                 tuple(
                     (finding.pkg_name, finding.blocked_reason or "")
-                    for finding in blocked
+                    for finding in blocked_before_run
                 )
             )
         )

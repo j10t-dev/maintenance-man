@@ -112,11 +112,11 @@ def _first_non_none(values: Sequence[str | Workflow | None]):
 def _consolidated_lifecycle_state(
     group: Sequence[VulnFinding | UpdateFinding],
 ) -> tuple[UpdateStatus | None, str | None, Workflow | None]:
-    """Collapse a group of consolidated VulnFindings into one lifecycle state.
+    """Collapse rows applied as one change into one lifecycle state.
 
-    Findings that share a package and fix target are processed as a single
-    upgrade; this helper picks the representative status (plus failed_phase
-    and flow) for the whole group:
+    Vulnerabilities sharing a package, or rows sharing a catalogue target, are
+    applied as a single change; this helper picks the representative status
+    (plus failed_phase and flow) for the whole group:
 
     * any FAILED  → FAILED with the first failed finding's phase/flow
     * else any READY → READY with the first ready finding's phase/flow

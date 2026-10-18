@@ -132,8 +132,8 @@ def apply_gradle_update(
     Returns a typed block — and runs no command — when the target or catalogue
     has drifted.  Returns None after a verified apply.  Raises GradleError for
     command, invalid-output or post-mutation safety failures, because mutation
-    may already have begun.  The caller must perform the current age check
-    first; this function has no VCS side effects.
+    may already have begun.  Age and routing eligibility are decided by
+    ``mm scan``; this function has no VCS side effects.
     """
     root = Path(project.path)
     catalogue_path = root / GRADLE_CATALOGUE_RELPATH

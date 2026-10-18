@@ -803,7 +803,9 @@ class TestUpdateAll:
         (
             "promote_bookmark_to_main",
             "out",
-            "vulnerable\tpromotion\tfailed\tlocal main\t-\t-\tinjected",
+            "vulnerable\tpromotion\tfailed\tlocal main\t-\t-\t"
+            "injected · rebase with jj rebase -b mm/update-dependencies "
+            "-d main, then rerun",
         ),
         (
             "working_copy_state",

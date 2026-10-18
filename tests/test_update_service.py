@@ -463,7 +463,12 @@ def test_finalisation_failures_emit_operation_and_fail(
     )
 
     assert result.outcome is Outcome.FAILED
-    assert OperationFailed(operation, "api", "blocked") in emit.events
+    expected_error = (
+        "blocked · rebase with jj rebase -b mm/update-dependencies -d main, then rerun"
+        if operation is Operation.PROMOTE
+        else "blocked"
+    )
+    assert OperationFailed(operation, "api", expected_error) in emit.events
     if operation is Operation.PROMOTE:
         repo = state.services().repository(project.path)
         assert repo.bookmark_exists(bookmark="mm/update-dependencies")
