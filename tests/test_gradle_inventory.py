@@ -106,29 +106,29 @@ class TestLoadInventory:
             with pytest.raises(GradleError, match=r"1.5 or later"):
                 load_inventory(bom)
 
-    def test_malformed_inventory_json_is_an_error(self, tmp_path):
-        bom = tmp_path / "bom.json"
-        bom.write_text("{not json", encoding="utf-8")
-
-        with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-            load_inventory(bom)
-
     @pytest.mark.parametrize(
-        "document",
+        "payload",
         [
-            [],
-            None,
-            {"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [None]},
-            {
-                "bomFormat": "CycloneDX",
-                "specVersion": "1.6",
-                "components": {"purl": "pkg:maven/g/a@1"},
-            },
+            b"{not json",
+            b"\xff\xfe",
+            b"[]",
+            b"null",
+            b'{"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [null]}',
+            b'{"bomFormat": "CycloneDX", "specVersion": "1.6", '
+            b'"components": {"purl": "pkg:maven/g/a@1"}}',
+        ],
+        ids=[
+            "invalid-json",
+            "undecodable-bytes",
+            "array",
+            "null",
+            "null-component",
+            "components-not-an-array",
         ],
     )
-    def test_malformed_inventory_structure_is_a_gradle_error(self, tmp_path, document):
+    def test_malformed_inventory_structure_is_a_gradle_error(self, tmp_path, payload):
         bom = tmp_path / "bom.json"
-        bom.write_text(json.dumps(document), encoding="utf-8")
+        bom.write_bytes(payload)
 
         with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
             load_inventory(bom)
@@ -145,37 +145,9 @@ def test_load_inventory_returns_the_original_bytes(tmp_path):
     assert inventory.components
 
 
-def test_load_inventory_rejects_undecodable_bytes(tmp_path):
-    bom = tmp_path / "bom.json"
-    bom.write_bytes(b"\xff\xfe")
-    with pytest.raises(GradleError, match="malformed CycloneDX inventory"):
-        load_inventory(bom)
-
-
 def test_parse_inventory_text_labels_errors_with_its_source():
     with pytest.raises(GradleError, match="memory-bom is not a CycloneDX document"):
         parse_inventory_text('{"bomFormat": "other"}', source="memory-bom")
-
-
-def test_construction_defers_nested_identity_validation():
-    inventory = parse_inventory_text(
-        json.dumps(
-            {
-                "bomFormat": "CycloneDX",
-                "specVersion": "1.6",
-                "components": [
-                    {
-                        "type": "library",
-                        "purl": "pkg:maven/g/lib@1",
-                        "components": [{"purl": 42}],
-                    }
-                ],
-            }
-        ),
-        source="memory-bom",
-    )
-    with pytest.raises(GradleError, match="Malformed CycloneDX inventory"):
-        bind_inventory(inventory, _report({SCOPE: [_module("lib")]}))
 
 
 def test_bind_reports_missing_and_extra_modules_in_order():
@@ -262,6 +234,14 @@ def test_bind_refuses_unverified_local_identity(purl):
             "components must be an array",
         ),
         ({"purl": "pkg:maven/g/lib@1", "components": [3]}, "must be an object"),
+        (
+            {
+                "type": "library",
+                "purl": "pkg:maven/g/lib@1",
+                "components": [{"purl": 42}],
+            },
+            "purl must be a string",
+        ),
     ],
 )
 def test_bind_rejects_malformed_nested_identity(component, message):

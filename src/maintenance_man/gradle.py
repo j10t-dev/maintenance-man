@@ -4,8 +4,6 @@ Runs the project's wrapper, parses catalogue declarations and update reports,
 groups shared versions, and manages adapter-owned temporary outputs.
 """
 
-from __future__ import annotations
-
 import hashlib
 import os
 import re
@@ -51,6 +49,10 @@ _DISCOVER_ARGS = [
     "--console=plain",
 ]
 _UNSAFE_TEXT_RE = re.compile(r"[\x00-\x1f\x7f]")
+_REPORT_TABLES: tuple[tuple[str, GradleKind, int, str], ...] = (
+    ("libraries", "library", 2, "group:artifact:version"),
+    ("plugins", "plugin", 1, "plugin.id:version"),
+)
 
 
 class GradleError(Exception):
@@ -357,38 +359,23 @@ def parse_update_report_text(
         raise GradleError(msg) from e
 
     proposals: list[ReportProposal] = []
-    for alias, value in _table(raw, "libraries", source).items():
-        if not isinstance(value, str) or value.count(":") != 2:
-            msg = (
-                f"malformed library entry '{alias}' in {source}: expected "
-                f"'group:artifact:version', got {value!r}"
+    for table, kind, separators, shape in _REPORT_TABLES:
+        for alias, value in _table(raw, table, source).items():
+            if not isinstance(value, str) or value.count(":") != separators:
+                msg = (
+                    f"malformed {kind} entry '{alias}' in {source}: expected "
+                    f"'{shape}', got {value!r}"
+                )
+                raise GradleError(msg)
+            coordinate, version = value.rsplit(":", 1)
+            proposals.append(
+                ReportProposal(
+                    kind=kind,
+                    alias=assert_safe_text(alias, "report alias"),
+                    coordinate=assert_safe_text(coordinate, "report coordinate"),
+                    version=assert_safe_text(version, "report version"),
+                )
             )
-            raise GradleError(msg)
-        group, name, version = value.split(":")
-        proposals.append(
-            ReportProposal(
-                kind="library",
-                alias=assert_safe_text(alias, "report alias"),
-                coordinate=assert_safe_text(f"{group}:{name}", "report coordinate"),
-                version=assert_safe_text(version, "report version"),
-            )
-        )
-    for alias, value in _table(raw, "plugins", source).items():
-        if not isinstance(value, str) or value.count(":") != 1:
-            msg = (
-                f"malformed plugin entry '{alias}' in {source}: expected "
-                f"'plugin.id:version', got {value!r}"
-            )
-            raise GradleError(msg)
-        plugin_id, version = value.split(":")
-        proposals.append(
-            ReportProposal(
-                kind="plugin",
-                alias=assert_safe_text(alias, "report alias"),
-                coordinate=assert_safe_text(plugin_id, "report coordinate"),
-                version=assert_safe_text(version, "report version"),
-            )
-        )
     return proposals
 
 
@@ -402,17 +389,7 @@ def build_update_findings(
 
     for proposal in proposals:
         entry = catalogue.entry(proposal.kind, proposal.alias)
-        if entry is None:
-            findings.append(
-                _blocked_finding(
-                    proposal.alias,
-                    proposal.version,
-                    "mapping",
-                    f"report alias '{proposal.alias}' is not in the source catalogue",
-                )
-            )
-            continue
-        if entry.coordinate != proposal.coordinate:
+        if entry is not None and entry.coordinate != proposal.coordinate:
             findings.append(
                 _known_group_block(
                     catalogue,
@@ -429,38 +406,15 @@ def build_update_findings(
                 )
             )
             continue
-        if entry.unsupported is not None:
-            findings.append(
-                _blocked_finding(
-                    entry.alias, proposal.version, "mapping", entry.unsupported
-                )
-            )
+        block = _proposal_block(catalogue, entry, proposal)
+        if block is not None:
+            name, reason = block
+            findings.append(_blocked_finding(name, proposal.version, "mapping", reason))
             continue
 
+        assert entry is not None
         version = catalogue.version_of(entry)
-        if version is None:
-            findings.append(
-                _blocked_finding(
-                    entry.alias,
-                    proposal.version,
-                    "mapping",
-                    f"'{entry.alias}' has no catalogue version (platform/BOM managed); "
-                    f"mm does not give it one",
-                )
-            )
-            continue
-        if version.value is None:
-            findings.append(
-                _blocked_finding(
-                    version.name,
-                    proposal.version,
-                    "mapping",
-                    version.unsupported
-                    or f"version '{version.name}' is not a simple literal",
-                )
-            )
-            continue
-
+        assert version is not None
         key = group_key_for(entry.kind, entry.alias, entry.version_ref)
         grouped.setdefault(key, []).append((entry, proposal))
         group_refs[key] = version.name if entry.version_ref is not None else None
@@ -471,6 +425,33 @@ def build_update_findings(
         findings.append(finding)
 
     return sorted(findings, key=lambda f: f.pkg_name)
+
+
+def _proposal_block(
+    catalogue: Catalogue, entry: CatalogueEntry | None, proposal: ReportProposal
+) -> tuple[str, str] | None:
+    """The name and reason a proposal cannot be applied, or None when it maps to a
+    simple catalogue version."""
+    if entry is None:
+        return (
+            proposal.alias,
+            f"report alias '{proposal.alias}' is not in the source catalogue",
+        )
+    if entry.unsupported is not None:
+        return entry.alias, entry.unsupported
+    version = catalogue.version_of(entry)
+    if version is None:
+        return (
+            entry.alias,
+            f"'{entry.alias}' has no catalogue version (platform/BOM managed); "
+            f"mm does not give it one",
+        )
+    if version.value is None:
+        return (
+            version.name,
+            version.unsupported or f"version '{version.name}' is not a simple literal",
+        )
+    return None
 
 
 @contextmanager
@@ -710,15 +691,10 @@ def _group_finding(
     target_version = assert_safe_text(versions.pop(), "target version")
     installed = catalogue.version_of(entries[0])
     assert installed is not None and installed.value is not None
-    members = [
-        GradleMember(
-            kind=entry.kind,
-            alias=assert_safe_text(entry.alias, "catalogue alias"),
-            coordinate=assert_safe_text(entry.coordinate, "catalogue coordinate"),
-            installed_version=installed.value,
-        )
-        for entry in entries
-    ]
+    for entry in entries:
+        assert_safe_text(entry.alias, "catalogue alias")
+        assert_safe_text(entry.coordinate, "catalogue coordinate")
+    members = _members(entries, installed.value)
     return UpdateFinding(
         pkg_name=display,
         installed_version=installed.value,
@@ -749,18 +725,23 @@ def _known_group_block(
     if installed is not None and installed.value is not None:
         finding.gradle_target = GradleUpdateTarget(
             version_ref=version_ref,
-            members=[
-                GradleMember(
-                    kind=entry.kind,
-                    alias=entry.alias,
-                    coordinate=entry.coordinate,
-                    installed_version=installed.value,
-                )
-                for entry in entries
-            ],
+            members=_members(entries, installed.value),
             target_version=installed.value,
         )
     return finding
+
+
+def _members(entries: list[CatalogueEntry], installed: str) -> list[GradleMember]:
+    """Target members for catalogue entries that share one installed version."""
+    return [
+        GradleMember(
+            kind=entry.kind,
+            alias=entry.alias,
+            coordinate=entry.coordinate,
+            installed_version=installed,
+        )
+        for entry in entries
+    ]
 
 
 def _blocked_finding(
@@ -1003,96 +984,57 @@ def _validate_catalogue_member_version(
 def _assert_only_target_changed(
     before: Catalogue, after: Catalogue, target: GradleUpdateTarget
 ) -> None:
-    """The semantic change must be exactly the intended version group.
+    """The parsed catalogue after apply must equal the parsed catalogue before
+    it with only the target's members and version reference at the target
+    version; formatting, comments and coordinate notation are not compared."""
+    expected = _catalogue_view(before, target, at_target=True)
+    actual = _catalogue_view(after, target, at_target=False)
+    differences = sorted(
+        key
+        for key in expected.keys() | actual.keys()
+        if key not in expected or key not in actual or expected[key] != actual[key]
+    )
+    if differences:
+        msg = (
+            "versionCatalogApplyUpdates did not produce exactly the selected "
+            f"change; differs at: {', '.join(differences)}"
+        )
+        raise GradleError(msg)
 
-    Formatting, comment loss and equivalent coordinate notation are accepted
-    because both sides are compared as parsed models, not as text.
+
+def _catalogue_view(
+    catalogue: Catalogue, target: GradleUpdateTarget, *, at_target: bool
+) -> dict[str, object]:
+    """Each alias, version entry and preserved section as a comparable value.
+
+    With *at_target*, the target's members and version reference read as the
+    target version. Only selected members carry their unsupported reason,
+    because only they must keep a simple version.
     """
-    if before.preserved_semantics != after.preserved_semantics:
-        msg = (
-            "versionCatalogApplyUpdates changed bundles or unsupported "
-            "catalogue declarations"
-        )
-        raise GradleError(msg)
-    changed = {
-        (member.kind, normalise_alias(member.alias)) for member in target.members
+    selected = {(m.kind, normalise_alias(m.alias)) for m in target.members}
+    selected_ref = normalise_alias(target.version_ref) if target.version_ref else None
+    view: dict[str, object] = {
+        f"preserved {name}": value
+        for name, value in catalogue.preserved_semantics.items()
     }
-    if set(before.entries) != set(after.entries):
-        msg = (
-            "versionCatalogApplyUpdates added or removed catalogue aliases; "
-            "the catalogue change was not the selected group"
+    for key, entry in catalogue.entries.items():
+        chosen = key in selected
+        version = (
+            target.target_version
+            if chosen and at_target
+            else _version_value(catalogue, entry)
         )
-        raise GradleError(msg)
-
-    for key, old in before.entries.items():
-        _assert_alias_change(
-            before,
-            after,
-            old,
-            selected=key in changed,
-            target_version=target.target_version,
+        unsupported = entry.unsupported if chosen and not at_target else None
+        view[f"{key[0]} {key[1]}"] = (
+            entry.coordinate,
+            _ref_key(entry),
+            version,
+            unsupported,
         )
-
-    if set(before.versions) != set(after.versions):
-        msg = "versionCatalogApplyUpdates added or removed version entries"
-        raise GradleError(msg)
-
-    changed_ref = normalise_alias(target.version_ref) if target.version_ref else None
-    for name, old_version in before.versions.items():
-        _assert_named_version_change(
-            old_version,
-            after.versions[name],
-            selected=name == changed_ref,
-            target_version=target.target_version,
-        )
-
-
-def _assert_alias_change(
-    before: Catalogue,
-    after: Catalogue,
-    old: CatalogueEntry,
-    *,
-    selected: bool,
-    target_version: str,
-) -> None:
-    new = after.entries[old.key]
-    if old.coordinate != new.coordinate or _ref_key(old) != _ref_key(new):
-        msg = (
-            f"alias '{old.alias}' changed identity during apply: "
-            f"{old.coordinate}/{_ref_key(old)} -> {new.coordinate}/{_ref_key(new)}"
-        )
-        raise GradleError(msg)
-    old_value = _version_value(before, old)
-    new_value = _version_value(after, new)
-    if selected and (new.unsupported is not None or new_value is None):
-        msg = f"selected alias {new.alias!r} no longer has a simple version"
-        raise GradleError(msg)
-    if selected and new_value != target_version:
-        msg = f"'{old.alias}' is {new_value!r} after apply, expected {target_version!r}"
-        raise GradleError(msg)
-    if not selected and old_value != new_value:
-        msg = f"unexpected change to '{old.alias}': {old_value!r} -> {new_value!r}"
-        raise GradleError(msg)
-
-
-def _assert_named_version_change(
-    old: CatalogueVersion,
-    new: CatalogueVersion,
-    *,
-    selected: bool,
-    target_version: str,
-) -> None:
-    if selected and new.value != target_version:
-        msg = (
-            f"version '{old.name}' is {new.value!r} after apply, "
-            f"expected {target_version!r}"
-        )
-        raise GradleError(msg)
-    if not selected and new.value != old.value:
-        msg = (
-            f"unexpected change to version '{old.name}': {old.value!r} -> {new.value!r}"
-        )
-        raise GradleError(msg)
+    for name, version in catalogue.versions.items():
+        at = at_target and name == selected_ref
+        view[f"version {name}"] = target.target_version if at else version.value
+    return view
 
 
 def _version_value(catalogue: Catalogue, entry: CatalogueEntry) -> str | None:

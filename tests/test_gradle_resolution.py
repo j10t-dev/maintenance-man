@@ -19,6 +19,8 @@ from maintenance_man.gradle import (
 )
 from maintenance_man.gradle_resolution import (
     ROUTING_UNDECLARED,
+    _report_command,
+    _validation_requests,
     attach_gradle_publications,
     exact_fix_candidate,
     generate_gradle_report,
@@ -30,9 +32,7 @@ from maintenance_man.gradle_resolution import (
 )
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
-    CandidateValidation,
     CandidateValidationBatch,
-    CandidateWithheld,
     CompleteResolution,
     GradleCandidate,
     IncompleteResolution,
@@ -41,20 +41,21 @@ from maintenance_man.models.gradle import (
     PublicationFact,
     PublicationRequest,
     RepositoryDeclaration,
+    ResolutionEdge,
     ResolutionReport,
     ResolvedComponent,
     ScopeId,
     ScopeResolution,
+    UnknownOwner,
 )
-from maintenance_man.models.scan import (
-    GradleMember,
-    GradleUpdateTarget,
-    Severity,
-    VulnFinding,
-)
+from maintenance_man.models.scan import Severity, VulnFinding
 from tests.support.clock import FakeClock
-from tests.support.findings import make_vuln
-from tests.support.gradle import fixture_runner, report_payload
+from tests.support.findings import make_gradle_member, make_gradle_target, make_vuln
+from tests.support.gradle import (
+    fixture_runner,
+    make_gradle_candidate,
+    report_payload,
+)
 from tests.support.process import completed
 from tests.support.projects import make_project
 
@@ -186,17 +187,13 @@ def test_fix_tokens_have_one_exact_branch_candidate(installed, fixes, expected):
     assert exact_fix_candidate(installed, fixes) == expected
 
 
-def ownership_graph(
-    tmp_path,
-    *,
-    ambiguous=False,
-    constraint=False,
-    domain="project",
-    longer_path=False,
-    overlapping=False,
-    cycle=False,
-    converging=False,
-):
+BASE_EDGES = [("root", "parent"), ("parent", "child")]
+
+
+def resolution_graph(tmp_path, edges, *, domain="project"):
+    """Catalogue a -> g:parent and b -> g:other, plus one scope holding every edge
+    endpoint; an edge is (source, target) or (source, target, "constraint"), and
+    "child" resolves at 2.0.0, every other module at 1.0.0."""
     (tmp_path / "libs.toml").write_text(
         """
 [versions]
@@ -208,190 +205,111 @@ b = { module = "g:other", version.ref = "b" }
 """
     )
     catalogue = parse_catalogue(tmp_path / "libs.toml")
+
+    def version(name):
+        return "2.0.0" if name == "child" else "1.0.0"
+
     raw = report_payload()
     raw["selected_scopes"][0]["domain"] = domain
     scope = raw["scopes"][0]
     scope["scope"]["domain"] = domain
+    names = dict.fromkeys(
+        name for source, target, *_ in edges for name in (source, target)
+    )
     scope["components"] += [
         {
-            "id": "parent",
+            "id": name,
             "kind": "module",
-            "module": {"group": "g", "artifact": "parent", "version": "1.0.0"},
+            "module": {"group": "g", "artifact": name, "version": version(name)},
             "variants": ["runtime"],
-        },
-        {
-            "id": "child",
-            "kind": "module",
-            "module": {"group": "g", "artifact": "child", "version": "2.0.0"},
-            "variants": ["runtime"],
-        },
+        }
+        for name in names
+        if name != "root"
     ]
     scope["edges"] = [
         {
-            "source": "root",
-            "target": "parent",
-            "requested": "g:parent:1.0.0",
-            "constraint": False,
-        },
-        {
-            "source": "parent",
-            "target": "child",
-            "requested": "g:child:2.0.0",
-            "constraint": constraint,
-        },
+            "source": source,
+            "target": target,
+            "requested": f"g:{target}:{version(target)}",
+            "constraint": bool(constraint),
+        }
+        for source, target, *constraint in edges
     ]
-    if cycle:
-        scope["edges"].append(
-            {
-                "source": "child",
-                "target": "parent",
-                "requested": "g:parent:1.0.0",
-                "constraint": False,
-            }
-        )
-    if converging:
-        scope["components"] += [
-            {
-                "id": name,
-                "kind": "module",
-                "module": {"group": "g", "artifact": name, "version": "1.0.0"},
-                "variants": [],
-            }
-            for name in ("constrained-bridge", "unconstrained-bridge")
-        ]
-        scope["edges"] = [
-            scope["edges"][0],
-            {
-                "source": "parent",
-                "target": "constrained-bridge",
-                "requested": "g:constrained-bridge:1.0.0",
-                "constraint": True,
-            },
-            {
-                "source": "constrained-bridge",
-                "target": "child",
-                "requested": "g:child:2.0.0",
-                "constraint": False,
-            },
-            {
-                "source": "parent",
-                "target": "unconstrained-bridge",
-                "requested": "g:unconstrained-bridge:1.0.0",
-                "constraint": False,
-            },
-            {
-                "source": "unconstrained-bridge",
-                "target": "child",
-                "requested": "g:child:2.0.0",
-                "constraint": False,
-            },
-        ]
-    if ambiguous:
-        scope["components"].append(
-            {
-                "id": "other",
-                "kind": "module",
-                "module": {"group": "g", "artifact": "other", "version": "1.0.0"},
-                "variants": [],
-            }
-        )
-        scope["edges"] += [
-            {
-                "source": "root",
-                "target": "other",
-                "requested": "g:other:1.0.0",
-                "constraint": False,
-            },
-            {
-                "source": "other",
-                "target": "child",
-                "requested": "g:child:2.0.0",
-                "constraint": False,
-            },
-        ]
-        if overlapping:
-            scope["edges"][-1] = {
-                "source": "other",
-                "target": "parent",
-                "requested": "g:parent:1.0.0",
-                "constraint": False,
-            }
-        elif longer_path:
-            scope["components"].append(
-                {
-                    "id": "intermediate",
-                    "kind": "module",
-                    "module": {
-                        "group": "g",
-                        "artifact": "intermediate",
-                        "version": "1.0.0",
-                    },
-                    "variants": [],
-                }
-            )
-            scope["edges"][-1] = {
-                "source": "other",
-                "target": "intermediate",
-                "requested": "g:intermediate:1.0.0",
-                "constraint": False,
-            }
-            scope["edges"].append(
-                {
-                    "source": "intermediate",
-                    "target": "child",
-                    "requested": "g:child:2.0.0",
-                    "constraint": False,
-                }
-            )
     result = parse_resolution_report(json.dumps(raw))
     assert isinstance(result, CompleteResolution)
     return catalogue, result
 
 
 @pytest.mark.parametrize(
-    "ambiguous,constraint,longer_path,overlapping,cycle,converging,affected,kind,group",
+    "edges, affected, expected",
     [
-        (False, False, False, False, False, False, "child", "parent", "ref:a"),
-        (False, True, False, False, False, False, "child", "platform", "ref:a"),
-        (False, False, False, False, True, False, "child", "parent", "ref:a"),
-        (False, False, False, False, False, True, "child", "parent", "ref:a"),
-        (True, False, False, False, False, False, "child", "unknown", None),
-        (True, False, True, False, False, False, "child", "unknown", None),
-        (True, False, False, True, False, False, "child", "unknown", None),
-        (True, False, False, True, False, False, "parent", "unknown", None),
+        (BASE_EDGES, "child", (KnownOwner(kind="parent", group_key="ref:a"),)),
+        (
+            [("root", "parent"), ("parent", "child", "constraint")],
+            "child",
+            (KnownOwner(kind="platform", group_key="ref:a"),),
+        ),
+        (
+            [*BASE_EDGES, ("child", "parent")],
+            "child",
+            (KnownOwner(kind="parent", group_key="ref:a"),),
+        ),
+        (
+            [
+                ("root", "parent"),
+                ("parent", "constrained-bridge", "constraint"),
+                ("constrained-bridge", "child"),
+                ("parent", "unconstrained-bridge"),
+                ("unconstrained-bridge", "child"),
+            ],
+            "child",
+            (KnownOwner(kind="parent", group_key="ref:a"),),
+        ),
+        (
+            [*BASE_EDGES, ("root", "other"), ("other", "child")],
+            "child",
+            (UnknownOwner(),),
+        ),
+        (
+            [
+                *BASE_EDGES,
+                ("root", "other"),
+                ("other", "intermediate"),
+                ("intermediate", "child"),
+            ],
+            "child",
+            (UnknownOwner(),),
+        ),
+        (
+            [*BASE_EDGES, ("root", "other"), ("other", "parent")],
+            "child",
+            (UnknownOwner(),),
+        ),
+        (
+            [*BASE_EDGES, ("root", "other"), ("other", "parent")],
+            "parent",
+            (UnknownOwner(),),
+        ),
+    ],
+    ids=[
+        "chain",
+        "constraint",
+        "cycle",
+        "converging",
+        "second-owner",
+        "second-owner-longer-path",
+        "overlapping-child",
+        "overlapping-parent",
     ],
 )
-def test_actual_edges_establish_unique_owner(
-    tmp_path,
-    ambiguous,
-    constraint,
-    longer_path,
-    overlapping,
-    cycle,
-    converging,
-    affected,
-    kind,
-    group,
+def test_given_resolved_edges_when_owners_resolved_then_one_owner_or_unknown(
+    tmp_path, edges, affected, expected
 ):
-    catalogue, result = ownership_graph(
-        tmp_path,
-        ambiguous=ambiguous,
-        constraint=constraint,
-        longer_path=longer_path,
-        overlapping=overlapping,
-        cycle=cycle,
-        converging=converging,
-    )
-    module = ModuleId(
-        group="g",
-        artifact=affected,
-        version="1.0.0" if affected == "parent" else "2.0.0",
-    )
-    owners = resolve_gradle_owners(catalogue, result, module)
-    assert len(owners) == 1
-    assert owners[0].kind == kind
-    if isinstance(owners[0], KnownOwner):
-        assert owners[0].group_key == group
+    catalogue, result = resolution_graph(tmp_path, edges)
+    version = "1.0.0" if affected == "parent" else "2.0.0"
+    module = ModuleId(group="g", artifact=affected, version=version)
+
+    assert resolve_gradle_owners(catalogue, result, module) == expected
 
 
 def plugin_marker_graph(tmp_path, *, domain="buildscript", failure=None):
@@ -474,23 +392,20 @@ plugin = { id = "com.example.plugin", version.ref = "plugin" }
 
 
 @pytest.mark.parametrize(
-    "domain,kind,group",
+    "domain,expected",
     [
-        ("buildscript", "plugin", "ref:plugin"),
-        ("project", "unknown", None),
+        ("buildscript", (KnownOwner(kind="plugin", group_key="ref:plugin"),)),
+        ("project", (UnknownOwner(),)),
     ],
 )
-def test_plugin_marker_owner_is_limited_to_buildscript(tmp_path, domain, kind, group):
+def test_plugin_marker_owner_is_limited_to_buildscript(tmp_path, domain, expected):
     catalogue, resolution = plugin_marker_graph(tmp_path, domain=domain)
     owners = resolve_gradle_owners(
         catalogue,
         resolution,
         ModuleId(group="com.example", artifact="implementation", version="2.0.0"),
     )
-    assert len(owners) == 1
-    assert owners[0].kind == kind
-    if isinstance(owners[0], KnownOwner):
-        assert owners[0].group_key == group
+    assert owners == expected
 
 
 @pytest.mark.parametrize("failure", ["two_edges", "range", "mismatch"])
@@ -501,25 +416,15 @@ def test_plugin_marker_requires_one_exact_implementation_edge(tmp_path, failure)
         resolution,
         ModuleId(group="com.example", artifact="implementation", version="2.0.0"),
     )
-    assert len(owners) == 1
-    assert owners[0].kind == "unknown"
+    assert owners == (UnknownOwner(),)
 
 
 def candidate():
-    return GradleCandidate(
-        target=GradleUpdateTarget(
-            version_ref="a",
-            members=[
-                GradleMember(
-                    kind="library",
-                    alias="a",
-                    coordinate="g:parent",
-                    installed_version="1.0.0",
-                )
-            ],
-            target_version="1.0.1",
-        ),
-        origins=frozenset({"ordinary"}),
+    member = make_gradle_member(
+        alias="a", coordinate="g:parent", installed_version="1.0.0"
+    )
+    return make_gradle_candidate(
+        make_gradle_target(version_ref="a", members=[member], target_version="1.0.1")
     )
 
 
@@ -574,7 +479,7 @@ def test_metadata_batch_is_complete_and_does_not_mutate(tmp_path, response_kind)
 
 
 def test_parent_never_invents_version_from_child_fix(tmp_path):
-    catalogue, resolution = ownership_graph(tmp_path)
+    catalogue, resolution = resolution_graph(tmp_path, BASE_EDGES)
     finding = VulnFinding(
         vuln_id="CVE-2030-1",
         pkg_name="g:child",
@@ -655,7 +560,7 @@ def test_given_underscored_version_ref_when_selected_then_rows_share_one_candida
 def test_given_advisory_owned_in_two_scopes_when_selected_then_each_owner_lists_it(
     tmp_path,
 ):
-    catalogue, base = ownership_graph(tmp_path)
+    catalogue, base = resolution_graph(tmp_path, BASE_EDGES)
     raw = base.report.model_dump(mode="json")
     first = raw["scopes"][0]
     second_id = {
@@ -714,7 +619,7 @@ def test_given_advisory_owned_in_two_scopes_when_selected_then_each_owner_lists_
 
 
 def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
-    catalogue, resolution = ownership_graph(tmp_path)
+    catalogue, resolution = resolution_graph(tmp_path, BASE_EDGES)
     finding = VulnFinding(
         vuln_id="CVE-2030-1",
         pkg_name="g:parent",
@@ -729,22 +634,19 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
     result = select_gradle_candidates(catalogue, resolution, [finding], [])
 
     assert result.withheld == ()
-    assert len(result.candidates) == 1
-    selected = result.candidates[0]
-    assert selected.target == candidate().target
-    assert selected.origins == frozenset({"security"})
-    assert selected.vulnerability_indices == (0,)
-    assert selected.owner_keys == ("ref:a",)
-    assert selected.scopes == (
-        ScopeId(project_path=":", domain="project", configuration="runtimeClasspath"),
+    assert result.candidates == (
+        make_gradle_candidate(
+            candidate().target,
+            origins=frozenset({"security"}),
+            vulnerability_indices=(0,),
+        ),
     )
-    assert selected.publication_requests == ()
 
 
 def test_given_no_fix_advisory_on_same_owner_when_selected_then_fixed_one_qualifies(
     tmp_path,
 ):
-    catalogue, resolution = ownership_graph(tmp_path)
+    catalogue, resolution = resolution_graph(tmp_path, BASE_EDGES)
     advisories = [
         VulnFinding(
             vuln_id=vuln_id,
@@ -768,7 +670,7 @@ def test_given_no_fix_advisory_on_same_owner_when_selected_then_fixed_one_qualif
 
 
 def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
-    catalogue, resolution = ownership_graph(tmp_path)
+    catalogue, resolution = resolution_graph(tmp_path, BASE_EDGES)
     discovered = [
         build_update_findings(
             catalogue,
@@ -797,26 +699,16 @@ def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_r
 ):
     _write_gradle_project_files(tmp_path)
     project = make_project(tmp_path, package_manager="gradle")
-    selected = two_member_candidate().model_copy(
-        update={
-            "scopes": (
-                ScopeId(
-                    project_path=":app",
-                    domain="project",
-                    configuration="runtimeClasspath",
-                ),
-                ScopeId(
-                    project_path=":app",
-                    domain="project",
-                    configuration="compileClasspath",
-                ),
-                ScopeId(
-                    project_path=":lib",
-                    domain="project",
-                    configuration="runtimeClasspath",
-                ),
-            )
-        }
+    scopes = (
+        ScopeId(
+            project_path=":app", domain="project", configuration="runtimeClasspath"
+        ),
+        ScopeId(
+            project_path=":app", domain="project", configuration="compileClasspath"
+        ),
+        ScopeId(
+            project_path=":lib", domain="project", configuration="runtimeClasspath"
+        ),
     )
     root = ResolvedComponent(id="root", kind="root", module=None, variants=())
     library = ResolvedComponent(
@@ -828,12 +720,12 @@ def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_r
     resolution = CompleteResolution(
         report=_resolution_with_repositories(()).report.model_copy(
             update={
-                "selected_scopes": selected.scopes,
+                "selected_scopes": scopes,
                 "scopes": tuple(
                     ScopeResolution(
                         scope=scope, components=(root, library), edges=(), unresolved=()
                     )
-                    for scope in selected.scopes
+                    for scope in scopes
                 ),
             }
         )
@@ -862,7 +754,9 @@ def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_r
         "maintenance_man.gradle_resolution.run_gradle",
         side_effect=_validation_runner(respond),
     ):
-        result = validate_gradle_candidates(project, [selected], resolution)
+        result = validate_gradle_candidates(
+            project, [two_member_candidate()], resolution
+        )
 
     assert len(calls) == 1
     assert [
@@ -900,28 +794,31 @@ def _resolution_with_repositories(repositories):
     )
 
 
-def _two_library_candidate():
-    return GradleCandidate(
-        target=GradleUpdateTarget(
-            version_ref="grp",
-            members=[
-                GradleMember(
-                    kind="library",
-                    alias="a",
-                    coordinate="g:a",
-                    installed_version="1.0.0",
-                ),
-                GradleMember(
-                    kind="library",
-                    alias="b",
-                    coordinate="g:b",
-                    installed_version="1.0.0",
-                ),
-            ],
-            target_version="2.0.0",
-        ),
-        origins=frozenset({"ordinary"}),
+def _group_member(alias, kind="library"):
+    coordinate = f"g:{alias}" if kind == "library" else "com.example.plugin"
+    return make_gradle_member(
+        kind=kind, alias=alias, coordinate=coordinate, installed_version="1.0.0"
     )
+
+
+def _group_candidate(*members):
+    return make_gradle_candidate(
+        make_gradle_target(
+            version_ref="grp", members=list(members), target_version="2.0.0"
+        )
+    )
+
+
+def _two_library_candidate():
+    return _group_candidate(_group_member("a"), _group_member("b"))
+
+
+def _plugin_candidate():
+    return _group_candidate(_group_member("p", "plugin"))
+
+
+def two_member_candidate():
+    return _group_candidate(_group_member("a"), _group_member("p", "plugin"))
 
 
 def test_attach_gradle_publications_binds_scoped_repositories_and_modules():
@@ -951,30 +848,10 @@ def test_attach_gradle_publications_binds_scoped_repositories_and_modules():
         ),
     )
     resolution = _resolution_with_repositories(repositories)
-    batch = CandidateValidationBatch(
-        schema_version=1,
-        results=(
-            CandidateValidation(
-                kind="library",
-                request_id="0",
-                project_path=":app",
-                group_key="ref:grp",
-                alias="a",
-                selected_version="2.0.0",
-                implementation=None,
-                reason=None,
-            ),
-            CandidateValidation(
-                kind="library",
-                request_id="1",
-                project_path=":lib",
-                group_key="ref:grp",
-                alias="b",
-                selected_version="2.0.0",
-                implementation=None,
-                reason=None,
-            ),
-        ),
+    requests = _validation_requests((candidate,), resolution)
+    batch = _batch(
+        _success_row(requests[0], project_path=":app"),
+        _success_row(requests[1], project_path=":lib"),
     )
 
     result = attach_gradle_publications(candidate, resolution, batch)
@@ -990,85 +867,37 @@ def test_attach_gradle_publications_binds_scoped_repositories_and_modules():
 
 
 def test_attach_gradle_publications_withholds_when_a_row_is_missing():
-    candidate = GradleCandidate(
-        target=GradleUpdateTarget(
-            version_ref="grp",
-            members=[
-                GradleMember(
-                    kind="library",
-                    alias="a",
-                    coordinate="g:a",
-                    installed_version="1.0.0",
-                )
-            ],
-            target_version="2.0.0",
-        ),
-        origins=frozenset({"ordinary"}),
+    result = attach_gradle_publications(
+        _group_candidate(_group_member("a")),
+        _resolution_with_repositories(()),
+        _batch(),
     )
-    resolution = _resolution_with_repositories(())
-    batch = CandidateValidationBatch(schema_version=1, results=())
 
-    result = attach_gradle_publications(candidate, resolution, batch)
-
-    assert isinstance(result, CandidateWithheld)
-    assert result.reason == "missing native candidate validation"
-
-
-def _plugin_candidate():
-    return GradleCandidate(
-        target=GradleUpdateTarget(
-            version_ref="grp",
-            members=[
-                GradleMember(
-                    kind="plugin",
-                    alias="p",
-                    coordinate="com.example.plugin",
-                    installed_version="1.0.0",
-                )
-            ],
-            target_version="2.0.0",
-        ),
-        origins=frozenset({"ordinary"}),
-    )
+    assert result == "missing native candidate validation"
 
 
 def test_attach_gradle_publications_withholds_conflicting_marker_implementations():
     candidate = _plugin_candidate()
     resolution = _resolution_with_repositories(())
-    batch = CandidateValidationBatch(
-        schema_version=1,
-        results=(
-            CandidateValidation(
-                kind="plugin",
-                request_id="0",
-                project_path=":",
-                group_key="ref:grp",
-                alias="p",
-                selected_version="2.0.0",
-                implementation=ModuleId(
-                    group="com.example", artifact="impl", version="2.0.0"
-                ),
-                reason=None,
+    (request,) = _validation_requests((candidate,), resolution)
+    batch = _batch(
+        _success_row(
+            request,
+            implementation=ModuleId(
+                group="com.example", artifact="impl", version="2.0.0"
             ),
-            CandidateValidation(
-                kind="plugin",
-                request_id="1",
-                project_path=":",
-                group_key="ref:grp",
-                alias="p",
-                selected_version="2.0.0",
-                implementation=ModuleId(
-                    group="com.example", artifact="impl", version="3.0.0"
-                ),
-                reason=None,
+        ),
+        _success_row(
+            {**request, "request_id": "1"},
+            implementation=ModuleId(
+                group="com.example", artifact="impl", version="3.0.0"
             ),
         ),
     )
 
     result = attach_gradle_publications(candidate, resolution, batch)
 
-    assert isinstance(result, CandidateWithheld)
-    assert result.reason == "conflicting marker implementations"
+    assert result == "conflicting marker implementations"
 
 
 def test_attach_gradle_publications_builds_plugin_marker_module():
@@ -1086,58 +915,21 @@ def test_attach_gradle_publications_builds_plugin_marker_module():
         ),
     )
     resolution = _resolution_with_repositories(repositories)
-    batch = CandidateValidationBatch(
-        schema_version=1,
-        results=(
-            CandidateValidation(
-                kind="plugin",
-                request_id="0",
-                project_path=":",
-                group_key="ref:grp",
-                alias="p",
-                selected_version="2.0.0",
-                implementation=implementation,
-                reason=None,
-            ),
-        ),
-    )
+    (request,) = _validation_requests((candidate,), resolution)
+    batch = _batch(_success_row(request, implementation=implementation))
 
     result = attach_gradle_publications(candidate, resolution, batch)
 
     assert isinstance(result, GradleCandidate)
     assert len(result.publication_requests) == 1
-    request = result.publication_requests[0]
-    assert request.module == ModuleId(
+    publication = result.publication_requests[0]
+    assert publication.module == ModuleId(
         group="com.example.plugin",
         artifact="com.example.plugin.gradle.plugin",
         version="2.0.0",
     )
-    assert request.marker_implementation == implementation
-    assert request.repositories == ("portal",)
-
-
-def two_member_candidate():
-    return GradleCandidate(
-        target=GradleUpdateTarget(
-            version_ref="grp",
-            members=[
-                GradleMember(
-                    kind="library",
-                    alias="a",
-                    coordinate="g:a",
-                    installed_version="1.0.0",
-                ),
-                GradleMember(
-                    kind="plugin",
-                    alias="p",
-                    coordinate="com.example.plugin",
-                    installed_version="1.0.0",
-                ),
-            ],
-            target_version="2.0.0",
-        ),
-        origins=frozenset({"ordinary"}),
-    )
+    assert publication.marker_implementation == implementation
+    assert publication.repositories == ("portal",)
 
 
 def _success_row(request, **overrides):
@@ -1153,6 +945,12 @@ def _success_row(request, **overrides):
     }
     row.update(overrides)
     return row
+
+
+def _batch(*rows):
+    return CandidateValidationBatch.model_validate(
+        {"schema_version": 1, "results": rows}
+    )
 
 
 def _validation_runner(build_response):
@@ -1178,9 +976,6 @@ def _write_candidate_validation_response(directory, rows):
 def test_shared_members_validate_only_in_projects_that_resolve_them(
     tmp_path, security_only
 ):
-    from maintenance_man.gradle import ReportProposal, build_update_findings
-    from maintenance_man.models.gradle import ResolutionEdge
-
     _write_gradle_project_files(tmp_path)
     project = make_project(tmp_path, package_manager="gradle")
     catalogue_path = tmp_path / "gradle/libs.versions.toml"
@@ -1434,8 +1229,6 @@ def test_validate_gradle_candidates_refuses_catalogue_mutation(tmp_path):
 
 @pytest.mark.parametrize("task", ["mmGradleReport", "mmGradleValidateCandidates"])
 def test_both_report_tasks_use_the_shared_init_script_command(tmp_path, task):
-    from maintenance_man.gradle_resolution import _report_command
-
     _write_gradle_project_files(tmp_path)
     project = make_project(tmp_path, package_manager="gradle")
     script = tmp_path / ".mm-gradle-inventory" / "gradle-report.gradle"
@@ -1481,19 +1274,16 @@ def test_both_report_tasks_use_the_shared_init_script_command(tmp_path, task):
 
 
 def test_mixed_library_plugin_alias_keeps_member_validation_separate():
-    from maintenance_man.gradle_resolution import _validation_requests
-
-    candidate = GradleCandidate(
-        target=GradleUpdateTarget(
+    candidate = make_gradle_candidate(
+        make_gradle_target(
             version_ref="kotlin",
             members=[
-                GradleMember(
-                    kind="library",
+                make_gradle_member(
                     alias="kotlin",
                     coordinate="org.jetbrains.kotlin:kotlin-stdlib",
                     installed_version="2.0.0",
                 ),
-                GradleMember(
+                make_gradle_member(
                     kind="plugin",
                     alias="kotlin",
                     coordinate="org.jetbrains.kotlin.jvm",
@@ -1501,29 +1291,21 @@ def test_mixed_library_plugin_alias_keeps_member_validation_separate():
                 ),
             ],
             target_version="2.1.0",
-        ),
-        origins=frozenset({"ordinary"}),
+        )
     )
     implementation = ModuleId(
         group="org.jetbrains.kotlin", artifact="kotlin-gradle-plugin", version="2.1.0"
     )
-    batch = CandidateValidationBatch(
-        schema_version=1,
-        results=tuple(
-            CandidateValidation(
-                kind=request["kind"],
-                request_id=request["request_id"],
-                project_path=request["project_path"],
-                group_key=request["group_key"],
-                alias=request["alias"],
-                selected_version="2.1.0",
+    batch = _batch(
+        *(
+            _success_row(
+                request,
                 implementation=implementation if request["kind"] == "plugin" else None,
-                reason=None,
             )
             for request in _validation_requests(
                 (candidate,), _resolution_with_repositories(())
             )
-        ),
+        )
     )
     result = attach_gradle_publications(
         candidate, _resolution_with_repositories(()), batch
@@ -1541,20 +1323,9 @@ _MODULE = ModuleId(group="g", artifact="lib", version="2")
 
 
 def _age_candidate():
-    return GradleCandidate(
-        target=GradleUpdateTarget(
-            version_ref="lib",
-            members=[
-                GradleMember(
-                    kind="library",
-                    alias="lib",
-                    coordinate="g:lib",
-                    installed_version="1",
-                )
-            ],
-            target_version="2",
-        ),
-        origins=frozenset({"ordinary"}),
+    member = make_gradle_member(alias="lib", coordinate="g:lib", installed_version="1")
+    return make_gradle_candidate(
+        make_gradle_target(version_ref="lib", members=[member], target_version="2"),
         publication_requests=(
             PublicationRequest(
                 module=_MODULE, repositories=("central",), routing_supported=True

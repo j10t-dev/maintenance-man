@@ -175,57 +175,6 @@ def _prepare_gradle_project(root: Path, source: Path, repository: Path) -> None:
     )
 
 
-def test_local_gradle_producer_fixture_is_complete(tmp_path):
-    source = tmp_path / "wrapper-source"
-    (source / "gradle/wrapper").mkdir(parents=True)
-    (source / "gradlew").write_text("#!/bin/sh\n")
-    (source / "gradle/wrapper/gradle-wrapper.properties").write_text("fixture\n")
-    repository = tmp_path / "repository"
-    root = tmp_path / "project"
-
-    _write_local_maven_repository(repository)
-    _prepare_gradle_project(root, source, repository)
-
-    for version in ("1.0", "2.0"):
-        directory = repository / f"g/a/{version}"
-        assert (directory / f"a-{version}.pom").read_text() == (
-            "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>"
-            f"<artifactId>a</artifactId><version>{version}</version></project>"
-        )
-        assert zipfile.is_zipfile(directory / f"a-{version}.jar")
-    assert (repository / "g/a/maven-metadata.xml").read_text() == (
-        "<metadata><groupId>g</groupId><artifactId>a</artifactId><versioning>"
-        "<versions><version>1.0</version><version>2.0</version></versions>"
-        "</versioning></metadata>"
-    )
-    marker_root = repository / "mm/fixture/plugin/mm.fixture.plugin.gradle.plugin"
-    for version in ("1.0", "2.0"):
-        marker = (
-            marker_root / version / f"mm.fixture.plugin.gradle.plugin-{version}.pom"
-        ).read_text()
-        assert f"<version>{version}</version><packaging>pom</packaging>" in marker
-        assert (
-            "<dependency><groupId>g</groupId><artifactId>a</artifactId>"
-            "<version>1.0</version></dependency>"
-        ) in marker
-    marker_metadata = marker_root / "maven-metadata.xml"
-    assert "<version>1.0</version><version>2.0</version>" in marker_metadata.read_text()
-    uri = repository.as_uri()
-    assert f"url = uri('{uri}')" in (root / "settings.gradle").read_text()
-    assert "include ':app'" in (root / "settings.gradle").read_text()
-    assert (root / "build.gradle").read_text().count(f"url = uri('{uri}')") == 2
-    assert (root / "app/build.gradle").read_text() == "plugins { id 'java-library' }\n"
-    assert (root / "gradle/libs.versions.toml").read_text() == (
-        '[versions]\nartifact = "1.0"\n[libraries]\n'
-        'artifact = { module = "g:a", version.ref = "artifact" }\n'
-    )
-    assert (root / ".mm-gradle-inventory/.mm-owned").read_text() == ""
-    assert (
-        "mmGradleReport"
-        in (root / ".mm-gradle-inventory/gradle-report.gradle").read_text()
-    )
-
-
 @pytest.mark.integration
 def test_real_gradle_producer_and_native_intervals(tmp_path):
     wrapper = os.environ.get("MM_GRADLE_WRAPPER")

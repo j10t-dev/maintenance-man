@@ -52,13 +52,11 @@ from maintenance_man.models.gradle import (
     ResolutionOutcome,
     ResolutionReport,
     ResolvedComponent,
-    ScopeId,
     ScopeResolution,
     UnknownOwner,
 )
 from maintenance_man.models.scan import (
     GradleKind,
-    GradleUpdateTarget,
     UpdateFinding,
     VulnFinding,
     group_key_for,
@@ -330,17 +328,12 @@ def _plugin_marker_evidence(
 
 
 def _classify_owner_evidence(
-    scope: ScopeId, owners: dict[_OwnerEvidence, int]
+    owners: dict[_OwnerEvidence, int],
 ) -> tuple[OwnerResolution, ...]:
     if len({group for group, _ in owners}) == 1:
         group, kind = min(owners, key=lambda owner: (owners[owner], owner))
-        return (KnownOwner(kind=kind, group_key=group, scope=scope),)
-    reason = (
-        "multiple independently versioned catalogue owners"
-        if owners
-        else "no supported catalogue owner in resolved graph"
-    )
-    return (UnknownOwner(reason=reason, scope=scope),)
+        return (KnownOwner(kind=kind, group_key=group),)
+    return (UnknownOwner(),)
 
 
 def _scope_owners(
@@ -371,7 +364,7 @@ def _scope_owners(
         owners = _plugin_marker_evidence(
             catalogue, scope, components, direct, set(affected)
         )
-    return _classify_owner_evidence(scope.scope, owners)
+    return _classify_owner_evidence(owners)
 
 
 def resolve_gradle_owners(
@@ -382,7 +375,7 @@ def resolve_gradle_owners(
         for scope in resolution.report.scopes
         for owner in _scope_owners(catalogue, scope, module)
     )
-    return owners or (UnknownOwner(reason="module absent from selected resolution"),)
+    return owners or (UnknownOwner(),)
 
 
 def exact_fix_candidate(installed: str, fixes: str | None) -> str | None:
@@ -402,33 +395,11 @@ def exact_fix_candidate(installed: str, fixes: str | None) -> str | None:
     return matching[0] if len(matching) == 1 else None
 
 
-def _candidate_scopes(
-    resolution: CompleteResolution, target: GradleUpdateTarget
-) -> tuple[ScopeId, ...]:
-    coordinates = {
-        member.coordinate for member in target.members if member.kind == "library"
-    }
-    plugin_markers = {
-        f"{m.coordinate}:{m.coordinate}.gradle.plugin"
-        for m in target.members
-        if m.kind == "plugin"
-    }
-    return tuple(
-        scope.scope
-        for scope in resolution.report.scopes
-        if any(
-            component.module is not None
-            and component.module.coordinate in coordinates | plugin_markers
-            for component in scope.components
-        )
-    )
-
-
 type _VulnerabilityLink = tuple[int, VulnFinding, list[KnownOwner]]
 
 
 def _collect_ordinary_proposals(
-    resolution: CompleteResolution, discovered: Sequence[UpdateFinding]
+    discovered: Sequence[UpdateFinding],
 ) -> tuple[dict[str, GradleCandidate], list[CandidateWithheld], set[str]]:
     candidates: dict[str, GradleCandidate] = {}
     withheld: list[CandidateWithheld] = []
@@ -456,10 +427,7 @@ def _collect_ordinary_proposals(
         ):
             conflicting.add(key)
         candidates[key] = GradleCandidate(
-            target=target,
-            origins=frozenset({"ordinary"}),
-            owner_keys=(key,),
-            scopes=_candidate_scopes(resolution, target),
+            target=target, origins=frozenset({"ordinary"})
         )
     return candidates, withheld, conflicting
 
@@ -477,13 +445,7 @@ def _link_vulnerabilities(
         parts = finding.pkg_name.split(":")
         if len(parts) != 2:
             withheld.append(
-                CandidateWithheld(
-                    group_key=None,
-                    coordinate=finding.pkg_name,
-                    installed_version=finding.installed_version,
-                    reason="finding lacks Maven coordinate",
-                    vulnerability_indices=(index,),
-                )
+                _withheld_finding(index, finding, "finding lacks Maven coordinate")
             )
             continue
         module = ModuleId(
@@ -493,12 +455,8 @@ def _link_vulnerabilities(
         known = [owner for owner in owners if isinstance(owner, KnownOwner)]
         if any(isinstance(owner, UnknownOwner) for owner in owners) or not known:
             withheld.append(
-                CandidateWithheld(
-                    group_key=None,
-                    coordinate=finding.pkg_name,
-                    installed_version=finding.installed_version,
-                    reason="cannot identify an unambiguous catalogue entry",
-                    vulnerability_indices=(index,),
+                _withheld_finding(
+                    index, finding, "cannot identify an unambiguous catalogue entry"
                 )
             )
             continue
@@ -509,12 +467,24 @@ def _link_vulnerabilities(
     return linked, withheld
 
 
+def _withheld_finding(
+    index: int, finding: VulnFinding, reason: str
+) -> CandidateWithheld:
+    """Withhold one advisory that names no single catalogue owner."""
+    return CandidateWithheld(
+        group_key=None,
+        coordinate=finding.pkg_name,
+        installed_version=finding.installed_version,
+        reason=reason,
+        vulnerability_indices=(index,),
+    )
+
+
 def _security_only_proposal(
     catalogue: Catalogue,
     key: str,
     links: list[_VulnerabilityLink],
     vulnerability_indices: tuple[int, ...],
-    scopes: tuple[ScopeId, ...],
 ) -> GradleCandidate | CandidateWithheld:
     entries = [
         entry
@@ -560,8 +530,6 @@ def _security_only_proposal(
         target=built[0].gradle_target,
         origins=frozenset({"security"}),
         vulnerability_indices=vulnerability_indices,
-        owner_keys=(key,),
-        scopes=scopes,
     )
 
 
@@ -574,20 +542,15 @@ def _build_security_proposals(
     withheld: list[CandidateWithheld] = []
     for key, links in linked.items():
         indices = tuple(index for index, _, _ in links)
-        scopes = tuple(
-            dict.fromkeys(owner.scope for _, _, owners in links for owner in owners)
-        )
         if key in candidates:
-            existing = candidates[key]
-            proposals[key] = existing.model_copy(
+            proposals[key] = candidates[key].model_copy(
                 update={
                     "origins": frozenset({"ordinary", "security"}),
                     "vulnerability_indices": indices,
-                    "scopes": tuple(dict.fromkeys((*existing.scopes, *scopes))),
                 }
             )
             continue
-        proposal = _security_only_proposal(catalogue, key, links, indices, scopes)
+        proposal = _security_only_proposal(catalogue, key, links, indices)
         if isinstance(proposal, CandidateWithheld):
             withheld.append(proposal)
         else:
@@ -602,9 +565,7 @@ def select_gradle_candidates(
     discovered: Sequence[UpdateFinding],
 ) -> GradleFixPlan:
     """Merge ordinary and security proposals, retaining each withheld reason."""
-    candidates, withheld, conflicting = _collect_ordinary_proposals(
-        resolution, discovered
-    )
+    candidates, withheld, conflicting = _collect_ordinary_proposals(discovered)
     linked, unlinked_findings = _link_vulnerabilities(
         catalogue, resolution, vulnerabilities
     )
@@ -648,9 +609,11 @@ def _validation_requests(
     candidates: Sequence[GradleCandidate],
     resolution: CompleteResolution,
 ) -> list[ValidationRequest]:
-    # A shared catalogue version can span projects with different repositories.
-    # Candidate scopes also include advisory ownership; resolve each member's
-    # actual consumers independently from that candidate-wide union.
+    """One request per member and consuming project; plugins validate at the root.
+
+    A shared catalogue version can span projects with different repositories,
+    so each member resolves its own consumers.
+    """
     projects: dict[str, set[str]] = {}
     for scope in resolution.report.scopes:
         for component in scope.components:
@@ -760,7 +723,8 @@ def attach_gradle_publications(
     candidate: GradleCandidate,
     resolution: CompleteResolution,
     batch: CandidateValidationBatch,
-) -> GradleCandidate | CandidateWithheld:
+) -> GradleCandidate | str:
+    """Bind publication requests to *candidate*, or return the reason to withhold it."""
     requests = []
     for member in candidate.target.members:
         rows = [
@@ -772,12 +736,7 @@ def attach_gradle_publications(
         ]
         failure = next((row.reason for row in rows if row.reason), None)
         if not rows or failure:
-            return CandidateWithheld(
-                group_key=candidate.target.group_key,
-                coordinate=member.coordinate,
-                installed_version=member.installed_version,
-                reason=failure or "missing native candidate validation",
-            )
+            return failure or "missing native candidate validation"
         paths = {row.project_path for row in rows}
         domain = "plugin" if member.kind == "plugin" else "library"
         repositories = tuple(
@@ -787,21 +746,11 @@ def attach_gradle_publications(
         )
         module = member_module(member, candidate.target.target_version)
         if module is None:
-            return CandidateWithheld(
-                group_key=candidate.target.group_key,
-                coordinate=member.coordinate,
-                installed_version=member.installed_version,
-                reason="unsupported catalogue member coordinate",
-            )
+            return "unsupported catalogue member coordinate"
         if member.kind == "plugin":
             implementations = {row.implementation for row in rows}
             if len(implementations) != 1 or None in implementations:
-                return CandidateWithheld(
-                    group_key=candidate.target.group_key,
-                    coordinate=member.coordinate,
-                    installed_version=member.installed_version,
-                    reason="conflicting marker implementations",
-                )
+                return "conflicting marker implementations"
             requests.append(
                 publication_request(
                     module, repositories, implementation=next(iter(implementations))
@@ -846,8 +795,8 @@ def prepare_gradle_candidates(
     prepared = []
     for candidate in candidates:
         bound = attach_gradle_publications(candidate, resolution, batch)
-        if isinstance(bound, CandidateWithheld):
-            prepared.append(PreparedCandidate(candidate, withheld_reason=bound.reason))
+        if isinstance(bound, str):
+            prepared.append(PreparedCandidate(candidate, withheld_reason=bound))
         else:
             prepared.append(PreparedCandidate(bound))
     if minimum_age_days > 0:

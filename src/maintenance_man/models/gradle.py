@@ -144,22 +144,19 @@ type ResolutionOutcome = Annotated[
 RepositoryId = Literal["central", "google", "portal"]
 
 
-class PublicationRequest(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+class PublicationRequest(GradleRecord):
     module: ModuleId
     repositories: tuple[RepositoryId, ...]
     routing_supported: bool = False
     marker_implementation: ModuleId | None = None
 
 
-class AgeBlock(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+class AgeBlock(GradleRecord):
     kind: Literal["age"] = "age"
     reason: str
 
 
-class PublicationFact(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+class PublicationFact(GradleRecord):
     repository: RepositoryId
     module: ModuleId
     source_url: str
@@ -179,8 +176,7 @@ class PublicationFact(BaseModel):
         return value
 
 
-class PublicationEvidence(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+class PublicationEvidence(GradleRecord):
     facts: tuple[PublicationFact, ...]
 
     @field_validator("facts")
@@ -202,8 +198,6 @@ class GradleCandidate(GradleRecord):
     vulnerability_indices: tuple[int, ...] = ()
     """Positions, in the vulnerability sequence given to select_gradle_candidates,
     of the advisories this candidate fixes."""
-    owner_keys: tuple[str, ...] = ()
-    scopes: tuple[ScopeId, ...] = ()
     publication_requests: tuple[PublicationRequest, ...] = ()
 
 
@@ -213,13 +207,10 @@ type OwnerKind = Literal["direct", "parent", "platform", "plugin"]
 class KnownOwner(GradleRecord):
     kind: OwnerKind
     group_key: str
-    scope: ScopeId
 
 
 class UnknownOwner(GradleRecord):
     kind: Literal["unknown"] = "unknown"
-    reason: str
-    scope: ScopeId | None = None
 
 
 type OwnerResolution = Annotated[KnownOwner | UnknownOwner, Field(discriminator="kind")]
