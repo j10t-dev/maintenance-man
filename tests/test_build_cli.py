@@ -3,43 +3,40 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from maintenance_man import cli, output, paths
+from maintenance_man import output, paths
 from maintenance_man.cli import ExitCode
 from maintenance_man.deployer import BuildError
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from tests.fake_vcs import FakeJjState
-from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.cli import run_mm
 from tests.support.projects import write_config
+from tests.support.repository import (
+    configure_jj_projects,
+    copy_jj_repository,
+    fail_repository_method,
+)
 
 
 @pytest.fixture
-def _build_vcs(
-    mm_home_with_projects: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> FakeJjState:
-    state, _paths = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
-    return state
+def _build_repositories(mm_home_with_projects: Path, tmp_path: Path) -> dict[str, Path]:
+    return configure_jj_projects(mm_home_with_projects, tmp_path)
 
 
 def test_label_failure_does_not_block_persisted_build_activity(
     mm_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project_path = tmp_path / "project"
-    state = FakeJjState()
-    state.seed_repository(project_path, files={"dep.txt": "version=1\n"})
-    state.fail(
+    project_path = copy_jj_repository(tmp_path / "project").path
+    fail_repository_method(
+        monkeypatch,
+        project_path,
         "revision_bookmarks",
-        error=RevisionError("label unavailable"),
-        path=project_path,
+        RevisionError("label unavailable"),
     )
     write_config(
         mm_home,
         f'[projects.demo]\npath = "{project_path}"\npackage_manager = "uv"\n'
         'build_command = "build"\n',
     )
-    monkeypatch.setattr(cli, "make_vcs_services", state.services)
     monkeypatch.setattr(
         "maintenance_man.services.deploy.run_shell_command",
         lambda *args, **kwargs: None,
@@ -51,18 +48,17 @@ def test_label_failure_does_not_block_persisted_build_activity(
     assert recorded is not None
     assert recorded.success is True
     assert recorded.branch == "unknown"
-    assert any(call.method == "revision_bookmarks" for call in state.attempts)
 
 
 class TestBuildCommand:
     def test_no_build_config(
-        self, mm_home_with_projects: Path, _build_vcs: FakeJjState
+        self, mm_home_with_projects: Path, _build_repositories: dict[str, Path]
     ) -> None:
         """Error when project has no build_command configured."""
         assert run_mm("build", "no-deploy") == ExitCode.ERROR
 
     def test_no_build_config_deploy_only_project(
-        self, mm_home_with_projects: Path, _build_vcs: FakeJjState
+        self, mm_home_with_projects: Path, _build_repositories: dict[str, Path]
     ) -> None:
         """Error when project has deploy_command but no build_command."""
         assert run_mm("build", "deploy-only") == ExitCode.ERROR
@@ -71,13 +67,15 @@ class TestBuildCommand:
     def test_successful_build(
         self,
         mock_build: MagicMock,
-        mm_home_with_projects: Path,
-        _build_vcs: FakeJjState,
+        _build_repositories: dict[str, Path],
     ) -> None:
-        """Exit 0 on successful build."""
+        """Exit 0 on successful build, recording the activity on main."""
         assert run_mm("build", "deployable") == ExitCode.OK
         mock_build.assert_called_once()
-        assert any(call.method == "revision_bookmarks" for call in _build_vcs.attempts)
+        recorded = load_activity(paths.activity_path())["deployable"].last_build
+        assert recorded is not None
+        assert recorded.success is True
+        assert recorded.branch == "main"
 
     @patch(
         "maintenance_man.services.deploy.run_shell_command",
@@ -86,14 +84,17 @@ class TestBuildCommand:
     def test_failed_build(
         self,
         mock_build: MagicMock,
-        mm_home_with_projects: Path,
-        _build_vcs: FakeJjState,
+        _build_repositories: dict[str, Path],
     ) -> None:
-        """Exit BUILD_FAILED on build failure."""
+        """Exit BUILD_FAILED on build failure, still recording the activity."""
         assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
+        recorded = load_activity(paths.activity_path())["deployable"].last_build
+        assert recorded is not None
+        assert recorded.success is False
+        assert recorded.branch == "main"
 
     def test_unknown_project(
-        self, mm_home_with_projects: Path, _build_vcs: FakeJjState
+        self, mm_home_with_projects: Path, _build_repositories: dict[str, Path]
     ) -> None:
         """Error when project doesn't exist."""
         assert run_mm("build", "nonexistent") == ExitCode.ERROR
@@ -103,7 +104,7 @@ class TestBuildCommand:
         self,
         mock_build: MagicMock,
         mm_home_with_projects: Path,
-        _build_vcs: FakeJjState,
+        _build_repositories: dict[str, Path],
     ) -> None:
         assert run_mm("build", "deployable", "--verbose") == ExitCode.OK
         assert output.is_verbose() is True
@@ -116,7 +117,7 @@ class TestBuildCommand:
         self,
         mock_build: MagicMock,
         mm_home_with_projects: Path,
-        _build_vcs: FakeJjState,
+        _build_repositories: dict[str, Path],
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert run_mm("build", "deployable") == ExitCode.OK
@@ -133,7 +134,7 @@ class TestBuildCommand:
         self,
         mock_build: MagicMock,
         mm_home_with_projects: Path,
-        _build_vcs: FakeJjState,
+        _build_repositories: dict[str, Path],
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
@@ -144,36 +145,3 @@ class TestBuildCommand:
             "Build for deployable failed (exit 2)\n"
         )
         assert captured.err == ""
-
-    @patch("maintenance_man.services.deploy.record_activity")
-    @patch("maintenance_man.services.deploy.run_shell_command")
-    def test_successful_build_records_activity(
-        self,
-        mock_build: MagicMock,
-        mock_record: MagicMock,
-        mm_home_with_projects: Path,
-        _build_vcs: FakeJjState,
-    ) -> None:
-        """Successful build records activity event."""
-        assert run_mm("build", "deployable") == ExitCode.OK
-        mock_record.assert_called_once()
-        _, kwargs = mock_record.call_args
-        assert kwargs["success"] is True
-
-    @patch("maintenance_man.services.deploy.record_activity")
-    @patch(
-        "maintenance_man.services.deploy.run_shell_command",
-        side_effect=BuildError("build failed"),
-    )
-    def test_failed_build_records_activity(
-        self,
-        mock_build: MagicMock,
-        mock_record: MagicMock,
-        mm_home_with_projects: Path,
-        _build_vcs: FakeJjState,
-    ) -> None:
-        """Failed build still records activity event with success=False."""
-        assert run_mm("build", "deployable") == ExitCode.BUILD_FAILED
-        mock_record.assert_called_once()
-        _, kwargs = mock_record.call_args
-        assert kwargs["success"] is False

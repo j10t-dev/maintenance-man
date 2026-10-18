@@ -12,20 +12,15 @@ import pytest
 from rich.cells import cell_len
 
 from maintenance_man import output
-from maintenance_man.cli import _print_project_todo, _print_scan_result
+from maintenance_man.cli import _print_scan_result
 from maintenance_man.exit_codes import ExitCode
 from maintenance_man.models.scan import ScanResult
-from tests.support.cli import TerminalStream, run_mm
+from maintenance_man.storage import save_scan_results
+from tests.support.cli import TerminalStream, run_mm, terminal_stdout
 from tests.support.findings import make_update, make_vuln
 from tests.support.projects import write_config
 
 _LONG_NAME = "a-project-with-a-long-name-that-must-survive"
-
-
-def _save_scan(home: Path, result: ScanResult) -> None:
-    (home / "scan-results" / f"{result.project}.json").write_text(
-        result.model_dump_json(), encoding="utf-8"
-    )
 
 
 def _scanned_result(**overrides: object) -> ScanResult:
@@ -55,7 +50,7 @@ def output_home(mm_home: Path, tmp_path: Path) -> Path:
 def test_given_saved_scan_when_list_is_piped_then_full_record_survives(
     output_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _save_scan(output_home, _scanned_result())
+    save_scan_results(_LONG_NAME, _scanned_result())
 
     assert run_mm("list") == 0
 
@@ -74,7 +69,7 @@ def test_given_literal_finding_when_detail_is_piped_then_data_stays_in_one_recor
         pkg_name="literal[red]package[/red]",
         blocked_reason="needs\treview\nthen repair",
     )
-    _save_scan(output_home, _scanned_result(updates=[update]))
+    save_scan_results(_LONG_NAME, _scanned_result(updates=[update]))
 
     assert run_mm("list", "--detail") == 0
 
@@ -102,10 +97,7 @@ def test_given_unscanned_project_when_list_is_piped_then_counts_are_unknown(
 def test_given_long_records_when_terminal_renders_then_each_record_stays_on_one_line(
     monkeypatch: pytest.MonkeyPatch, width: int
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("COLUMNS", str(width))
-    monkeypatch.setenv("NO_COLOR", "1")
+    stream = terminal_stdout(monkeypatch, width)
 
     output.records(
         "api",
@@ -172,11 +164,8 @@ def test_given_clean_and_unscanned_projects_when_listed_then_counts_stay_distinc
         config.read_text(encoding="utf-8")
         + f'\n[projects.unscanned]\npath = "{output_home}"\npackage_manager = "uv"\n',
     )
-    _save_scan(output_home, _scanned_result())
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("COLUMNS", "120")
-    monkeypatch.setenv("NO_COLOR", "1")
+    save_scan_results(_LONG_NAME, _scanned_result())
+    stream = terminal_stdout(monkeypatch, 120)
 
     assert run_mm("list") == 0
 
@@ -186,12 +175,21 @@ def test_given_clean_and_unscanned_projects_when_listed_then_counts_stay_distinc
     assert lines[3].split()[1:4] == ["-", "-", "-"]
 
 
-def test_given_indented_todo_when_piped_then_source_lines_are_preserved(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    (tmp_path / "TODO.md").write_text("\n  - [ ] literal[red]\n\n")
+def _write_api_todo(mm_home: Path, tmp_path: Path, text: str) -> None:
+    project = tmp_path / "api"
+    project.mkdir()
+    (project / "TODO.md").write_text(text)
+    write_config(
+        mm_home, f'[projects.api]\npath = "{project}"\npackage_manager = "uv"\n'
+    )
 
-    _print_project_todo("api", tmp_path)
+
+def test_given_indented_todo_when_piped_then_source_lines_are_preserved(
+    mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_api_todo(mm_home, tmp_path, "\n  - [ ] literal[red]\n\n")
+
+    assert run_mm("todo", "api") == 0
 
     assert capsys.readouterr().out == (
         "api\t1\t\napi\t2\t  - [ ] literal[red]\napi\t3\t\n"
@@ -199,14 +197,12 @@ def test_given_indented_todo_when_piped_then_source_lines_are_preserved(
 
 
 def test_given_tab_indented_todo_when_terminal_renders_then_tabs_expand_to_spaces(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mm_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("NO_COLOR", "1")
-    (tmp_path / "TODO.md").write_text("- item\n\t- nested\n")
+    stream = terminal_stdout(monkeypatch)
+    _write_api_todo(mm_home, tmp_path, "- item\n\t- nested\n")
 
-    _print_project_todo("api", tmp_path)
+    assert run_mm("todo", "api") == 0
 
     assert stream.getvalue().splitlines() == [
         "api · TODO.md",
@@ -234,10 +230,7 @@ def test_given_terminal_stderr_when_stdout_is_piped_then_width_uses_stderr(
 def test_given_short_success_when_narrow_then_padding_does_not_create_ellipsis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("COLUMNS", "40")
-    monkeypatch.setenv("NO_COLOR", "1")
+    stream = terminal_stdout(monkeypatch, 40)
 
     output.outcome(
         "api", "update", "passed", "http-client", installed="1.0.0", target="1.0.1"
@@ -250,10 +243,7 @@ def test_given_short_success_when_narrow_then_padding_does_not_create_ellipsis(
 def test_given_maven_finding_when_terminal_renders_then_kind_remains_visible(
     monkeypatch: pytest.MonkeyPatch, width: int
 ) -> None:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("COLUMNS", str(width))
-    monkeypatch.setenv("NO_COLOR", "1")
+    stream = terminal_stdout(monkeypatch, width)
     vuln = make_vuln(pkg_name="org.springframework.boot:spring-boot-starter-web")
 
     _print_scan_result(_scanned_result(project="api", vulnerabilities=[vuln]))

@@ -5,11 +5,10 @@ import pytest
 
 from maintenance_man import cli
 from maintenance_man.cli import ExitCode
-from maintenance_man.config import load_config
 from maintenance_man.vcs import RevisionError
-from tests.fake_vcs import FakeJjState
-from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.cli import refuse_jj_commands, run_mm
 from tests.support.projects import write_config
+from tests.support.repository import configure_jj_projects, fail_repository_method
 
 
 class TestSyncCommand:
@@ -20,9 +19,10 @@ class TestSyncCommand:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        state, _ = configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
-        path = load_config().projects["vulnerable"].path
-        state.fail("fetch", error=RevisionError("fetch failed"), path=path)
+        path = configure_jj_projects(mm_home_with_projects, tmp_path)["vulnerable"]
+        fail_repository_method(
+            monkeypatch, path, "fetch", RevisionError("fetch failed")
+        )
 
         assert run_mm("sync", "vulnerable") == ExitCode.SYNC_FAILED
         assert "fetch failed" in capsys.readouterr().err
@@ -32,19 +32,19 @@ class TestSyncCommand:
         mm_home_with_projects: Path,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        state = FakeJjState()
-        path = load_config().projects["vulnerable"].path
-        state.seed_repository(path, files={"dep.txt": "version=1\n"})
-        factory = MagicMock(return_value=state.services())
+        path = configure_jj_projects(mm_home_with_projects, tmp_path)["vulnerable"]
+        for method in ("revision_bookmarks", "change_id"):
+            fail_repository_method(
+                monkeypatch, path, method, AssertionError(f"unexpected {method}")
+            )
+        factory = MagicMock(wraps=cli.make_vcs_services)
         monkeypatch.setattr(cli, "make_vcs_services", factory)
 
         assert run_mm("sync", "vulnerable") == ExitCode.OK
         factory.assert_called_once_with()
-        assert not any(
-            call.method in {"revision_bookmarks", "change_id"}
-            for call in state.attempts
-        )
+        assert capsys.readouterr().out == "vulnerable\tsync\tunchanged\tmain\t-\t-\t-\n"
 
     def test_reports_successful_action(
         self,
@@ -53,7 +53,7 @@ class TestSyncCommand:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+        configure_jj_projects(mm_home_with_projects, tmp_path)
 
         assert run_mm("sync", "vulnerable") == ExitCode.OK
         captured = capsys.readouterr()
@@ -99,8 +99,7 @@ package_manager = "uv"
 test_unit = "uv run pytest"
 """
         write_config(mm_home, config_text)
-        state = FakeJjState()
-        monkeypatch.setattr(cli, "make_vcs_services", state.services)
+        refuse_jj_commands(monkeypatch)
 
         assert run_mm("sync") == ExitCode.SYNC_FAILED
         captured = capsys.readouterr()
@@ -108,4 +107,3 @@ test_unit = "uv run pytest"
         assert captured.err == (
             f"warning: ghost · path does not exist: {missing_path}\n"
         )
-        assert state.attempts == []

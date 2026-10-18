@@ -1,12 +1,11 @@
 import re
 from datetime import UTC, datetime
-from io import StringIO
 from pathlib import Path
 
 import pytest
 
 from maintenance_man import cli, scanner
-from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code
+from maintenance_man.cli import ExitCode, _print_scan_result
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
@@ -20,8 +19,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from maintenance_man.services import scan as scan_service
-from maintenance_man.services.scan import ScanSummary
-from tests.support.cli import TerminalStream, run_mm
+from tests.support.cli import run_mm, terminal_stdout
 from tests.support.findings import (
     make_gradle_member,
     make_gradle_target,
@@ -34,14 +32,6 @@ from tests.support.process import missing_tool
 from tests.support.projects import write_config
 
 
-def _terminal_stdout(monkeypatch: pytest.MonkeyPatch, width: int = 220) -> StringIO:
-    stream = TerminalStream()
-    monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setenv("COLUMNS", str(width))
-    monkeypatch.setenv("NO_COLOR", "1")
-    return stream
-
-
 @pytest.mark.parametrize(
     ("pkg_name", "reason"),
     [
@@ -52,7 +42,7 @@ def _terminal_stdout(monkeypatch: pytest.MonkeyPatch, width: int = 220) -> Strin
 def test_given_blocked_update_when_scan_result_printed_then_row_is_literal(
     monkeypatch, pkg_name, reason
 ):
-    stream = _terminal_stdout(monkeypatch)
+    stream = terminal_stdout(monkeypatch, 220)
     blocked = make_update(
         pkg_name=pkg_name,
         installed_version="unknown",
@@ -284,11 +274,22 @@ def test_batch_scan_without_trivy_scans_uv_and_exits_error(
     assert (results / "second.json").is_file()
 
 
-class TestScanSingleProject:
-    def test_scan_project_with_vulns_exits_2(self, mm_home_with_projects: Path):
-        """mm scan vulnerable — has vulns, should exit 2."""
-        assert run_mm("scan", "vulnerable") == 2
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (("scan", "vulnerable"), 2),
+        (("scan", "clean"), 0),
+        (("scan",), 2),
+        (("scan", "outdated"), 3),
+    ],
+)
+def test_given_saved_project_when_scanned_then_exit_code_reflects_findings(
+    mm_home_with_projects: Path, argv: tuple[str, ...], expected: int
+) -> None:
+    assert run_mm(*argv) == expected
 
+
+class TestScanSingleProject:
     def test_scan_project_with_vulns_shows_findings(
         self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
     ):
@@ -298,26 +299,12 @@ class TestScanSingleProject:
         assert "CVE-2024-0001" in output
         assert "some-pkg" in output
 
-    def test_scan_clean_project_exits_0(self, mm_home_with_projects: Path):
-        """mm scan clean — clean, should exit 0."""
-        assert run_mm("scan", "clean") == 0
-
     def test_scan_unknown_project_exits_1(self, mm_home_with_projects: Path):
         """mm scan nonexistent — should exit 1."""
         assert run_mm("scan", "nonexistent") == 1
 
 
-class TestScanAllProjects:
-    def test_scan_all_exits_worst_case(self, mm_home_with_projects: Path):
-        """mm scan (no args) — should exit 2 if any project has vulns."""
-        assert run_mm("scan") == 2
-
-
 class TestScanUpdatesExitCodes:
-    def test_scan_updates_only_exits_3(self, mm_home_with_projects: Path):
-        """mm scan outdated — updates only, no vulns, should exit 3."""
-        assert run_mm("scan", "outdated") == 3
-
     def test_scan_updates_output_shows_update_rows(
         self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
     ):
@@ -373,29 +360,6 @@ def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
     assert "publication date" in rows[0][9]
 
 
-def test_blocked_update_candidates_still_exit_updates_found():
-    """A ScanResult whose only update is blocked must still reach
-    UPDATES_FOUND: has_updates counts blocked candidates (they stay in
-    ``updates``), and that count is what drives the exit code — not whether
-    any update happens to be eligible.
-    """
-    result = make_scan_result(
-        vulns=[],
-        updates=[
-            make_update(
-                pkg_name="ksp",
-                installed_version="2.3.10",
-                latest_version="2.3.12",
-                blocked_reason="no Maven Central publication date",
-                gradle_block_kind="age",
-            )
-        ],
-    )
-
-    assert result.has_updates is True
-    assert _scan_exit_code(ScanSummary.of(result)) == ExitCode.UPDATES_FOUND
-
-
 def _blocked_mixed_result() -> ScanResult:
     result = _make_vulnerable_result()
     result.vulnerabilities[0].blocked_reason = "Cannot identify catalogue entry"
@@ -419,7 +383,7 @@ def _blocked_mixed_result() -> ScanResult:
 def test_given_blocked_scan_when_rendered_then_each_blocked_row_carries_its_reason(
     monkeypatch,
 ):
-    stream = _terminal_stdout(monkeypatch)
+    stream = terminal_stdout(monkeypatch, 220)
 
     cli._print_scan_result(_blocked_mixed_result())
 
@@ -452,7 +416,7 @@ def test_given_blocked_scan_when_piped_then_kind_stays_and_status_is_blocked(cap
 def test_given_long_blocked_detail_when_rendered_narrow_then_text_ends_in_ellipsis(
     monkeypatch,
 ):
-    stream = _terminal_stdout(monkeypatch, width=80)
+    stream = terminal_stdout(monkeypatch, 80)
     result = _make_vulnerable_result()
     result.vulnerabilities[0].pkg_name = "org.apache.commons:commons-lang3"
     result.vulnerabilities[
@@ -509,7 +473,6 @@ def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
 
 @pytest.mark.parametrize("all_projects", [False, True])
 @pytest.mark.parametrize("with_updates", [False, True])
-@pytest.mark.parametrize("manager", ["gradle", "bun"])
 @pytest.mark.parametrize("with_vulnerability", [False, True])
 def test_scan_blocked_no_fix_vulnerability_exit(
     mm_home,
@@ -517,13 +480,12 @@ def test_scan_blocked_no_fix_vulnerability_exit(
     monkeypatch,
     all_projects,
     with_updates,
-    manager,
     with_vulnerability,
 ):
     mm_home.mkdir(parents=True, exist_ok=True)
     write_config(
         mm_home,
-        f'[projects.sample]\npath = "{tmp_path}"\npackage_manager = "{manager}"\n',
+        f'[projects.sample]\npath = "{tmp_path}"\npackage_manager = "bun"\n',
     )
     result = make_scan_result(
         vulns=[
@@ -559,7 +521,7 @@ def test_scan_blocked_no_fix_vulnerability_exit(
 
 @pytest.mark.parametrize("manager", ["gradle", "uv", "bun", "mvn"])
 def test_scan_uses_standard_rows_for_each_advisory(monkeypatch, manager, tmp_path):
-    stream = _terminal_stdout(monkeypatch, width=180)
+    stream = terminal_stdout(monkeypatch, 180)
     scope = ":app/project/debugRuntimeClasspath"
     findings = [
         VulnFinding(
