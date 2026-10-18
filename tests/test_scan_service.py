@@ -1,12 +1,9 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
 
 from maintenance_man.config import ProjectNotFoundError
 from maintenance_man.models.events import (
-    Operation,
     OperationFailed,
     Outcome,
     ProjectSkipped,
@@ -18,18 +15,10 @@ from maintenance_man.models.scan import Severity, VulnFinding
 from maintenance_man.scanner import ScanError
 from maintenance_man.services import scan as scan_service
 from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import SyncAction, VcsServices
-from tests.fake_vcs import FakeJjState
+from maintenance_man.vcs_workflow import SyncAction, make_vcs_services
 from tests.fakes import RecordingEmit
 from tests.support.findings import make_scan_result
 from tests.support.projects import make_config, make_project
-
-
-def _services(*paths: Path) -> VcsServices:
-    state = FakeJjState()
-    for path in paths:
-        state.seed_repository(path, files={"dep.txt": "version=1\n"})
-    return state.services()
 
 
 def test_scan_all_continues_after_failure_and_summarises_results(
@@ -62,7 +51,7 @@ def test_scan_all_continues_after_failure_and_summarises_results(
 
     assert recorded.events == [
         ScanReported(first, 0.25),
-        OperationFailed(Operation.SCAN, "second", "boom"),
+        OperationFailed("scan", "second", "boom"),
         ScanReported(third, 0.5),
     ]
     assert summary == scan_service.ScanSummary(
@@ -133,21 +122,14 @@ def test_sync_projects_deduplicates_names_and_emits_success(
     cfg = make_config(
         projects={name: make_project(path) for name, path in paths.items()}
     )
-    synced: list[Path] = []
-
-    def fake_sync(*, repo):
-        synced.append(repo.path)
-        return SyncAction.UNCHANGED
-
-    monkeypatch.setattr(scan_service, "sync_main", fake_sync)
+    monkeypatch.setattr(scan_service, "sync_main", lambda *, repo: SyncAction.UNCHANGED)
     recorded = RecordingEmit()
 
     outcome = scan_service.sync_projects(
-        cfg, ["b", "a", "b"], vcs=_services(*paths.values()), emit=recorded
+        cfg, ["b", "a", "b"], vcs=make_vcs_services(), emit=recorded
     )
 
     assert outcome is Outcome.SUCCEEDED
-    assert synced == [paths["b"], paths["a"]]
     assert recorded.events == [
         SyncCompleted("b", "already up to date"),
         SyncCompleted("a", "already up to date"),
@@ -167,10 +149,12 @@ def test_sync_projects_reports_revision_failure(
     )
     recorded = RecordingEmit()
 
-    outcome = scan_service.sync_projects(cfg, ["a"], vcs=_services(path), emit=recorded)
+    outcome = scan_service.sync_projects(
+        cfg, ["a"], vcs=make_vcs_services(), emit=recorded
+    )
 
     assert outcome is Outcome.FAILED
-    assert recorded.events == [OperationFailed(Operation.SYNC, "a", "offline")]
+    assert recorded.events == [OperationFailed("sync", "a", "offline")]
 
 
 def test_sync_projects_missing_path_is_failure(tmp_path: Path) -> None:
@@ -178,7 +162,9 @@ def test_sync_projects_missing_path_is_failure(tmp_path: Path) -> None:
     cfg = make_config(projects={"ghost": make_project(missing)})
     recorded = RecordingEmit()
 
-    outcome = scan_service.sync_projects(cfg, [], vcs=_services(), emit=recorded)
+    outcome = scan_service.sync_projects(
+        cfg, [], vcs=make_vcs_services(), emit=recorded
+    )
 
     assert outcome is Outcome.FAILED
     assert recorded.events == [
@@ -193,5 +179,5 @@ def test_sync_projects_rejects_unknown_name(tmp_path: Path) -> None:
 
     with pytest.raises(ProjectNotFoundError, match="Unknown project 'missing'"):
         scan_service.sync_projects(
-            cfg, ["missing"], vcs=_services(), emit=RecordingEmit()
+            cfg, ["missing"], vcs=make_vcs_services(), emit=RecordingEmit()
         )

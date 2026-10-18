@@ -11,7 +11,6 @@ from maintenance_man.models.events import (
     BlockersStillFailing,
     DeployStep,
     DeployStepFailed,
-    DeployStepStarted,
     DeployStepSucceeded,
     Event,
     FindingFailed,
@@ -24,12 +23,12 @@ from maintenance_man.models.events import (
     HealthChecked,
     HealthcheckUnconfigured,
     MissingTestConfig,
-    Operation,
     OperationFailed,
     ProcessingStarted,
     ProjectSkipped,
     ProjectStarted,
     Promoted,
+    PromotionFailed,
     ResolvePaused,
     ScanReported,
     SkipReason,
@@ -55,15 +54,6 @@ def _pipe_scan() -> ScanResult:
     return scan
 
 
-_OPERATION_DIAGNOSTICS = {
-    Operation.UPDATE_SETUP: "error: api · update setup · boom",
-    Operation.REFRESH: "error: api · workspace refresh · boom",
-    Operation.WORKSPACE_CLEANUP: "error: api · workspace cleanup · boom",
-    Operation.BOOKMARK_CLEANUP: "error: api · bookmark cleanup · boom",
-    Operation.RESOLVE_SETUP: "error: api · resolve setup · boom",
-    Operation.SCAN: "error: api · scan · boom",
-    Operation.SYNC: "error: api · sync · boom",
-}
 _STEP_WORDS = [
     (FindingStepKind.PREPARE, "prepare"),
     (FindingStepKind.PACKAGE_COMMAND, "package command"),
@@ -129,7 +119,7 @@ _RESOLVE_RECORD = "api\tresolve\tfailed\tpkg\t1.0\t1.1\tcommit failed\n"
             "",
         ),
         (
-            OperationFailed(Operation.PROMOTE, "api", "conflict"),
+            PromotionFailed("api", "conflict"),
             "update",
             "api\tpromotion\tfailed\tlocal main\t-\t-\tconflict\n",
             "",
@@ -195,16 +185,25 @@ def test_given_step_failure_without_project_when_rendered_then_error_omits_proje
 
 
 @pytest.mark.parametrize(
-    "operation", [item for item in Operation if item is not Operation.PROMOTE]
+    ("operation", "expected"),
+    [
+        ("update setup", "error: api · update setup · boom\n"),
+        ("workspace refresh", "error: api · workspace refresh · boom\n"),
+        ("workspace cleanup", "error: api · workspace cleanup · boom\n"),
+        ("bookmark cleanup", "error: api · bookmark cleanup · boom\n"),
+        ("resolve setup", "error: api · resolve setup · boom\n"),
+        ("scan", "error: api · scan · boom\n"),
+        ("sync", "error: api · sync · boom\n"),
+    ],
 )
 def test_given_operation_failure_when_rendered_then_diagnostic_goes_to_stderr(
-    capsys: pytest.CaptureFixture[str], operation: Operation
+    capsys: pytest.CaptureFixture[str], operation: str, expected: str
 ) -> None:
     cli._Renderer(batch=False, project="api")(OperationFailed(operation, "api", "boom"))
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == f"{_OPERATION_DIAGNOSTICS[operation]}\n"
+    assert captured.err == expected
 
 
 @pytest.mark.parametrize(
@@ -438,7 +437,6 @@ _SKIPPED_AFTER_BUILD = "api\tdeploy\tskipped\tdeploy\t-\t-\tbuild failed\n"
 @pytest.mark.parametrize(
     ("event", "stdout", "stderr"),
     [
-        *[(DeployStepStarted("api", step), "", _NO_STDERR) for step in DeployStep],
         (
             DeployStepSucceeded("api", DeployStep.BUILD),
             "api\tbuild\tpassed\tbuild\t-\t-\t-\n",
@@ -459,8 +457,6 @@ _SKIPPED_AFTER_BUILD = "api\tdeploy\tskipped\tdeploy\t-\t-\tbuild failed\n"
             "api\tdeploy\tfailed\tdeploy\t-\t-\texit 3\n",
             _NO_STDERR,
         ),
-        (DeployStepSucceeded("api", DeployStep.HEALTH), "", _NO_STDERR),
-        (DeployStepFailed("api", DeployStep.HEALTH, "x"), "", _NO_STDERR),
         (
             HealthChecked("api", True, None),
             "api\thealth\tpassed\thealthcheck\t-\t-\t-\n",
@@ -607,11 +603,8 @@ def test_given_project_without_scan_results_when_skipped_then_only_single_notice
     [
         (
             [
-                DeployStepStarted("api", DeployStep.BUILD),
                 DeployStepSucceeded("api", DeployStep.BUILD),
-                DeployStepStarted("api", DeployStep.DEPLOY),
                 DeployStepSucceeded("api", DeployStep.DEPLOY),
-                DeployStepStarted("api", DeployStep.HEALTH),
                 HealthChecked("api", False, "HTTP 503"),
             ],
             [
@@ -623,7 +616,6 @@ def test_given_project_without_scan_results_when_skipped_then_only_single_notice
         ),
         (
             [
-                DeployStepStarted("api", DeployStep.BUILD),
                 DeployStepFailed("api", DeployStep.BUILD, "exit 2"),
             ],
             [
@@ -665,6 +657,18 @@ def test_given_project_events_when_rendered_on_terminal_then_one_heading_per_pro
     renderer = cli._Renderer(batch=True)
     for step in steps:
         renderer(step)
+
+    assert Text.from_ansi(stream.getvalue()).plain.splitlines() == expected
+
+
+@pytest.mark.parametrize(("flow", "expected"), [("deploy", ["api"]), ("update", [])])
+def test_given_terminal_when_project_starts_then_only_deploy_prints_heading(
+    monkeypatch: pytest.MonkeyPatch, flow: cli._Flow, expected: list[str]
+) -> None:
+    stream = TerminalStream()
+    monkeypatch.setattr("sys.stdout", stream)
+
+    cli._Renderer(batch=True, flow=flow)(ProjectStarted("api"))
 
     assert Text.from_ansi(stream.getvalue()).plain.splitlines() == expected
 

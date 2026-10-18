@@ -4,10 +4,10 @@ from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Emit,
     MissingTestConfig,
-    Operation,
     OperationFailed,
     ProjectSkipped,
     Promoted,
+    PromotionFailed,
     SkipReason,
 )
 from maintenance_man.models.scan import (
@@ -22,7 +22,7 @@ from maintenance_man.storage import (
     load_scan_results,
     save_scan_results,
 )
-from maintenance_man.updater import remove_completed_findings
+from maintenance_man.updater import Finding, remove_completed_findings
 from maintenance_man.vcs import RevisionError
 from maintenance_man.vcs_workflow import VcsServices, refresh_working_copy_from_main
 
@@ -64,12 +64,17 @@ def report_missing_test_config(
     return True
 
 
+def is_owned(finding: Finding, flow: Workflow, *statuses: UpdateStatus) -> bool:
+    """Whether the flow owns the finding and it is in one of the statuses."""
+    return finding.flow is flow and finding.update_status in statuses
+
+
 def complete_ready_findings(
     scan_result: ScanResult, name: str, *, flow: Workflow
 ) -> None:
     """Complete and remove a flow's ready findings, then persist the mutated scan."""
     for finding in scan_result.findings:
-        if finding.update_status is UpdateStatus.READY and finding.flow is flow:
+        if is_owned(finding, flow, UpdateStatus.READY):
             finding.update_status = UpdateStatus.COMPLETED
     remove_completed_findings(scan_result)
     save_scan_results(name, scan_result)
@@ -97,8 +102,7 @@ def finalise_local_changes(
         repo.promote_bookmark_to_main(bookmark=bookmark)
     except RevisionError as exc:
         emit(
-            OperationFailed(
-                Operation.PROMOTE,
+            PromotionFailed(
                 name,
                 f"{exc} · rebase with jj rebase -b {bookmark} -d main, then rerun",
             )
@@ -107,14 +111,14 @@ def finalise_local_changes(
     try:
         refresh_working_copy_from_main(repo=repo)
     except RevisionError as exc:
-        emit(OperationFailed(Operation.REFRESH, name, str(exc)))
+        emit(OperationFailed("workspace refresh", name, str(exc)))
         return False
     complete_ready_findings(scan_result, name, flow=flow)
     emit(Promoted())
     try:
         repo.delete_bookmark(bookmark=bookmark)
     except RevisionError as exc:
-        emit(OperationFailed(Operation.BOOKMARK_CLEANUP, name, str(exc)))
+        emit(OperationFailed("bookmark cleanup", name, str(exc)))
         return False
     return True
 

@@ -7,7 +7,7 @@ import pytest
 
 from maintenance_man import updater, vcs_workflow
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.events import Operation, OperationFailed, Outcome
+from maintenance_man.models.events import OperationFailed, Outcome, PromotionFailed
 from maintenance_man.models.scan import UpdateStatus, Workflow
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import update as update_service
@@ -91,8 +91,9 @@ def test_given_main_moved_sideways_when_promoting_then_work_stays_pending_until_
     second = _update(passing, emit)
 
     assert second.outcome is Outcome.FAILED
-    failures = emit.of_type(OperationFailed)
-    assert [event.operation for event in failures] == [Operation.PROMOTE]
+    assert emit.of_type(OperationFailed) == []
+    failures = emit.of_type(PromotionFailed)
+    assert [event.project for event in failures] == ["api"]
     assert failures[0].error.endswith(
         f" · rebase with jj rebase -b {MANAGED} -d main, then rerun"
     )
@@ -192,7 +193,7 @@ def test_given_cleanup_failure_when_batch_updated_then_next_project_promotes(
         event.operation
         for event in emit.of_type(OperationFailed)
         if event.project == "api"
-    ] == [Operation.WORKSPACE_CLEANUP]
+    ] == ["workspace cleanup"]
 
 
 def _bun_project(

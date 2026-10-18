@@ -9,7 +9,6 @@ from maintenance_man.models.events import (
     FindingsBlocked,
     FindingStepFailed,
     FindingStepKind,
-    Operation,
     OperationFailed,
     Outcome,
     ResolvePaused,
@@ -51,7 +50,10 @@ def resolve_project(
     if continue_:
         return _handle_continue(name, project, scan_result, vcs=vcs, emit=emit)
     _refuse_mixed_ownership(name, scan_result)
-    if any(_is_failed_resolve_finding(finding) for finding in scan_result.findings):
+    if any(
+        flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
+        for finding in scan_result.findings
+    ):
         msg = f"resolve already paused for {name} — rerun with --continue"
         raise WorkflowError(msg)
 
@@ -93,33 +95,17 @@ def _select_resolve_candidates(scan_result: ScanResult) -> list[Finding]:
 def _is_resolve_candidate(finding: VulnFinding | UpdateFinding) -> bool:
     return is_eligible(finding) and (
         finding.update_status is None
-        or (
-            finding.flow is Workflow.RESOLVE
-            and finding.update_status is UpdateStatus.FAILED
-        )
-    )
-
-
-def _is_failed_resolve_finding(finding: Finding) -> bool:
-    return (
-        finding.update_status is UpdateStatus.FAILED
-        and finding.flow is Workflow.RESOLVE
-    )
-
-
-def _is_ready_resolve_finding(finding: Finding) -> bool:
-    return (
-        finding.update_status is UpdateStatus.READY and finding.flow is Workflow.RESOLVE
+        or flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
     )
 
 
 def _refuse_mixed_ownership(name: str, scan_result: ScanResult) -> None:
-    pending = {
-        finding.flow
+    if _has_update_progress(scan_result) and any(
+        flows.is_owned(
+            finding, Workflow.RESOLVE, UpdateStatus.READY, UpdateStatus.FAILED
+        )
         for finding in scan_result.findings
-        if finding.update_status in (UpdateStatus.READY, UpdateStatus.FAILED)
-    }
-    if {Workflow.UPDATE, Workflow.RESOLVE} <= pending:
+    ):
         msg = (
             "Resolve cannot take over pending updates while resolve progress also "
             f"exists for {name}. Run mm scan {name} to start again from main."
@@ -129,8 +115,9 @@ def _refuse_mixed_ownership(name: str, scan_result: ScanResult) -> None:
 
 def _has_update_progress(scan_result: ScanResult) -> bool:
     return any(
-        finding.flow is Workflow.UPDATE
-        and finding.update_status in (UpdateStatus.READY, UpdateStatus.FAILED)
+        flows.is_owned(
+            finding, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
+        )
         for finding in scan_result.findings
     )
 
@@ -192,8 +179,7 @@ def _prepare_resolve_bookmark(
     repo = vcs.repository(project_path)
     try:
         if any(
-            finding.update_status is UpdateStatus.READY
-            and finding.flow is Workflow.RESOLVE
+            flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.READY)
             for finding in scan_result.findings
         ):
             if not repo.bookmark_exists(bookmark=bookmark):
@@ -211,7 +197,7 @@ def _prepare_resolve_bookmark(
         repo.create_bookmark(bookmark=bookmark, revision="main")
         repo.new_change(revision=bookmark)
     except RevisionError as exc:
-        emit(OperationFailed(Operation.RESOLVE_SETUP, name, str(exc)))
+        emit(OperationFailed("resolve setup", name, str(exc)))
         return False
     return True
 
@@ -236,7 +222,8 @@ def _run_candidates(
         emit=emit,
     )
     if any(not result.passed for result in results) or any(
-        _is_failed_resolve_finding(finding) for finding in scan_result.findings
+        flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
+        for finding in scan_result.findings
     ):
         emit(ResolvePaused(name))
         return Outcome.FAILED
@@ -250,7 +237,10 @@ def _run_candidates(
                 )
             )
         )
-    if not any(_is_ready_resolve_finding(finding) for finding in scan_result.findings):
+    if not any(
+        flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.READY)
+        for finding in scan_result.findings
+    ):
         return Outcome.SUCCEEDED
     return (
         Outcome.SUCCEEDED
@@ -280,7 +270,7 @@ def _handle_continue(
         [
             finding
             for finding in scan_result.findings
-            if _is_failed_resolve_finding(finding)
+            if flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
         ]
     )
     if not failed:

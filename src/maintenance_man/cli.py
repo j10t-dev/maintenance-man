@@ -4,7 +4,6 @@ import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, NoReturn, get_args
 
@@ -12,6 +11,7 @@ import cyclopts
 from rich.text import Text
 
 from maintenance_man import __version__, output, paths, vcs_workflow
+from maintenance_man.clock import utc_now
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
@@ -29,7 +29,6 @@ from maintenance_man.models.events import (
     BlockersStillFailing,
     DeployStep,
     DeployStepFailed,
-    DeployStepStarted,
     DeployStepSucceeded,
     Event,
     FindingFailed,
@@ -41,16 +40,17 @@ from maintenance_man.models.events import (
     HealthChecked,
     HealthcheckUnconfigured,
     MissingTestConfig,
-    Operation,
     OperationFailed,
     Outcome,
     ProcessingStarted,
     ProjectSkipped,
     ProjectStarted,
     Promoted,
+    PromotionFailed,
     ResolvePaused,
     ScanReported,
     SkipReason,
+    Status,
     SyncCompleted,
     TestCommandStarted,
 )
@@ -167,13 +167,15 @@ class _Renderer:
 
     @__call__.register
     def _render_operation_failed(self, event: OperationFailed) -> None:
-        if event.operation is Operation.PROMOTE:
-            output.outcome(
-                event.project, "promotion", "failed", _LOCAL_MAIN, reason=event.error
-            )
-            return
-        words = _OPERATION_WORDS[event.operation]
-        output.diagnostic("error", f"{event.project} · {words} · {event.error}")
+        output.diagnostic(
+            "error", f"{event.project} · {event.operation} · {event.error}"
+        )
+
+    @__call__.register
+    def _render_promotion_failed(self, event: PromotionFailed) -> None:
+        output.outcome(
+            event.project, "promotion", "failed", _LOCAL_MAIN, reason=event.error
+        )
 
     @__call__.register
     def _render_scan_reported(self, event: ScanReported) -> None:
@@ -242,6 +244,8 @@ class _Renderer:
     @__call__.register
     def _render_project_started(self, event: ProjectStarted) -> None:
         self.project = event.project
+        if self.flow == "deploy":
+            output.heading(event.project)
 
     @__call__.register
     def _render_finding_started(self, event: FindingStarted) -> None:
@@ -288,21 +292,13 @@ class _Renderer:
         )
 
     @__call__.register
-    def _render_deploy_step_started(self, event: DeployStepStarted) -> None:
-        output.heading(event.project)
-
-    @__call__.register
     def _render_deploy_step_succeeded(self, event: DeployStepSucceeded) -> None:
-        word = _DEPLOY_STEP_WORDS.get(event.step)
-        if word is None:
-            return
+        word = event.step.value
         _project_outcome(event.project, word, "passed", word)
 
     @__call__.register
     def _render_deploy_step_failed(self, event: DeployStepFailed) -> None:
-        word = _DEPLOY_STEP_WORDS.get(event.step)
-        if word is None:
-            return
+        word = event.step.value
         _project_outcome(event.project, word, "failed", word, event.error)
         if event.step is DeployStep.BUILD:
             _project_outcome(
@@ -327,7 +323,7 @@ class _Renderer:
         output.notice("--check: no healthcheck_url configured in [defaults]")
 
 
-_DEPLOY_SKIPS: dict[SkipReason, tuple[output.Status, str]] = {
+_DEPLOY_SKIPS: dict[SkipReason, tuple[Status, str]] = {
     SkipReason.NOT_DEPLOYABLE: ("skipped", "not deployable"),
     SkipReason.UNCHANGED: (
         "unchanged",
@@ -338,31 +334,12 @@ _DEPLOY_SKIPS: dict[SkipReason, tuple[output.Status, str]] = {
         "could not resolve main revision · use --force to deploy anyway",
     ),
 }
-_STATUS_ORDER: tuple[output.Status, ...] = get_args(output.Status.__value__)
-_DEPLOY_STATUS_WORDS: dict[str, output.Status] = {
-    "pass": "passed",
-    "skip": "skipped",
-    "unchanged": "unchanged",
-    "blocked": "blocked",
-}
-_DEPLOY_STEP_WORDS: dict[DeployStep, str] = {
-    DeployStep.BUILD: "build",
-    DeployStep.DEPLOY: "deploy",
-}
-_OPERATION_WORDS: dict[Operation, str] = {
-    Operation.UPDATE_SETUP: "update setup",
-    Operation.REFRESH: "workspace refresh",
-    Operation.WORKSPACE_CLEANUP: "workspace cleanup",
-    Operation.BOOKMARK_CLEANUP: "bookmark cleanup",
-    Operation.RESOLVE_SETUP: "resolve setup",
-    Operation.SCAN: "scan",
-    Operation.SYNC: "sync",
-}
+_STATUS_ORDER: tuple[Status, ...] = get_args(Status.__value__)
 _LOCAL_MAIN = "local main"
 
 
 def _project_outcome(
-    project: str, operation: str, status: output.Status, subject: str, reason: str = ""
+    project: str, operation: str, status: Status, subject: str, reason: str = ""
 ) -> None:
     """Print an outcome under the project's heading, which prints once."""
     output.heading(project)
@@ -387,6 +364,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(ExitCode.ERROR)
 
 
+type ConfigOption = Annotated[
+    Path | None,
+    cyclopts.Parameter(help="Path to config file. Uses ~/.mm/config.toml if omitted."),
+]
+type VerboseOption = Annotated[
+    bool,
+    cyclopts.Parameter(
+        help="Stream subprocess logs to stderr, including successful commands."
+    ),
+]
+
+
+def _reset_output_and_load_config(
+    config: Path | None, *, verbose: bool = False
+) -> MmConfig:
+    output.reset_invocation_output(verbose=verbose)
+    return load_config(config)
+
+
 @app.command
 @_command
 def init() -> None:
@@ -402,7 +398,7 @@ def init() -> None:
 def scan(
     project: str | None = None,
     *,
-    config: Path | None = None,
+    config: ConfigOption = None,
 ) -> None:
     """Scan projects for vulnerabilities and available updates.
 
@@ -410,18 +406,14 @@ def scan(
     ----------
     project: str | None
         Project name to scan. Scans all if omitted.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.reset_invocation_output(verbose=False)
-    cfg = _load_cfg(config)
+    cfg = _reset_output_and_load_config(config)
 
     if not cfg.projects:
-        _notice_no_projects(config)
-        return
+        _exit_without_projects(config)
 
     if project:
-        proj_config = _resolve_proj(cfg, project)
+        proj_config = resolve_project(cfg, project)
         result = scan_service.scan_one(
             project,
             proj_config,
@@ -445,8 +437,7 @@ def _exit_if_no_update_targets(
     cfg: MmConfig, target_names: list[str], config: Path | None
 ) -> None:
     if not cfg.projects:
-        _notice_no_projects(config)
-        sys.exit(ExitCode.OK)
+        _exit_without_projects(config)
 
     if not target_names:
         output.notice("No target projects")
@@ -458,8 +449,8 @@ def _exit_if_no_update_targets(
 def update(
     *projects: str,
     negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
-    config: Path | None = None,
-    verbose: bool = False,
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
 ) -> None:
     """Apply updates from scan results to one, many, or all projects.
 
@@ -471,13 +462,8 @@ def update(
         single-project flow.
     negate: bool
         Treat all positional project names as exclusions.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
-    verbose: bool
-        Stream subprocess logs to stderr, including successful commands.
     """
-    output.reset_invocation_output(verbose=verbose)
-    cfg = _load_cfg(config)
+    cfg = _reset_output_and_load_config(config, verbose=verbose)
     mode, targets = update_service.resolve_update_targets(cfg, projects, negate=negate)
 
     _exit_if_no_update_targets(cfg, targets, config)
@@ -487,7 +473,7 @@ def update(
     vcs = make_vcs_services()
     if mode == "single":
         name = targets[0]
-        proj_config = _resolve_proj(cfg, name)
+        proj_config = resolve_project(cfg, name)
         result = update_service.update_project(
             name,
             proj_config,
@@ -517,7 +503,7 @@ def update(
 @_command
 def sync(
     *projects: str,
-    config: Path | None = None,
+    config: ConfigOption = None,
 ) -> None:
     """Sync local main with remote for one, many, or all configured projects.
 
@@ -525,15 +511,11 @@ def sync(
     ----------
     projects: str
         Project names to sync. No names syncs all configured projects.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.reset_invocation_output(verbose=False)
-    cfg = _load_cfg(config)
+    cfg = _reset_output_and_load_config(config)
 
     if not cfg.projects:
-        _notice_no_projects(config)
-        sys.exit(ExitCode.OK)
+        _exit_without_projects(config)
 
     vcs_services = make_vcs_services()
     outcome = scan_service.sync_projects(
@@ -556,16 +538,13 @@ def _print_deploy_summary(results: Sequence[deploy_service.DeployResult]) -> Non
     if not results:
         output.notice("No projects have deploy_command configured")
         return
-    counts = Counter(_deploy_status(result) for result in results)
+    counts = Counter(
+        "failed" if "failed" in (r.build_status, r.deploy_status) else r.deploy_status
+        for r in results
+    )
     output.summary(
         {status: counts[status] for status in _STATUS_ORDER if counts[status]}
     )
-
-
-def _deploy_status(result: deploy_service.DeployResult) -> output.Status:
-    if "fail" in (result.build_status, result.deploy_status):
-        return "failed"
-    return _DEPLOY_STATUS_WORDS[result.deploy_status]
 
 
 @app.command
@@ -576,8 +555,8 @@ def deploy(
     build: bool = False,
     check: bool = False,
     force: Annotated[bool, cyclopts.Parameter(name=["--force", "-f"])] = False,
-    config: Path | None = None,
-    verbose: bool = False,
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
 ) -> None:
     """Deploy a project.
 
@@ -593,13 +572,8 @@ def deploy(
     force: bool
         Deploy even when main is unchanged since the last successful deploy or
         could not be resolved.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
-    verbose: bool
-        Stream subprocess logs to stderr, including successful commands.
     """
-    output.reset_invocation_output(verbose=verbose)
-    cfg = _load_cfg(config)
+    cfg = _reset_output_and_load_config(config, verbose=verbose)
     vcs = make_vcs_services()
     batch = not project
     renderer = _Renderer(batch=batch, flow="deploy")
@@ -608,8 +582,7 @@ def deploy(
         if check and not cfg.defaults.healthcheck_url:
             renderer(HealthcheckUnconfigured())
         if not cfg.projects:
-            _notice_no_projects(config)
-            sys.exit(ExitCode.OK)
+            _exit_without_projects(config)
         results = deploy_service.deploy_all(
             cfg,
             check=check,
@@ -619,13 +592,13 @@ def deploy(
         )
         _print_deploy_summary(results)
         any_failed = any(
-            result.deploy_status == "fail" or result.build_status == "fail"
+            "failed" in (result.build_status, result.deploy_status)
             for result in results
         )
         sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
 
     assert project is not None
-    proj_config = _resolve_proj(cfg, project)
+    proj_config = resolve_project(cfg, project)
     result = deploy_service.deploy_project(
         project,
         proj_config,
@@ -636,9 +609,9 @@ def deploy(
         vcs=vcs,
         emit=renderer,
     )
-    if result.build_status == "fail":
+    if result.build_status == "failed":
         sys.exit(ExitCode.BUILD_FAILED)
-    if result.deploy_status == "fail":
+    if result.deploy_status == "failed":
         sys.exit(ExitCode.DEPLOY_FAILED)
     sys.exit(ExitCode.OK)
 
@@ -648,8 +621,8 @@ def deploy(
 def test(
     project: str,
     *,
-    config: Path | None = None,
-    verbose: bool = False,
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
 ) -> None:
     """Run a project's test suite.
 
@@ -660,14 +633,9 @@ def test(
     ----------
     project: str
         Project name to test.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
-    verbose: bool
-        Stream subprocess logs to stderr, including successful commands.
     """
-    output.reset_invocation_output(verbose=verbose)
-    cfg = _load_cfg(config)
-    proj_config = _resolve_proj(cfg, project)
+    cfg = _reset_output_and_load_config(config, verbose=verbose)
+    proj_config = resolve_project(cfg, project)
     _require_test_config(project, proj_config, config)
 
     output.heading(project)
@@ -688,8 +656,8 @@ def test(
 def build(
     project: str,
     *,
-    config: Path | None = None,
-    verbose: bool = False,
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
 ) -> None:
     """Build a project's artefacts.
 
@@ -697,14 +665,9 @@ def build(
     ----------
     project: str
         Project name to build.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
-    verbose: bool
-        Stream subprocess logs to stderr, including successful commands.
     """
-    output.reset_invocation_output(verbose=verbose)
-    cfg = _load_cfg(config)
-    proj_config = _resolve_proj(cfg, project)
+    cfg = _reset_output_and_load_config(config, verbose=verbose)
+    proj_config = resolve_project(cfg, project)
     vcs = make_vcs_services()
 
     if not proj_config.build_command:
@@ -730,7 +693,7 @@ def build(
 def list_projects(
     *,
     detail: Annotated[bool, cyclopts.Parameter(name=("--detail", "-d"))] = False,
-    config: Path | None = None,
+    config: ConfigOption = None,
 ) -> None:
     """List all configured projects with scan findings summary.
 
@@ -738,15 +701,11 @@ def list_projects(
     ----------
     detail: bool
         Show full findings detail for each project.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.reset_invocation_output(verbose=False)
-    cfg = _load_cfg(config)
+    cfg = _reset_output_and_load_config(config)
 
     if not cfg.projects:
-        _notice_no_projects(config)
-        return
+        _exit_without_projects(config)
 
     scan_results: dict[str, ScanResult] = {}
     for name in cfg.projects:
@@ -916,7 +875,7 @@ def _fit_columns(
 def todo(
     project: str | None = None,
     *,
-    config: Path | None = None,
+    config: ConfigOption = None,
 ) -> None:
     """Show TODO.md items for projects.
 
@@ -924,43 +883,33 @@ def todo(
     ----------
     project: str | None
         Project name. Shows all projects if omitted.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
     """
-    output.reset_invocation_output(verbose=False)
-    cfg = _load_cfg(config)
+    cfg = _reset_output_and_load_config(config)
 
     if project:
-        proj_config = _resolve_proj(cfg, project)
-        _print_project_todo(project, proj_config.path)
+        proj_config = resolve_project(cfg, project)
+        _print_project_todo(project, _read_todo(proj_config.path))
         return
 
     if not cfg.projects:
-        _notice_no_projects(config)
-        return
+        _exit_without_projects(config)
 
-    empty = []
-    has_content = []
-    for name in sorted(cfg.projects):
-        todo_path = cfg.projects[name].path / "TODO.md"
-        content = todo_path.read_text().strip() if todo_path.exists() else ""
-        if content:
-            has_content.append(name)
-        else:
-            empty.append(name)
-
+    todos = {name: _read_todo(cfg.projects[name].path) for name in sorted(cfg.projects)}
+    empty = [name for name, content in todos.items() if not content.strip()]
     if empty:
         output.notice(f"{len(empty)} projects have no TODO items: {', '.join(empty)}")
-    for name in has_content:
-        _print_project_todo(name, cfg.projects[name].path)
+    for name, content in todos.items():
+        if content.strip():
+            _print_project_todo(name, content)
 
 
-# -- Helpers ------------------------------------------------------------------
-
-
-def _print_project_todo(name: str, project_path: Path) -> None:
+def _read_todo(project_path: Path) -> str:
+    """The raw TODO.md text, or '' when the file is absent."""
     todo_path = project_path / "TODO.md"
-    content = todo_path.read_text() if todo_path.exists() else ""
+    return todo_path.read_text() if todo_path.exists() else ""
+
+
+def _print_project_todo(name: str, content: str) -> None:
     if not content.strip():
         output.notice(f"No TODO items in {name}")
         return
@@ -974,13 +923,14 @@ def _print_project_todo(name: str, project_path: Path) -> None:
     )
 
 
-def _notice_no_projects(config: Path | None) -> None:
+def _exit_without_projects(config: Path | None) -> NoReturn:
     output.notice("No projects configured")
     output.diagnostic("hint", f"add projects to {_config_file(config)}")
+    sys.exit(ExitCode.OK)
 
 
 def _config_file(config: Path | None) -> Path:
-    """The file `_load_cfg` reads for this `--config` value."""
+    """The file `load_config` reads for this `--config` value."""
     return config or paths.config_path()
 
 
@@ -991,14 +941,6 @@ def _fatal(
     if hint:
         output.diagnostic("hint", hint)
     sys.exit(code)
-
-
-def _load_cfg(config: Path | None) -> MmConfig:
-    return load_config(config)
-
-
-def _resolve_proj(cfg: MmConfig, project: str) -> ProjectConfig:
-    return resolve_project(cfg, project)
 
 
 def _require_test_config(
@@ -1133,8 +1075,8 @@ def _choose_findings(
 def resolve(
     project: str,
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
-    config: Path | None = None,
-    verbose: bool = False,
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
 ) -> None:
     """Work through failed findings for a project.
 
@@ -1150,14 +1092,9 @@ def resolve(
         Project name (required).
     continue_: bool
         Re-test a paused, manually fixed finding on the resolve branch.
-    config: Path | None
-        Path to config file. Uses ~/.mm/config.toml if omitted.
-    verbose: bool
-        Stream subprocess logs to stderr, including successful commands.
     """
-    output.reset_invocation_output(verbose=verbose)
-    cfg = _load_cfg(config)
-    proj_config = _resolve_proj(cfg, project)
+    cfg = _reset_output_and_load_config(config, verbose=verbose)
+    proj_config = resolve_project(cfg, project)
     vcs_workflow.require_vcs_tools()
     vcs = make_vcs_services()
     outcome = resolve_service.resolve_project(
@@ -1285,7 +1222,7 @@ def _update_rows(updates: list[UpdateFinding]) -> _FindingRows:
     for update in updates:
         reason = update.blocked_reason or ""
         age = (
-            f"{(datetime.now(UTC) - update.published_date).days}d old"
+            f"{(utc_now() - update.published_date).days}d old"
             if update.published_date
             else ""
         )

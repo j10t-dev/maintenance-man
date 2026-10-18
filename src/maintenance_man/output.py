@@ -6,7 +6,7 @@ import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import datetime
 from threading import Lock, Timer
 from typing import Literal, TextIO
 
@@ -17,7 +17,8 @@ from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
 
-type Status = Literal["passed", "failed", "blocked", "skipped", "unchanged"]
+from maintenance_man.clock import utc_now
+from maintenance_man.models.events import Status
 
 
 def reset_invocation_output(*, verbose: bool) -> None:
@@ -308,7 +309,7 @@ def timestamp(value: datetime | None) -> str:
 
 def relative_time(value: datetime, now: datetime | None = None) -> str:
     """Use short relative timestamps for terminal metadata."""
-    seconds = int(((now or datetime.now(UTC)) - value).total_seconds())
+    seconds = int(((now or utc_now()) - value).total_seconds())
     if seconds < 60:
         return "just now"
     if seconds < 3600:

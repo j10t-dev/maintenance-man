@@ -12,8 +12,9 @@ from maintenance_man.scanner import ScanError
 from maintenance_man.services import WorkflowError
 from maintenance_man.services.update import UpdateSetupError
 from maintenance_man.vcs import RevisionError
-from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.cli import run_mm
 from tests.support.projects import write_config
+from tests.support.repository import configure_jj_projects
 
 
 @pytest.mark.parametrize(
@@ -75,7 +76,7 @@ def test_given_a_service_refusal_when_a_command_runs_then_it_maps_to_one_error_l
     error: Exception,
     expected_code: int,
 ) -> None:
-    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+    configure_jj_projects(mm_home_with_projects, tmp_path)
     monkeypatch.setattr(service_seam, MagicMock(side_effect=error))
 
     code = run_mm(*argv)
@@ -156,7 +157,7 @@ def test_fatal_prints_bracketed_plain_text_literally(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
-        cli, "_load_cfg", MagicMock(side_effect=ConfigError("bad [projects.x]"))
+        cli, "load_config", MagicMock(side_effect=ConfigError("bad [projects.x]"))
     )
 
     assert run_mm("scan") == 1

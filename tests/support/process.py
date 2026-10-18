@@ -33,11 +33,14 @@ def missing_tool(tool: str) -> Callable[[str, str], Path]:
 
 
 def refuse_new_processes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail the test when anything starts a process; scanning, discovery, native
-    preparation, build_command and pushes all need one."""
+    """Fail the test when anything other than jj starts a process; scanning,
+    discovery, native preparation and build_command all need one."""
+    start = subprocess.Popen
 
-    def refuse(args, *_, **__):
-        msg = f"unexpected process: {args!r}"
-        raise AssertionError(msg)
+    def refuse(args, *popen_args, **kwargs):
+        if not (isinstance(args, list | tuple) and args and args[0] == "jj"):
+            msg = f"unexpected process: {args!r}"
+            raise AssertionError(msg)
+        return start(args, *popen_args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", refuse)

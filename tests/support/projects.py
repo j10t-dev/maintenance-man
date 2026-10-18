@@ -11,8 +11,9 @@ from maintenance_man.models.scan import (
     ScanResult,
 )
 from maintenance_man.storage import save_scan_results
-from tests.fake_vcs import FakeJjState
+from maintenance_man.vcs import JjRepository
 from tests.support.findings import make_gradle_target, make_scan_result, make_update
+from tests.support.repository import commit_to_main, copy_jj_repository, write_file
 
 
 def make_project(path: Path, **overrides: Any) -> ProjectConfig:
@@ -57,26 +58,17 @@ def seed_project(
     scan: ScanResult,
     *,
     test_unit: str | None = "pytest",
-) -> tuple[FakeJjState, ProjectConfig]:
-    """Create a fake repository and persist the supplied scan under its project name."""
+) -> tuple[JjRepository, ProjectConfig]:
+    """Copy a jj repository and persist the supplied scan under its project name."""
     project = make_project(tmp_path / name, test_unit=test_unit)
-    state = FakeJjState()
-    state.seed_repository(project.path, files={"dep.txt": "version=1\n"})
-    state.register_files(
-        project.path,
-        "mm-fixture-some-pkg.txt",
-        "mm-fixture-pkg-a.txt",
-        "mm-fixture-pkg-b.txt",
-    )
+    repo = copy_jj_repository(project.path)
     scan.project = name
     save_scan_results(name, scan)
-    return state, project
+    return repo, project
 
 
-def seed_gradle_project(
-    tmp_path: Path, state: FakeJjState, name: str, **overrides: Any
-) -> ProjectConfig:
-    """Create a fake Gradle repository and save one shared-catalogue update."""
+def seed_gradle_project(tmp_path: Path, name: str, **overrides: Any) -> ProjectConfig:
+    """Copy a jj repository holding a Gradle project and save one shared update."""
     project = make_project(
         tmp_path / name,
         package_manager="gradle",
@@ -86,10 +78,10 @@ def seed_gradle_project(
     catalogue = (FIXTURES_DIR / "gradle" / "libs.versions.toml").read_text(
         encoding="utf-8"
     )
-    state.seed_repository(
-        project.path,
-        files={"gradlew": "#!/bin/sh\nexit 0\n", GRADLE_CATALOGUE_RELPATH: catalogue},
-    )
+    repo = copy_jj_repository(project.path)
+    write_file(repo, "gradlew", "#!/bin/sh\nexit 0\n")
+    write_file(repo, GRADLE_CATALOGUE_RELPATH, catalogue)
+    commit_to_main(repo, "gradle project")
     scan = make_scan_result(
         vulns=[],
         updates=[make_update(pkg_name="room", gradle_target=make_gradle_target())],

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -9,7 +7,6 @@ from maintenance_man.gradle import GradleError
 from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
     Emit,
-    Operation,
     OperationFailed,
     Outcome,
     ProjectSkipped,
@@ -77,7 +74,7 @@ def scan_all(cfg: MmConfig, *, emit: Emit) -> ScanSummary:
                 emit=emit,
             )
         except SCAN_ERRORS as exc:
-            emit(OperationFailed(Operation.SCAN, name, str(exc)))
+            emit(OperationFailed("scan", name, str(exc)))
             had_error = True
             continue
         results.append(result)
@@ -109,7 +106,7 @@ def sync_projects(
         try:
             action = sync_main(repo=vcs.repository(project.path))
         except RevisionError as exc:
-            emit(OperationFailed(Operation.SYNC, name, str(exc)))
+            emit(OperationFailed("sync", name, str(exc)))
             failed = True
         else:
             emit(SyncCompleted(name, action.value))

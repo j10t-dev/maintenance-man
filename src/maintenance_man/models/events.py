@@ -1,8 +1,11 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 from maintenance_man.models.scan import ScanResult, UpdateResult
+
+type Status = Literal["passed", "failed", "blocked", "skipped", "unchanged"]
 
 
 class Outcome(StrEnum):
@@ -20,21 +23,9 @@ class SkipReason(StrEnum):
     BLOCKED = "blocked"
 
 
-class Operation(StrEnum):
-    UPDATE_SETUP = "update_setup"
-    PROMOTE = "promote"
-    REFRESH = "refresh"
-    WORKSPACE_CLEANUP = "workspace_cleanup"
-    BOOKMARK_CLEANUP = "bookmark_cleanup"
-    RESOLVE_SETUP = "resolve_setup"
-    SCAN = "scan"
-    SYNC = "sync"
-
-
 class DeployStep(StrEnum):
     BUILD = "build"
     DEPLOY = "deploy"
-    HEALTH = "health"
 
 
 class FindingStepKind(StrEnum):
@@ -48,107 +39,114 @@ class FindingStepKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ProjectStarted:
+class Event:
+    """Something a service reports while it works; the CLI renders each kind."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectStarted(Event):
     project: str
 
 
 @dataclass(frozen=True, slots=True)
-class ProjectSkipped:
+class ProjectSkipped(Event):
     project: str
     reason: SkipReason
     detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class OperationFailed:
-    operation: Operation
+class OperationFailed(Event):
+    operation: str
+    """The step that failed, in the reader's words, such as 'workspace cleanup'."""
+
     project: str
     error: str
 
 
 @dataclass(frozen=True, slots=True)
-class ScanReported:
+class PromotionFailed(Event):
+    project: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScanReported(Event):
     result: ScanResult
     elapsed_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class MissingTestConfig:
+class MissingTestConfig(Event):
     project: str
 
 
 @dataclass(frozen=True, slots=True)
-class ProcessingStarted:
+class ProcessingStarted(Event):
     vulns: int
     updates: int
 
 
 @dataclass(frozen=True, slots=True)
-class FindingsProcessed:
+class FindingsProcessed(Event):
     results: tuple[UpdateResult, ...]
     blocked: int
 
 
 @dataclass(frozen=True, slots=True)
-class Promoted:
+class Promoted(Event):
     """A workflow bookmark has been promoted to local main."""
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvePaused:
+class ResolvePaused(Event):
     project: str
 
 
 @dataclass(frozen=True, slots=True)
-class FindingsBlocked:
+class FindingsBlocked(Event):
     findings: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
-class BlockersStillFailing:
+class BlockersStillFailing(Event):
     phase: str
     pkgs: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class SyncCompleted:
+class SyncCompleted(Event):
     project: str
     action: str
 
 
 @dataclass(frozen=True, slots=True)
-class DeployStepStarted:
+class DeployStepSucceeded(Event):
     project: str
     step: DeployStep
 
 
 @dataclass(frozen=True, slots=True)
-class DeployStepSucceeded:
-    project: str
-    step: DeployStep
-
-
-@dataclass(frozen=True, slots=True)
-class DeployStepFailed:
+class DeployStepFailed(Event):
     project: str
     step: DeployStep
     error: str
 
 
 @dataclass(frozen=True, slots=True)
-class HealthChecked:
+class HealthChecked(Event):
     project: str
     is_up: bool
     error: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class HealthcheckUnconfigured:
+class HealthcheckUnconfigured(Event):
     pass
 
 
 @dataclass(frozen=True, slots=True)
-class FindingStarted:
+class FindingStarted(Event):
     """An update attempt has started for this package and version pair."""
 
     pkg: str
@@ -157,18 +155,18 @@ class FindingStarted:
 
 
 @dataclass(frozen=True, slots=True)
-class TestCommandStarted:
+class TestCommandStarted(Event):
     command: str
 
 
 @dataclass(frozen=True, slots=True)
-class FindingStepFailed:
+class FindingStepFailed(Event):
     step: FindingStepKind
     error: str
 
 
 @dataclass(frozen=True, slots=True)
-class FindingPassed:
+class FindingPassed(Event):
     pkg: str
     already_applied: bool
     installed: str
@@ -176,35 +174,11 @@ class FindingPassed:
 
 
 @dataclass(frozen=True, slots=True)
-class FindingFailed:
+class FindingFailed(Event):
     pkg: str
     phase: str
     installed: str
     target: str
 
 
-type Event = (
-    ProjectStarted
-    | ProjectSkipped
-    | OperationFailed
-    | ScanReported
-    | MissingTestConfig
-    | ProcessingStarted
-    | FindingsProcessed
-    | Promoted
-    | ResolvePaused
-    | FindingsBlocked
-    | BlockersStillFailing
-    | SyncCompleted
-    | DeployStepStarted
-    | DeployStepSucceeded
-    | DeployStepFailed
-    | HealthChecked
-    | HealthcheckUnconfigured
-    | FindingStarted
-    | TestCommandStarted
-    | FindingStepFailed
-    | FindingPassed
-    | FindingFailed
-)
 type Emit = Callable[[Event], None]

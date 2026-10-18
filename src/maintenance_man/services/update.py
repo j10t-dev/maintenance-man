@@ -12,12 +12,12 @@ from maintenance_man.models.config import MmConfig, ProjectConfig
 from maintenance_man.models.events import (
     Emit,
     FindingsProcessed,
-    Operation,
     OperationFailed,
     Outcome,
     ProcessingStarted,
     ProjectSkipped,
     ProjectStarted,
+    PromotionFailed,
     ScanReported,
     SkipReason,
 )
@@ -113,7 +113,7 @@ def update_project(
         try:
             remove_workspace(repo=vcs.repository(project.path), project=name)
         except RevisionError as exc:
-            emit(OperationFailed(Operation.WORKSPACE_CLEANUP, name, str(exc)))
+            emit(OperationFailed("workspace cleanup", name, str(exc)))
             cleaned = False
 
     outcome = _finish_update(project.path, scan_result, name, vcs=vcs, emit=emit)
@@ -153,7 +153,7 @@ def update_projects(
             emit(ProjectSkipped(name, SkipReason.FLOW_CONFLICT, str(exc)))
             had_errors = True
         except UpdateSetupError as exc:
-            emit(OperationFailed(Operation.UPDATE_SETUP, name, str(exc)))
+            emit(OperationFailed("update setup", name, str(exc)))
             had_errors = True
         else:
             projects.append(result)
@@ -180,19 +180,14 @@ def resolve_update_targets(
 def _has_update_work(scan_result: ScanResult) -> bool:
     return any(
         _is_selectable(finding)
-        or (
-            finding.update_status is UpdateStatus.READY
-            and finding.flow is Workflow.UPDATE
-        )
+        or flows.is_owned(finding, Workflow.UPDATE, UpdateStatus.READY)
         for finding in scan_result.findings
     )
 
 
-def _has_update_state(
-    scan_result: ScanResult, statuses: tuple[UpdateStatus, ...]
-) -> bool:
+def _has_update_state(scan_result: ScanResult, *statuses: UpdateStatus) -> bool:
     return any(
-        finding.update_status in statuses and finding.flow is Workflow.UPDATE
+        flows.is_owned(finding, Workflow.UPDATE, *statuses)
         for finding in scan_result.findings
     )
 
@@ -208,7 +203,7 @@ def _enter_update_workspace(
     repo = vcs.repository(project_config.path)
     remove_workspace(repo=repo, project=project)
 
-    if _has_update_state(scan_result, (UpdateStatus.READY, UpdateStatus.FAILED)):
+    if _has_update_state(scan_result, UpdateStatus.READY, UpdateStatus.FAILED):
         if not repo.bookmark_exists(bookmark=bookmark):
             msg = (
                 f"update bookmark '{bookmark}' is missing but in-progress "
@@ -255,10 +250,7 @@ def _require_sdk_in_workspace(
 def _is_selectable(finding: VulnFinding | UpdateFinding) -> bool:
     return is_eligible(finding) and (
         finding.update_status is None
-        or (
-            finding.update_status is UpdateStatus.FAILED
-            and finding.flow is Workflow.UPDATE
-        )
+        or flows.is_owned(finding, Workflow.UPDATE, UpdateStatus.FAILED)
     )
 
 
@@ -331,17 +323,16 @@ def _finish_update(
     vcs: VcsServices,
     emit: Emit,
 ) -> Outcome:
-    if _has_update_state(scan_result, (UpdateStatus.FAILED,)):
+    if _has_update_state(scan_result, UpdateStatus.FAILED):
         emit(
-            OperationFailed(
-                Operation.PROMOTE,
+            PromotionFailed(
                 name,
                 "failed updates remain pending · "
                 f"rerun mm update {name} or repair with mm resolve {name}",
             )
         )
         return Outcome.FAILED
-    if not _has_update_state(scan_result, (UpdateStatus.READY,)):
+    if not _has_update_state(scan_result, UpdateStatus.READY):
         return Outcome.SUCCEEDED
     finalised = flows.finalise_local_changes(
         project_path, scan_result, name, Workflow.UPDATE, vcs=vcs, emit=emit

@@ -1,26 +1,29 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     BlockersStillFailing,
+    Emit,
     FindingPassed,
     FindingsBlocked,
     FindingStepFailed,
     FindingStepKind,
     MissingTestConfig,
-    Operation,
     OperationFailed,
     Outcome,
     Promoted,
+    PromotionFailed,
     ResolvePaused,
 )
 from maintenance_man.models.scan import ScanResult, UpdateStatus, Workflow
 from maintenance_man.services import WorkflowError
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.storage import load_scan_results, save_scan_results
-from maintenance_man.vcs import RevisionError
-from tests.fake_vcs import FakeJjState
+from maintenance_man.vcs import JjRepository, RevisionError
+from maintenance_man.vcs_workflow import make_vcs_services
 from tests.fakes import FakeFindingProcessor, RecordingEmit
 from tests.support.findings import (
     make_scan_result,
@@ -28,20 +31,52 @@ from tests.support.findings import (
     make_vuln,
 )
 from tests.support.projects import seed_gradle_project, seed_project
+from tests.support.repository import (
+    commit_descriptions,
+    commit_file,
+    fail_repository_method,
+    operation_id,
+    remote_bookmark_target,
+    write_file,
+)
 
 _BOOKMARK = "mm/resolve-dependencies"
 _UPDATE_BOOKMARK = "mm/update-dependencies"
 
 
-def _record_tip_at_promotion(state: FakeJjState, path: Path) -> list[str]:
+def _resolve(
+    project: ProjectConfig, *, continue_: bool = False, emit: Emit | None = None
+) -> Outcome:
+    return resolve_service.resolve_project(
+        "api",
+        project,
+        continue_=continue_,
+        vcs=make_vcs_services(),
+        emit=emit or RecordingEmit(),
+    )
+
+
+def _before_promotion(
+    monkeypatch: pytest.MonkeyPatch, path: Path, action: Callable[[], None]
+) -> None:
+    promote = JjRepository.promote_bookmark_to_main
+
+    def wrapper(repository: JjRepository, *, bookmark: str) -> None:
+        if repository.path.resolve() == path.resolve():
+            action()
+        promote(repository, bookmark=bookmark)
+
+    monkeypatch.setattr(JjRepository, "promote_bookmark_to_main", wrapper)
+
+
+def _record_tip_at_promotion(
+    monkeypatch: pytest.MonkeyPatch, repo: JjRepository
+) -> list[str]:
     tips: list[str] = []
-    state.hook(
-        "promote_bookmark_to_main",
-        phase="before",
-        action=lambda: tips.append(
-            state.repository(path).resolve_revision(revision=_BOOKMARK)
-        ),
-        path=path,
+    _before_promotion(
+        monkeypatch,
+        repo.path,
+        lambda: tips.append(repo.resolve_revision(revision=_BOOKMARK)),
     )
     return tips
 
@@ -70,26 +105,25 @@ def _pending_stack_scan() -> ScanResult:
     )
 
 
-def _stack_update_commits(state: FakeJjState, path: Path, *packages: str) -> str:
-    repo = state.services().repository(path)
+def _stack_update_commits(repo: JjRepository, *packages: str) -> str:
     for package in packages:
-        (path / f"mm-fixture-{package}.txt").write_text("1.0.1", encoding="utf-8")
-        repo.commit(message=f"fixture: update {package}")
+        commit_file(
+            repo, f"mm-fixture-{package}.txt", "1.0.1", f"fixture: update {package}"
+        )
     repo.set_bookmark(bookmark=_UPDATE_BOOKMARK, revision="@-")
     return repo.resolve_revision(revision=_UPDATE_BOOKMARK)
 
 
-def _commit_repair(state: FakeJjState, path: Path) -> None:
-    (path / "dep.txt").write_text("repaired\n", encoding="utf-8")
-    state.services().repository(path).commit(message="repair")
+def _commit_repair(repo: JjRepository) -> None:
+    commit_file(repo, "dep.txt", "repaired\n", "repair")
 
 
 class TestResolveCandidates:
     def test_given_pending_update_stack_when_resolving_then_resolve_owns_it_at_same_tip(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        state, project = seed_project(tmp_path, "api", _pending_stack_scan())
-        update_tip = _stack_update_commits(state, project.path, "pkg-a", "pkg-c")
+        repo, project = seed_project(tmp_path, "api", _pending_stack_scan())
+        update_tip = _stack_update_commits(repo, "pkg-a", "pkg-c")
         processed: list[tuple[str, ...]] = []
         processor = FakeFindingProcessor({"pkg-b": (False, "unit")})
 
@@ -99,13 +133,7 @@ class TestResolveCandidates:
 
         monkeypatch.setattr(resolve_service, "process_findings", process)
 
-        outcome = resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=False,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        outcome = _resolve(project)
 
         assert outcome is Outcome.FAILED
         assert processed == [("pkg-b",)]
@@ -117,7 +145,6 @@ class TestResolveCandidates:
             ("pkg-b", Workflow.RESOLVE, UpdateStatus.FAILED),
             ("pkg-c", Workflow.RESOLVE, UpdateStatus.READY),
         ]
-        repo = state.services().repository(project.path)
         assert repo.resolve_revision(revision=_BOOKMARK) == update_tip
         assert repo.same_revision(left="@-", right=_BOOKMARK)
         assert not repo.bookmark_exists(bookmark=_UPDATE_BOOKMARK)
@@ -125,8 +152,8 @@ class TestResolveCandidates:
     def test_given_interrupted_takeover_when_resolving_again_then_failure_is_retried(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        state, project = seed_project(tmp_path, "api", _pending_stack_scan())
-        update_tip = _stack_update_commits(state, project.path, "pkg-a", "pkg-c")
+        repo, project = seed_project(tmp_path, "api", _pending_stack_scan())
+        update_tip = _stack_update_commits(repo, "pkg-a", "pkg-c")
         rows_after_takeover: list[
             list[tuple[UpdateStatus | None, Workflow | None]]
         ] = []
@@ -142,13 +169,7 @@ class TestResolveCandidates:
 
         monkeypatch.setattr(resolve_service, "process_findings", interrupted)
         with pytest.raises(KeyboardInterrupt):
-            resolve_service.resolve_project(
-                "api",
-                project,
-                continue_=False,
-                vcs=state.services(),
-                emit=RecordingEmit(),
-            )
+            _resolve(project)
         processed: list[tuple[str, ...]] = []
         processor = FakeFindingProcessor({"pkg-b": (True, None)})
 
@@ -158,13 +179,7 @@ class TestResolveCandidates:
 
         monkeypatch.setattr(resolve_service, "process_findings", process)
 
-        outcome = resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=False,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        outcome = _resolve(project)
 
         assert rows_after_takeover == [
             [
@@ -176,7 +191,6 @@ class TestResolveCandidates:
         assert outcome is Outcome.SUCCEEDED
         assert processed == [("pkg-b",)]
         assert load_scan_results("api").findings == ()
-        repo = state.services().repository(project.path)
         assert repo.is_ancestor(ancestor=update_tip, descendant="main")
 
     @pytest.mark.parametrize(
@@ -203,26 +217,20 @@ class TestResolveCandidates:
     def test_given_unsafe_state_when_taking_over_then_nothing_changes(
         self, tmp_path: Path, dirty: bool, update_bookmark: bool, message: str
     ) -> None:
-        state, project = seed_project(tmp_path, "api", _pending_stack_scan())
+        repo, project = seed_project(tmp_path, "api", _pending_stack_scan())
         if update_bookmark:
-            _stack_update_commits(state, project.path, "pkg-a", "pkg-c")
+            _stack_update_commits(repo, "pkg-a", "pkg-c")
         if dirty:
-            (project.path / "dep.txt").write_text("dirty\n", encoding="utf-8")
+            write_file(repo, "dep.txt", "dirty\n")
         saved_before = load_scan_results("api")
-        state.clear_calls()
+        before = operation_id(repo)
 
         with pytest.raises(WorkflowError) as raised:
-            resolve_service.resolve_project(
-                "api",
-                project,
-                continue_=False,
-                vcs=state.services(),
-                emit=RecordingEmit(),
-            )
+            _resolve(project)
 
         assert str(raised.value) == message.format(path=project.path.resolve())
         assert load_scan_results("api") == saved_before
-        assert state.effects == []
+        assert operation_id(repo) == before
 
     @pytest.mark.parametrize("continue_", [False, True], ids=["resolve", "continue"])
     def test_given_update_and_resolve_progress_when_run_then_resolve_refuses_unchanged(
@@ -237,26 +245,20 @@ class TestResolveCandidates:
                 failed_phase="unit",
             )
         )
-        state, project = seed_project(tmp_path, "api", scan)
-        _stack_update_commits(state, project.path, "pkg-a", "pkg-c")
+        repo, project = seed_project(tmp_path, "api", scan)
+        _stack_update_commits(repo, "pkg-a", "pkg-c")
         saved_before = load_scan_results("api")
-        state.clear_calls()
+        before = operation_id(repo)
 
         with pytest.raises(WorkflowError) as raised:
-            resolve_service.resolve_project(
-                "api",
-                project,
-                continue_=continue_,
-                vcs=state.services(),
-                emit=RecordingEmit(),
-            )
+            _resolve(project, continue_=continue_)
 
         assert str(raised.value) == (
             "Resolve cannot take over pending updates while resolve progress "
             "also exists for api. Run mm scan api to start again from main."
         )
         assert load_scan_results("api") == saved_before
-        assert state.effects == []
+        assert operation_id(repo) == before
 
     def test_given_ready_finding_when_resolve_runs_then_it_is_promoted_and_removed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -271,11 +273,8 @@ class TestResolveCandidates:
                 ),
             ],
         )
-        state, project = seed_project(tmp_path, "api", scan)
-        state.register_files(project.path, "mm-fixture-pkg-a.txt")
-        (project.path / "mm-fixture-pkg-a.txt").write_text("1.0.1", encoding="utf-8")
-        repo = state.services().repository(project.path)
-        repo.commit(message="fixture: update pkg-a")
+        repo, project = seed_project(tmp_path, "api", scan)
+        commit_file(repo, "mm-fixture-pkg-a.txt", "1.0.1", "fixture: update pkg-a")
         repo.set_bookmark(bookmark=_BOOKMARK, revision="@-")
         resolve_tip = repo.resolve_revision(revision=_BOOKMARK)
         monkeypatch.setattr(
@@ -283,13 +282,7 @@ class TestResolveCandidates:
         )
         emit = RecordingEmit()
 
-        outcome = resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=False,
-            vcs=state.services(),
-            emit=emit,
-        )
+        outcome = _resolve(project, emit=emit)
 
         assert outcome is Outcome.SUCCEEDED
         assert emit.events[-1] == Promoted()
@@ -302,33 +295,25 @@ def test_fresh_resolve_promotes_and_removes_completed_findings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result()
-    state, project = seed_project(tmp_path, "api", scan)
+    repo, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
         FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)}),
     )
-    resolve_tips = _record_tip_at_promotion(state, project.path)
+    resolve_tips = _record_tip_at_promotion(monkeypatch, repo)
+    main_before = repo.resolve_revision(revision="main")
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=False,
-        vcs=state.services(),
-        emit=emit,
-    )
+    outcome = _resolve(project, emit=emit)
 
     assert outcome is Outcome.SUCCEEDED
     assert emit.events[-1] == Promoted()
     assert load_scan_results("api").findings == ()
-    created = [call for call in state.effects if call.method == "create_bookmark"]
-    assert len(created) == 1
-    assert dict(created[0].arguments) == {
-        "bookmark": _BOOKMARK,
-        "revision": "main",
-    }
-    repo = state.services().repository(project.path)
+    assert commit_descriptions(repo, f"{main_before}..main") == [
+        "fixture: update some-pkg",
+        "fixture: update pkg-a",
+    ]
     assert repo.same_revision(left="main", right=resolve_tips[0])
     assert not repo.bookmark_exists(bookmark=_BOOKMARK)
 
@@ -336,28 +321,24 @@ def test_fresh_resolve_promotes_and_removes_completed_findings(
 def test_failed_candidate_pauses_without_promoting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state, project = seed_project(tmp_path, "api", make_scan_result())
+    repo, project = seed_project(tmp_path, "api", make_scan_result())
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
         FakeFindingProcessor({"some-pkg": (False, "unit"), "pkg-a": (True, None)}),
     )
+    main_origin = repo.resolve_revision(revision="main@origin")
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=False,
-        vcs=state.services(),
-        emit=emit,
-    )
+    outcome = _resolve(project, emit=emit)
 
     assert outcome is Outcome.FAILED
     assert emit.events[-1] == ResolvePaused("api")
     saved = load_scan_results("api")
     assert saved.vulnerabilities[0].update_status is UpdateStatus.FAILED
     assert saved.vulnerabilities[0].failed_phase == "unit"
-    assert not any(call.method == "push_bookmark" for call in state.attempts)
+    assert remote_bookmark_target(repo, "main") == main_origin
+    assert remote_bookmark_target(repo, _BOOKMARK) is None
     assert Promoted() not in emit.events
 
 
@@ -376,22 +357,17 @@ def test_given_blocked_and_ready_rows_when_resolve_completes_then_it_promotes(
         ],
         updates=[],
     )
-    state, project = seed_project(tmp_path, "api", scan)
+    repo, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
         FakeFindingProcessor({"some-pkg": (True, None)}),
     )
-    resolve_tips = _record_tip_at_promotion(state, project.path)
+    resolve_tips = _record_tip_at_promotion(monkeypatch, repo)
+    main_origin = repo.resolve_revision(revision="main@origin")
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=False,
-        vcs=state.services(),
-        emit=emit,
-    )
+    outcome = _resolve(project, emit=emit)
 
     assert outcome is Outcome.SUCCEEDED
     assert emit.of_type(FindingsBlocked) == [
@@ -401,9 +377,9 @@ def test_given_blocked_and_ready_rows_when_resolve_completes_then_it_promotes(
     assert [
         (row.pkg_name, row.update_status) for row in load_scan_results("api").findings
     ] == [("blocked", None)]
-    repo = state.services().repository(project.path)
     assert repo.same_revision(left="main", right=resolve_tips[0])
-    assert not any(call.method == "push_bookmark" for call in state.attempts)
+    assert remote_bookmark_target(repo, "main") == main_origin
+    assert remote_bookmark_target(repo, _BOOKMARK) is None
 
 
 def test_given_row_blocked_during_run_when_resolve_completes_then_it_is_reported_once(
@@ -416,7 +392,7 @@ def test_given_row_blocked_during_run_when_resolve_completes_then_it_is_reported
         ],
         updates=[],
     )
-    state, project = seed_project(tmp_path, "api", scan)
+    _, project = seed_project(tmp_path, "api", scan)
     passing = FakeFindingProcessor({"some-pkg": (True, None)})
 
     def process_and_block_drifted(findings, *args, scan_result, emit, **kwargs):
@@ -429,13 +405,7 @@ def test_given_row_blocked_during_run_when_resolve_completes_then_it_is_reported
     monkeypatch.setattr(resolve_service, "process_findings", process_and_block_drifted)
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=False,
-        vcs=state.services(),
-        emit=emit,
-    )
+    outcome = _resolve(project, emit=emit)
 
     assert outcome is Outcome.SUCCEEDED
     assert emit.of_type(FindingsBlocked) == [
@@ -446,28 +416,21 @@ def test_given_row_blocked_during_run_when_resolve_completes_then_it_is_reported
 def test_given_promotion_failure_when_resolve_completes_then_ready_and_bookmark_remain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state, project = seed_project(tmp_path, "api", make_scan_result())
+    repo, project = seed_project(tmp_path, "api", make_scan_result())
     monkeypatch.setattr(
         resolve_service,
         "process_findings",
         FakeFindingProcessor({"some-pkg": (True, None), "pkg-a": (True, None)}),
     )
-    state.fail(
-        "promote_bookmark_to_main", error=RevisionError("denied"), path=project.path
+    fail_repository_method(
+        monkeypatch, project.path, "promote_bookmark_to_main", RevisionError("denied")
     )
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=False,
-        vcs=state.services(),
-        emit=emit,
-    )
+    outcome = _resolve(project, emit=emit)
 
     assert outcome is Outcome.FAILED
-    assert emit.events[-1] == OperationFailed(
-        Operation.PROMOTE,
+    assert emit.events[-1] == PromotionFailed(
         "api",
         f"denied · rebase with jj rebase -b {_BOOKMARK} -d main, then rerun",
     )
@@ -475,7 +438,7 @@ def test_given_promotion_failure_when_resolve_completes_then_ready_and_bookmark_
         finding.update_status is UpdateStatus.READY
         for finding in load_scan_results("api").findings
     )
-    assert state.services().repository(project.path).bookmark_exists(bookmark=_BOOKMARK)
+    assert repo.bookmark_exists(bookmark=_BOOKMARK)
 
 
 def test_continue_failing_retest_persists_phase_and_reports_blockers(
@@ -491,23 +454,15 @@ def test_continue_failing_retest_persists_phase_and_reports_blockers(
         ],
         updates=[],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    state.services().repository(project.path).set_bookmark(
-        bookmark=_BOOKMARK, revision="main"
-    )
-    _commit_repair(state, project.path)
+    repo, project = seed_project(tmp_path, "api", scan)
+    repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
+    _commit_repair(repo)
     monkeypatch.setattr(
         resolve_service, "run_test_phases", lambda *_args, **_kwargs: "unit"
     )
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=True,
-        vcs=state.services(),
-        emit=emit,
-    )
+    outcome = _resolve(project, continue_=True, emit=emit)
 
     assert outcome is Outcome.FAILED
     assert emit.events[-1] == BlockersStillFailing("unit", ("some-pkg",))
@@ -532,11 +487,9 @@ def test_continue_passing_retest_marks_blocker_passed_then_promotes(
         ],
         updates=[make_update(pkg_name="pkg-a")],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    state.services().repository(project.path).set_bookmark(
-        bookmark=_BOOKMARK, revision="main"
-    )
-    _commit_repair(state, project.path)
+    repo, project = seed_project(tmp_path, "api", scan)
+    repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
+    _commit_repair(repo)
     monkeypatch.setattr(
         resolve_service, "run_test_phases", lambda *_args, **_kwargs: None
     )
@@ -550,29 +503,21 @@ def test_continue_passing_retest_marks_blocker_passed_then_promotes(
             persisted.failed_phase,
             persisted.flow,
         ) == (UpdateStatus.READY, None, Workflow.RESOLVE)
-        repo = state.services().repository(project.path)
         assert repo.same_revision(left=_BOOKMARK, right="@-")
         processed.append(tuple(finding.pkg_name for finding in findings))
         return processor(findings, project_config, **kwargs)
 
     monkeypatch.setattr(resolve_service, "process_findings", process)
-    resolve_tips = _record_tip_at_promotion(state, project.path)
+    resolve_tips = _record_tip_at_promotion(monkeypatch, repo)
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=True,
-        vcs=state.services(),
-        emit=emit,
-    )
+    outcome = _resolve(project, continue_=True, emit=emit)
 
     assert outcome is Outcome.SUCCEEDED
     assert FindingPassed("some-pkg", False, "1.0.0", "1.0.1") in emit.events
     assert processed == [("pkg-a",)]
     assert emit.events[-1] == Promoted()
     assert load_scan_results("api").findings == ()
-    repo = state.services().repository(project.path)
     assert repo.same_revision(left="main", right=resolve_tips[0])
     assert not repo.bookmark_exists(bookmark=_BOOKMARK)
 
@@ -584,7 +529,7 @@ def test_missing_resume_bookmark_raises_workflow_error(
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.RESOLVE)],
     )
-    state, project = seed_project(tmp_path, "api", scan)
+    _, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(resolve_service, "process_findings", FakeFindingProcessor({}))
 
     with pytest.raises(
@@ -594,13 +539,7 @@ def test_missing_resume_bookmark_raises_workflow_error(
             "in-progress state exists"
         ),
     ):
-        resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=False,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        _resolve(project)
 
 
 def test_paused_resolve_requires_continue(tmp_path: Path) -> None:
@@ -608,42 +547,30 @@ def test_paused_resolve_requires_continue(tmp_path: Path) -> None:
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    state.services().repository(project.path).set_bookmark(
-        bookmark=_BOOKMARK, revision="main"
-    )
+    repo, project = seed_project(tmp_path, "api", scan)
+    repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
 
     with pytest.raises(WorkflowError) as raised:
-        resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=False,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        _resolve(project)
 
     assert str(raised.value) == "resolve already paused for api — rerun with --continue"
 
 
-def test_continue_wraps_repository_inspection_error(tmp_path: Path) -> None:
+def test_continue_wraps_repository_inspection_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     scan = make_scan_result(
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    state.services().repository(project.path).set_bookmark(
-        bookmark=_BOOKMARK, revision="main"
+    repo, project = seed_project(tmp_path, "api", scan)
+    repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
+    fail_repository_method(
+        monkeypatch, project.path, "has_changes", RevisionError("unknown")
     )
-    state.fail("has_changes", error=RevisionError("unknown"), path=project.path)
 
     with pytest.raises(WorkflowError) as raised:
-        resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=True,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        _resolve(project, continue_=True)
 
     assert str(raised.value) == "Cannot inspect resolve work: unknown"
     assert isinstance(raised.value.__cause__, RevisionError)
@@ -654,20 +581,12 @@ def test_continue_refuses_dirty_current_change(tmp_path: Path) -> None:
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    state.services().repository(project.path).set_bookmark(
-        bookmark=_BOOKMARK, revision="main"
-    )
-    (project.path / "dep.txt").write_text("dirty\n", encoding="utf-8")
+    repo, project = seed_project(tmp_path, "api", scan)
+    repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
+    write_file(repo, "dep.txt", "dirty\n")
 
     with pytest.raises(WorkflowError) as raised:
-        resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=True,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        _resolve(project, continue_=True)
 
     assert str(raised.value) == (
         "--continue requires an empty current jj change — commit or discard "
@@ -675,27 +594,19 @@ def test_continue_refuses_dirty_current_change(tmp_path: Path) -> None:
     )
 
 
-def test_prepare_failure_emits_then_raises_aborted(tmp_path: Path) -> None:
-    state, project = seed_project(tmp_path, "api", make_scan_result())
-    state.fail(
-        "create_bookmark",
-        error=RevisionError("cannot create"),
-        path=project.path,
+def test_prepare_failure_emits_then_raises_aborted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, project = seed_project(tmp_path, "api", make_scan_result())
+    fail_repository_method(
+        monkeypatch, project.path, "create_bookmark", RevisionError("cannot create")
     )
     emit = RecordingEmit()
 
     with pytest.raises(WorkflowError, match="aborted resolve for api"):
-        resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=False,
-            vcs=state.services(),
-            emit=emit,
-        )
+        _resolve(project, emit=emit)
 
-    assert emit.events[-1] == OperationFailed(
-        Operation.RESOLVE_SETUP, "api", "cannot create"
-    )
+    assert emit.events[-1] == OperationFailed("resolve setup", "api", "cannot create")
 
 
 def test_given_bookmark_move_failure_when_continuing_then_repair_base_is_saved(
@@ -711,28 +622,19 @@ def test_given_bookmark_move_failure_when_continuing_then_repair_base_is_saved(
         ],
         updates=[],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    repo = state.services().repository(project.path)
+    repo, project = seed_project(tmp_path, "api", scan)
     repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
     base = repo.resolve_revision(revision="main")
-    _commit_repair(state, project.path)
-    state.fail(
-        "set_bookmark",
-        error=RevisionError("cannot move"),
-        path=project.path,
+    _commit_repair(repo)
+    fail_repository_method(
+        monkeypatch, project.path, "set_bookmark", RevisionError("cannot move")
     )
     monkeypatch.setattr(
         resolve_service, "run_test_phases", lambda *_args, **_kwargs: None
     )
 
     with pytest.raises(WorkflowError) as raised:
-        resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=True,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        _resolve(project, continue_=True)
 
     assert str(raised.value) == (
         "could not move mm/resolve-dependencies to the committed manual fix"
@@ -783,12 +685,10 @@ def test_given_unsafe_state_when_continuing_then_resolve_refuses_before_effects(
             for index, (status, flow) in enumerate(rows)
         ],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    state.services().repository(project.path).set_bookmark(
-        bookmark=_BOOKMARK, revision="main"
-    )
+    repo, project = seed_project(tmp_path, "api", scan)
+    repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
     saved_before = load_scan_results("api")
-    state.clear_calls()
+    before = operation_id(repo)
     monkeypatch.setattr(
         resolve_service,
         "run_test_phases",
@@ -796,17 +696,11 @@ def test_given_unsafe_state_when_continuing_then_resolve_refuses_before_effects(
     )
 
     with pytest.raises(WorkflowError) as raised:
-        resolve_service.resolve_project(
-            "api",
-            project,
-            continue_=True,
-            vcs=state.services(),
-            emit=RecordingEmit(),
-        )
+        _resolve(project, continue_=True)
 
     assert str(raised.value) == message
     assert load_scan_results("api") == saved_before
-    assert state.effects == []
+    assert operation_id(repo) == before
 
 
 def test_given_ready_write_interrupted_when_continuing_again_then_same_repair_completes(
@@ -816,12 +710,11 @@ def test_given_ready_write_interrupted_when_continuing_again_then_same_repair_co
         vulns=[],
         updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
     )
-    state, project = seed_project(tmp_path, "api", scan)
-    repo = state.services().repository(project.path)
+    repo, project = seed_project(tmp_path, "api", scan)
     repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
     scan.resolve_repair_base = repo.resolve_revision(revision="main")
     save_scan_results("api", scan)
-    _commit_repair(state, project.path)
+    _commit_repair(repo)
     repair = repo.resolve_revision(revision="@-")
     repo.set_bookmark(bookmark=_BOOKMARK, revision="@-")
     monkeypatch.setattr(
@@ -829,22 +722,13 @@ def test_given_ready_write_interrupted_when_continuing_again_then_same_repair_co
     )
     monkeypatch.setattr(resolve_service, "process_findings", FakeFindingProcessor({}))
     bases_at_promotion: list[str | None] = []
-    state.hook(
-        "promote_bookmark_to_main",
-        phase="before",
-        action=lambda: bases_at_promotion.append(
-            load_scan_results("api").resolve_repair_base
-        ),
-        path=project.path,
+    _before_promotion(
+        monkeypatch,
+        project.path,
+        lambda: bases_at_promotion.append(load_scan_results("api").resolve_repair_base),
     )
 
-    outcome = resolve_service.resolve_project(
-        "api",
-        project,
-        continue_=True,
-        vcs=state.services(),
-        emit=RecordingEmit(),
-    )
+    outcome = _resolve(project, continue_=True)
 
     assert outcome is Outcome.SUCCEEDED
     assert bases_at_promotion == [None]
@@ -855,20 +739,17 @@ def test_given_ready_write_interrupted_when_continuing_again_then_same_repair_co
 def test_given_repair_missing_saved_target_when_continuing_then_bookmark_stays(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state = FakeJjState()
-    project = seed_gradle_project(tmp_path, state, "api")
-    state.register_files(project.path, "repair.txt")
+    project = seed_gradle_project(tmp_path, "api")
+    repo = JjRepository(project.path)
     scan = load_scan_results("api")
     row = scan.updates[0]
     row.update_status = UpdateStatus.FAILED
     row.failed_phase = "unit"
     row.flow = Workflow.RESOLVE
     save_scan_results("api", scan)
-    repo = state.services().repository(project.path)
     repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
     base = repo.resolve_revision(revision="main")
-    (project.path / "repair.txt").write_text("unrelated\n", encoding="utf-8")
-    repo.commit(message="repair")
+    commit_file(repo, "repair.txt", "unrelated\n", "repair")
     monkeypatch.setattr(
         resolve_service,
         "run_test_phases",
@@ -876,9 +757,7 @@ def test_given_repair_missing_saved_target_when_continuing_then_bookmark_stays(
     )
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api", project, continue_=True, vcs=state.services(), emit=emit
-    )
+    outcome = _resolve(project, continue_=True, emit=emit)
 
     assert outcome is Outcome.FAILED
     assert emit.of_type(FindingStepFailed) == [
@@ -898,13 +777,12 @@ def test_given_repair_missing_saved_target_when_continuing_then_bookmark_stays(
 def test_given_no_test_phase_when_resolving_then_project_fails_before_effects(
     tmp_path: Path,
 ) -> None:
-    state, project = seed_project(tmp_path, "api", make_scan_result(), test_unit=None)
+    repo, project = seed_project(tmp_path, "api", make_scan_result(), test_unit=None)
+    before = operation_id(repo)
     emit = RecordingEmit()
 
-    outcome = resolve_service.resolve_project(
-        "api", project, continue_=False, vcs=state.services(), emit=emit
-    )
+    outcome = _resolve(project, emit=emit)
 
     assert outcome is Outcome.FAILED
     assert emit.events == [MissingTestConfig("api")]
-    assert state.effects == []
+    assert operation_id(repo) == before

@@ -9,7 +9,6 @@ from maintenance_man.models.config import DefaultsConfig, MmConfig
 from maintenance_man.models.events import (
     DeployStep,
     DeployStepFailed,
-    DeployStepStarted,
     DeployStepSucceeded,
     HealthChecked,
     HealthcheckUnconfigured,
@@ -21,34 +20,32 @@ from maintenance_man.services import WorkflowError
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from tests.fake_vcs import FakeJjState
+from maintenance_man.vcs_workflow import make_vcs_services
 from tests.fakes import RecordingEmit
 from tests.support.projects import make_activity, make_project
+from tests.support.repository import copy_jj_repository, fail_repository_method
 
 
 @pytest.mark.parametrize(
     "resolved, prior, force, expected",
     [
-        (True, "same-success", False, deploy_service.GateDecision.SKIP_UNCHANGED),
-        (True, "old-success", False, deploy_service.GateDecision.DEPLOY),
-        (True, "same-failure", False, deploy_service.GateDecision.DEPLOY),
-        (True, "missing-id", False, deploy_service.GateDecision.DEPLOY),
-        (True, "none", False, deploy_service.GateDecision.DEPLOY),
-        (False, "none", False, deploy_service.GateDecision.SKIP_BLOCKED),
-        (True, "same-success", True, deploy_service.GateDecision.DEPLOY),
-        (False, "none", True, deploy_service.GateDecision.DEPLOY),
+        (True, "same-success", False, SkipReason.UNCHANGED),
+        (True, "old-success", False, None),
+        (True, "same-failure", False, None),
+        (True, "missing-id", False, None),
+        (True, "none", False, None),
+        (False, "none", False, SkipReason.BLOCKED),
+        (True, "same-success", True, None),
+        (False, "none", True, None),
     ],
 )
-def test_gate_decision(tmp_path, resolved, prior, force, expected) -> None:
+def test_gate_decision(tmp_path, monkeypatch, resolved, prior, force, expected) -> None:
     project_path = tmp_path / "project"
-    state = FakeJjState()
-    repo = state.seed_repository(project_path, files={})
+    repo = copy_jj_repository(project_path)
     expected_id = repo.resolve_revision(revision="main") if resolved else None
     if not resolved:
-        state.fail(
-            "resolve_revision",
-            error=RevisionError("no main"),
-            path=project_path,
+        fail_repository_method(
+            monkeypatch, project_path, "resolve_revision", RevisionError("no main")
         )
     activity = {
         "same-success": make_activity(success=True, commit_id=expected_id),
@@ -58,18 +55,17 @@ def test_gate_decision(tmp_path, resolved, prior, force, expected) -> None:
         "none": {},
     }[prior]
 
-    decision, current_id = deploy_service.should_deploy(
-        "app", project_path, activity, force=force, vcs=state.services()
+    skip, current_id = deploy_service.should_deploy(
+        "app", project_path, activity, force=force, vcs=make_vcs_services()
     )
 
-    assert decision is expected
+    assert skip is expected
     assert current_id == expected_id
 
 
 def test_last_build_only_does_not_gate(tmp_path) -> None:
     project_path = tmp_path / "project"
-    state = FakeJjState()
-    repo = state.seed_repository(project_path, files={})
+    repo = copy_jj_repository(project_path)
     main_id = repo.resolve_revision(revision="main")
     activity = {
         "app": ProjectActivity(
@@ -82,23 +78,20 @@ def test_last_build_only_does_not_gate(tmp_path) -> None:
         )
     }
 
-    decision, current_id = deploy_service.should_deploy(
-        "app", project_path, activity, force=False, vcs=state.services()
+    skip, current_id = deploy_service.should_deploy(
+        "app", project_path, activity, force=False, vcs=make_vcs_services()
     )
 
-    assert decision is deploy_service.GateDecision.DEPLOY
+    assert skip is None
     assert current_id == main_id
 
 
 def test_build_launch_failure_records_a_failed_build(mm_home, tmp_path) -> None:
     missing = tmp_path / "missing"
-    state = FakeJjState()
-    state.seed_repository(missing, files={})
-    missing.rmdir()
     project = make_project(missing, build_command="true")
 
     with pytest.raises(BuildError):
-        deploy_service.build_project("demo", project, vcs=state.services())
+        deploy_service.build_project("demo", project, vcs=make_vcs_services())
 
     recorded = load_activity(paths.activity_path())["demo"].last_build
     assert recorded is not None
@@ -108,7 +101,6 @@ def test_build_launch_failure_records_a_failed_build(mm_home, tmp_path) -> None:
 def test_deploy_all_reports_gates_steps_results_and_activity(
     tmp_path, monkeypatch
 ) -> None:
-    state = FakeJjState()
     projects = {
         "deployed": make_project(
             tmp_path / "deployed", build_command="build", deploy_command="deploy"
@@ -128,15 +120,14 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         "no_deploy_command": make_project(tmp_path / "no_deploy_command"),
     }
     main_ids = {
-        name: state.seed_repository(projects[name].path, files={}).resolve_revision(
-            revision="main"
-        )
+        name: copy_jj_repository(projects[name].path).resolve_revision(revision="main")
         for name in ("deployed", "unchanged", "missing_revision")
     }
-    state.fail(
+    fail_repository_method(
+        monkeypatch,
+        projects["missing_revision"].path,
         "resolve_revision",
-        error=RevisionError("no main"),
-        path=projects["missing_revision"].path,
+        RevisionError("no main"),
     )
     runs: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
@@ -164,16 +155,16 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         MmConfig(projects=projects),
         check=False,
         force=False,
-        vcs=state.services(),
+        vcs=make_vcs_services(),
         emit=emit,
     )
 
     assert results == (
-        deploy_service.DeployResult("deployed", "pass", "pass"),
-        deploy_service.DeployResult("disabled", "skip", "skip"),
-        deploy_service.DeployResult("missing_path", "skip", "fail"),
-        deploy_service.DeployResult("missing_revision", "skip", "blocked"),
-        deploy_service.DeployResult("unchanged", "skip", "unchanged"),
+        deploy_service.DeployResult("deployed", "passed", "passed"),
+        deploy_service.DeployResult("disabled", "skipped", "skipped"),
+        deploy_service.DeployResult("missing_path", "skipped", "failed"),
+        deploy_service.DeployResult("missing_revision", "skipped", "blocked"),
+        deploy_service.DeployResult("unchanged", "skipped", "unchanged"),
     )
     assert runs == [
         (
@@ -187,9 +178,7 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
     ]
     assert emit.events == [
         ProjectStarted("deployed"),
-        DeployStepStarted("deployed", DeployStep.BUILD),
         DeployStepSucceeded("deployed", DeployStep.BUILD),
-        DeployStepStarted("deployed", DeployStep.DEPLOY),
         DeployStepSucceeded("deployed", DeployStep.DEPLOY),
         ProjectSkipped("disabled", SkipReason.NOT_DEPLOYABLE),
         ProjectSkipped(
@@ -205,9 +194,8 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
 
 
 def test_deploy_all_checks_health_after_success(tmp_path, monkeypatch) -> None:
-    state = FakeJjState()
     project = make_project(tmp_path / "a", deploy_command="deploy")
-    state.seed_repository(project.path, files={})
+    copy_jj_repository(project.path)
     monkeypatch.setattr(
         deploy_service, "run_shell_command", lambda *args, **kwargs: None
     )
@@ -225,13 +213,13 @@ def test_deploy_all_checks_health_after_success(tmp_path, monkeypatch) -> None:
         ),
         check=True,
         force=False,
-        vcs=state.services(),
+        vcs=make_vcs_services(),
         emit=emit,
     )
 
-    assert result == (deploy_service.DeployResult("a", "skip", "pass"),)
+    assert result == (deploy_service.DeployResult("a", "skipped", "passed"),)
     assert emit.events[-2:] == [
-        DeployStepStarted("a", DeployStep.HEALTH),
+        DeployStepSucceeded("a", DeployStep.DEPLOY),
         HealthChecked("a", True, None),
     ]
 
@@ -239,11 +227,10 @@ def test_deploy_all_checks_health_after_success(tmp_path, monkeypatch) -> None:
 def test_deploy_all_build_failure_stops_project_and_records_failure(
     tmp_path, monkeypatch
 ) -> None:
-    state = FakeJjState()
     project = make_project(
         tmp_path / "a", build_command="build", deploy_command="deploy"
     )
-    state.seed_repository(project.path, files={})
+    copy_jj_repository(project.path)
     error = BuildError("build failed")
 
     def run(command, path, **kwargs):
@@ -259,11 +246,11 @@ def test_deploy_all_build_failure_stops_project_and_records_failure(
         MmConfig(projects={"a": project}),
         check=False,
         force=False,
-        vcs=state.services(),
+        vcs=make_vcs_services(),
         emit=emit,
     )
 
-    assert results == (deploy_service.DeployResult("a", "fail", "skip"),)
+    assert results == (deploy_service.DeployResult("a", "failed", "skipped"),)
     assert deployed == []
     assert emit.events[-1] == DeployStepFailed("a", DeployStep.BUILD, "build failed")
     recorded = load_activity(paths.activity_path())["a"].last_build
@@ -272,9 +259,7 @@ def test_deploy_all_build_failure_stops_project_and_records_failure(
 
 
 def test_deploy_project_refuses_missing_command(tmp_path) -> None:
-    state = FakeJjState()
     project = make_project(tmp_path / "api")
-    state.seed_repository(project.path, files={})
 
     with pytest.raises(
         WorkflowError,
@@ -288,7 +273,7 @@ def test_deploy_project_refuses_missing_command(tmp_path) -> None:
             build=False,
             check=False,
             force=False,
-            vcs=state.services(),
+            vcs=make_vcs_services(),
             emit=RecordingEmit(),
         )
 
@@ -296,10 +281,11 @@ def test_deploy_project_refuses_missing_command(tmp_path) -> None:
 def test_deploy_project_refuses_unresolvable_main_without_force(
     tmp_path, monkeypatch
 ) -> None:
-    state = FakeJjState()
     project = make_project(tmp_path / "api", deploy_command="deploy")
-    state.seed_repository(project.path, files={})
-    state.fail("resolve_revision", error=RevisionError("no main"), path=project.path)
+    copy_jj_repository(project.path)
+    fail_repository_method(
+        monkeypatch, project.path, "resolve_revision", RevisionError("no main")
+    )
     deployed: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         deploy_service,
@@ -319,17 +305,18 @@ def test_deploy_project_refuses_unresolvable_main_without_force(
             build=False,
             check=False,
             force=False,
-            vcs=state.services(),
+            vcs=make_vcs_services(),
             emit=RecordingEmit(),
         )
     assert deployed == []
 
 
 def test_deploy_project_force_allows_unresolvable_main(tmp_path, monkeypatch) -> None:
-    state = FakeJjState()
     project = make_project(tmp_path / "api", deploy_command="deploy")
-    state.seed_repository(project.path, files={})
-    state.fail("resolve_revision", error=RevisionError("no main"), path=project.path)
+    copy_jj_repository(project.path)
+    fail_repository_method(
+        monkeypatch, project.path, "resolve_revision", RevisionError("no main")
+    )
     deployed: list[str] = []
     monkeypatch.setattr(
         deploy_service,
@@ -344,11 +331,11 @@ def test_deploy_project_force_allows_unresolvable_main(tmp_path, monkeypatch) ->
         build=False,
         check=False,
         force=True,
-        vcs=state.services(),
+        vcs=make_vcs_services(),
         emit=RecordingEmit(),
     )
 
-    assert result == deploy_service.DeployResult("api", "skip", "pass")
+    assert result == deploy_service.DeployResult("api", "skipped", "passed")
     assert deployed == ["deploy"]
     recorded = load_activity(paths.activity_path())["api"].last_deploy
     assert recorded is not None
@@ -366,11 +353,11 @@ def test_deploy_project_skips_not_deployable(tmp_path) -> None:
         build=False,
         check=False,
         force=False,
-        vcs=FakeJjState().services(),
+        vcs=make_vcs_services(),
         emit=emit,
     )
 
-    assert result == deploy_service.DeployResult("api", "skip", "skip")
+    assert result == deploy_service.DeployResult("api", "skipped", "skipped")
     assert emit.events == [ProjectSkipped("api", SkipReason.NOT_DEPLOYABLE)]
 
 
@@ -378,9 +365,8 @@ def test_deploy_project_skips_not_deployable(tmp_path) -> None:
 def test_deploy_project_reports_unconfigured_health_after_success(
     tmp_path, monkeypatch, healthcheck_url
 ) -> None:
-    state = FakeJjState()
     project = make_project(tmp_path / "api", deploy_command="deploy")
-    state.seed_repository(project.path, files={})
+    copy_jj_repository(project.path)
     monkeypatch.setattr(
         deploy_service, "run_shell_command", lambda *args, **kwargs: None
     )
@@ -400,29 +386,25 @@ def test_deploy_project_reports_unconfigured_health_after_success(
         build=False,
         check=True,
         force=False,
-        vcs=state.services(),
+        vcs=make_vcs_services(),
         emit=emit,
     )
 
-    assert result == deploy_service.DeployResult("api", "skip", "pass")
+    assert result == deploy_service.DeployResult("api", "skipped", "passed")
     assert emit.events[-2:] == [
         DeployStepSucceeded("api", DeployStep.DEPLOY),
         HealthcheckUnconfigured(),
     ]
     assert health_checks == []
     assert not emit.of_type(HealthChecked)
-    assert all(
-        event.step is not DeployStep.HEALTH for event in emit.of_type(DeployStepStarted)
-    )
 
 
 @pytest.mark.parametrize("healthcheck_url", [None, ""])
 def test_deploy_all_leaves_unconfigured_health_to_the_cli(
     tmp_path, monkeypatch, healthcheck_url
 ) -> None:
-    state = FakeJjState()
     project = make_project(tmp_path / "api", deploy_command="deploy")
-    state.seed_repository(project.path, files={})
+    copy_jj_repository(project.path)
     monkeypatch.setattr(
         deploy_service, "run_shell_command", lambda *args, **kwargs: None
     )
@@ -442,34 +424,47 @@ def test_deploy_all_leaves_unconfigured_health_to_the_cli(
         ),
         check=True,
         force=False,
-        vcs=state.services(),
+        vcs=make_vcs_services(),
         emit=emit,
     )
 
-    assert result == (deploy_service.DeployResult("api", "skip", "pass"),)
+    assert result == (deploy_service.DeployResult("api", "skipped", "passed"),)
     assert health_checks == []
     assert not emit.of_type(HealthcheckUnconfigured)
     assert not emit.of_type(HealthChecked)
-    assert all(
-        event.step is not DeployStep.HEALTH for event in emit.of_type(DeployStepStarted)
-    )
 
 
 @pytest.mark.parametrize(
-    "failure, error, expected_statuses",
+    "failure, error, expected_statuses, expected_events",
     [
-        (BuildError, BuildError("build failed"), ("fail", "skip")),
-        (DeployError, DeployError("deploy failed"), ("pass", "fail")),
+        (
+            BuildError,
+            BuildError("build failed"),
+            ("failed", "skipped"),
+            [
+                ProjectStarted("api"),
+                DeployStepFailed("api", DeployStep.BUILD, "build failed"),
+            ],
+        ),
+        (
+            DeployError,
+            DeployError("deploy failed"),
+            ("passed", "failed"),
+            [
+                ProjectStarted("api"),
+                DeployStepSucceeded("api", DeployStep.BUILD),
+                DeployStepFailed("api", DeployStep.DEPLOY, "deploy failed"),
+            ],
+        ),
     ],
 )
 def test_failed_deploy_has_no_health_hint(
-    tmp_path, monkeypatch, failure, error, expected_statuses
+    tmp_path, monkeypatch, failure, error, expected_statuses, expected_events
 ) -> None:
-    state = FakeJjState()
     project = make_project(
         tmp_path / "api", build_command="build", deploy_command="deploy"
     )
-    state.seed_repository(project.path, files={"dep.txt": "version=1\n"})
+    copy_jj_repository(project.path)
 
     def run(*args, **kwargs):
         if kwargs["error"] is failure:
@@ -484,14 +479,9 @@ def test_failed_deploy_has_no_health_hint(
         build=True,
         check=True,
         force=True,
-        vcs=state.services(),
+        vcs=make_vcs_services(),
         emit=emit,
     )
 
     assert (result.build_status, result.deploy_status) == expected_statuses
-    assert isinstance(emit.events[-1], DeployStepFailed)
-    assert not emit.of_type(HealthcheckUnconfigured)
-    assert not emit.of_type(HealthChecked)
-    assert all(
-        event.step is not DeployStep.HEALTH for event in emit.of_type(DeployStepStarted)
-    )
+    assert emit.events == expected_events

@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,9 +9,15 @@ from maintenance_man.deployer import BuildError, DeployError, HealthCheckResult
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from tests.fake_vcs import FakeJjState
-from tests.support.cli import configure_fake_vcs, run_mm
+from tests.support.cli import run_mm
 from tests.support.projects import write_config
+from tests.support.repository import (
+    commit_to_main,
+    configure_jj_projects,
+    copy_jj_repository,
+    fail_repository_method,
+    write_file,
+)
 
 
 @pytest.mark.parametrize(
@@ -21,17 +26,17 @@ from tests.support.projects import write_config
         ([], "No projects have deploy_command configured\n"),
         (
             [
-                deploy_service.DeployResult("a", "pass", "pass"),
-                deploy_service.DeployResult("b", "fail", "skip"),
-                deploy_service.DeployResult("c", "pass", "fail"),
-                deploy_service.DeployResult("d", "skip", "skip"),
-                deploy_service.DeployResult("e", "skip", "unchanged"),
-                deploy_service.DeployResult("f", "skip", "blocked"),
-                deploy_service.DeployResult("g", "skip", "fail"),
+                deploy_service.DeployResult("a", "passed", "passed"),
+                deploy_service.DeployResult("b", "failed", "skipped"),
+                deploy_service.DeployResult("c", "passed", "failed"),
+                deploy_service.DeployResult("d", "skipped", "skipped"),
+                deploy_service.DeployResult("e", "skipped", "unchanged"),
+                deploy_service.DeployResult("f", "skipped", "blocked"),
+                deploy_service.DeployResult("g", "skipped", "failed"),
             ],
             "1 passed · 3 failed · 1 blocked · 1 skipped · 1 unchanged\n",
         ),
-        ([deploy_service.DeployResult("a", "pass", "pass")], "1 passed\n"),
+        ([deploy_service.DeployResult("a", "passed", "passed")], "1 passed\n"),
     ],
     ids=["none", "every-status", "passed-only"],
 )
@@ -60,7 +65,7 @@ def test_given_batch_deploy_with_failed_build_when_run_then_deploy_is_recorded_s
             raise error
 
     monkeypatch.setattr(deploy_service, "run_shell_command", run)
-    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+    configure_jj_projects(mm_home_with_projects, tmp_path)
 
     assert run_mm("deploy") == ExitCode.DEPLOY_FAILED
 
@@ -82,7 +87,7 @@ def test_given_unusable_projects_when_batch_deploy_then_records_and_summary_agre
     monkeypatch.setattr(
         deploy_service, "run_shell_command", lambda *args, **kwargs: None
     )
-    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+    configure_jj_projects(mm_home_with_projects, tmp_path)
     config_path = mm_home_with_projects / "config.toml"
     missing = tmp_path / "missing"
     write_config(
@@ -104,28 +109,9 @@ def test_given_unusable_projects_when_batch_deploy_then_records_and_summary_agre
     assert captured.err == "2 passed · 1 failed · 1 skipped\n"
 
 
-@dataclass(frozen=True)
-class _DeployVcs:
-    state: FakeJjState
-    paths: dict[str, Path]
-    main_ids: dict[str, str]
-
-
 @pytest.fixture
-def _deploy_vcs(
-    mm_home_with_projects: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> _DeployVcs:
-    state, paths_by_name = configure_fake_vcs(
-        mm_home_with_projects, tmp_path, monkeypatch
-    )
-    main_ids = {
-        name: state.repository(path).resolve_revision(revision="main")
-        for name, path in paths_by_name.items()
-    }
-    state.clear_calls()
-    return _DeployVcs(state=state, paths=paths_by_name, main_ids=main_ids)
+def _jj_projects(mm_home_with_projects: Path, tmp_path: Path) -> None:
+    configure_jj_projects(mm_home_with_projects, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -145,19 +131,15 @@ def test_unresolved_main_deploy_gate_persists_no_invented_identity(
     expected_commit,
 ):
     project_path = tmp_path / "project"
-    state = FakeJjState()
-    state.seed_repository(project_path, files={"dep.txt": "version=1\n"})
-    state.fail(
-        "resolve_revision",
-        error=RevisionError("main unavailable"),
-        path=project_path,
+    copy_jj_repository(project_path)
+    fail_repository_method(
+        monkeypatch, project_path, "resolve_revision", RevisionError("main unavailable")
     )
     write_config(
         mm_home,
         f'[projects.demo]\npath = "{project_path}"\npackage_manager = "uv"\n'
         'deploy_command = "deploy"\n',
     )
-    monkeypatch.setattr(cli, "make_vcs_services", state.services)
     deployed: list[str] = []
     monkeypatch.setattr(
         deploy_service,
@@ -169,7 +151,6 @@ def test_unresolved_main_deploy_gate_persists_no_invented_identity(
     assert run_mm(*argv) == expected_code
 
     assert deployed == (["deploy"] if expected_deploys else [])
-    assert any(call.method == "resolve_revision" for call in state.attempts)
     activity = load_activity(paths.activity_path())
     if expected_commit == "absent":
         assert "demo" not in activity
@@ -182,24 +163,17 @@ def test_deploy_saves_the_exact_main_identity_used_by_the_gate(
     mm_home, tmp_path, monkeypatch
 ):
     project_path = tmp_path / "project"
-    state = FakeJjState()
-    repo = state.seed_repository(project_path, files={"dep.txt": "version=1\n"})
+    repo = copy_jj_repository(project_path)
     main_id = repo.resolve_revision(revision="main")
     write_config(
         mm_home,
         f'[projects.demo]\npath = "{project_path}"\npackage_manager = "uv"\n'
         'deploy_command = "deploy"\n',
     )
-    monkeypatch.setattr(cli, "make_vcs_services", state.services)
 
     def deploy(*args, **kwargs):
-        advanced = state.seed_commit(
-            project_path,
-            parent=main_id,
-            files={"dep.txt": "version=2\n"},
-            description="advanced during deployment",
-        )
-        state.seed_bookmark(project_path, bookmark="main", targets=(advanced,))
+        write_file(repo, "dep.txt", "version=2\n")
+        commit_to_main(repo, "advanced during deployment")
 
     monkeypatch.setattr(deploy_service, "run_shell_command", deploy)
 
@@ -209,14 +183,10 @@ def test_deploy_saves_the_exact_main_identity_used_by_the_gate(
     assert event is not None
     assert event.commit_id == main_id
     assert repo.resolve_revision(revision="main") != main_id
-    assert any(call.method == "resolve_revision" for call in state.attempts)
 
 
+@pytest.mark.usefixtures("_jj_projects")
 class TestDeployCommand:
-    @pytest.fixture(autouse=True)
-    def _gate(self, _deploy_vcs: _DeployVcs) -> None:
-        pass
-
     def test_no_deploy_config(self, mm_home_with_projects: Path) -> None:
         """Error when project has no deploy_command configured."""
         assert run_mm("deploy", "no-deploy") == ExitCode.ERROR
@@ -299,11 +269,8 @@ class TestDeployCommand:
         assert captured.err == ""
 
 
+@pytest.mark.usefixtures("_jj_projects")
 class TestDeployCheck:
-    @pytest.fixture(autouse=True)
-    def _gate(self, _deploy_vcs: _DeployVcs) -> None:
-        pass
-
     @patch(
         "maintenance_man.services.deploy.check_health",
         return_value=HealthCheckResult(is_up=True),
@@ -398,7 +365,7 @@ def test_given_empty_project_name_when_deploy_then_runs_deploy_all_in_batch_mode
     mm_home_with_projects: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     monkeypatch.setattr(deploy_service, "run_shell_command", lambda *a, **k: None)
-    configure_fake_vcs(mm_home_with_projects, tmp_path, monkeypatch)
+    configure_jj_projects(mm_home_with_projects, tmp_path)
 
     code = run_mm("deploy", "")
     captured = capsys.readouterr()
@@ -408,11 +375,8 @@ def test_given_empty_project_name_when_deploy_then_runs_deploy_all_in_batch_mode
     assert "deployable\tbuild\tpassed\tbuild\t-\t-\t-" in captured.out
 
 
+@pytest.mark.usefixtures("_jj_projects")
 class TestMassDeployCommand:
-    @pytest.fixture(autouse=True)
-    def _gate(self, _deploy_vcs: _DeployVcs) -> None:
-        pass
-
     @patch("maintenance_man.services.deploy.run_shell_command")
     def test_deploys_all_projects_and_prints_summary(
         self,
