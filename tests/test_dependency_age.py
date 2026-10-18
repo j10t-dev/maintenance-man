@@ -6,7 +6,7 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from pathlib import Path
@@ -24,7 +24,6 @@ from maintenance_man.dependency_age import (
     _public_url,
     _publication_http,
     evaluate_gradle_candidate_age,
-    filter_gradle_updates_by_age,
     filter_registry_updates_by_age,
     lookup_gradle_publication,
     member_module,
@@ -1110,185 +1109,6 @@ def test_gradle_age_without_requests_is_withheld(tmp_path):
     assert result == AgeBlock(reason="candidate has no publication requests")
 
 
-@pytest.mark.parametrize(
-    ("members", "repositories", "facts", "expected_dates", "expected_blocks"),
-    [
-        (
-            (("library", "one", "g:one"), ("library", "two", "g:two")),
-            (("library", "https://repo.maven.apache.org/maven2"),),
-            (
-                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
-                (datetime(2026, 9, 3, tzinfo=UTC), "0" * 64),
-            ),
-            [datetime(2026, 9, 3, tzinfo=UTC)],
-            [None],
-        ),
-        (
-            (("library", "one", "g:one"), ("library", "two", "g:two")),
-            (("library", "https://repo.maven.apache.org/maven2"),),
-            (
-                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
-                (datetime(2026, 9, 17, tzinfo=UTC), "0" * 64),
-            ),
-            [],
-            [],
-        ),
-        (
-            (("library", "one", "g:one"), ("library", "two", "g:two")),
-            (("library", "https://repo.maven.apache.org/maven2"),),
-            (
-                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
-                TimeoutError("unavailable"),
-            ),
-            [None],
-            [None],
-        ),
-        (
-            (("library", "one", "g:one"), ("library", "two", "g:two")),
-            (("library", "https://repo.maven.apache.org/maven2"),),
-            (
-                (datetime(2026, 9, 17, tzinfo=UTC), "0" * 64),
-                TimeoutError("unavailable"),
-            ),
-            [],
-            [],
-        ),
-        (
-            (("library", "one", "g:one"),),
-            (
-                ("library", "https://repo.maven.apache.org/maven2"),
-                ("library", "https://dl.google.com/dl/android/maven2"),
-            ),
-            ((datetime(2026, 9, 1, tzinfo=UTC), "0" * 64), None),
-            [datetime(2026, 9, 1, tzinfo=UTC)],
-            [None],
-        ),
-        (
-            (("library", "one", "g:one"),),
-            (
-                ("library", "https://repo.maven.apache.org/maven2"),
-                ("library", "https://dl.google.com/dl/android/maven2"),
-            ),
-            (
-                (datetime(2026, 9, 17, tzinfo=UTC), "0" * 64),
-                TimeoutError("unavailable"),
-            ),
-            [],
-            [],
-        ),
-        (
-            (("library", "one", "g:one"),),
-            (
-                ("library", "https://repo.maven.apache.org/maven2"),
-                ("library", "https://dl.google.com/dl/android/maven2"),
-            ),
-            (
-                (datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),
-                (datetime(2026, 9, 1, tzinfo=UTC), "1" * 64),
-            ),
-            [None],
-            [None],
-        ),
-        (
-            (("library", "one", "g:one"),),
-            (("library", "https://repo.maven.apache.org/maven2"),),
-            ((datetime(2026, 9, 11, tzinfo=UTC), "0" * 64),),
-            [],
-            [],
-        ),
-        (
-            (("library", "one", "g:one"), ("plugin", "two", "g.two")),
-            (("library", "https://repo.maven.apache.org/maven2"),),
-            ((datetime(2026, 9, 1, tzinfo=UTC), "0" * 64),),
-            [None],
-            [None],
-        ),
-    ],
-    ids=[
-        "all-members-old",
-        "one-member-young",
-        "one-member-unknown",
-        "young-member-with-unknown-member",
-        "one-repository-absent",
-        "young-repository-with-unknown-repository",
-        "conflicting-digest",
-        "equal-cutoff",
-        "member-routing-unknown",
-    ],
-)
-def test_gradle_scan_age_rule(
-    tmp_path,
-    monkeypatch,
-    members,
-    repositories,
-    facts,
-    expected_dates,
-    expected_blocks,
-):
-    row, project, resolution = _scan_age_inputs(
-        tmp_path,
-        member_specs=members,
-        repository_specs=repositories,
-    )
-    outcomes = iter(facts)
-
-    def submit(repository, module):
-        value = next(outcomes)
-        if isinstance(value, TimeoutError):
-            value = AgeBlock(reason="publication lookup failed")
-        elif isinstance(value, tuple):
-            value = _publication_fact(module, repository, value[0], value[1])
-        future = Future()
-        future.set_result(value)
-        return future
-
-    context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
-    monkeypatch.setattr(context, "submit", submit)
-    with context:
-        result = filter_gradle_updates_by_age([row], project, resolution, 7, context)
-    assert [update.published_date for update in result] == expected_dates
-    assert [update.blocked_reason for update in result] == expected_blocks
-
-
-def test_given_plugin_marker_when_filtered_then_marker_date_and_routing_are_kept(
-    tmp_path,
-):
-    marker = ModuleId(
-        group="org.example.plugin",
-        artifact="org.example.plugin.gradle.plugin",
-        version="2",
-    )
-    implementation = ModuleId(group="g", artifact="impl", version="2")
-    update, project, resolution = _scan_age_inputs(
-        tmp_path,
-        member_specs=(("plugin", "plugin", marker.group),),
-        repository_specs=(("plugin", "https://plugins.gradle.org/m2"),),
-    )
-    requests = []
-
-    def transport(url, repository, suffix, count):
-        count()
-        requests.append((repository, suffix))
-        return (
-            _pom(marker, implementation),
-            {"Last-Modified": "Tue, 01 Sep 2026 00:00:00 GMT"},
-            url,
-        )
-
-    with PublicationLookupContext(tmp_path, transport, FakeClock(_PUB_NOW)) as context:
-        result = filter_gradle_updates_by_age([update], project, resolution, 7, context)
-
-    assert requests == [
-        (
-            "portal",
-            "org/example/plugin/org.example.plugin.gradle.plugin/2/"
-            "org.example.plugin.gradle.plugin-2.pom",
-        )
-    ]
-    assert [row.published_date for row in result] == [datetime(2026, 9, 1, tzinfo=UTC)]
-    assert [row.blocked_reason for row in result] == [None]
-
-
 _DEFAULT_GRADLE_MEMBER_SPECS = (("library", "one", "g:one"),)
 _DEFAULT_GRADLE_REPOSITORY_SPECS = (
     ("library", "https://repo.maven.apache.org/maven2"),
@@ -1342,53 +1162,6 @@ def _scan_age_inputs(
         )
     )
     return update, project, resolution
-
-
-def test_gradle_scan_submits_every_update_before_waiting(tmp_path, monkeypatch):
-    first, project, resolution = _scan_age_inputs(tmp_path)
-    second, _, _ = _scan_age_inputs(
-        tmp_path, member_specs=(("library", "two", "g:two"),)
-    )
-    expected_submissions = 4
-    submitted = []
-
-    def submit(repository, module):
-        submitted.append((repository, module))
-        fact = _publication_fact(module, repository, datetime(2026, 9, 1, tzinfo=UTC))
-        future = Future()
-        futures.append((future, fact))
-        if len(submitted) == expected_submissions:
-            for pending, value in futures:
-                pending.set_result(value)
-        return future
-
-    futures = []
-    outcome = []
-    context = PublicationLookupContext(tmp_path, clock=FakeClock(_PUB_NOW))
-    monkeypatch.setattr(context, "submit", submit)
-
-    def filter_updates():
-        try:
-            with context:
-                outcome.append(
-                    filter_gradle_updates_by_age(
-                        [first, second], project, resolution, 7, context
-                    )
-                )
-        except BaseException as error:
-            outcome.append(error)
-
-    worker = threading.Thread(target=filter_updates, daemon=True)
-    worker.start()
-    worker.join(2)
-    assert not worker.is_alive(), "filter waited before submitting every update"
-    if isinstance(outcome[0], BaseException):
-        raise outcome[0]
-    result = outcome[0]
-    assert [update.gradle_target for update in result] == [
-        first.gradle_target,
-        second.gradle_target,
-    ]
 
 
 def _pypi_body(name="pkg", version="1.0", uploads=("2025-12-31T00:00:00Z",)):

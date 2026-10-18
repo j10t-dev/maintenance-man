@@ -1,5 +1,6 @@
 import contextlib
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,17 +21,24 @@ from maintenance_man import paths
 from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
-    filter_gradle_updates_by_age,
     filter_registry_updates_by_age,
 )
 from maintenance_man.gradle import (
+    GRADLE_CATALOGUE_RELPATH,
     GradleError,
     discover_gradle_updates,
+    parse_catalogue,
 )
 from maintenance_man.gradle_inventory import bind_inventory
-from maintenance_man.gradle_resolution import generate_gradle_report
+from maintenance_man.gradle_resolution import (
+    PreparedCandidate,
+    generate_gradle_report,
+    prepare_gradle_candidates,
+    select_gradle_candidates,
+)
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
+    CandidateWithheld,
     CompleteResolution,
     IncompleteResolution,
 )
@@ -125,8 +133,8 @@ def _scan_gradle_project(
 ]:
     vulns, resolution = scan_gradle(project)
     updates = discover_gradle_updates(project)
-    updates = filter_gradle_updates_by_age(
-        updates, project, resolution, min_version_age_days, publication
+    vulns, updates = _prepare_gradle_scan_findings(
+        project, vulns, resolution, updates, min_version_age_days, publication
     )
     secrets = (
         scan_secrets(Path(project.path), project.scan_skip_dirs)
@@ -134,6 +142,89 @@ def _scan_gradle_project(
         else []
     )
     return vulns, updates, secrets, resolution
+
+
+def _prepare_gradle_scan_findings(
+    project: ProjectConfig,
+    vulnerabilities: list[VulnFinding],
+    resolution: CompleteResolution,
+    proposals: list[UpdateFinding],
+    minimum_age_days: int,
+    publication: PublicationLookupContext,
+) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+    """Save one vulnerability row per exact source/target association, and give
+    every Gradle row either its prepared target or the reason it is blocked."""
+    catalogue = parse_catalogue(project.path / GRADLE_CATALOGUE_RELPATH)
+    plan = select_gradle_candidates(catalogue, resolution, vulnerabilities, proposals)
+    prepared = prepare_gradle_candidates(
+        project,
+        plan.candidates,
+        resolution,
+        publication,
+        minimum_age_days,
+        clock=publication.clock,
+    )
+    rows = [
+        row
+        for index, finding in enumerate(vulnerabilities)
+        for row in _vulnerability_rows(index, finding, prepared, plan.withheld)
+    ]
+    updates = [
+        _prepared_update(update, prepared, plan.withheld, publication)
+        for update in proposals
+    ]
+    return rows, updates
+
+
+def _vulnerability_rows(
+    index: int,
+    finding: VulnFinding,
+    prepared: tuple[PreparedCandidate, ...],
+    withheld: tuple[CandidateWithheld, ...],
+) -> Iterator[VulnFinding]:
+    if finding.fixed_version is None:
+        yield finding.model_copy(update={"blocked_reason": "no published fix"})
+        return
+    for item in prepared:
+        if index in item.candidate.vulnerability_indices:
+            yield finding.model_copy(
+                update={
+                    "gradle_target": item.candidate.target,
+                    "blocked_reason": item.withheld_reason,
+                }
+            )
+    for entry in withheld:
+        if index in entry.vulnerability_indices:
+            yield finding.model_copy(update={"blocked_reason": entry.reason})
+
+
+def _prepared_update(
+    update: UpdateFinding,
+    prepared: tuple[PreparedCandidate, ...],
+    withheld: tuple[CandidateWithheld, ...],
+    publication: PublicationLookupContext,
+) -> UpdateFinding:
+    unsupported = "no supported catalogue target"
+    if update.blocked_reason is not None:
+        return update
+    if update.gradle_target is None:
+        return update.model_copy(update={"blocked_reason": unsupported})
+    key = update.gradle_target.group_key
+    for item in prepared:
+        if item.candidate.target.group_key != key:
+            continue
+        changes: dict[str, object] = {
+            "gradle_target": item.candidate.target,
+            "blocked_reason": item.withheld_reason,
+        }
+        if item.withheld_reason is None:
+            changes["published_date"] = max(
+                publication.results[request.model_dump_json()].timestamp
+                for request in item.candidate.publication_requests
+            )
+        return update.model_copy(update=changes)
+    reason = next((entry.reason for entry in withheld if entry.group_key == key), None)
+    return update.model_copy(update={"blocked_reason": reason or unsupported})
 
 
 def _check_outdated(

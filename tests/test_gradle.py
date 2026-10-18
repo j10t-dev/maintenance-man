@@ -17,7 +17,6 @@ from maintenance_man.gradle import (
     apply_gradle_update,
     claim_owned_dir,
     discover_gradle_updates,
-    normalise_alias,
     owned_gradle_inventory,
     parse_catalogue,
     render_selected_report,
@@ -31,6 +30,7 @@ from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
     SemverTier,
+    normalise_alias,
 )
 from tests.support.findings import make_gradle_target
 from tests.support.gradle import (

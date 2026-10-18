@@ -89,6 +89,20 @@ class UpdateResult:
     failed_phase: str | None = None
 
 
+def normalise_alias(name: str) -> str:
+    """Gradle treats '-', '_' and '.' as equivalent alias separators."""
+    return name.replace("_", "-").replace(".", "-")
+
+
+def group_key_for(kind: str, alias: str, version_ref: str | None) -> str:
+    """Stable identity of the catalogue version a finding edits: the version
+    reference when one exists, else the entry itself.
+    """
+    if version_ref is not None:
+        return f"ref:{normalise_alias(version_ref)}"
+    return f"{kind}:{normalise_alias(alias)}"
+
+
 class GradleMember(BaseModel):
     """One catalogue alias changed by a Gradle update target."""
 
@@ -108,10 +122,8 @@ class GradleUpdateTarget(BaseModel):
     @property
     def group_key(self) -> str:
         """Stable identity used to group findings into one update attempt."""
-        if self.version_ref is not None:
-            return f"ref:{self.version_ref}"
         member = self.members[0]
-        return f"{member.kind}:{member.alias}"
+        return group_key_for(member.kind, member.alias, self.version_ref)
 
     @property
     def display_name(self) -> str:
@@ -150,10 +162,15 @@ class VulnFinding(BaseModel):
 
     @property
     def target_version(self) -> str:
-        if self.fixed_version is None:
-            msg = "No fixed version available"
-            raise ValueError(msg)
-        return self.fixed_version
+        """The version this finding is fixed by: the advisory fix, or the saved
+        catalogue target.
+        """
+        if self.fixed_version is not None:
+            return self.fixed_version
+        if self.gradle_target is not None:
+            return self.gradle_target.target_version
+        msg = "No fixed version available"
+        raise ValueError(msg)
 
     @property
     def detail(self) -> str:

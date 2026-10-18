@@ -28,17 +28,27 @@ from maintenance_man.gradle_inventory import (
     parse_inventory_text,
 )
 from maintenance_man.gradle_resolution import (
+    ROUTING_UNDECLARED,
     GeneratedGradleReport,
     parse_resolution_report,
 )
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import Operation, OperationFailed, ScanReported
-from maintenance_man.models.gradle import ModuleId
+from maintenance_man.models.gradle import (
+    CandidateValidation,
+    CandidateValidationBatch,
+    CandidateWithheld,
+    GradleCandidate,
+    GradleFixPlan,
+    ModuleId,
+)
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
     Severity,
+    UpdateStatus,
     VulnFinding,
+    Workflow,
 )
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.package_managers import PACKAGE_MANAGERS
@@ -51,11 +61,11 @@ from maintenance_man.scanner import (
     scan_project,
 )
 from maintenance_man.services import scan as scan_service
-from maintenance_man.storage import load_scan_results
+from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.uv_dependencies import normalise_pkg_name
 from tests.fakes import FakeCommands, RecordingEmit
 from tests.support.clock import FakeClock
-from tests.support.findings import make_update, make_vuln
+from tests.support.findings import make_scan_result, make_update, make_vuln
 from tests.support.gradle import GRADLE_FIXTURES, fixture_runner
 from tests.support.package_managers import ops_with_outdated
 from tests.support.process import completed
@@ -389,6 +399,44 @@ def _configure_update_scan(monkeypatch, *, updates, vulnerabilities=()) -> None:
     )
 
 
+def test_given_pending_statuses_when_scan_succeeds_then_saved_rows_are_fresh(
+    scan_results_dir, tmp_path, monkeypatch
+):
+    save_scan_results(
+        "demo",
+        make_scan_result(
+            vulns=[
+                make_vuln(
+                    pkg_name="some-pkg",
+                    update_status=UpdateStatus.FAILED,
+                    failed_phase="unit",
+                    flow=Workflow.UPDATE,
+                )
+            ],
+            updates=[
+                make_update(
+                    pkg_name="pkg-a",
+                    update_status=UpdateStatus.READY,
+                    flow=Workflow.UPDATE,
+                )
+            ],
+        ),
+    )
+    _configure_update_scan(
+        monkeypatch,
+        updates=[make_update(pkg_name="pkg-a")],
+        vulnerabilities=[make_vuln(pkg_name="some-pkg")],
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+
+    scan_project("demo", project)
+
+    assert [
+        (row.pkg_name, row.update_status, row.failed_phase, row.flow)
+        for row in load_scan_results("demo").findings
+    ] == [("some-pkg", None, None, None), ("pkg-a", None, None, None)]
+
+
 def test_given_outdated_packages_when_scanned_then_updates_are_returned(
     scan_results_dir, monkeypatch
 ):
@@ -531,19 +579,29 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
             member_specs=(("library", f"lib{index}", module.coordinate),),
             repository_specs=(("library", "https://dl.google.com/dl/android/maven2"),),
         )
+        assert finding.gradle_target is not None
         findings.append(
             finding.model_copy(
                 update={
                     "pkg_name": module.coordinate,
                     "installed_version": "1",
                     "latest_version": "2",
+                    "gradle_target": finding.gradle_target.model_copy(
+                        update={"version_ref": f"lib{index}"}
+                    ),
                 }
             )
         )
+    (gradle_project.path / "gradle/libs.versions.toml").write_text(
+        '[versions]\nlib0 = "1"\nlib1 = "1"\n[libraries]\n'
+        'lib0 = { module = "org.example:lib0", version.ref = "lib0" }\n'
+        'lib1 = { module = "org.example:lib1", version.ref = "lib1" }\n',
+        encoding="utf-8",
+    )
     state = SimpleNamespace(
         findings=findings,
         vulns=[],
-        young=False,
+        lib0="old",
         entered=set(),
         clock=FakeClock(datetime(2026, 9, 18, tzinfo=UTC)),
     )
@@ -552,6 +610,11 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         count()
         artifact = suffix.split("/")[-3]
         state.entered.add(artifact)
+        if artifact == "lib0" and state.lib0 == "missing":
+            return None
+        if artifact == "lib0" and state.lib0 == "offline":
+            msg = "offline"
+            raise OSError(msg)
         configured_module = modules[artifact]
         module = ModuleId(
             group=configured_module.group,
@@ -565,12 +628,34 @@ def scoped_publication_scan(tmp_path, monkeypatch, gradle_project, mm_home):
         ).encode()
         published = (
             "Thu, 17 Sep 2026 00:00:00 GMT"
-            if state.young and artifact == "lib0"
+            if state.lib0 == "young" and artifact == "lib0"
             else "Tue, 01 Sep 2026 00:00:00 GMT"
         )
         return body, {"Last-Modified": published}, url
 
+    def validate(project, candidates, resolution):
+        return CandidateValidationBatch(
+            schema_version=1,
+            results=tuple(
+                CandidateValidation(
+                    request_id=f"{candidate.target.group_key}/{member.alias}",
+                    project_path=":",
+                    group_key=candidate.target.group_key,
+                    alias=member.alias,
+                    kind=member.kind,
+                    selected_version=candidate.target.target_version,
+                    implementation=None,
+                    reason=None,
+                )
+                for candidate in candidates
+                for member in candidate.target.members
+            ),
+        )
+
     monkeypatch.setattr(dependency_age, "_publication_http", transport)
+    monkeypatch.setattr(
+        "maintenance_man.gradle_resolution.validate_gradle_candidates", validate
+    )
     monkeypatch.setattr(
         scanner, "scan_gradle", lambda project: (state.vulns, resolution)
     )
@@ -644,21 +729,120 @@ def test_gradle_scan_reports_unmapped_update_without_planning_diagnostics(
     state = scoped_publication_scan
     state.findings.append(make_update(pkg_name="unmapped", gradle_target=None))
     result = scan_project("android", state.project, 7, clock=state.clock)
-    assert result.updates[-1].blocked_reason is None
+    assert result.updates[-1].blocked_reason == "no supported catalogue target"
     assert result.updates[-1].gradle_block_kind is None
 
 
-def test_given_supplied_clock_when_scanned_then_old_update_is_returned_and_persisted(
+def test_given_supplied_clock_when_scanned_then_both_updates_are_returned_and_persisted(
     scoped_publication_scan,
 ):
     state = scoped_publication_scan
-    state.young = True
+    state.lib0 = "young"
     clock = FakeClock(datetime(2026, 9, 18, tzinfo=UTC))
 
     result = scan_project("android", state.project, 7, clock=clock)
 
-    assert [row.pkg_name for row in result.updates] == ["org.example:lib1"]
+    assert [(row.pkg_name, row.blocked_reason) for row in result.updates] == [
+        ("org.example:lib0", "publication younger than required 7 days"),
+        ("org.example:lib1", None),
+    ]
     assert load_scan_results("android") == result
+
+
+@pytest.mark.parametrize(
+    ("lib0", "routing", "expected_blocked", "expected_date"),
+    [
+        ("old", "standard-public", None, datetime(2026, 9, 1, tzinfo=UTC)),
+        (
+            "young",
+            "standard-public",
+            "publication younger than required 7 days",
+            None,
+        ),
+        (
+            "missing",
+            "standard-public",
+            "no trusted exact POM for org.example:lib0:2",
+            None,
+        ),
+        (
+            "offline",
+            "standard-public",
+            "org.example:lib0:2: publication lookup failed",
+            None,
+        ),
+        ("old", None, ROUTING_UNDECLARED, None),
+    ],
+)
+def test_given_gradle_proposal_when_scanned_then_age_is_fail_closed(
+    scoped_publication_scan, lib0, routing, expected_blocked, expected_date
+):
+    state = scoped_publication_scan
+    state.lib0 = lib0
+    project = state.project.model_copy(update={"gradle_repository_routing": routing})
+
+    scan_project("android", project, 7, clock=state.clock)
+
+    saved = {row.pkg_name: row for row in load_scan_results("android").updates}
+    first = saved["org.example:lib0"]
+    assert (first.blocked_reason, first.published_date) == (
+        expected_blocked,
+        expected_date,
+    )
+    assert (saved["org.example:lib1"].blocked_reason is None) is (
+        routing == "standard-public"
+    )
+
+
+def test_given_recorded_plan_when_scanned_then_rows_follow_exact_associations(
+    scoped_publication_scan, monkeypatch
+):
+    state = scoped_publication_scan
+    first, second = (
+        GradleCandidate(
+            target=row.gradle_target,
+            origins=frozenset({"ordinary"}),
+            vulnerability_indices=indices,
+        )
+        for row, indices in zip(state.findings, ((0,), (0, 1, 3)), strict=True)
+    )
+    unowned = CandidateWithheld(
+        group_key=None,
+        coordinate="g:x",
+        installed_version="1",
+        reason="cannot identify an unambiguous catalogue entry",
+        vulnerability_indices=(2,),
+    )
+    monkeypatch.setattr(
+        scanner,
+        "select_gradle_candidates",
+        lambda *args: GradleFixPlan(candidates=(first, second), withheld=(unowned,)),
+    )
+    state.vulns = [make_vuln(vuln_id=f"CVE-{number}") for number in (1, 2, 3)]
+    state.vulns.append(make_vuln(vuln_id="CVE-4", fixed_version=None))
+
+    result = scan_project("android", state.project, 7, clock=state.clock)
+
+    saved = load_scan_results("android")
+    assert [
+        (
+            v.vuln_id,
+            v.gradle_target.group_key if v.gradle_target else None,
+            v.blocked_reason,
+        )
+        for v in saved.vulnerabilities
+    ] == [
+        ("CVE-1", "ref:lib0", None),
+        ("CVE-1", "ref:lib1", None),
+        ("CVE-2", "ref:lib1", None),
+        ("CVE-3", None, "cannot identify an unambiguous catalogue entry"),
+        ("CVE-4", None, "no published fix"),
+    ]
+    assert [(u.gradle_target, u.blocked_reason) for u in saved.updates] == [
+        (first.target, None),
+        (second.target, None),
+    ]
+    assert saved == result
 
 
 _GRADLE_BOM_MODULES = [

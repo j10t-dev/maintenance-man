@@ -29,6 +29,8 @@ from maintenance_man.models.scan import (
     SemverTier,
     UpdateFinding,
     classify_semver,
+    group_key_for,
+    normalise_alias,
 )
 from maintenance_man.process import run_logged
 
@@ -459,11 +461,7 @@ def build_update_findings(
             )
             continue
 
-        key = (
-            f"ref:{normalise_alias(entry.version_ref)}"
-            if entry.version_ref is not None
-            else f"{entry.kind}:{normalise_alias(entry.alias)}"
-        )
+        key = group_key_for(entry.kind, entry.alias, entry.version_ref)
         grouped.setdefault(key, []).append((entry, proposal))
         group_refs[key] = version.name if entry.version_ref is not None else None
 
@@ -622,11 +620,6 @@ def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str
         f"ANDROID_HOME or ANDROID_SDK_ROOT before running mm update, or track "
         f"local.properties in the repository."
     )
-
-
-def normalise_alias(name: str) -> str:
-    """Gradle treats '-', '_' and '.' as equivalent alias separators."""
-    return name.replace("_", "-").replace(".", "-")
 
 
 def assert_safe_text(value: str, label: str) -> str:

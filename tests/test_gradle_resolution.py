@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -13,9 +13,12 @@ from maintenance_man.gradle import (
     GRADLE_INVENTORY_BOM_RELPATH,
     GRADLE_INVENTORY_RELPATH,
     GradleError,
+    ReportProposal,
+    build_update_findings,
     parse_catalogue,
 )
 from maintenance_man.gradle_resolution import (
+    ROUTING_UNDECLARED,
     attach_gradle_publications,
     exact_fix_candidate,
     generate_gradle_report,
@@ -50,6 +53,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
 )
 from tests.support.clock import FakeClock
+from tests.support.findings import make_vuln
 from tests.support.gradle import fixture_runner, report_payload
 from tests.support.process import completed
 from tests.support.projects import make_project
@@ -587,6 +591,128 @@ def test_parent_never_invents_version_from_child_fix(tmp_path):
     assert "independent" in result.withheld[0].reason
 
 
+def test_given_underscored_version_ref_when_selected_then_rows_share_one_candidate(
+    tmp_path,
+):
+    (tmp_path / "libs.toml").write_text(
+        '[versions]\nroom_version = "2.8.4"\n'
+        "[libraries]\n"
+        'room-runtime = { module = "androidx.room:room-runtime", '
+        'version.ref = "room_version" }\n'
+    )
+    catalogue = parse_catalogue(tmp_path / "libs.toml")
+    raw = report_payload()
+    scope = raw["scopes"][0]
+    scope["components"].append(
+        {
+            "id": "room",
+            "kind": "module",
+            "module": {
+                "group": "androidx.room",
+                "artifact": "room-runtime",
+                "version": "2.8.4",
+            },
+            "variants": ["runtime"],
+        }
+    )
+    scope["edges"].append(
+        {
+            "source": "root",
+            "target": "room",
+            "requested": "androidx.room:room-runtime:2.8.4",
+            "constraint": False,
+        }
+    )
+    resolution = parse_resolution_report(json.dumps(raw))
+    assert isinstance(resolution, CompleteResolution)
+    discovered = build_update_findings(
+        catalogue,
+        [
+            ReportProposal(
+                kind="library",
+                alias="room-runtime",
+                coordinate="androidx.room:room-runtime",
+                version="2.8.5",
+            )
+        ],
+    )
+    advisory = make_vuln(
+        vuln_id="CVE-2030-9",
+        pkg_name="androidx.room:room-runtime",
+        installed_version="2.8.4",
+        fixed_version="2.8.5",
+    )
+
+    plan = select_gradle_candidates(catalogue, resolution, [advisory], discovered)
+
+    assert [
+        (c.target.group_key, c.origins, c.vulnerability_indices)
+        for c in plan.candidates
+    ] == [("ref:room-version", frozenset({"ordinary", "security"}), (0,))]
+    assert plan.withheld == ()
+
+
+def test_given_advisory_owned_in_two_scopes_when_selected_then_each_owner_lists_it(
+    tmp_path,
+):
+    catalogue, base = ownership_graph(tmp_path)
+    raw = base.report.model_dump(mode="json")
+    first = raw["scopes"][0]
+    second_id = {
+        "project_path": ":",
+        "domain": "project",
+        "configuration": "testRuntimeClasspath",
+    }
+    second = json.loads(json.dumps(first))
+    second["scope"] = second_id
+    for component in second["components"]:
+        if component["id"] == "parent":
+            component["id"] = "other"
+            component["module"]["artifact"] = "other"
+    second["edges"] = [
+        {
+            "source": "root",
+            "target": "other",
+            "requested": "g:other:1.0.0",
+            "constraint": False,
+        },
+        {
+            "source": "other",
+            "target": "child",
+            "requested": "g:child:2.0.0",
+            "constraint": False,
+        },
+    ]
+    raw["selected_scopes"].append(second_id)
+    raw["scopes"].append(second)
+    resolution = parse_resolution_report(json.dumps(raw))
+    assert isinstance(resolution, CompleteResolution)
+    discovered = [
+        build_update_findings(
+            catalogue,
+            [
+                ReportProposal(
+                    kind="library", alias=alias, coordinate=coordinate, version=version
+                )
+            ],
+        )[0]
+        for alias, coordinate, version in (
+            ("a", "g:parent", "1.0.1"),
+            ("b", "g:other", "1.0.2"),
+        )
+    ]
+    advisory = make_vuln(
+        pkg_name="g:child", installed_version="2.0.0", fixed_version="2.0.1"
+    )
+
+    plan = select_gradle_candidates(catalogue, resolution, [advisory], discovered)
+
+    assert [(c.target.group_key, c.vulnerability_indices) for c in plan.candidates] == [
+        ("ref:a", (0,)),
+        ("ref:b", (0,)),
+    ]
+
+
 def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
     catalogue, resolution = ownership_graph(tmp_path)
     finding = VulnFinding(
@@ -607,8 +733,7 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
     selected = result.candidates[0]
     assert selected.target == candidate().target
     assert selected.origins == frozenset({"security"})
-    assert selected.requested_advisories == frozenset({"CVE-2030-1"})
-    assert selected.requested_coordinates == frozenset({"g:parent"})
+    assert selected.vulnerability_indices == (0,)
     assert selected.owner_keys == ("ref:a",)
     assert selected.scopes == (
         ScopeId(project_path=":", domain="project", configuration="runtimeClasspath"),
@@ -617,8 +742,6 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
 
 
 def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
-    from maintenance_man.gradle import ReportProposal, build_update_findings
-
     catalogue, resolution = ownership_graph(tmp_path)
     discovered = [
         build_update_findings(
@@ -1465,6 +1588,25 @@ def test_candidate_age_boundary_uses_the_injected_clock(offset, minimum, withhel
     assert (prepared.withheld_reason is not None) is withheld
     if withheld:
         assert prepared.withheld_reason == "publication younger than required 7 days"
+
+
+def test_given_undeclared_routing_when_prepared_then_candidate_is_withheld():
+    validate = MagicMock()
+    project = ProjectConfig(
+        path=Path("/unused"), package_manager="gradle", gradle_repository_routing=None
+    )
+    with patch.object(candidates, "validate_gradle_candidates", validate):
+        (prepared,) = prepare_gradle_candidates(
+            project,
+            (_age_candidate(),),
+            CompleteResolution(report=report_stub()),
+            cast(PublicationLookupContext, SimpleNamespace()),
+            7,
+            clock=FakeClock(_NOW),
+        )
+
+    assert prepared.withheld_reason == ROUTING_UNDECLARED
+    validate.assert_not_called()
 
 
 def test_candidate_age_reads_the_clock_after_prefetch():

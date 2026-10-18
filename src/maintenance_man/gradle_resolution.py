@@ -31,7 +31,6 @@ from maintenance_man.gradle import (
     ReportProposal,
     build_update_findings,
     file_digest,
-    normalise_alias,
     owned_gradle_inventory,
     require_catalogue_unchanged,
     run_gradle,
@@ -62,6 +61,7 @@ from maintenance_man.models.scan import (
     GradleUpdateTarget,
     UpdateFinding,
     VulnFinding,
+    group_key_for,
 )
 
 
@@ -196,14 +196,12 @@ def generate_gradle_report(
         )
 
 
+ROUTING_UNDECLARED = (
+    "Public repository routing has not been declared; automatic publication "
+    "eligibility requires gradle_repository_routing = 'standard-public'"
+)
 EXACT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 BRANCH = re.compile(r"^(\d+)\.(\d+)(?:\D|$)")
-
-
-def _entry_group(entry: CatalogueEntry) -> str:
-    if entry.version_ref is not None:
-        return f"ref:{normalise_alias(entry.version_ref)}"
-    return f"{entry.kind}:{normalise_alias(entry.alias)}"
 
 
 def _editable_version(catalogue: Catalogue, entry: CatalogueEntry) -> str | None:
@@ -235,7 +233,9 @@ def _editable_library_roots(
                 and entry.coordinate == module.coordinate
                 and version_value == module.version
             ):
-                editable.setdefault(component_id, set()).add(_entry_group(entry))
+                editable.setdefault(component_id, set()).add(
+                    group_key_for(entry.kind, entry.alias, entry.version_ref)
+                )
     return editable
 
 
@@ -320,7 +320,12 @@ def _plugin_marker_evidence(
                 and requested[-1] == implementation.version
                 and affected & _reachable_from(implementation_edge.target, scope.edges)
             ):
-                owners[(_entry_group(entry), "plugin")] = 0
+                owners[
+                    (
+                        group_key_for(entry.kind, entry.alias, entry.version_ref),
+                        "plugin",
+                    )
+                ] = 0
     return owners
 
 
@@ -419,7 +424,7 @@ def _candidate_scopes(
     )
 
 
-type _VulnerabilityLink = tuple[VulnFinding, list[KnownOwner]]
+type _VulnerabilityLink = tuple[int, VulnFinding, list[KnownOwner]]
 
 
 def _collect_ordinary_proposals(
@@ -466,7 +471,9 @@ def _link_vulnerabilities(
 ) -> tuple[dict[str, list[_VulnerabilityLink]], list[CandidateWithheld]]:
     linked: dict[str, list[_VulnerabilityLink]] = {}
     withheld: list[CandidateWithheld] = []
-    for finding in vulnerabilities:
+    for index, finding in enumerate(vulnerabilities):
+        if finding.fixed_version is None:
+            continue
         parts = finding.pkg_name.split(":")
         if len(parts) != 2:
             withheld.append(
@@ -475,7 +482,7 @@ def _link_vulnerabilities(
                     coordinate=finding.pkg_name,
                     installed_version=finding.installed_version,
                     reason="finding lacks Maven coordinate",
-                    advisory_ids=frozenset({finding.vuln_id}),
+                    vulnerability_indices=(index,),
                 )
             )
             continue
@@ -484,19 +491,21 @@ def _link_vulnerabilities(
         )
         owners = resolve_gradle_owners(catalogue, resolution, module)
         known = [owner for owner in owners if isinstance(owner, KnownOwner)]
-        groups = {owner.group_key for owner in known}
-        if any(isinstance(owner, UnknownOwner) for owner in owners) or len(groups) != 1:
+        if any(isinstance(owner, UnknownOwner) for owner in owners) or not known:
             withheld.append(
                 CandidateWithheld(
                     group_key=None,
                     coordinate=finding.pkg_name,
                     installed_version=finding.installed_version,
                     reason="cannot identify an unambiguous catalogue entry",
-                    advisory_ids=frozenset({finding.vuln_id}),
+                    vulnerability_indices=(index,),
                 )
             )
             continue
-        linked.setdefault(next(iter(groups)), []).append((finding, known))
+        for key in sorted({owner.group_key for owner in known}):
+            linked.setdefault(key, []).append(
+                (index, finding, [o for o in known if o.group_key == key])
+            )
     return linked, withheld
 
 
@@ -504,28 +513,29 @@ def _security_only_proposal(
     catalogue: Catalogue,
     key: str,
     links: list[_VulnerabilityLink],
-    advisory_ids: frozenset[str],
-    coordinates: frozenset[str],
+    vulnerability_indices: tuple[int, ...],
     scopes: tuple[ScopeId, ...],
 ) -> GradleCandidate | CandidateWithheld:
     entries = [
-        entry for entry in catalogue.entries.values() if _entry_group(entry) == key
+        entry
+        for entry in catalogue.entries.values()
+        if group_key_for(entry.kind, entry.alias, entry.version_ref) == key
     ]
     versions = {
         exact_fix_candidate(finding.installed_version, finding.fixed_version)
-        for finding, _ in links
+        for _, finding, _ in links
     }
     if (
-        any(owner.kind != "direct" for _, owners in links for owner in owners)
+        any(owner.kind != "direct" for _, _, owners in links for owner in owners)
         or None in versions
         or len(versions) != 1
     ):
         return CandidateWithheld(
             group_key=key,
-            coordinate=links[0][0].pkg_name,
-            installed_version=links[0][0].installed_version,
+            coordinate=links[0][1].pkg_name,
+            installed_version=links[0][1].installed_version,
             reason="owner requires one independent exact catalogue proposal",
-            advisory_ids=advisory_ids,
+            vulnerability_indices=vulnerability_indices,
         )
     version = next(version for version in versions if version is not None)
     proposals = [
@@ -541,16 +551,15 @@ def _security_only_proposal(
     if len(built) != 1 or built[0].blocked_reason or built[0].gradle_target is None:
         return CandidateWithheld(
             group_key=key,
-            coordinate=links[0][0].pkg_name,
-            installed_version=links[0][0].installed_version,
+            coordinate=links[0][1].pkg_name,
+            installed_version=links[0][1].installed_version,
             reason="incompatible shared catalogue group",
-            advisory_ids=advisory_ids,
+            vulnerability_indices=vulnerability_indices,
         )
     return GradleCandidate(
         target=built[0].gradle_target,
         origins=frozenset({"security"}),
-        requested_advisories=advisory_ids,
-        requested_coordinates=coordinates,
+        vulnerability_indices=vulnerability_indices,
         owner_keys=(key,),
         scopes=scopes,
     )
@@ -564,25 +573,21 @@ def _build_security_proposals(
     proposals: dict[str, GradleCandidate] = {}
     withheld: list[CandidateWithheld] = []
     for key, links in linked.items():
-        advisory_ids = frozenset(finding.vuln_id for finding, _ in links)
-        coordinates = frozenset(finding.pkg_name for finding, _ in links)
+        indices = tuple(index for index, _, _ in links)
         scopes = tuple(
-            dict.fromkeys(owner.scope for _, owners in links for owner in owners)
+            dict.fromkeys(owner.scope for _, _, owners in links for owner in owners)
         )
         if key in candidates:
             existing = candidates[key]
             proposals[key] = existing.model_copy(
                 update={
                     "origins": frozenset({"ordinary", "security"}),
-                    "requested_advisories": advisory_ids,
-                    "requested_coordinates": coordinates,
+                    "vulnerability_indices": indices,
                     "scopes": tuple(dict.fromkeys((*existing.scopes, *scopes))),
                 }
             )
             continue
-        proposal = _security_only_proposal(
-            catalogue, key, links, advisory_ids, coordinates, scopes
-        )
+        proposal = _security_only_proposal(catalogue, key, links, indices, scopes)
         if isinstance(proposal, CandidateWithheld):
             withheld.append(proposal)
         else:
@@ -617,6 +622,7 @@ def select_gradle_candidates(
                 coordinate=candidate.target.display_name,
                 installed_version=candidate.target.members[0].installed_version,
                 reason="conflicting or non-exact catalogue proposals",
+                vulnerability_indices=candidate.vulnerability_indices,
             )
         )
     return GradleFixPlan(
@@ -771,7 +777,6 @@ def attach_gradle_publications(
                 coordinate=member.coordinate,
                 installed_version=member.installed_version,
                 reason=failure or "missing native candidate validation",
-                advisory_ids=candidate.requested_advisories,
             )
         paths = {row.project_path for row in rows}
         domain = "plugin" if member.kind == "plugin" else "library"
@@ -829,7 +834,14 @@ def prepare_gradle_candidates(
     *,
     clock: Clock,
 ) -> tuple[PreparedCandidate, ...]:
-    """Validate proposed catalogue changes and apply the release-age policy."""
+    """Validate proposed catalogue changes and apply the release-age policy.
+
+    Without declared public routing every candidate is withheld unvalidated.
+    """
+    if project.gradle_repository_routing != "standard-public":
+        return tuple(
+            PreparedCandidate(candidate, ROUTING_UNDECLARED) for candidate in candidates
+        )
     batch = validate_gradle_candidates(project, candidates, resolution)
     prepared = []
     for candidate in candidates:
@@ -837,8 +849,6 @@ def prepare_gradle_candidates(
         if isinstance(bound, CandidateWithheld):
             prepared.append(PreparedCandidate(candidate, withheld_reason=bound.reason))
         else:
-            if project.gradle_repository_routing != "standard-public":
-                bound = bound.model_copy(update={"publication_requests": ()})
             prepared.append(PreparedCandidate(bound))
     if minimum_age_days > 0:
         publication.prefetch(

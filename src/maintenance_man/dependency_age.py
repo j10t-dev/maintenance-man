@@ -23,10 +23,8 @@ from packaging.version import Version
 from pydantic import BaseModel, Field, StrictInt, StrictStr, ValidationError
 
 from maintenance_man.clock import Clock, utc_now
-from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     AgeBlock,
-    CompleteResolution,
     ModuleId,
     PublicationEvidence,
     PublicationFact,
@@ -97,18 +95,6 @@ class PublicationLookupContext:
                     continue
                 for repository in request.repositories:
                     self.submit(repository, module)
-
-    def evidence_for(self, candidate):
-        """Return the aggregate evidence already looked up for *candidate*.
-
-        Only requests that resolved to full ``PublicationEvidence`` (never a
-        block) are returned, for receipt persistence after a passed check.
-        """
-        return tuple(
-            self.results[r.model_dump_json()]
-            for r in candidate.publication_requests
-            if isinstance(self.results.get(r.model_dump_json()), PublicationEvidence)
-        )
 
     def _count(self):
         with self.lock:
@@ -381,35 +367,6 @@ class _RegistryLookup:
 
 type _MavenResult = PublicationFact | AgeBlock | None
 type _RegistryResult = RegistryFact | AgeBlock | None
-
-
-def filter_gradle_updates_by_age(
-    updates: list[UpdateFinding],
-    project: ProjectConfig,
-    resolution: CompleteResolution,
-    min_age_days: int,
-    context: PublicationLookupContext,
-) -> list[UpdateFinding]:
-    """Filter known young catalogue proposals; unknown dates remain eligible.
-
-    Scan-time lookups use catalogue coordinates and declared repositories only.
-    Native candidate validation remains part of the update workflow.
-    """
-    if (
-        not updates
-        or min_age_days == 0
-        or project.gradle_repository_routing != "standard-public"
-    ):
-        return list(updates)
-    cutoff = context.clock() - timedelta(days=min_age_days)
-    return _filter_by_age(
-        updates,
-        lambda update: (
-            _gradle_members(update, resolution, context),
-            len(update.gradle_target.members) if update.gradle_target else 0,
-        ),
-        cutoff,
-    )
 
 
 def filter_registry_updates_by_age(
@@ -939,34 +896,6 @@ def _maven_module(coordinate: str, version: str) -> ModuleId | None:
     if not group or not separator or not artifact or ":" in artifact:
         return None
     return ModuleId(group=group, artifact=artifact, version=version)
-
-
-def _gradle_members(
-    update: UpdateFinding,
-    resolution: CompleteResolution,
-    context: PublicationLookupContext,
-) -> list[_Member]:
-    requests: list[_Member] = []
-    if update.gradle_target is None:
-        return requests
-    for member in update.gradle_target.members:
-        module = member_module(member, update.latest_version)
-        if module is None:
-            continue
-        repositories = tuple(
-            repository
-            for repository in resolution.report.repositories
-            if repository.domain == member.kind
-        )
-        request = publication_request(module, repositories)
-        if request.routing_supported:
-            requests.append(
-                tuple(
-                    context.submit(repository, module)
-                    for repository in request.repositories
-                )
-            )
-    return requests
 
 
 def _registry_members(

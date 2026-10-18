@@ -199,8 +199,9 @@ class PublicationEvidence(BaseModel):
 class GradleCandidate(GradleRecord):
     target: GradleUpdateTarget
     origins: frozenset[Literal["ordinary", "security"]] = Field(min_length=1)
-    requested_advisories: frozenset[str] = frozenset()
-    requested_coordinates: frozenset[str] = frozenset()
+    vulnerability_indices: tuple[int, ...] = ()
+    """Positions, in the vulnerability sequence given to select_gradle_candidates,
+    of the advisories this candidate fixes."""
     owner_keys: tuple[str, ...] = ()
     scopes: tuple[ScopeId, ...] = ()
     publication_requests: tuple[PublicationRequest, ...] = ()
@@ -229,7 +230,9 @@ class CandidateWithheld(GradleRecord):
     coordinate: str
     installed_version: str
     reason: str
-    advisory_ids: frozenset[str] = frozenset()
+    vulnerability_indices: tuple[int, ...] = ()
+    """Positions, in the same sequence, of the advisories this withheld entry
+    blocks."""
 
 
 class GradleFixPlan(GradleRecord):

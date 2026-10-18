@@ -18,7 +18,12 @@ from maintenance_man.models.scan import (
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import classify_semver
-from tests.support.findings import make_scan_result, make_update, make_vuln
+from tests.support.findings import (
+    make_gradle_target,
+    make_scan_result,
+    make_update,
+    make_vuln,
+)
 
 
 @pytest.mark.parametrize(
@@ -543,6 +548,26 @@ def test_inline_target_display_name_is_its_coordinate():
 
     assert target.group_key == "library:gson"
     assert target.display_name == "com.google.code.gson:gson"
+
+
+@pytest.mark.parametrize(
+    ("fixed_version", "gradle_target", "expected"),
+    [
+        ("1.0.1", None, "1.0.1"),
+        (None, make_gradle_target(), "2.8.5"),
+    ],
+)
+def test_given_vulnerability_when_target_version_read_then_fix_or_saved_target_is_used(
+    fixed_version, gradle_target, expected
+):
+    finding = make_vuln(fixed_version=fixed_version, gradle_target=gradle_target)
+
+    assert finding.target_version == expected
+
+
+def test_given_vulnerability_without_fix_or_target_when_read_then_error():
+    with pytest.raises(ValueError, match="No fixed version available"):
+        _ = make_vuln(fixed_version=None).target_version
 
 
 def test_old_scan_does_not_require_gradle_resolution():
