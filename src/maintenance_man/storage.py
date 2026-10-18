@@ -3,11 +3,11 @@
 import json
 import os
 import secrets
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from maintenance_man import paths
+from maintenance_man.clock import utc_now
 from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.models.scan import ScanResult
 
@@ -93,7 +93,7 @@ def record_activity(
         activity = load_activity(path)
         proj = activity.get(project, ProjectActivity())
         event = ActivityEvent(
-            timestamp=datetime.now(UTC),
+            timestamp=utc_now(),
             success=success,
             branch=branch,
             commit_id=commit_id,

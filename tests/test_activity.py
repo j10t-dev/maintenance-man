@@ -2,10 +2,22 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from maintenance_man.models.activity import ActivityEvent
+import pytest
+
+from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.storage import load_activity, record_activity
 
-_TS = datetime(2026, 3, 20, 14, 32, tzinfo=UTC)
+_NOW = datetime(2026, 3, 20, 12, 0, tzinfo=UTC)
+_RECORDED = ActivityEvent(timestamp=_NOW, success=False, branch="feat/x")
+_EARLIER = ActivityEvent(
+    timestamp=datetime(2026, 3, 20, 9, 0, tzinfo=UTC), success=True, branch="main"
+)
+_EARLIER_JSON = {"timestamp": "2026-03-20T09:00:00Z", "success": True, "branch": "main"}
+
+
+@pytest.fixture(autouse=True)
+def _fixed_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("maintenance_man.storage.utc_now", lambda: _NOW)
 
 
 class TestActivityEvent:
@@ -24,12 +36,6 @@ class TestActivityEvent:
 class TestLoadActivity:
     def test_returns_empty_dict_when_file_missing(self, tmp_path: Path):
         result = load_activity(tmp_path / "activity.json")
-        assert result == {}
-
-    def test_returns_empty_dict_when_file_corrupt(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        path.write_text("NOT JSON")
-        result = load_activity(path)
         assert result == {}
 
     def test_loads_valid_activity(self, tmp_path: Path):
@@ -51,48 +57,66 @@ class TestLoadActivity:
 
 
 class TestRecordActivity:
-    def test_records_build_event(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        ("event_type", "expected"),
+        [
+            (
+                "build",
+                {"myapp": ProjectActivity(last_build=_RECORDED)},
+            ),
+            (
+                "deploy",
+                {"myapp": ProjectActivity(last_deploy=_RECORDED)},
+            ),
+        ],
+    )
+    def test_given_event_type_when_recorded_then_only_that_event_is_set(
+        self, tmp_path: Path, event_type, expected
+    ):
         path = tmp_path / "activity.json"
-        record_activity(path, "myapp", "build", success=True, branch="main")
-        result = load_activity(path)
-        assert result["myapp"].last_build is not None
-        assert result["myapp"].last_build.success is True
-        assert result["myapp"].last_build.branch == "main"
-        assert result["myapp"].last_build.commit_id is None
-        assert result["myapp"].last_deploy is None
 
-    def test_records_deploy_event(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        record_activity(path, "myapp", "deploy", success=False, branch="feat/x")
-        result = load_activity(path)
-        assert result["myapp"].last_deploy is not None
-        assert result["myapp"].last_deploy.success is False
-        assert result["myapp"].last_deploy.branch == "feat/x"
+        record_activity(path, "myapp", event_type, success=False, branch="feat/x")
 
-    def test_preserves_existing_data(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        record_activity(path, "myapp", "build", success=True, branch="main")
-        record_activity(path, "myapp", "deploy", success=True, branch="main")
-        result = load_activity(path)
-        assert result["myapp"].last_build is not None
-        assert result["myapp"].last_deploy is not None
+        assert load_activity(path) == expected
 
-    def test_preserves_other_projects(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        ("existing", "project", "event_type", "expected"),
+        [
+            pytest.param(
+                {"myapp": {"last_build": _EARLIER_JSON}},
+                "myapp",
+                "deploy",
+                {"myapp": ProjectActivity(last_build=_EARLIER, last_deploy=_RECORDED)},
+                id="same-project-keeps-the-other-event",
+            ),
+            pytest.param(
+                {"app-a": {"last_build": _EARLIER_JSON}},
+                "app-b",
+                "deploy",
+                {
+                    "app-a": ProjectActivity(last_build=_EARLIER),
+                    "app-b": ProjectActivity(last_deploy=_RECORDED),
+                },
+                id="other-projects-are-kept",
+            ),
+            pytest.param(
+                {"myapp": {"last_build": _EARLIER_JSON}},
+                "myapp",
+                "build",
+                {"myapp": ProjectActivity(last_build=_RECORDED)},
+                id="same-event-type-is-overwritten",
+            ),
+        ],
+    )
+    def test_given_saved_activity_when_recorded_then_one_event_is_merged(
+        self, tmp_path: Path, existing, project, event_type, expected
+    ):
         path = tmp_path / "activity.json"
-        record_activity(path, "app-a", "build", success=True, branch="main")
-        record_activity(path, "app-b", "deploy", success=True, branch="main")
-        result = load_activity(path)
-        assert "app-a" in result
-        assert "app-b" in result
+        path.write_text(json.dumps(existing), encoding="utf-8")
 
-    def test_overwrites_previous_event(self, tmp_path: Path):
-        path = tmp_path / "activity.json"
-        record_activity(path, "myapp", "build", success=True, branch="main")
-        record_activity(path, "myapp", "build", success=False, branch="feat/x")
-        result = load_activity(path)
-        assert result["myapp"].last_build is not None
-        assert result["myapp"].last_build.success is False
-        assert result["myapp"].last_build.branch == "feat/x"
+        record_activity(path, project, event_type, success=False, branch="feat/x")
+
+        assert load_activity(path) == expected
 
     def test_silently_handles_unwritable_path(self, tmp_path: Path):
         """record_activity must not raise even if the file can't be written."""

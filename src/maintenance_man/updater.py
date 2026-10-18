@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import shlex
 import subprocess
 from collections.abc import Sequence
@@ -56,24 +54,6 @@ class FindingStep:
         return self.failed_phase is None
 
 
-def finding_transition(step: FindingStep) -> tuple[UpdateStatus, str | None]:
-    if step.passed:
-        return UpdateStatus.READY, None
-    return UpdateStatus.FAILED, step.failed_phase
-
-
-def should_discard(step: FindingStep, on_failure: FailureStrategy) -> bool:
-    return not step.passed and step.discardable and on_failure == "continue"
-
-
-def should_stop(
-    step: FindingStep, on_failure: FailureStrategy, discarded: bool | None
-) -> bool:
-    if step.passed:
-        return False
-    return not step.discardable or on_failure == "stop" or discarded is False
-
-
 class Finding(Protocol):
     """Common interface for VulnFinding and UpdateFinding during update processing."""
 
@@ -112,36 +92,18 @@ def _first_non_none(values: Sequence[str | Workflow | None]):
 def _consolidated_lifecycle_state(
     group: Sequence[VulnFinding | UpdateFinding],
 ) -> tuple[UpdateStatus | None, str | None, Workflow | None]:
-    """Collapse rows applied as one change into one lifecycle state.
-
-    Vulnerabilities sharing a package, or rows sharing a catalogue target, are
-    applied as a single change; this helper picks the representative status
-    (plus failed_phase and flow) for the whole group:
-
-    * any FAILED  → FAILED with the first failed finding's phase/flow
-    * else any READY → READY with the first ready finding's phase/flow
-    * else all COMPLETED → COMPLETED
-    * else (mixed/empty) → (None, None, None)
-    """
-    failed = [v for v in group if v.update_status == UpdateStatus.FAILED]
-    if failed:
-        return (
-            UpdateStatus.FAILED,
-            _first_non_none([v.failed_phase for v in failed]),
-            _first_non_none([v.flow for v in failed]),
-        )
-
-    ready = [v for v in group if v.update_status == UpdateStatus.READY]
-    if ready:
-        return (
-            UpdateStatus.READY,
-            _first_non_none([v.failed_phase for v in ready]),
-            _first_non_none([v.flow for v in ready]),
-        )
-
-    if group and all(v.update_status == UpdateStatus.COMPLETED for v in group):
+    """FAILED if any row failed, else READY if any is ready, each with the first
+    such row's phase and flow; COMPLETED when every row completed; else none."""
+    for status in (UpdateStatus.FAILED, UpdateStatus.READY):
+        rows = [row for row in group if row.update_status is status]
+        if rows:
+            return (
+                status,
+                _first_non_none([row.failed_phase for row in rows]),
+                _first_non_none([row.flow for row in rows]),
+            )
+    if group and all(row.update_status is UpdateStatus.COMPLETED for row in group):
         return (UpdateStatus.COMPLETED, None, None)
-
     return (None, None, None)
 
 
@@ -406,14 +368,18 @@ def process_findings(
                     finding.target_version,
                 )
             )
-        finding.update_status, finding.failed_phase = finding_transition(step)
+        finding.update_status = (
+            UpdateStatus.READY if step.passed else UpdateStatus.FAILED
+        )
+        finding.failed_phase = step.failed_phase
         finding.flow = flow
         save_scan_results(scan_result.project, scan_result)
-        discarded = _discard(repo, emit) if should_discard(step, on_failure) else None
         results.append(
             UpdateResult(finding.pkg_name, kind, step.passed, step.failed_phase)
         )
-        if should_stop(step, on_failure, discarded):
+        if step.passed:
+            continue
+        if not (on_failure == "continue" and step.discardable and _discard(repo, emit)):
             break
 
     return results

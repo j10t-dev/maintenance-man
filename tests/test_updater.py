@@ -2,16 +2,16 @@ import dataclasses
 import shlex
 import subprocess
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
-    validate_gradle_target,
 )
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
@@ -38,25 +38,23 @@ from maintenance_man.updater import (
     Applied,
     ApplyFailed,
     Blocked,
-    FindingStep,
+    FailureStrategy,
+    Finding,
     _apply_update,
     apply_finding,
     consolidate_vulns,
-    finding_transition,
     group_findings,
     process_findings,
     remove_completed_findings,
     run_test_phases,
-    should_discard,
-    should_stop,
     sort_updates_by_risk,
 )
 from maintenance_man.uv_dependencies import (
     UvUngroupedLocation,
     get_uv_dependency_locations,
 )
-from maintenance_man.vcs_workflow import VcsServices
-from tests.fake_vcs import FakeJj, FakeJjState
+from maintenance_man.vcs import JjRepository, RevisionError
+from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
 from tests.fakes import RecordingEmit
 from tests.support.findings import (
     make_gradle_member,
@@ -67,6 +65,16 @@ from tests.support.findings import (
 )
 from tests.support.gradle import catalogue_apply_runner
 from tests.support.process import completed
+from tests.support.projects import make_project
+from tests.support.repository import (
+    MANAGED,
+    commit_descriptions,
+    commit_to_main,
+    copy_jj_repository,
+    fail_repository_method,
+    operation_id,
+    write_file,
+)
 
 _ROOM = make_gradle_target()
 _KSP = make_gradle_target(
@@ -87,58 +95,6 @@ _DRIFT_REASON = (
     "update workspace. Rescan required"
 )
 
-PASSED = FindingStep(None)
-FAILED = FindingStep("unit")
-UNSAFE = FindingStep("commit", discardable=False)
-
-
-@pytest.mark.parametrize(
-    "step,on_failure,discard",
-    [
-        (PASSED, "continue", False),
-        (FAILED, "continue", True),
-        (FAILED, "stop", False),
-        (UNSAFE, "continue", False),
-        (UNSAFE, "stop", False),
-    ],
-)
-def test_given_finding_step_when_deciding_to_discard_then_returns_expected_decision(
-    step, on_failure, discard
-):
-    assert should_discard(step, on_failure) is discard
-
-
-@pytest.mark.parametrize(
-    "failed_phase,discardable,on_failure,discarded,expected",
-    [
-        (None, True, "continue", None, False),
-        ("unit", True, "continue", True, False),
-        ("unit", True, "continue", False, True),
-        ("unit", False, "continue", None, True),
-        ("unit", True, "stop", None, True),
-    ],
-)
-def test_given_finding_step_when_deciding_to_stop_then_returns_expected_decision(
-    failed_phase, discardable, on_failure, discarded, expected
-):
-    step = FindingStep(failed_phase, discardable)
-
-    result = should_stop(step, on_failure, discarded)
-
-    assert result is expected
-
-
-@pytest.mark.parametrize(
-    "step,expected",
-    [
-        (PASSED, (UpdateStatus.READY, None)),
-        (FAILED, (UpdateStatus.FAILED, "unit")),
-        (UNSAFE, (UpdateStatus.FAILED, "commit")),
-    ],
-)
-def test_finding_transition(step, expected):
-    assert finding_transition(step) == expected
-
 
 def _scan_result_for(
     project_config: ProjectConfig, updates: list[UpdateFinding]
@@ -157,15 +113,12 @@ def _scan_result_for(
 @pytest.fixture()
 def project_config(tmp_path: Path) -> ProjectConfig:
     return ProjectConfig(
-        path=tmp_path,
-        package_manager="bun",
-        test_unit="bun test",
+        path=tmp_path / "project", package_manager="bun", test_unit="bun test"
     )
 
 
 class ProcessorDeps(TypedDict):
-    state: FakeJjState
-    repo: FakeJj
+    repo: JjRepository
     services: VcsServices
     package: MagicMock
     phase: MagicMock
@@ -176,41 +129,49 @@ def processor_vcs(
     monkeypatch: pytest.MonkeyPatch, project_config: ProjectConfig
 ) -> ProcessorDeps:
     """Use real repository transitions while substituting package/test commands."""
-    path = Path(project_config.path)
-    state = FakeJjState()
-    repo = state.seed_repository(
-        path,
-        files={"dep.txt": "version=1\n", "package.json": "{}\n"},
-    )
+    repo = copy_jj_repository(Path(project_config.path))
+    write_file(repo, "package.json", "{}\n")
+    commit_to_main(repo, "add package manifest")
 
     def run_package(cmd, cwd, **kwargs):
-        assert cmd[:2] == ["bun", "add"]
-        assert cwd == path
-        assert kwargs == {
-            "timeout": 300,
-            "label": " ".join(cmd),
-            "stdin": subprocess.DEVNULL,
-        }
-        current = (path / "dep.txt").read_text(encoding="utf-8")
-        (path / "dep.txt").write_text(f"{current}{cmd[-1]}\n", encoding="utf-8")
+        dep = Path(cwd) / "dep.txt"
+        dep.write_text(
+            f"{dep.read_text(encoding='utf-8')}{cmd[-1]}\n", encoding="utf-8"
+        )
         return completed(cmd, returncode=0, stdout="", stderr="")
 
-    def run_phase(command, cwd, **kwargs):
-        assert command == "bun test"
-        assert cwd == path
-        assert kwargs == {"timeout": 600, "label": "unit tests"}
-
     package = MagicMock(side_effect=run_package)
-    phase = MagicMock(side_effect=run_phase)
+    phase = MagicMock(return_value=None)
     monkeypatch.setattr("maintenance_man.updater.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
     return {
-        "state": state,
         "repo": repo,
-        "services": state.services(),
+        "services": make_vcs_services(),
         "package": package,
         "phase": phase,
     }
+
+
+def _process(
+    findings: Sequence[Finding],
+    project_config: ProjectConfig,
+    deps: ProcessorDeps,
+    *,
+    flow: Workflow = Workflow.UPDATE,
+    on_failure: FailureStrategy = "continue",
+    scan: ScanResult | None = None,
+    emit: RecordingEmit | None = None,
+) -> list[UpdateResult]:
+    updates = [item for item in findings if isinstance(item, UpdateFinding)]
+    return process_findings(
+        findings,
+        project_config,
+        flow=flow,
+        on_failure=on_failure,
+        scan_result=_scan_result_for(project_config, updates) if scan is None else scan,
+        vcs=deps["services"],
+        emit=RecordingEmit() if emit is None else emit,
+    )
 
 
 class TestGetUvDependencyLocations:
@@ -293,19 +254,33 @@ class TestApplyUpdate:
             )
         ]
 
-    def test_uv_pyproject_read_failure_is_apply_failure(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ):
-        mock_run = MagicMock()
-        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
 
-        emit = RecordingEmit()
-        assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
-        assert mock_run.call_count == 0
-        assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PREPARE
-        assert "Failed to read" in emit.of_type(FindingStepFailed)[0].error
+@pytest.mark.parametrize(
+    ("package_manager", "message"),
+    [
+        ("uv", "Failed to read"),
+        ("gradle", "Gradle updates are applied through the Gradle adapter"),
+        ("bun", "package.json is missing"),
+    ],
+)
+def test_given_unpreparable_update_when_applied_then_prepare_failure_and_no_command(
+    package_manager: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(
+        "maintenance_man.updater.run_logged",
+        lambda *args, **kwargs: pytest.fail("no command may run"),
+    )
+    emit = RecordingEmit()
+
+    applied = _apply_update(package_manager, "pkg", "1.0.0", tmp_path, emit=emit)
+
+    assert applied is False
+    failures = emit.of_type(FindingStepFailed)
+    assert [failure.step for failure in failures] == [FindingStepKind.PREPARE]
+    assert message in failures[0].error
 
 
 def test_given_failing_package_command_when_applied_then_error_omits_child_text(
@@ -400,99 +375,79 @@ def test_maven_finalisation_does_not_run_after_a_failed_update(tmp_path, monkeyp
     ]
 
 
-def test_package_boundary_failure_is_persisted_as_a_failed_apply(
-    processor_vcs, project_config, tmp_path
-):
-    processor_vcs["package"].side_effect = ProcessError("package command timed out")
-    scan_result = ScanResult(
-        project="demo",
-        scanned_at=datetime.now(UTC),
-        trivy_target=str(tmp_path),
-        updates=[make_update(SemverTier.PATCH)],
-    )
-    update = scan_result.updates[0]
-    results = process_findings(
-        [update],
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan_result,
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert results[0].failed_phase == "apply"
-    saved = load_scan_results("demo")
-    assert saved.updates[0].update_status == UpdateStatus.FAILED
-    assert saved.updates[0].failed_phase == "apply"
-
-
 # -- run_test_phases --
 
 
-class TestRunTestPhases:
-    def test_all_green(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        mock_run = MagicMock(return_value=None)
-        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
-        tc = ProjectConfig(
-            path=tmp_path,
-            package_manager="bun",
-            test_unit="bun test",
-            test_integration="bun run test:integration",
-        )
-        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert failed_phase is None
-        assert mock_run.call_count == 2
+@pytest.mark.parametrize(
+    ("fields", "failing", "expected_phase", "expected_commands"),
+    [
+        pytest.param(
+            {"test_unit": "bun test", "test_integration": "bun run test:integration"},
+            None,
+            None,
+            ["bun test", "bun run test:integration"],
+            id="all-green",
+        ),
+        pytest.param(
+            {"test_unit": "bun test"},
+            None,
+            None,
+            ["bun test"],
+            id="unconfigured-phases-are-skipped",
+        ),
+        pytest.param(
+            {"test_unit": "  ", "test_integration": "bun run test:integration"},
+            None,
+            None,
+            ["bun run test:integration"],
+            id="blank-phase-is-skipped",
+        ),
+        pytest.param(
+            {"test_unit": "bun test"},
+            "bun test",
+            "unit",
+            ["bun test"],
+            id="unit-fails",
+        ),
+        pytest.param(
+            {"test_unit": "bun test", "test_integration": "bun run test:integration"},
+            "bun run test:integration",
+            "integration",
+            ["bun test", "bun run test:integration"],
+            id="integration-fails",
+        ),
+        pytest.param(
+            {"test_unit": "bun test", "test_integration": "bun run test:integration"},
+            "bun test",
+            "unit",
+            ["bun test"],
+            id="first-failure-stops-later-phases",
+        ),
+    ],
+)
+def test_given_test_phases_when_run_then_first_failure_stops_later_phases(
+    fields: dict[str, str],
+    failing: str | None,
+    expected_phase: str | None,
+    expected_commands: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    commands: list[str] = []
 
-    def test_unit_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        mock_run = MagicMock(side_effect=ProcessError("unit tests failed (exit 1)"))
-        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
-        tc = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="bun test")
-        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert failed_phase == "unit"
-        assert mock_run.call_count == 1
+    def run_shell_command(command, cwd, **kwargs):
+        commands.append(command)
+        if command == failing:
+            msg = f"{kwargs['label']} failed (exit 1)"
+            raise ProcessError(msg)
 
-    def test_integration_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        def side_effect(*args, **kwargs):
-            if "integration" in args[0]:
-                msg = f"{kwargs['label']} failed (exit 1)"
-                raise ProcessError(msg)
+    monkeypatch.setattr("maintenance_man.updater.run_shell_command", run_shell_command)
+    config = make_project(tmp_path, package_manager="bun", **fields)
 
-        mock_run = MagicMock(side_effect=side_effect)
-        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
-        tc = ProjectConfig(
-            path=tmp_path,
-            package_manager="bun",
-            test_unit="bun test",
-            test_integration="bun run test:integration",
-        )
-        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert failed_phase == "integration"
+    failed_phase = run_test_phases(config, tmp_path, emit=RecordingEmit())
 
-    def test_skips_unconfigured_phases(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ):
-        mock_run = MagicMock(return_value=None)
-        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
-        tc = ProjectConfig(
-            path=tmp_path, package_manager="bun", test_unit="bun test"
-        )  # no integration or component
-        failed_phase = run_test_phases(tc, tmp_path, emit=RecordingEmit())
-        assert failed_phase is None
-        assert mock_run.call_count == 1  # only unit
-
-    def test_blank_phase_is_skipped(self, monkeypatch, tmp_path):
-        mock_run = MagicMock(return_value=None)
-        monkeypatch.setattr("maintenance_man.updater.run_shell_command", mock_run)
-        tc = ProjectConfig(
-            path=tmp_path,
-            package_manager="bun",
-            test_unit="  ",
-            test_integration="bun run test:integration",
-        )
-        assert run_test_phases(tc, tmp_path, emit=RecordingEmit()) is None
-        assert [c.args[0] for c in mock_run.call_args_list] == [
-            "bun run test:integration"
-        ]
+    assert failed_phase == expected_phase
+    assert commands == expected_commands
 
 
 def test_test_phases_run_through_bash(tmp_path):
@@ -505,17 +460,6 @@ def test_test_phases_run_through_bash(tmp_path):
     # Under shlex.split printf prints every argument and exits 0; only Bash
     # performs the redirect.
     assert (tmp_path / "out.txt").read_text() == "a b"
-
-
-def test_first_failed_phase_stops_later_phases(tmp_path):
-    config = ProjectConfig(
-        path=tmp_path,
-        package_manager="bun",
-        test_unit="exit 3",
-        test_integration="touch integration-ran",
-    )
-    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) == "unit"
-    assert not (tmp_path / "integration-ran").exists()
 
 
 def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
@@ -531,26 +475,21 @@ def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
 
 
 class TestSortUpdatesByRisk:
-    def test_sorts_patch_minor_major(self):
-        updates = [
-            make_update(SemverTier.MAJOR),
-            make_update(SemverTier.PATCH),
-            make_update(SemverTier.MINOR),
-        ]
-        sorted_u = sort_updates_by_risk(updates)
-        assert [u.semver_tier for u in sorted_u] == [
-            SemverTier.PATCH,
-            SemverTier.MINOR,
-            SemverTier.MAJOR,
-        ]
+    @pytest.mark.parametrize(
+        ("tiers", "expected"),
+        [
+            (
+                [SemverTier.MAJOR, SemverTier.PATCH, SemverTier.MINOR],
+                [SemverTier.PATCH, SemverTier.MINOR, SemverTier.MAJOR],
+            ),
+            ([SemverTier.MINOR], [SemverTier.MINOR]),
+            ([], []),
+        ],
+    )
+    def test_sorts_patch_minor_major(self, tiers, expected):
+        updates = [make_update(tier) for tier in tiers]
 
-    def test_empty_list(self):
-        assert sort_updates_by_risk([]) == []
-
-    def test_single_update(self):
-        result = sort_updates_by_risk([make_update(SemverTier.MINOR)])
-        assert len(result) == 1
-        assert result[0].semver_tier == SemverTier.MINOR
+        assert [u.semver_tier for u in sort_updates_by_risk(updates)] == expected
 
 
 # -- consolidate_vulns --
@@ -592,14 +531,6 @@ class TestConsolidateVulns:
         assert len(result) == 2
         assert result[0].pkg_name == "pkg-a"
         assert result[1].pkg_name == "pkg-b"
-
-    def test_status_fanout_to_originals(self):
-        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
-        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="pkg", fixed_version="1.0.2")
-        consolidated = consolidate_vulns([v1, v2])
-        consolidated[0].update_status = UpdateStatus.COMPLETED
-        assert v1.update_status == UpdateStatus.COMPLETED
-        assert v2.update_status == UpdateStatus.COMPLETED
 
     def test_lifecycle_fanout_to_originals(self):
         v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
@@ -691,47 +622,186 @@ class TestRemoveCompletedFindings:
 # -- process_findings --
 
 
-def _services(bundle: ProcessorDeps) -> VcsServices:
-    return bundle["services"]
+_READY = (UpdateStatus.READY, None)
+_FAILED_UNIT = (UpdateStatus.FAILED, "unit")
+_FAILED_APPLY = (UpdateStatus.FAILED, "apply")
+_FAILED_COMMIT = (UpdateStatus.FAILED, "commit")
+_UNPROCESSED = (None, None)
+_PATCH_COMMIT = "chore: bump pkg-a 1.0.0 -> 1.0.1 (patch)"
+_MINOR_COMMIT = "chore: bump pkg-b 1.0.0 -> 1.1.0 (minor)"
+_MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
 
 
 @pytest.mark.parametrize(
-    "flow,bookmark",
+    (
+        "flow",
+        "on_failure",
+        "outcomes",
+        "expected_passed",
+        "expected_saved",
+        "expected_descriptions",
+        "expected_dep",
+    ),
     [
-        (Workflow.UPDATE, "mm/update-dependencies"),
-        (Workflow.RESOLVE, "mm/resolve-dependencies"),
+        pytest.param(
+            Workflow.UPDATE,
+            "continue",
+            ["pass", "unit", "pass"],
+            [True, False, True],
+            [_READY, _FAILED_UNIT, _READY],
+            [_PATCH_COMMIT, _MAJOR_COMMIT],
+            "version=1\npkg-a@1.0.1\npkg-c@2.0.0\n",
+            id="update-discards-the-failed-finding-and-continues",
+        ),
+        pytest.param(
+            Workflow.UPDATE,
+            "continue",
+            ["apply", "pass"],
+            [False, True],
+            [_FAILED_APPLY, _READY],
+            [_MINOR_COMMIT],
+            "version=1\npkg-b@1.1.0\n",
+            id="update-continues-after-an-apply-failure",
+        ),
+        pytest.param(
+            Workflow.RESOLVE,
+            "stop",
+            ["pass", "unit", "pass"],
+            [True, False],
+            [_READY, _FAILED_UNIT, _UNPROCESSED],
+            [_PATCH_COMMIT],
+            "version=1\npkg-a@1.0.1\npkg-b@1.1.0\n",
+            id="resolve-keeps-the-failed-change-and-stops",
+        ),
+        pytest.param(
+            Workflow.RESOLVE,
+            "stop",
+            ["apply", "pass"],
+            [False],
+            [_FAILED_APPLY, _UNPROCESSED],
+            [],
+            "version=1\npkg-a@1.0.1\n",
+            id="resolve-stops-after-an-apply-failure",
+        ),
+        pytest.param(
+            Workflow.RESOLVE,
+            "stop",
+            ["commit", "pass"],
+            [False],
+            [_FAILED_COMMIT, _UNPROCESSED],
+            [],
+            "version=1\npkg-a@1.0.1\n",
+            id="resolve-keeps-the-change-after-a-commit-failure",
+        ),
     ],
 )
-def test_success_commits_and_advances_the_flow_bookmark(
+def test_given_step_outcome_when_processed_then_status_discard_and_stop_follow_the_flow(
     flow: Workflow,
+    on_failure: FailureStrategy,
+    outcomes: list[str],
+    expected_passed: list[bool],
+    expected_saved: list[tuple[UpdateStatus | None, str | None]],
+    expected_descriptions: list[str],
+    expected_dep: str,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = processor_vcs["repo"]
+    findings = [
+        make_update(),
+        make_update(SemverTier.MINOR),
+        make_update(SemverTier.MAJOR),
+    ][: len(outcomes)]
+    attempted: list[str] = []
+    write_dep = processor_vcs["package"].side_effect
+
+    def run_package(cmd, cwd, **kwargs):
+        attempted.append(outcomes[len(attempted)])
+        completed_command = write_dep(cmd, cwd, **kwargs)
+        if attempted[-1] == "apply":
+            msg = "package failed"
+            raise ProcessError(msg)
+        return completed_command
+
+    def run_phase(command, cwd, **kwargs):
+        if attempted[-1] == "unit":
+            msg = "unit failed"
+            raise ProcessError(msg)
+
+    processor_vcs["package"].side_effect = run_package
+    processor_vcs["phase"].side_effect = run_phase
+    if "commit" in outcomes:
+        fail_repository_method(
+            monkeypatch, repo.path, "commit", RevisionError("cannot commit")
+        )
+
+    results = _process(
+        findings, project_config, processor_vcs, flow=flow, on_failure=on_failure
+    )
+
+    assert [result.passed for result in results] == expected_passed
+    assert [
+        (row.update_status, row.failed_phase)
+        for row in load_scan_results("demo").updates
+    ] == expected_saved
+    assert commit_descriptions(repo, "main..@-") == expected_descriptions
+    assert (repo.path / "dep.txt").read_text(encoding="utf-8") == expected_dep
+
+
+@pytest.mark.parametrize(
+    ("flow", "on_failure", "bookmark"),
+    [
+        (Workflow.UPDATE, "continue", MANAGED),
+        (Workflow.RESOLVE, "stop", "mm/resolve-dependencies"),
+    ],
+)
+@pytest.mark.parametrize("count", [1, 2])
+def test_given_passing_findings_when_processed_then_each_is_committed_and_bookmarked(
+    flow: Workflow,
+    on_failure: FailureStrategy,
     bookmark: str,
+    count: int,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
-    update = make_update()
+    findings = [make_update(), make_update(SemverTier.MINOR)][:count]
+    project_path = Path(project_config.path)
 
-    results = process_findings(
-        [update],
-        project_config,
-        flow=flow,
-        scan_result=_scan_result_for(project_config, [update]),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
+    results = _process(
+        findings, project_config, processor_vcs, flow=flow, on_failure=on_failure
     )
 
-    state = processor_vcs["state"]
-    assert results[0].passed is True
-    assert update.update_status == UpdateStatus.READY
-    assert update.failed_phase is None
-    assert update.flow == flow
-    assert [call.method for call in state.effects] == ["commit", "set_bookmark"]
     repo = processor_vcs["repo"]
+    package, phase = processor_vcs["package"], processor_vcs["phase"]
+    assert [result.passed for result in results] == [True] * count
+    assert [(row.update_status, row.failed_phase, row.flow) for row in findings] == [
+        (UpdateStatus.READY, None, flow)
+    ] * count
+    assert (
+        commit_descriptions(repo, "main..@-") == [_PATCH_COMMIT, _MINOR_COMMIT][:count]
+    )
     assert repo.same_revision(left=bookmark, right="@-")
+    assert package.call_count == phase.call_count == count
+    assert package.call_args_list[0] == call(
+        ["bun", "add", "pkg-a@1.0.1"],
+        project_path,
+        timeout=300,
+        label="bun add pkg-a@1.0.1",
+        stdin=subprocess.DEVNULL,
+    )
+    assert phase.call_args_list[0] == call(
+        "bun test", project_path, timeout=600, label="unit tests"
+    )
 
 
-@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
+@pytest.mark.parametrize(
+    ("flow", "on_failure"),
+    [(Workflow.UPDATE, "continue"), (Workflow.RESOLVE, "stop")],
+)
 def test_already_applied_is_ready_without_a_commit(
     flow: Workflow,
+    on_failure: FailureStrategy,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
@@ -740,240 +810,60 @@ def test_already_applied_is_ready_without_a_commit(
     )
     update = make_update()
 
-    results = process_findings(
-        [update],
-        project_config,
-        flow=flow,
-        on_failure="stop" if flow == Workflow.RESOLVE else "continue",
-        scan_result=_scan_result_for(project_config, [update]),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
+    results = _process(
+        [update], project_config, processor_vcs, flow=flow, on_failure=on_failure
     )
 
     assert results[0].passed is True
     assert update.update_status == UpdateStatus.READY
     assert update.flow == flow
-    assert not any(call.method == "commit" for call in processor_vcs["state"].attempts)
+    assert commit_descriptions(processor_vcs["repo"], "main..@-") == []
 
 
-def test_update_failure_discards_then_attempts_the_next_finding(
-    processor_vcs: ProcessorDeps, project_config: ProjectConfig
-):
-    phase = processor_vcs["phase"]
-    phase.side_effect = [ProcessError("unit failed"), None]
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-    emit = RecordingEmit()
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=emit,
-    )
-
-    assert [result.passed for result in results] == [False, True]
-    assert findings[0].update_status == UpdateStatus.FAILED
-    assert findings[0].failed_phase == "unit"
-    assert findings[0].flow == Workflow.UPDATE
-    assert processor_vcs["package"].call_count == 2
-    assert "discard" in [call.method for call in processor_vcs["state"].effects]
-    assert emit.of_type(FindingFailed)[0] == FindingFailed(
-        "pkg-a", "unit", "1.0.0", "1.0.1"
-    )
-
-
-@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
-def test_all_successful_findings_commit_without_discard(
-    flow: Workflow,
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=flow,
-        on_failure="stop" if flow == Workflow.RESOLVE else "continue",
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert len(results) == 2
-    assert all(result.passed for result in results)
-    assert processor_vcs["package"].call_count == 2
-    assert processor_vcs["phase"].call_count == 2
-    methods = [call.method for call in processor_vcs["state"].effects]
-    assert methods.count("commit") == 2
-    assert "discard" not in methods
-
-
-def test_update_success_failure_success_sequence_continues_after_discard(
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    processor_vcs["phase"].side_effect = [
-        None,
-        ProcessError("unit failed"),
-        None,
-    ]
-    findings = [
-        make_update(),
-        make_update(SemverTier.MINOR),
-        make_update(SemverTier.MAJOR),
-    ]
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert [result.passed for result in results] == [True, False, True]
-    methods = [call.method for call in processor_vcs["state"].effects]
-    assert methods.count("commit") == 2
-    assert methods.count("discard") == 1
-
-
-@pytest.mark.parametrize("failed_phase", ["unit", "apply", "commit"])
-def test_resolve_failure_preserves_changes_and_stops(
-    failed_phase: str,
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    if failed_phase == "unit":
-        processor_vcs["phase"].side_effect = ProcessError("unit failed")
-    elif failed_phase == "apply":
-        processor_vcs["package"].side_effect = ProcessError("package failed")
-    else:
-        from maintenance_man.vcs import RevisionError
-
-        processor_vcs["state"].fail(
-            "commit", error=RevisionError("injected"), path=project_config.path
-        )
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.RESOLVE,
-        on_failure="stop",
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert len(results) == 1
-    assert results[0].failed_phase == failed_phase
-    assert findings[0].update_status == UpdateStatus.FAILED
-    assert findings[0].flow == Workflow.RESOLVE
-    assert processor_vcs["package"].call_count == 1
-    assert findings[1].update_status is None
-    assert not any(call.method == "discard" for call in processor_vcs["state"].attempts)
-
-
-def test_resolve_success_then_failure_leaves_later_finding_unattempted(
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    processor_vcs["phase"].side_effect = [None, ProcessError("unit failed")]
-    findings = [
-        make_update(),
-        make_update(SemverTier.MINOR),
-        make_update(SemverTier.MAJOR),
-    ]
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.RESOLVE,
-        on_failure="stop",
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert [result.passed for result in results] == [True, False]
-    assert processor_vcs["package"].call_count == 2
-    assert findings[2].update_status is None
-    methods = [call.method for call in processor_vcs["state"].effects]
-    assert methods.count("commit") == 1
-    assert "discard" not in methods
-
-
-@pytest.mark.parametrize("method", ["has_changes", "commit", "set_bookmark"])
+@pytest.mark.parametrize(
+    ("method", "expected_passed", "expected_descriptions", "expected_dep"),
+    [
+        pytest.param(
+            "has_changes", [False], [], "version=1\npkg-a@1.0.1\n", id="has_changes"
+        ),
+        pytest.param(
+            "commit",
+            [False, True],
+            [_MINOR_COMMIT],
+            "version=1\npkg-b@1.1.0\n",
+            id="commit",
+        ),
+        pytest.param(
+            "set_bookmark",
+            [False],
+            [_PATCH_COMMIT],
+            "version=1\npkg-a@1.0.1\n",
+            id="set_bookmark",
+        ),
+    ],
+)
 def test_repository_failure_never_saves_ready(
     method: str,
+    expected_passed: list[bool],
+    expected_descriptions: list[str],
+    expected_dep: str,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    from maintenance_man.vcs import RevisionError
+    repo = processor_vcs["repo"]
+    fail_repository_method(monkeypatch, repo.path, method, RevisionError("injected"))
 
-    state = processor_vcs["state"]
-    state.fail(method, error=RevisionError("injected"), path=project_config.path)
-    finding = make_update()
-    second = make_update(SemverTier.MINOR)
-    scan = ScanResult(
-        project="demo",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target=str(project_config.path),
-        updates=[finding, second],
-    )
-    results = process_findings(
-        [finding, second],
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
+    results = _process(
+        [make_update(), make_update(SemverTier.MINOR)], project_config, processor_vcs
     )
 
     saved = load_scan_results("demo")
     assert saved.updates[0].update_status == UpdateStatus.FAILED
     assert saved.updates[0].failed_phase == "commit"
-    if method == "has_changes":
-        assert len(results) == 1
-        assert processor_vcs["package"].call_count == 1
-        assert not any(call.method in {"commit", "discard"} for call in state.attempts)
-    if method == "commit":
-        assert [result.passed for result in results] == [False, True]
-        assert processor_vcs["package"].call_count == 2
-        assert any(call.method == "discard" for call in state.effects)
-    if method == "set_bookmark":
-        assert len(results) == 1
-        assert processor_vcs["package"].call_count == 1
-        assert sum(call.method == "commit" for call in state.effects) == 1
-        assert not any(call.method == "discard" for call in state.attempts)
-
-
-def test_apply_failure_discards_and_continues(
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    processor_vcs["package"].side_effect = [
-        ProcessError("package failed"),
-        completed([], returncode=0, stdout="", stderr=""),
-    ]
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-
-    assert [result.passed for result in results] == [False, True]
-    assert results[0].failed_phase == "apply"
-    assert any(call.method == "discard" for call in processor_vcs["state"].effects)
+    assert [result.passed for result in results] == expected_passed
+    assert commit_descriptions(repo, "main..@-") == expected_descriptions
+    assert (repo.path / "dep.txt").read_text(encoding="utf-8") == expected_dep
 
 
 def test_given_failing_package_command_when_processed_then_apply_failure_emitted_once(
@@ -981,17 +871,9 @@ def test_given_failing_package_command_when_processed_then_apply_failure_emitted
     project_config: ProjectConfig,
 ):
     processor_vcs["package"].side_effect = ProcessError("package failed")
-    findings = [make_update()]
     emit = RecordingEmit()
 
-    process_findings(
-        findings,
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=emit,
-    )
+    _process([make_update()], project_config, processor_vcs, emit=emit)
 
     assert emit.events[-2:] == [
         FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, "package failed"),
@@ -1004,55 +886,41 @@ def test_empty_findings_have_no_repository_effects(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
-    assert (
-        process_findings(
-            [],
-            project_config,
-            flow=Workflow.UPDATE,
-            scan_result=_scan_result_for(project_config, []),
-            vcs=_services(processor_vcs),
-            emit=RecordingEmit(),
-        )
-        == []
-    )
-    assert processor_vcs["state"].effects == []
+    before = operation_id(processor_vcs["repo"])
+
+    assert _process([], project_config, processor_vcs) == []
+
+    assert operation_id(processor_vcs["repo"]) == before
 
 
 def test_failed_discard_persists_original_failure_and_stops(
-    processor_vcs: ProcessorDeps, project_config: ProjectConfig
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    from maintenance_man.vcs import RevisionError
-
-    state = processor_vcs["state"]
     processor_vcs["phase"].side_effect = ProcessError("unit failed")
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-    scan = ScanResult(
-        project="demo",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target=str(project_config.path),
-        updates=findings,
-    )
 
-    def assert_persisted_before_discard_failure() -> None:
+    original_discard = JjRepository.discard
+
+    def discard_after_checking_saved_failure(repository: JjRepository) -> None:
+        if repository.path.resolve() != processor_vcs["repo"].path.resolve():
+            original_discard(repository)
+            return
         saved = load_scan_results("demo")
-        assert saved.updates[0].update_status == UpdateStatus.FAILED
-        assert saved.updates[0].failed_phase == "unit"
+        assert (saved.updates[0].update_status, saved.updates[0].failed_phase) == (
+            UpdateStatus.FAILED,
+            "unit",
+        )
         msg = "cannot discard"
         raise RevisionError(msg)
 
-    state.hook(
-        "discard",
-        phase="before",
-        action=assert_persisted_before_discard_failure,
-        path=project_config.path,
-    )
+    monkeypatch.setattr(JjRepository, "discard", discard_after_checking_saved_failure)
     emit = RecordingEmit()
-    results = process_findings(
-        findings,
+
+    results = _process(
+        [make_update(), make_update(SemverTier.MINOR)],
         project_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        vcs=_services(processor_vcs),
+        processor_vcs,
         emit=emit,
     )
 
@@ -1069,18 +937,9 @@ def test_update_statuses_are_persisted_after_each_finding(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
-    findings = [make_update(), make_update(SemverTier.MINOR)]
-    scan = ScanResult(
-        project="demo",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target=str(project_config.path),
-        updates=findings,
-    )
     inspected_before_second_finding: list[bool] = []
     package_effect = processor_vcs["package"].side_effect
-    phase_effect = processor_vcs["phase"].side_effect
     assert callable(package_effect)
-    assert callable(phase_effect)
 
     def run_package(*args: object, **kwargs: object) -> object:
         if processor_vcs["package"].call_count == 2:
@@ -1092,21 +951,11 @@ def test_update_statuses_are_persisted_after_each_finding(
             inspected_before_second_finding.append(True)
         return package_effect(*args, **kwargs)
 
-    def run_phase(*args: object, **kwargs: object) -> None:
-        phase_effect(*args, **kwargs)
-        if processor_vcs["phase"].call_count == 2:
-            msg = "unit failed"
-            raise ProcessError(msg)
-
     processor_vcs["package"].side_effect = run_package
-    processor_vcs["phase"].side_effect = run_phase
-    process_findings(
-        findings,
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
+    processor_vcs["phase"].side_effect = [None, ProcessError("unit failed")]
+
+    _process(
+        [make_update(), make_update(SemverTier.MINOR)], project_config, processor_vcs
     )
 
     saved = load_scan_results("demo")
@@ -1123,21 +972,13 @@ def test_resolve_failure_status_is_persisted_before_stopping(
     project_config: ProjectConfig,
 ):
     processor_vcs["phase"].side_effect = ProcessError("unit failed")
-    finding = make_update(update_status=UpdateStatus.FAILED)
-    scan = ScanResult(
-        project="demo",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target=str(project_config.path),
-        updates=[finding],
-    )
-    process_findings(
-        [finding],
+
+    _process(
+        [make_update(update_status=UpdateStatus.FAILED)],
         project_config,
+        processor_vcs,
         flow=Workflow.RESOLVE,
         on_failure="stop",
-        scan_result=scan,
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
     )
 
     saved = load_scan_results("demo")
@@ -1168,21 +1009,10 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
         make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.31.0"),
         make_vuln(vuln_id="CVE-2", pkg_name="requests", fixed_version="2.32.4"),
     ]
-    scan = ScanResult(
-        project="demo",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target=str(project_config.path),
-        vulnerabilities=vulns,
-    )
+    scan = _scan_result_for(project_config, [])
+    scan.vulnerabilities = vulns
 
-    results = process_findings(
-        group_findings(vulns),
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
+    results = _process(group_findings(vulns), project_config, processor_vcs, scan=scan)
 
     assert [(result.kind, result.passed) for result in results] == [("vuln", passed)]
     saved = load_scan_results("demo")
@@ -1193,75 +1023,6 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
         (status, failed_phase, Workflow.UPDATE),
         (status, failed_phase, Workflow.UPDATE),
     ]
-
-
-def test_process_updates_sorts_by_risk(
-    processor_vcs: ProcessorDeps, project_config: ProjectConfig
-):
-    findings = sort_updates_by_risk(
-        [make_update(SemverTier.MAJOR), make_update(SemverTier.PATCH)]
-    )
-    results = process_findings(
-        findings,
-        project_config,
-        flow=Workflow.UPDATE,
-        scan_result=_scan_result_for(project_config, findings),
-        vcs=_services(processor_vcs),
-        emit=RecordingEmit(),
-    )
-    assert [result.pkg_name for result in results] == ["pkg-a", "pkg-c"]
-
-
-def test_gradle_config_records_a_failed_apply_not_a_crash(tmp_path):
-    """Unreachable by design; it must still degrade, not unwind the flow."""
-    emit = RecordingEmit()
-    assert _apply_update("gradle", "room", "2.8.5", tmp_path, emit=emit) is False
-    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PREPARE
-    assert "Gradle" in emit.of_type(FindingStepFailed)[0].error
-
-
-def test_a_test_phase_timeout_is_recorded_as_a_failed_phase(
-    project_config, monkeypatch
-):
-    def _timeout(command, cwd, **kwargs):
-        msg = "unit tests timed out after 600s"
-        raise ProcessError(msg)
-
-    monkeypatch.setattr("maintenance_man.updater.run_shell_command", _timeout)
-
-    assert (
-        run_test_phases(project_config, Path(project_config.path), emit=RecordingEmit())
-        == "unit"
-    )
-
-
-def test_an_uncommitted_catalogue_edit_blocks_with_a_workspace_hint(
-    gradle_project, tmp_path
-):
-    target = make_gradle_target()
-    catalogue = Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
-    catalogue.write_text(
-        catalogue.read_text(encoding="utf-8").replace(
-            'room = "2.8.4"', 'room = "2.8.6"'
-        ),
-        encoding="utf-8",
-    )
-
-    block = validate_gradle_target(gradle_project, target)
-
-    assert block is not None and block.kind == "stale"
-    assert "update workspace" in block.reason
-
-
-def test_bun_update_without_a_manifest_runs_no_command(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "maintenance_man.updater.run_logged",
-        lambda *args, **kwargs: pytest.fail("no command may run"),
-    )
-    emit = RecordingEmit()
-    assert _apply_update("bun", "zod", "4.6.5", tmp_path, emit=emit) is False
-    assert emit.of_type(FindingStepFailed)[0].step is FindingStepKind.PREPARE
-    assert "package.json" in emit.of_type(FindingStepFailed)[0].error
 
 
 def _group_summary(findings):
@@ -1410,24 +1171,16 @@ def test_given_saved_target_when_applied_then_outcome_matches_catalogue_state(
 def gradle_processor(
     monkeypatch: pytest.MonkeyPatch, gradle_project: ProjectConfig
 ) -> ProcessorDeps:
-    """A seeded Gradle repository whose wrapper applies the selected report."""
-    root = Path(gradle_project.path)
-    state = FakeJjState()
-    repo = state.seed_repository(
-        root,
-        files={
-            name: (root / name).read_text(encoding="utf-8")
-            for name in ("gradlew", GRADLE_CATALOGUE_RELPATH)
-        },
-    )
+    """A copied Gradle repository whose wrapper applies the selected report."""
+    repo = copy_jj_repository(Path(gradle_project.path))
+    commit_to_main(repo, "gradle project")
     package = MagicMock(side_effect=catalogue_apply_runner())
     phase = MagicMock()
     monkeypatch.setattr("maintenance_man.gradle.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
     return {
-        "state": state,
         "repo": repo,
-        "services": state.services(),
+        "services": make_vcs_services(),
         "package": package,
         "phase": phase,
     }
@@ -1447,23 +1200,18 @@ def test_given_rows_of_one_target_when_processed_then_one_change_marks_both_read
     scan = make_scan_result(vulns=[vuln], updates=[update])
     scan.project = "demo"
 
-    results = process_findings(
-        group_findings(rows),
-        gradle_project,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        vcs=gradle_processor["services"],
-        emit=RecordingEmit(),
+    results = _process(
+        group_findings(rows), gradle_project, gradle_processor, scan=scan
     )
 
-    state = gradle_processor["state"]
+    repo = gradle_processor["repo"]
     assert results == [UpdateResult("room", "vuln", True)]
     assert gradle_processor["package"].call_count == 1
     assert gradle_processor["phase"].call_count == 1
-    assert [call.method for call in state.effects] == ["commit", "set_bookmark"]
-    assert dict(state.effects[0].arguments) == {
-        "message": "fix: upgrade room 2.8.4 -> 2.8.5 for CVE-1, patch"
-    }
+    assert commit_descriptions(repo, "main..@-") == [
+        "fix: upgrade room 2.8.4 -> 2.8.5 for CVE-1, patch"
+    ]
+    assert repo.same_revision(left=MANAGED, right="@-")
     assert 'room = "2.8.5"' in (
         Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
     ).read_text(encoding="utf-8")
@@ -1491,14 +1239,7 @@ def test_given_two_owner_targets_when_one_fails_then_statuses_stay_independent(
     scan = make_scan_result(vulns=rows, updates=[])
     scan.project = "demo"
 
-    process_findings(
-        group_findings(rows),
-        gradle_project,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        vcs=gradle_processor["services"],
-        emit=RecordingEmit(),
-    )
+    _process(group_findings(rows), gradle_project, gradle_processor, scan=scan)
 
     catalogue = (Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH).read_text(
         encoding="utf-8"
@@ -1533,19 +1274,15 @@ def test_given_drifted_target_when_processed_then_rows_are_blocked_without_effec
     scan = make_scan_result(vulns=[], updates=[row])
     scan.project = "demo"
     emit = RecordingEmit()
+    before = operation_id(gradle_processor["repo"])
 
-    results = process_findings(
-        group_findings([row]),
-        gradle_project,
-        flow=Workflow.UPDATE,
-        scan_result=scan,
-        vcs=gradle_processor["services"],
-        emit=emit,
+    results = _process(
+        group_findings([row]), gradle_project, gradle_processor, scan=scan, emit=emit
     )
 
     saved = load_scan_results("demo").updates[0]
     assert results == []
-    assert gradle_processor["state"].effects == []
+    assert operation_id(gradle_processor["repo"]) == before
     assert gradle_processor["phase"].call_count == 0
     assert (
         saved.blocked_reason,

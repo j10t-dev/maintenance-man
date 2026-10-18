@@ -1,187 +1,91 @@
-from unittest.mock import MagicMock, patch
+import email.message
+import io
+from urllib.error import HTTPError, URLError
 
-from maintenance_man.deployer import check_health
+import pytest
+
+from maintenance_man.deployer import HealthCheckResult, check_health
+
+_UP = b'{"is_up": true}'
 
 
-class TestCheckHealth:
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_healthy_service(self, mock_urlopen: MagicMock) -> None:
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"name": "lifts", "is_up": true}'
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_response
+def _http_error(code: int, msg: str) -> HTTPError:
+    return HTTPError(url="", code=code, msg=msg, hdrs=email.message.Message(), fp=None)
 
-        result = check_health("http://pihost:8080", "lifts")
 
-        assert result.is_up is True
-        assert result.error is None
-        mock_urlopen.assert_called_once_with(
-            "http://pihost:8080/api/status/lifts", timeout=10
-        )
+@pytest.mark.parametrize(
+    ("outcomes", "expected", "attempts"),
+    [
+        pytest.param([_UP], HealthCheckResult(True, None), 1, id="up"),
+        pytest.param(
+            [b'{"is_up": false, "last_error": "x"}'],
+            HealthCheckResult(False, None),
+            1,
+            id="down",
+        ),
+        pytest.param(
+            [_http_error(404, "Not Found")],
+            HealthCheckResult(False, "Service 'lifts' not found in healthchecker"),
+            1,
+            id="unknown-service",
+        ),
+        pytest.param(
+            [URLError("Connection refused")] * 3,
+            HealthCheckResult(False, "Could not reach healthchecker after 3 attempts"),
+            3,
+            id="unreachable-exhausts-retries",
+        ),
+        pytest.param(
+            [URLError("Connection refused"), _UP],
+            HealthCheckResult(True, None),
+            2,
+            id="unreachable-then-up",
+        ),
+        pytest.param(
+            [_http_error(503, "Service Unavailable"), _UP],
+            HealthCheckResult(True, None),
+            2,
+            id="server-error-then-up",
+        ),
+        pytest.param(
+            [_http_error(503, "Service Unavailable")] * 3,
+            HealthCheckResult(False, "HTTP 503: Service Unavailable"),
+            3,
+            id="server-error-exhausts-retries",
+        ),
+        pytest.param(
+            [_http_error(403, "Forbidden")],
+            HealthCheckResult(False, "HTTP 403: Forbidden"),
+            1,
+            id="client-error-is-not-retried",
+        ),
+        pytest.param(
+            [b"<html>502 Bad Gateway</html>"],
+            HealthCheckResult(False, "Healthchecker returned non-JSON response"),
+            1,
+            id="non-json-body",
+        ),
+    ],
+)
+def test_given_healthchecker_responses_when_checked_then_result_and_attempts_match(
+    outcomes: list[bytes | Exception],
+    expected: HealthCheckResult,
+    attempts: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remaining = iter(outcomes)
+    calls: list[tuple[str, int]] = []
 
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_unhealthy_service(self, mock_urlopen: MagicMock) -> None:
-        mock_response = MagicMock()
-        mock_response.read.return_value = (
-            b'{"name": "lifts", "is_up": false, "last_error": "connection refused"}'
-        )
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_response
+    def urlopen(url: str, timeout: int) -> io.BytesIO:
+        calls.append((url, timeout))
+        outcome = next(remaining)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return io.BytesIO(outcome)
 
-        result = check_health("http://pihost:8080", "lifts")
+    monkeypatch.setattr("maintenance_man.deployer.urllib.request.urlopen", urlopen)
 
-        assert result.is_up is False
-        assert result.error is None
+    result = check_health("http://pihost:8080", "lifts", max_retries=3, initial_delay=0)
 
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_service_not_found(self, mock_urlopen: MagicMock) -> None:
-        from urllib.error import HTTPError
-
-        mock_urlopen.side_effect = HTTPError(
-            url="http://pihost:8080/api/status/unknown",
-            code=404,
-            msg="Not Found",
-            hdrs=None,  # ty:ignore[invalid-argument-type]
-            fp=None,
-        )
-
-        result = check_health("http://pihost:8080", "unknown")
-
-        assert result.is_up is False
-        assert result.error is not None
-        assert "not found" in result.error.lower()
-
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_connection_error_retries(self, mock_urlopen: MagicMock) -> None:
-        from urllib.error import URLError
-
-        mock_urlopen.side_effect = URLError("Connection refused")
-
-        result = check_health(
-            "http://pihost:8080",
-            "lifts",
-            max_retries=3,
-            initial_delay=0,
-        )
-
-        assert result.is_up is False
-        assert result.error is not None
-        assert mock_urlopen.call_count == 3
-
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_retries_then_succeeds(self, mock_urlopen: MagicMock) -> None:
-        from urllib.error import URLError
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"name": "lifts", "is_up": true}'
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        mock_urlopen.side_effect = [
-            URLError("Connection refused"),
-            mock_response,
-        ]
-
-        result = check_health(
-            "http://pihost:8080",
-            "lifts",
-            max_retries=3,
-            initial_delay=0,
-        )
-
-        assert result.is_up is True
-        assert mock_urlopen.call_count == 2
-
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_5xx_retries_then_succeeds(self, mock_urlopen: MagicMock) -> None:
-        from urllib.error import HTTPError
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"name": "lifts", "is_up": true}'
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        mock_urlopen.side_effect = [
-            HTTPError(
-                url="",
-                code=503,
-                msg="Service Unavailable",
-                hdrs=None,  # ty:ignore[invalid-argument-type]
-                fp=None,
-            ),
-            mock_response,
-        ]
-
-        result = check_health(
-            "http://pihost:8080",
-            "lifts",
-            max_retries=3,
-            initial_delay=0,
-        )
-
-        assert result.is_up is True
-        assert mock_urlopen.call_count == 2
-
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_5xx_exhausts_retries(self, mock_urlopen: MagicMock) -> None:
-        from urllib.error import HTTPError
-
-        mock_urlopen.side_effect = HTTPError(
-            url="",
-            code=502,
-            msg="Bad Gateway",
-            hdrs=None,  # ty:ignore[invalid-argument-type]
-            fp=None,
-        )
-
-        result = check_health(
-            "http://pihost:8080",
-            "lifts",
-            max_retries=3,
-            initial_delay=0,
-        )
-
-        assert result.is_up is False
-        assert result.error is not None
-        assert "502" in result.error
-        assert mock_urlopen.call_count == 3
-
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_4xx_does_not_retry(self, mock_urlopen: MagicMock) -> None:
-        from urllib.error import HTTPError
-
-        mock_urlopen.side_effect = HTTPError(
-            url="",
-            code=403,
-            msg="Forbidden",
-            hdrs=None,  # ty:ignore[invalid-argument-type]
-            fp=None,
-        )
-
-        result = check_health(
-            "http://pihost:8080",
-            "lifts",
-            max_retries=3,
-            initial_delay=0,
-        )
-
-        assert result.is_up is False
-        assert result.error is not None
-        assert "403" in result.error
-        assert mock_urlopen.call_count == 1
-
-    @patch("maintenance_man.deployer.urllib.request.urlopen")
-    def test_non_json_response(self, mock_urlopen: MagicMock) -> None:
-        mock_response = MagicMock()
-        mock_response.read.return_value = b"<html>502 Bad Gateway</html>"
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_response
-
-        result = check_health("http://pihost:8080", "lifts")
-
-        assert result.is_up is False
-        assert result.error is not None
-        assert "non-JSON" in result.error
+    assert result == expected
+    assert calls == [("http://pihost:8080/api/status/lifts", 10)] * attempts

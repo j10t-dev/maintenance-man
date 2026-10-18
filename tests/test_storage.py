@@ -12,6 +12,7 @@ from maintenance_man.models.scan import (
     SemverTier,
     UpdateFinding,
     UpdateStatus,
+    Workflow,
 )
 from maintenance_man.storage import (
     NoScanResultsError,
@@ -21,18 +22,7 @@ from maintenance_man.storage import (
     record_activity,
     save_scan_results,
 )
-from tests.support.findings import make_scan_result, make_update, make_vuln
-
-
-@pytest.fixture()
-def scan_result() -> ScanResult:
-    return ScanResult(
-        project="myapp",
-        scanned_at=datetime.now(tz=UTC),
-        trivy_target="/tmp/myapp",
-        vulnerabilities=[make_vuln()],
-        updates=[make_update(semver_tier=SemverTier.MAJOR)],
-    )
+from tests.support.findings import make_scan_result, make_update
 
 
 def _temporaries(directory: Path) -> list[str]:
@@ -87,7 +77,9 @@ def test_new_file_mode_follows_umask(tmp_path, kwargs, expected):
 
 
 def test_save_creates_directory_and_round_trips():
-    result = make_scan_result()
+    result = make_scan_result(
+        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)]
+    )
     save_scan_results("vulnerable", result)
     assert load_scan_results("vulnerable") == result
 
@@ -171,12 +163,6 @@ def test_given_invalid_fields_when_activity_is_loaded_then_empty_data_is_returne
 
 
 class TestSaveScanResults:
-    def test_writes_json_to_disk(self, scan_results_dir: Path, scan_result: ScanResult):
-        save_scan_results("myapp", scan_result)
-
-        data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
-        assert data["project"] == "myapp"
-
     def test_preserves_update_status(self, scan_results_dir: Path):
         result = ScanResult(
             project="myapp",
@@ -189,6 +175,7 @@ class TestSaveScanResults:
                     latest_version="1.0.1",
                     semver_tier=SemverTier.PATCH,
                     update_status=UpdateStatus.COMPLETED,
+                    flow=Workflow.UPDATE,
                 ),
             ],
         )
@@ -196,24 +183,13 @@ class TestSaveScanResults:
 
         data = json.loads((scan_results_dir / "myapp.json").read_text(encoding="utf-8"))
         assert data["updates"][0]["update_status"] == "completed"
+        assert data["updates"][0]["flow"] == "update"
 
 
 # -- load_scan_results --
 
 
 class TestLoadScanResults:
-    def test_load_existing(self, scan_results_dir: Path):
-        result = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-        )
-        (scan_results_dir / "myapp.json").write_text(
-            result.model_dump_json(indent=2), encoding="utf-8"
-        )
-        loaded = load_scan_results("myapp")
-        assert loaded.project == "myapp"
-
     def test_load_missing(self, scan_results_dir: Path):
         with pytest.raises(NoScanResultsError, match="nonexistent"):
             load_scan_results("nonexistent")

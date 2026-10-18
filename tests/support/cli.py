@@ -10,7 +10,6 @@ from typing import NoReturn
 import pytest
 
 from maintenance_man.cli import main
-from maintenance_man.config import load_config
 from maintenance_man.models.scan import (
     ScanResult,
     UpdateStatus,
@@ -18,10 +17,8 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import JjRepository
-from tests.fake_vcs import FakeJjState
 from tests.fakes import FakeFindingProcessor
 from tests.support.findings import make_scan_result, make_update, make_vuln
-from tests.support.projects import write_config
 from tests.support.repository import configure_jj_projects
 
 
@@ -42,32 +39,6 @@ def refuse_jj_commands(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(msg)
 
     monkeypatch.setattr("maintenance_man.vcs.run_captured", refuse)
-
-
-def configure_fake_vcs(
-    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[FakeJjState, dict[str, Path]]:
-    """Redirect projects to fake repositories, sharing duplicate paths."""
-    config_path = home / "config.toml"
-    configured = load_config(config_path)
-    replacements: dict[Path, Path] = {}
-    state = FakeJjState()
-    for project in configured.projects.values():
-        if project.path in replacements:
-            continue
-        target = tmp_path / "repositories" / f"repo-{len(replacements)}"
-        replacements[project.path] = target
-        state.seed_repository(target, files={"dep.txt": "version=1\n"})
-    text = config_path.read_text(encoding="utf-8")
-    for source, target in replacements.items():
-        text = text.replace(str(source), str(target))
-    write_config(home, text)
-    paths_by_name = {
-        name: replacements[project.path]
-        for name, project in configured.projects.items()
-    }
-    monkeypatch.setattr("maintenance_man.cli.make_vcs_services", state.services)
-    return state, paths_by_name
 
 
 class TerminalStream(StringIO):
