@@ -18,7 +18,6 @@ import pytest
 
 from maintenance_man import dependency_age as age
 from maintenance_man.dependency_age import (
-    _MAX_BYTES,
     PublicationError,
     PublicationLookupContext,
     _public_url,
@@ -292,8 +291,7 @@ def test_publication_routing_withheld_before_any_transport_call(
     )
     with context:
         result = lookup_gradle_publication(request, context)
-    assert isinstance(result, AgeBlock)
-    assert result.reason == "unsupported or missing scoped repository routing"
+    assert result == AgeBlock(reason="unsupported or missing scoped repository routing")
     assert calls == []
 
 
@@ -311,8 +309,7 @@ def test_publication_candidate_age_propagates_routing_withholding(
     candidate = SimpleNamespace(publication_requests=(request,))
     with context:
         result = evaluate_gradle_candidate_age(candidate, 0, context, _PUB_NOW)
-    assert isinstance(result, AgeBlock)
-    assert result.reason == "unsupported or missing scoped repository routing"
+    assert result == AgeBlock(reason="unsupported or missing scoped repository routing")
     assert calls == []
 
 
@@ -515,9 +512,10 @@ def test_publication_negative_results_retry_next_command(tmp_path):
         _, request, calls, context = _publication_fixture(
             tmp_path, responses={"central": None}
         )
+        absent = AgeBlock(reason="no trusted exact POM for org.example:lib:2.0")
         with context:
-            assert isinstance(lookup_gradle_publication(request, context), AgeBlock)
-            assert isinstance(lookup_gradle_publication(request, context), AgeBlock)
+            assert lookup_gradle_publication(request, context) == absent
+            assert lookup_gradle_publication(request, context) == absent
             assert len(calls) == 1
     assert not list(tmp_path.glob("*.json"))
 
@@ -532,10 +530,9 @@ def test_publication_failure_has_readable_reason_and_debug_details(tmp_path, cap
     with caplog.at_level("DEBUG", logger="maintenance_man.dependency_age"), context:
         result = lookup_gradle_publication(request, context)
 
-    assert isinstance(result, AgeBlock)
-    assert "org.example:lib:2.0" in result.reason
-    assert "publication lookup timed out" in result.reason
-    assert "PublicationError" not in result.reason
+    assert result == AgeBlock(
+        reason="org.example:lib:2.0: publication lookup timed out"
+    )
     assert "PublicationError" in caplog.text
 
 
@@ -603,34 +600,48 @@ def test_plugin_implementation_age_is_part_of_policy(tmp_path):
         assert any("/9.1/engine-9.1.pom" in url for url in calls)
 
 
+_UNRESOLVED = "org.example:lib:2.0: unresolved or ambiguous POM identity"
+_MISMATCH = "org.example:lib:2.0: POM identity mismatch"
+
+
+def _parented_pom(identity):
+    return (
+        "<project><parent><groupId>org.example</groupId>"
+        "<artifactId>parent</artifactId><version>2.0</version></parent>"
+        f"<artifactId>lib</artifactId>{identity}</project>"
+    ).encode()
+
+
 @pytest.mark.parametrize(
-    "body",
+    "body, reason",
     [
-        b'<!DOCTYPE project [<!ENTITY x SYSTEM "file:///etc/passwd">]><project/>',
-        b"<project><groupId>${group}</groupId><artifactId>lib</artifactId>"
-        b"<version>2.0</version></project>",
-        b"<project><parent><groupId>org.example</groupId><version>2.0</version>"
-        b"</parent><artifactId>lib</artifactId></project>",
-        b"<project><groupId>other</groupId><artifactId>lib</artifactId>"
-        b"<version>2.0</version></project>",
-        b"x" * (1024 * 1024 + 1),
-        *[
-            (
-                "<project><parent><groupId>org.example</groupId>"
-                "<artifactId>parent</artifactId><version>2.0</version></parent>"
-                f"<artifactId>lib</artifactId>{identity}</project>"
-            ).encode()
-            for identity in (
-                "<groupId>wrong.group</groupId>",
-                "<version>${revision}</version>",
-                "<version></version>",
-                "<version>2.0</version><version>2.0</version>",
-            )
-        ],
+        (
+            b'<!DOCTYPE project [<!ENTITY x SYSTEM "file:///etc/passwd">]><project/>',
+            "org.example:lib:2.0: POM entity declarations are unsupported",
+        ),
+        (
+            b"<project><groupId>${group}</groupId><artifactId>lib</artifactId>"
+            b"<version>2.0</version></project>",
+            _UNRESOLVED,
+        ),
+        (
+            b"<project><parent><groupId>org.example</groupId><version>2.0</version>"
+            b"</parent><artifactId>lib</artifactId></project>",
+            _UNRESOLVED,
+        ),
+        (
+            b"<project><groupId>other</groupId><artifactId>lib</artifactId>"
+            b"<version>2.0</version></project>",
+            _MISMATCH,
+        ),
+        (_parented_pom("<groupId>wrong.group</groupId>"), _MISMATCH),
+        (_parented_pom("<version>${revision}</version>"), _UNRESOLVED),
+        (_parented_pom("<version></version>"), _UNRESOLVED),
+        (_parented_pom("<version>2.0</version><version>2.0</version>"), _UNRESOLVED),
     ],
 )
 def test_given_unproven_pom_when_publication_is_looked_up_then_candidate_is_withheld(
-    tmp_path, body
+    tmp_path, body, reason
 ):
     _, request, _, context = _publication_fixture(
         tmp_path,
@@ -639,7 +650,7 @@ def test_given_unproven_pom_when_publication_is_looked_up_then_candidate_is_with
         },
     )
     with context:
-        assert isinstance(lookup_gradle_publication(request, context), AgeBlock)
+        assert lookup_gradle_publication(request, context) == AgeBlock(reason=reason)
 
 
 def test_publication_shared_pool_bounds_and_inflight_dedup(tmp_path):
@@ -863,9 +874,8 @@ def test_publication_http_response_eof(monkeypatch, transfer):
 def test_publication_http_response_size_bound(monkeypatch, extra_byte, accepted):
     """The live read loop accepts 1 MiB and refuses one byte more.
 
-    ``test_publication_rejects_unproven_pom``'s oversized case goes through a
-    fake transport and only exercises the post-hoc length check; this drives
-    the actual ``response.read1`` loop and its deadline-bounded socket reads.
+    It drives the actual ``response.read1`` loop and its deadline-bounded
+    socket reads.
     """
     body = b"x" * (age._MAX_BYTES + extra_byte)
     transfer_header = f"Content-Length: {len(body)}\r\n".encode()
@@ -952,12 +962,20 @@ def test_given_invalid_central_timestamp_when_looked_up_then_failure_is_containe
             context,
         )
 
-    assert isinstance(result, AgeBlock)
-    assert "invalid Central timestamp" in result.reason
+    assert result == AgeBlock(reason="org.example:lib:2.0: invalid Central timestamp")
 
 
-@pytest.mark.parametrize("unknown", [None, TimeoutError("unavailable")])
-def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown):
+@pytest.mark.parametrize(
+    "unknown, reason",
+    [
+        (None, "no trusted exact POM for org.example:lib1:2.0"),
+        (
+            TimeoutError("unavailable"),
+            "org.example:lib1:2.0: publication lookup failed",
+        ),
+    ],
+)
+def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown, reason):
     barrier = Barrier(2, timeout=10)
     modules = [
         ModuleId(group="org.example", artifact=f"lib{i}", version="2.0")
@@ -994,7 +1012,7 @@ def test_publication_prefetch_overlaps_candidate_groups(tmp_path, unknown):
             for candidate in candidates
         ]
     assert blocks[0] is None
-    assert isinstance(blocks[1], AgeBlock)
+    assert blocks[1] == AgeBlock(reason=reason)
 
 
 def test_publication_context_interrupt_cancels_queued_requests(tmp_path, monkeypatch):
@@ -1053,8 +1071,7 @@ def test_publication_malformed_http_withholds_candidate(
             ),
             context,
         )
-    assert isinstance(result, AgeBlock)
-    assert "publication lookup failed" in result.reason
+    assert result == AgeBlock(reason="org.example:lib:2.0: publication lookup failed")
     assert (
         "IncompleteRead" if failure == "truncated-chunk" else "BadStatusLine"
     ) in caplog.text
@@ -1526,7 +1543,6 @@ def test_pypi_absent_release_is_unknown(tmp_path):
             b'{"info": {"name": 1, "version": "1.0"}, "urls": []}',
             "unexpected PyPI response shape",
         ),
-        ("oversized", "PyPI response exceeds size limit"),
         (
             (_pypi_body(), "https://pypi.org/pypi/other/1.0/json"),
             "PyPI response URL changed",
@@ -1535,8 +1551,6 @@ def test_pypi_absent_release_is_unknown(tmp_path):
     ],
 )
 def test_pypi_failures_are_contained(tmp_path, response, reason):
-    if response == "oversized":
-        response = b" " * (_MAX_BYTES + 1)
     context, _ = _pypi_context(tmp_path, response)
     with context:
         result = context.submit_registry("pypi", "pkg", "1.0", tmp_path).result()

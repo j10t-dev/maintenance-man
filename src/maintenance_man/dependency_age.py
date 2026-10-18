@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import functools
 import hashlib
 import http.client
@@ -19,6 +17,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Annotated
 
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 from pydantic import BaseModel, Field, StrictInt, StrictStr, ValidationError
 
@@ -39,7 +38,6 @@ from maintenance_man.models.publication import (
 from maintenance_man.models.scan import GradleMember, UpdateFinding
 from maintenance_man.process import ProcessError, run_captured
 from maintenance_man.storage import atomic_write_text
-from maintenance_man.uv_dependencies import normalise_pkg_name
 
 
 class PublicationLookupContext:
@@ -104,24 +102,6 @@ class PublicationLookupContext:
         digest = hashlib.sha256(json.dumps(parts).encode()).hexdigest()
         return self.cache_dir / (digest + ".json")
 
-    def _maven_path(self, request: _MavenLookup, method: str) -> Path:
-        module = request.module
-        return self._path(
-            (
-                1,
-                request.repository,
-                module.group,
-                module.artifact,
-                module.version,
-                method,
-            )
-        )
-
-    def _registry_path(self, request: _RegistryLookup) -> Path:
-        return self._path(
-            ("registry", request.registry, request.package, request.version)
-        )
-
     def _fresh(self, checked_at):
         return timedelta(0) <= self.clock() - checked_at < timedelta(hours=24)
 
@@ -129,7 +109,7 @@ class PublicationLookupContext:
         for method in ("last_modified", "central_timestamp"):
             try:
                 fact = PublicationFact.model_validate_json(
-                    self._maven_path(request, method).read_bytes()
+                    self._path(request.cache_key(method)).read_bytes()
                 )
                 suffix = _artifact_suffix(request.module)
                 _public_url(fact.source_url, request.repository, suffix)
@@ -153,7 +133,7 @@ class PublicationLookupContext:
             return None
         try:
             fact = RegistryFact.model_validate_json(
-                self._registry_path(request).read_bytes()
+                self._path(request.cache_key()).read_bytes()
             )
         except OSError, ValueError:
             return None
@@ -271,7 +251,7 @@ class PublicationLookupContext:
             cached=functools.partial(self._cached_maven, request),
             lookup=functools.partial(self._pom_lookup, request),
             store=lambda fact: self._store(
-                self._maven_path(request, fact.method), fact
+                self._path(request.cache_key(fact.method)), fact
             ),
         )
 
@@ -280,7 +260,7 @@ class PublicationLookupContext:
     ) -> _RegistryResult:
         def store(fact: RegistryFact) -> None:
             if fact.registry == "pypi":
-                self._store(self._registry_path(request), fact)
+                self._store(self._path(request.cache_key()), fact)
 
         return self._fetch(
             label=f"{request.package}:{request.version}",
@@ -298,9 +278,6 @@ class PublicationLookupContext:
             return None
         body, headers, final_url = response
         _public_url(final_url, request.repository, suffix)
-        if len(body) > _MAX_BYTES:
-            msg = "POM exceeds size limit"
-            raise PublicationError(msg)
         implementation = _pom_identity(body, module)
         headers = {name.lower(): value for name, value in headers.items()}
         method, timestamp = self._publication_timestamp(
@@ -328,10 +305,7 @@ class PublicationLookupContext:
         if final_url != url:
             msg = "PyPI response URL changed"
             raise PublicationError(msg)
-        if len(body) > _MAX_BYTES:
-            msg = "PyPI response exceeds size limit"
-            raise PublicationError(msg)
-        return _pypi_timestamp(body, package, version)
+        return _parse_pypi_timestamp(body, package, version)
 
     def _registry_lookup(
         self, request: _RegistryLookup, project_path: Path
@@ -357,12 +331,27 @@ class _MavenLookup:
     repository: RepositoryId
     module: ModuleId
 
+    def cache_key(self, method: str) -> tuple[str | int, ...]:
+        """The cache identity of this lookup's fact for one timestamp method."""
+        return (
+            1,
+            self.repository,
+            self.module.group,
+            self.module.artifact,
+            self.module.version,
+            method,
+        )
+
 
 @dataclass(frozen=True)
 class _RegistryLookup:
     registry: Registry
     package: str
     version: str
+
+    def cache_key(self) -> tuple[str, ...]:
+        """The cache identity of this lookup's registry fact."""
+        return ("registry", self.registry, self.package, self.version)
 
 
 type _MavenResult = PublicationFact | AgeBlock | None
@@ -630,17 +619,14 @@ def _publication_http(url, repository, suffix, count):
 
 
 def _read_publication_body(response, deadline):
+    """Read at most the size limit, bounding each single-read ``read1`` by the
+    remaining deadline."""
     chunks = []
     size = 0
     while size <= _MAX_BYTES:
         if response.fp is None:
             break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            msg = "publication lookup timed out"
-            raise PublicationError(msg)
-        # HTTPResponse.read1 performs at most one underlying read.
-        # Bound that read by the remaining operation deadline.
+        remaining = _remaining(deadline)
         response.fp.raw._sock.settimeout(remaining)  # noqa: SLF001 http.client exposes no public socket accessor
         chunk = response.read1(min(65536, _MAX_BYTES + 1 - size))
         if not chunk:
@@ -781,9 +767,9 @@ class _PypiRelease(BaseModel):
     urls: list[_PypiUpload]
 
 
-def _pypi_timestamp(body, package, version):
+def _parse_pypi_timestamp(body, package, version):
     release = _pypi_release(body)
-    if normalise_pkg_name(release.info.name) != normalise_pkg_name(package) or Version(
+    if canonicalize_name(release.info.name) != canonicalize_name(package) or Version(
         release.info.version
     ) != Version(version):
         msg = "PyPI identity mismatch"

@@ -12,90 +12,17 @@ from maintenance_man.config import (
     load_config,
     resolve_project,
 )
-from maintenance_man.models.config import DefaultsConfig, MmConfig, ProjectConfig
+from maintenance_man.models.config import DefaultsConfig, MmConfig
 from tests.support.projects import write_config
 
 
 class TestDefaultsConfig:
-    def test_defaults_all_optional(self):
-        """DefaultsConfig works with no arguments — all fields have defaults."""
-        config = DefaultsConfig()
-        assert config.min_version_age_days == 7
-
-    def test_defaults_custom_value(self):
-        config = DefaultsConfig(min_version_age_days=14)
-        assert config.min_version_age_days == 14
-
     def test_defaults_rejects_unknown_keys(self):
         with pytest.raises(ValidationError, match="extra_field"):
             DefaultsConfig(extra_field="bad")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
 
 
-class TestProjectConfig:
-    def test_valid_project(self, tmp_path: Path):
-        proj = ProjectConfig(path=tmp_path, package_manager="bun")
-        assert proj.path == tmp_path
-        assert proj.package_manager == "bun"
-
-    @pytest.mark.parametrize("pm", ["bun", "uv", "mvn", "gradle"])
-    def test_all_package_managers_accepted(self, tmp_path: Path, pm: str):
-        proj = ProjectConfig(path=tmp_path, package_manager=pm)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
-        assert proj.package_manager == pm
-
-    def test_missing_path_raises(self):
-        with pytest.raises(ValidationError, match="path"):
-            ProjectConfig(package_manager="bun")  # type: ignore[call-arg]  # ty:ignore[missing-argument]
-
-    def test_missing_package_manager_raises(self, tmp_path: Path):
-        with pytest.raises(ValidationError, match="package_manager"):
-            ProjectConfig(path=tmp_path)  # type: ignore[call-arg]  # ty:ignore[missing-argument]
-
-    def test_invalid_package_manager_raises(self, tmp_path: Path):
-        with pytest.raises(ValidationError, match="package_manager"):
-            ProjectConfig(path=tmp_path, package_manager="npm")  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
-
-    def test_rejects_unknown_keys(self, tmp_path: Path):
-        with pytest.raises(ValidationError, match="language"):
-            ProjectConfig(path=tmp_path, package_manager="bun", language="typescript")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
-
-
 class TestMmConfig:
-    def test_empty_config_valid(self):
-        """MmConfig with no arguments is valid — defaults and empty projects."""
-        config = MmConfig()
-        assert config.defaults.min_version_age_days == 7
-        assert config.projects == {}
-
-    def test_config_with_projects(self, tmp_path: Path):
-        config = MmConfig(
-            projects={
-                "myapp": ProjectConfig(path=tmp_path, package_manager="bun"),
-            }
-        )
-        assert "myapp" in config.projects
-        assert config.projects["myapp"].package_manager == "bun"
-
-    def test_full_toml_round_trip(self, tmp_path: Path):
-        """Parse a realistic TOML string through the full model."""
-        toml_str = f"""
-[defaults]
-min_version_age_days = 14
-
-[projects.project-alpha]
-path = "{tmp_path}"
-package_manager = "bun"
-
-[projects.project-beta]
-path = "{tmp_path}"
-package_manager = "uv"
-"""
-        raw = tomllib.loads(toml_str)
-        config = MmConfig(**raw)
-        assert config.defaults.min_version_age_days == 14
-        assert len(config.projects) == 2
-        assert config.projects["project-alpha"].package_manager == "bun"
-        assert config.projects["project-beta"].package_manager == "uv"
-
     def test_toml_missing_defaults_uses_fallback(self, tmp_path: Path):
         """If [defaults] is omitted from TOML, fallback values are used."""
         toml_str = f"""

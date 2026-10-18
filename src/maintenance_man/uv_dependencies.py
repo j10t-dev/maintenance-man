@@ -1,22 +1,16 @@
-import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 
 
 class UvDependencyError(Exception):
     """Raised when UV dependency declarations cannot be read or resolved."""
 
 
-_PEP503_NORMALISE_RE = re.compile(r"[-_.]+")
-
-
-# Scans [project.dependencies] and [dependency-groups] only.
-# [project.optional-dependencies] are not scanned; packages declared only there
-# (or packages that are purely transitive) fall through to kind="transitive".
 @dataclass(frozen=True, slots=True)
 class UvUngroupedLocation:
     """A runtime declaration or package found only through resolution."""
@@ -34,26 +28,10 @@ class UvGroupLocation:
 type UvDependencyLocation = UvUngroupedLocation | UvGroupLocation
 
 
-def normalise_pkg_name(name: str) -> str:
-    """Normalise a package name per PEP 503."""
-    return _PEP503_NORMALISE_RE.sub("-", name).lower()
-
-
 def get_uv_direct_dep_names(project_path: Path) -> set[str]:
     """Return normalised names of direct UV dependencies from pyproject.toml."""
     data = _load_pyproject(project_path)
-    names: set[str] = set()
-
-    for spec in _iter_runtime_dependency_specs(data):
-        if name := _extract_requirement_name(spec):
-            names.add(name)
-
-    for _, specs in _iter_dependency_groups(data):
-        for spec in specs:
-            if name := _extract_requirement_name(spec):
-                names.add(name)
-
-    return names
+    return set().union(*_declared_names(data).values())
 
 
 def get_uv_dependency_locations(
@@ -65,22 +43,30 @@ def get_uv_dependency_locations(
     Returns ``[UvUngroupedLocation(kind="transitive")]`` when no direct declaration
     is found (transitive dependency or optional-extras-only declaration).
     """
-    data = _load_pyproject(project_path)
-    target = normalise_pkg_name(pkg_name)
-    locations: list[UvDependencyLocation] = []
+    target = canonicalize_name(pkg_name)
+    locations: list[UvDependencyLocation] = [
+        UvUngroupedLocation(kind="runtime")
+        if group is None
+        else UvGroupLocation(group=group)
+        for group, names in _declared_names(_load_pyproject(project_path)).items()
+        if target in names
+    ]
+    return locations or [UvUngroupedLocation(kind="transitive")]
 
-    runtime_specs = _iter_runtime_dependency_specs(data)
-    if any(_extract_requirement_name(spec) == target for spec in runtime_specs):
-        locations.append(UvUngroupedLocation(kind="runtime"))
 
+def _declared_names(data: dict) -> dict[str | None, set[str]]:
+    """Normalised names per declaring table: None for [project.dependencies], else
+    the dependency group; optional dependencies are not read."""
+    declared: dict[str | None, set[str]] = {
+        None: _requirement_names(_iter_runtime_dependency_specs(data))
+    }
     for group, specs in _iter_dependency_groups(data):
-        if any(_extract_requirement_name(spec) == target for spec in specs):
-            locations.append(UvGroupLocation(group=group))
+        declared[group] = _requirement_names(specs)
+    return declared
 
-    if not locations:
-        return [UvUngroupedLocation(kind="transitive")]
 
-    return locations
+def _requirement_names(specs: list[str]) -> set[str]:
+    return {name for spec in specs if (name := _extract_requirement_name(spec))}
 
 
 def _load_pyproject(project_path: Path) -> dict:
@@ -118,4 +104,4 @@ def _extract_requirement_name(spec: str) -> str | None:
         requirement = Requirement(spec)
     except InvalidRequirement:
         return None
-    return normalise_pkg_name(requirement.name)
+    return canonicalize_name(requirement.name)

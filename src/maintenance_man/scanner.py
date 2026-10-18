@@ -1,21 +1,12 @@
 import contextlib
 import re
-from collections.abc import Iterator
-from dataclasses import dataclass
-from datetime import UTC, datetime
+import subprocess
+from collections.abc import Collection, Iterator
+from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal, assert_never
+from typing import Annotated, assert_never
 
-from pydantic import (
-    BaseModel,
-    Field,
-    JsonValue,
-    StrictStr,
-    ValidationError,
-    ValidationInfo,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from maintenance_man import paths
 from maintenance_man.clock import Clock, utc_now
@@ -90,11 +81,7 @@ def scan_project(
             match ops.vulnerability_source:
                 case "uv-audit":
                     vulns = _run_uv_audit(project_path)
-                    secrets = (
-                        scan_secrets(project_path, project.scan_skip_dirs)
-                        if project.scan_secrets
-                        else []
-                    )
+                    secrets = _requested_secrets(project)
                 case "trivy":
                     vulns, secrets = _run_trivy_scan(
                         project_path,
@@ -109,7 +96,7 @@ def scan_project(
 
     scan_result = ScanResult(
         project=name,
-        scanned_at=datetime.now(UTC),
+        scanned_at=utc_now(),
         trivy_target=str(project_path),
         vulnerabilities=vulns,
         secrets=secrets,
@@ -136,12 +123,14 @@ def _scan_gradle_project(
     vulns, updates = _prepare_gradle_scan_findings(
         project, vulns, resolution, updates, min_version_age_days, publication
     )
-    secrets = (
-        scan_secrets(Path(project.path), project.scan_skip_dirs)
-        if project.scan_secrets
-        else []
-    )
-    return vulns, updates, secrets, resolution
+    return vulns, updates, _requested_secrets(project), resolution
+
+
+def _requested_secrets(project: ProjectConfig) -> list[SecretFinding]:
+    """Run the secrets scan only when the project asks for it."""
+    if not project.scan_secrets:
+        return []
+    return scan_secrets(Path(project.path), project.scan_skip_dirs)
 
 
 def _prepare_gradle_scan_findings(
@@ -265,14 +254,8 @@ def scan_gradle(
             )
         bom = generated.bom_path
         cmd = ["trivy", "sbom", "--format", "json", "--scanners", "vuln", str(bom)]
-        completed = run_captured(
-            cmd,
-            project.path,
-            timeout=300,
-            label="Trivy SBOM scan",
-            error=ScanError,
-        )
-        findings = _parse_gradle_trivy_output(completed.stdout)
+        completed = _run_scan_command(cmd, project.path, "Trivy SBOM scan")
+        findings = _parse_trivy(completed.stdout, "Trivy SBOM", secrets=False)[0]
         scoped = {
             (module.coordinate, module.version): {
                 f"{scope.project_path}/{scope.domain}/{scope.configuration}"
@@ -292,26 +275,17 @@ def scan_gradle(
         return findings, outcome
 
 
-def _parse_gradle_trivy_output(payload: str) -> list[VulnFinding]:
-    """Parse consumed SBOM response fields and return vulnerability findings."""
-    response = _parse_trivy_response(payload, "Trivy SBOM", consume_secrets=False)
-    try:
-        return _parse_vulns(response.results)
-    except ValidationError as e:
-        msg = f"Malformed Trivy SBOM vulnerability fields: {e}"
-        raise ScanError(msg) from e
-
-
-def _parse_trivy_response(
-    payload: str, label: str, *, consume_secrets: bool
-) -> _TrivyResponse:
-    try:
-        return _TrivyResponse.model_validate_json(
-            payload, context={"consume_secrets": consume_secrets}
-        )
-    except ValidationError as e:
-        msg = f"Malformed {label} output: {e}"
-        raise ScanError(msg) from e
+def _run_scan_command(
+    command: list[str],
+    cwd: Path,
+    label: str,
+    *,
+    ok_codes: Collection[int] = frozenset({0}),
+) -> subprocess.CompletedProcess[str]:
+    """Run a scan tool with the scan timeout, raising ScanError on failure."""
+    return run_captured(
+        command, cwd, timeout=300, label=label, error=ScanError, ok_codes=ok_codes
+    )
 
 
 _NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
@@ -336,46 +310,22 @@ class _TrivySecret(BaseModel):
     severity: Severity = Field(Severity.UNKNOWN, alias="Severity")
 
 
+class _TrivyResult(BaseModel):
+    """One result's class; its other fields are validated only when consumed."""
+
+    model_config = ConfigDict(extra="allow")
+    class_: StrictStr = Field("", alias="Class")
+
+
 class _TrivyLanguageResult(BaseModel):
-    class_: Literal["lang-pkgs"] = Field(alias="Class")
     vulnerabilities: list[_TrivyVulnerability] | None = Field(
         None, alias="Vulnerabilities"
     )
 
 
-class _TrivyNonLanguageResult(BaseModel):
-    class_: StrictStr = Field("", alias="Class")
-    vulnerabilities: list[dict[str, JsonValue]] | None = Field(
-        None, alias="Vulnerabilities"
-    )
+class _TrivySecretResult(BaseModel):
     target: StrictStr = Field("", alias="Target")
     secrets: list[_TrivySecret] | None = Field(None, alias="Secrets")
-
-    @field_validator("class_")
-    @classmethod
-    def reject_language_class(cls, value: str) -> str:
-        if value == "lang-pkgs":
-            msg = "language package results must use the language result schema"
-            raise ValueError(msg)
-        return value
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalise_unconsumed_secret_fields(
-        cls, value: object, info: ValidationInfo
-    ) -> object:
-        if not isinstance(value, dict):
-            return value
-        if (
-            value.get("Class") == "secret"
-            and info.context is not None
-            and info.context["consume_secrets"]
-        ):
-            return value
-        return {**value, "Target": "", "Secrets": None}
-
-
-type _TrivyResult = _TrivyLanguageResult | _TrivyNonLanguageResult
 
 
 class _TrivyResponse(BaseModel):
@@ -384,84 +334,43 @@ class _TrivyResponse(BaseModel):
 
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
     """Run uv's native lockfile-based audit against a project."""
-    cmd = ["uv", "audit", "--locked"]
-    completed = run_captured(
-        cmd,
+    completed = _run_scan_command(
+        ["uv", "audit", "--locked"],
         project_path,
-        timeout=300,
-        label="uv audit --locked",
-        error=ScanError,
+        "uv audit --locked",
         ok_codes={0, 1},
     )
-
     return _parse_uv_audit_vulns(completed.stdout)
-
-
-@dataclass(frozen=True)
-class _UvAuditPackage:
-    name: str
-    version: str
-
-
-@dataclass
-class _UvAuditAdvisory:
-    vuln_id: str
-    title: str
-    fixed_version: str | None = None
-    url: str | None = None
 
 
 def _parse_uv_audit_vulns(output: str) -> list[VulnFinding]:
     """Parse uv audit's human-readable vulnerability output."""
     findings: list[VulnFinding] = []
-    package: _UvAuditPackage | None = None
-    advisory: _UvAuditAdvisory | None = None
+    package: tuple[str, str] | None = None
+    current: VulnFinding | None = None
 
     for line in output.splitlines():
         if match := _UV_AUDIT_PACKAGE_RE.match(line):
-            _append_uv_audit_finding(findings, package, advisory)
-            package = _UvAuditPackage(match.group("pkg"), match.group("version"))
-            advisory = None
+            package = (match.group("pkg"), match.group("version"))
+            current = None
+        elif (match := _UV_AUDIT_VULN_RE.match(line)) and package is not None:
+            current = VulnFinding(
+                vuln_id=match.group("id"),
+                pkg_name=package[0],
+                installed_version=package[1],
+                severity=Severity.UNKNOWN,
+                title=match.group("title"),
+                description=match.group("title"),
+                status="affected",
+            )
+            findings.append(current)
+        elif current is None:
             continue
-
-        if match := _UV_AUDIT_VULN_RE.match(line):
-            _append_uv_audit_finding(findings, package, advisory)
-            advisory = _UvAuditAdvisory(match.group("id"), match.group("title"))
-            continue
-
-        if advisory is None:
-            continue
-
-        if match := _UV_AUDIT_FIXED_RE.match(line):
-            advisory.fixed_version = match.group("version")
+        elif match := _UV_AUDIT_FIXED_RE.match(line):
+            current.fixed_version = match.group("version")
         elif match := _UV_AUDIT_URL_RE.match(line):
-            advisory.url = match.group("url")
-
-    _append_uv_audit_finding(findings, package, advisory)
+            current.primary_url = match.group("url")
     return findings
-
-
-def _append_uv_audit_finding(
-    findings: list[VulnFinding],
-    package: _UvAuditPackage | None,
-    advisory: _UvAuditAdvisory | None,
-) -> None:
-    if package is None or advisory is None:
-        return
-
-    findings.append(
-        VulnFinding(
-            vuln_id=advisory.vuln_id,
-            pkg_name=package.name,
-            installed_version=package.version,
-            fixed_version=advisory.fixed_version,
-            severity=Severity.UNKNOWN,
-            title=advisory.title or "No summary provided",
-            description=advisory.title or "",
-            status="affected",
-            primary_url=advisory.url,
-        )
-    )
 
 
 _UV_AUDIT_PACKAGE_RE = re.compile(
@@ -502,30 +411,42 @@ def _run_trivy_scan(
     for d in skip_dirs or []:
         cmd.extend(["--skip-dirs", d])
     cmd.append(".")
-    completed = run_captured(
-        cmd,
-        project_path,
-        timeout=300,
-        label="Trivy filesystem scan",
-        error=ScanError,
-    )
+    completed = _run_scan_command(cmd, project_path, "Trivy filesystem scan")
+    return _parse_trivy(completed.stdout, "Trivy", secrets="secret" in scanners)
 
-    response = _parse_trivy_response(
-        completed.stdout, "Trivy", consume_secrets="secret" in scanners
-    )
+
+def _parse_trivy(
+    payload: str, label: str, *, secrets: bool
+) -> tuple[list[VulnFinding], list[SecretFinding]]:
+    """Parse the consumed Trivy result classes; malformed ones are a ScanError."""
     try:
-        return _parse_vulns(response.results), _parse_secrets(response.results)
+        results = _TrivyResponse.model_validate_json(payload).results
+        vulns = _parse_vulns(_consumed(results, "lang-pkgs", _TrivyLanguageResult))
+        found = (
+            _parse_secrets(_consumed(results, "secret", _TrivySecretResult))
+            if secrets
+            else []
+        )
     except ValidationError as e:
-        msg = f"Malformed Trivy finding fields: {e}"
+        msg = f"Malformed {label} output: {e}"
         raise ScanError(msg) from e
+    return vulns, found
 
 
-def _parse_vulns(results: list[_TrivyResult]) -> list[VulnFinding]:
+def _consumed[M: BaseModel](
+    results: list[_TrivyResult], class_: str, model: type[M]
+) -> list[M]:
+    return [
+        model.model_validate(result.model_extra or {})
+        for result in results
+        if result.class_ == class_
+    ]
+
+
+def _parse_vulns(results: list[_TrivyLanguageResult]) -> list[VulnFinding]:
     """Extract vulnerability findings from Trivy results."""
     findings: list[VulnFinding] = []
     for result in results:
-        if not isinstance(result, _TrivyLanguageResult):
-            continue
         for vulnerability in result.vulnerabilities or []:
             severity_raw = vulnerability.severity.upper()
             try:
@@ -555,7 +476,7 @@ def _parse_vulns(results: list[_TrivyResult]) -> list[VulnFinding]:
     return findings
 
 
-def _parse_secrets(results: list[_TrivyResult]) -> list[SecretFinding]:
+def _parse_secrets(results: list[_TrivySecretResult]) -> list[SecretFinding]:
     """Extract secret findings from Trivy results."""
     return [
         SecretFinding(
@@ -565,6 +486,5 @@ def _parse_secrets(results: list[_TrivyResult]) -> list[SecretFinding]:
             severity=secret.severity,
         )
         for result in results
-        if isinstance(result, _TrivyNonLanguageResult) and result.class_ == "secret"
         for secret in result.secrets or []
     ]

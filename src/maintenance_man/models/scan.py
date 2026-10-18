@@ -9,25 +9,18 @@ from pydantic import BaseModel
 
 
 class Severity(StrEnum):
-    CRITICAL = "CRITICAL"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
+    """Declared from least to most severe."""
+
     UNKNOWN = "UNKNOWN"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
 
     @property
     def rank(self) -> int:
         """Higher is more severe; UNKNOWN ranks lowest."""
-        return _SEVERITY_RANK[self]
-
-
-_SEVERITY_RANK = {
-    Severity.UNKNOWN: 0,
-    Severity.LOW: 1,
-    Severity.MEDIUM: 2,
-    Severity.HIGH: 3,
-    Severity.CRITICAL: 4,
-}
+        return list(Severity).index(self)
 
 
 class SemverTier(StrEnum):
@@ -267,12 +260,9 @@ def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
     then fix version descending.  This keeps all vulns for a package together
     so the "fix" marker is easy to follow.
     """
-    # Build a lookup of worst (lowest negative rank) severity per package.
     worst: dict[str, int] = {}
     for v in vulns:
-        order = -v.severity.rank
-        if v.pkg_name not in worst or order < worst[v.pkg_name]:
-            worst[v.pkg_name] = order
+        worst[v.pkg_name] = min(worst.get(v.pkg_name, 0), -v.severity.rank)
 
     def _key(v: VulnFinding) -> tuple[int, str, int]:
         return (
@@ -281,8 +271,5 @@ def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
             -v.severity.rank,
         )
 
-    # Two-pass stable sort: version desc first, then the composite key.
-    # The stable sort preserves version-desc ordering within each
-    # (package, severity) group.
     by_version = sorted(vulns, key=_fix_version_key, reverse=True)
     return sorted(by_version, key=_key)

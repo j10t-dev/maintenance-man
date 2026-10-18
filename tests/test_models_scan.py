@@ -1,7 +1,6 @@
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import ValidationError
 
 from maintenance_man.models.scan import (
     GradleMember,
@@ -18,6 +17,7 @@ from maintenance_man.models.scan import (
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import classify_semver
+from maintenance_man.storage import load_scan_results, save_scan_results
 from tests.support.findings import (
     make_gradle_target,
     make_scan_result,
@@ -45,21 +45,52 @@ def test_given_versions_when_classified_then_semver_tier_is_returned(
     assert classify_semver(installed, latest) == expected
 
 
-def test_sort_keeps_critical_first_and_unknown_last():
-    vulns = [
-        make_vuln(pkg_name="a", severity=Severity.UNKNOWN),
-        make_vuln(pkg_name="b", severity=Severity.LOW),
-        make_vuln(pkg_name="c", severity=Severity.CRITICAL),
-        make_vuln(pkg_name="d", severity=Severity.HIGH),
-        make_vuln(pkg_name="e", severity=Severity.MEDIUM),
-    ]
-    assert [v.pkg_name for v in sort_vulns_by_severity(vulns)] == [
-        "c",
-        "d",
-        "e",
-        "b",
-        "a",
-    ]
+@pytest.mark.parametrize(
+    ("vulns", "expected"),
+    [
+        (
+            [
+                make_vuln(vuln_id="a", pkg_name="a", severity=Severity.UNKNOWN),
+                make_vuln(vuln_id="b", pkg_name="b", severity=Severity.LOW),
+                make_vuln(vuln_id="c", pkg_name="c", severity=Severity.CRITICAL),
+                make_vuln(vuln_id="d", pkg_name="d", severity=Severity.HIGH),
+                make_vuln(vuln_id="e", pkg_name="e", severity=Severity.MEDIUM),
+            ],
+            ["c", "d", "e", "b", "a"],
+        ),
+        (
+            [
+                make_vuln(vuln_id="CVE-LOW", fixed_version="2.31.0"),
+                make_vuln(vuln_id="CVE-HIGH", fixed_version="2.32.4"),
+                make_vuln(vuln_id="CVE-MID", fixed_version="2.32.0"),
+            ],
+            ["CVE-HIGH", "CVE-MID", "CVE-LOW"],
+        ),
+        (
+            [
+                make_vuln(vuln_id="flask-high", pkg_name="flask"),
+                make_vuln(
+                    vuln_id="requests-crit",
+                    pkg_name="requests",
+                    severity=Severity.CRITICAL,
+                ),
+                make_vuln(
+                    vuln_id="requests-med",
+                    pkg_name="requests",
+                    severity=Severity.MEDIUM,
+                ),
+            ],
+            ["requests-crit", "requests-med", "flask-high"],
+        ),
+        ([make_vuln(vuln_id="only")], ["only"]),
+        ([], []),
+    ],
+    ids=["severity-order", "fix-version-descending", "package-groups", "one", "empty"],
+)
+def test_given_vulnerabilities_when_sorted_then_severity_groups_then_fix_descending(
+    vulns, expected
+):
+    assert [v.vuln_id for v in sort_vulns_by_severity(vulns)] == expected
 
 
 @pytest.mark.parametrize(
@@ -70,6 +101,10 @@ def test_sort_keeps_critical_first_and_unknown_last():
         (["bad-first", "bad-last"], "bad-first"),
         ([None, "bad"], "bad"),
         ([None], ""),
+        (["2.31.0", "2.32.4", "2.32.0"], "2.32.4"),
+        (["1.0.1"], "1.0.1"),
+        (["not-a-version", "2.0.0"], "2.0.0"),
+        (["2.0.0", "not-a-version"], "2.0.0"),
     ],
 )
 def test_highest_fix_version(versions, expected):
@@ -85,380 +120,74 @@ def test_findings_lists_vulnerabilities_then_updates():
 
 
 @pytest.mark.parametrize(
-    ("overrides", "expected"),
+    ("vulns", "secrets", "updates", "expected"),
     [
-        ({}, False),
-        ({"vulnerabilities": [make_vuln()]}, True),
-        ({"updates": [make_update()]}, True),
+        ([], [], [], (False, False, False)),
+        ([make_vuln()], [], [], (True, True, False)),
+        ([make_vuln(fixed_version=None)], [], [], (True, False, False)),
+        ([], [], [make_update()], (True, False, True)),
         (
-            {
-                "secrets": [
-                    SecretFinding(
-                        file="a.env",
-                        rule_id="key",
-                        title="Key",
-                        severity=Severity.HIGH,
-                    )
-                ]
-            },
-            True,
+            [],
+            [
+                SecretFinding(
+                    file="a.env", rule_id="key", title="Key", severity=Severity.HIGH
+                )
+            ],
+            [],
+            (True, False, False),
         ),
     ],
-    ids=["clean", "vulnerability", "update", "secret"],
+    ids=["clean", "fixed-vulnerability", "no-fix-vulnerability", "update", "secret"],
 )
-def test_given_scan_result_when_checked_for_findings_then_secrets_count_too(
-    overrides: dict[str, list], expected: bool
-) -> None:
-    result = ScanResult.model_validate(
-        {
-            "project": "api",
-            "scanned_at": datetime(2026, 1, 30, tzinfo=UTC),
-            "trivy_target": ".",
-        }
-        | overrides
+def test_given_findings_when_summarised_then_scan_flags_match(
+    vulns, secrets, updates, expected
+):
+    result = make_scan_result(vulns=vulns, updates=updates).model_copy(
+        update={"secrets": secrets}
     )
 
-    assert result.has_findings is expected
+    assert (
+        result.has_findings,
+        result.has_actionable_vulns,
+        result.has_updates,
+    ) == expected
 
 
-class TestVulnFinding:
-    def test_vuln_finding_with_fix(self):
-        finding = VulnFinding(
-            vuln_id="CVE-2026-23490",
-            pkg_name="pyasn1",
-            installed_version="0.6.1",
-            fixed_version="0.6.2",
-            severity=Severity.HIGH,
-            title="pyasn1: DoS via malformed RELATIVE-OID",
-            description="Memory exhaustion from malformed RELATIVE-OID.",
-            status="fixed",
-            primary_url="https://avd.aquasec.com/nvd/cve-2026-23490",
-            published_date=datetime(2026, 1, 16, tzinfo=UTC),
-        )
-        assert finding.vuln_id == "CVE-2026-23490"
-        assert finding.fixed_version == "0.6.2"
-        assert finding.actionable is True
-
-    def test_vuln_finding_advisory_no_fix(self):
-        finding = VulnFinding(
-            vuln_id="CVE-2025-99999",
-            pkg_name="somelib",
-            installed_version="1.0.0",
-            fixed_version=None,
-            severity=Severity.HIGH,
-            title="somelib: advisory only",
-            description="No fix available.",
-            status="affected",
-        )
-        assert finding.fixed_version is None
-        assert finding.actionable is False
-
-    def test_vuln_finding_rejects_invalid_severity(self):
-        with pytest.raises(ValidationError, match="severity"):
+@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
+def test_scan_result_round_trips_ready_flow(mm_home, flow: Workflow):
+    result = ScanResult(
+        project="project-ready",
+        scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
+        trivy_target="/tmp/project-ready",
+        vulnerabilities=[
             VulnFinding(
-                vuln_id="CVE-2025-00001",
-                pkg_name="pkg",
-                installed_version="1.0",
-                severity="BOGUS",  # type: ignore[arg-type]
+                vuln_id="CVE-2026-00001",
+                pkg_name="requests",
+                installed_version="2.31.0",
+                fixed_version="2.32.4",
+                severity=Severity.HIGH,
                 title="t",
                 description="d",
                 status="fixed",
+                update_status=UpdateStatus.READY,
+                flow=flow,
             )
-
-
-class TestSecretFinding:
-    def test_secret_finding(self):
-        finding = SecretFinding(
-            file="creds/service.json",
-            rule_id="gcp-service-account",
-            title="Google (GCP) Service-account",
-            severity=Severity.CRITICAL,
-        )
-        assert finding.rule_id == "gcp-service-account"
-
-
-class TestScanResult:
-    @pytest.mark.parametrize(
-        ("flow", "expected_flow"),
-        [
-            (Workflow.UPDATE, "update"),
-            (Workflow.RESOLVE, "resolve"),
         ],
-        ids=["update", "resolve"],
+        updates=[
+            UpdateFinding(
+                pkg_name="react",
+                installed_version="18.2.0",
+                latest_version="19.0.0",
+                semver_tier=SemverTier.MAJOR,
+                update_status=UpdateStatus.READY,
+                flow=flow,
+            )
+        ],
     )
-    def test_scan_result_round_trips_ready_flow(
-        self,
-        flow: Workflow,
-        expected_flow: str,
-    ):
-        result = ScanResult(
-            project="project-ready",
-            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-ready",
-            vulnerabilities=[
-                VulnFinding(
-                    vuln_id="CVE-2026-00001",
-                    pkg_name="requests",
-                    installed_version="2.31.0",
-                    fixed_version="2.32.4",
-                    severity=Severity.HIGH,
-                    title="t",
-                    description="d",
-                    status="fixed",
-                    update_status=UpdateStatus.READY,
-                    flow=flow,
-                )
-            ],
-            updates=[
-                UpdateFinding(
-                    pkg_name="react",
-                    installed_version="18.2.0",
-                    latest_version="19.0.0",
-                    semver_tier=SemverTier.MAJOR,
-                    update_status=UpdateStatus.READY,
-                    flow=flow,
-                )
-            ],
-        )
 
-        reloaded = ScanResult.model_validate_json(result.model_dump_json())
+    save_scan_results("project-ready", result)
 
-        assert reloaded.project == "project-ready"
-        assert reloaded.scanned_at == datetime(2026, 1, 30, tzinfo=UTC)
-        assert reloaded.trivy_target == "/tmp/project-ready"
-        vulnerability = reloaded.vulnerabilities[0]
-        assert vulnerability.vuln_id == "CVE-2026-00001"
-        assert vulnerability.pkg_name == "requests"
-        assert vulnerability.installed_version == "2.31.0"
-        assert vulnerability.fixed_version == "2.32.4"
-        assert vulnerability.severity == Severity.HIGH
-        assert vulnerability.title == "t"
-        assert vulnerability.description == "d"
-        assert vulnerability.status == "fixed"
-        assert vulnerability.update_status == UpdateStatus.READY
-        assert vulnerability.flow == expected_flow
-        update = reloaded.updates[0]
-        assert update.pkg_name == "react"
-        assert update.installed_version == "18.2.0"
-        assert update.latest_version == "19.0.0"
-        assert update.semver_tier == SemverTier.MAJOR
-        assert update.update_status == UpdateStatus.READY
-        assert update.flow == expected_flow
-
-    def test_update_status_started_no_longer_exists(self):
-        assert not hasattr(UpdateStatus, "STARTED")
-
-    def test_scan_result_empty(self):
-        result = ScanResult(
-            project="project-alpha",
-            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-alpha",
-            vulnerabilities=[],
-            secrets=[],
-        )
-        assert result.has_actionable_vulns is False
-
-    def test_scan_result_with_vulns(self):
-        vuln = VulnFinding(
-            vuln_id="CVE-2026-23490",
-            pkg_name="pyasn1",
-            installed_version="0.6.1",
-            fixed_version="0.6.2",
-            severity=Severity.HIGH,
-            title="t",
-            description="d",
-            status="fixed",
-        )
-        result = ScanResult(
-            project="project-beta",
-            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-beta",
-            vulnerabilities=[vuln],
-            secrets=[],
-        )
-        assert result.has_actionable_vulns is True
-
-    def test_scan_result_with_updates(self):
-        finding = UpdateFinding(
-            pkg_name="axios",
-            installed_version="1.6.0",
-            latest_version="1.7.2",
-            semver_tier=SemverTier.MINOR,
-        )
-        result = ScanResult(
-            project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-gamma",
-            updates=[finding],
-        )
-        assert result.has_updates is True
-        assert len(result.updates) == 1
-
-    def test_scan_result_empty_has_no_updates(self):
-        result = ScanResult(
-            project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-gamma",
-        )
-        assert result.has_updates is False
-
-
-class TestUpdateFinding:
-    def test_update_finding_minor(self):
-        finding = UpdateFinding(
-            pkg_name="axios",
-            installed_version="1.6.0",
-            latest_version="1.7.2",
-            semver_tier=SemverTier.MINOR,
-        )
-        assert finding.pkg_name == "axios"
-        assert finding.semver_tier == SemverTier.MINOR
-        assert finding.published_date is None
-
-    def test_update_finding_with_publish_date(self):
-        finding = UpdateFinding(
-            pkg_name="lodash",
-            installed_version="4.17.20",
-            latest_version="4.17.21",
-            semver_tier=SemverTier.PATCH,
-            published_date=datetime(2026, 1, 10, tzinfo=UTC),
-        )
-        assert finding.published_date is not None
-        assert finding.semver_tier == SemverTier.PATCH
-
-    def test_update_finding_round_trip_json(self):
-        finding = UpdateFinding(
-            pkg_name="react",
-            installed_version="18.2.0",
-            latest_version="19.0.0",
-            semver_tier=SemverTier.MAJOR,
-            published_date=datetime(2026, 1, 20, tzinfo=UTC),
-        )
-        result = ScanResult(
-            project="project-gamma",
-            scanned_at=datetime(2026, 1, 30, tzinfo=UTC),
-            trivy_target="/tmp/project-gamma",
-            updates=[finding],
-        )
-        json_str = result.model_dump_json()
-        reloaded = ScanResult.model_validate_json(json_str)
-        assert len(reloaded.updates) == 1
-        assert reloaded.updates[0].pkg_name == "react"
-        assert reloaded.updates[0].semver_tier == SemverTier.MAJOR
-
-
-class TestSortVulnsBySeverity:
-    def _make_vuln(
-        self,
-        severity: Severity,
-        fixed_version: str = "1.0.1",
-        vuln_id: str | None = None,
-    ) -> VulnFinding:
-        return VulnFinding(
-            vuln_id=vuln_id or f"CVE-{severity.value}",
-            pkg_name="pkg",
-            installed_version="1.0.0",
-            fixed_version=fixed_version,
-            severity=severity,
-            title="t",
-            description="d",
-            status="fixed",
-        )
-
-    def test_sorts_critical_first(self):
-        vulns = [
-            self._make_vuln(Severity.LOW),
-            self._make_vuln(Severity.CRITICAL),
-            self._make_vuln(Severity.MEDIUM),
-            self._make_vuln(Severity.HIGH),
-            self._make_vuln(Severity.UNKNOWN),
-        ]
-        result = sort_vulns_by_severity(vulns)
-        assert [v.severity for v in result] == [
-            Severity.CRITICAL,
-            Severity.HIGH,
-            Severity.MEDIUM,
-            Severity.LOW,
-            Severity.UNKNOWN,
-        ]
-
-    def test_subsorts_by_fix_version_descending(self):
-        vulns = [
-            self._make_vuln(Severity.HIGH, "2.31.0", vuln_id="CVE-LOW"),
-            self._make_vuln(Severity.HIGH, "2.32.4", vuln_id="CVE-HIGH"),
-            self._make_vuln(Severity.HIGH, "2.32.0", vuln_id="CVE-MID"),
-        ]
-        result = sort_vulns_by_severity(vulns)
-        assert [v.vuln_id for v in result] == [
-            "CVE-HIGH",
-            "CVE-MID",
-            "CVE-LOW",
-        ]
-
-    def test_single_item(self):
-        result = sort_vulns_by_severity([self._make_vuln(Severity.HIGH)])
-        assert len(result) == 1
-        assert result[0].severity == Severity.HIGH
-
-    def test_empty_list(self):
-        assert sort_vulns_by_severity([]) == []
-
-    def test_groups_by_package_then_severity(self):
-        """Vulns for same package stay together, ordered by worst severity."""
-        vulns = [
-            self._make_vuln(Severity.HIGH, vuln_id="flask-high"),
-            self._make_vuln(Severity.CRITICAL, vuln_id="requests-crit"),
-            self._make_vuln(Severity.MEDIUM, vuln_id="requests-med"),
-        ]
-        # Patch pkg_name directly — _make_vuln always uses "pkg".
-        vulns[0] = vulns[0].model_copy(update={"pkg_name": "flask"})
-        vulns[1] = vulns[1].model_copy(update={"pkg_name": "requests"})
-        vulns[2] = vulns[2].model_copy(update={"pkg_name": "requests"})
-
-        result = sort_vulns_by_severity(vulns)
-        assert [v.vuln_id for v in result] == [
-            "requests-crit",
-            "requests-med",
-            "flask-high",
-        ]
-
-
-# -- highest_fix_version --
-
-
-class TestHighestFixVersion:
-    def test_picks_highest_semver(self):
-        vulns = [
-            make_vuln(fixed_version="2.31.0"),
-            make_vuln(fixed_version="2.32.4"),
-            make_vuln(fixed_version="2.32.0"),
-        ]
-        assert highest_fix_version(vulns) == "2.32.4"
-
-    def test_single_vuln(self):
-        assert highest_fix_version([make_vuln(fixed_version="1.0.1")]) == "1.0.1"
-
-    def test_invalid_version_ignored(self):
-        vulns = [
-            make_vuln(fixed_version="not-a-version"),
-            make_vuln(fixed_version="2.0.0"),
-        ]
-        assert highest_fix_version(vulns) == "2.0.0"
-
-    def test_invalid_version_order_independent(self):
-        vulns = [
-            make_vuln(fixed_version="2.0.0"),
-            make_vuln(fixed_version="not-a-version"),
-        ]
-        assert highest_fix_version(vulns) == "2.0.0"
-
-
-class TestSemverTier:
-    def test_semver_tier_values(self):
-        assert SemverTier.PATCH == "patch"
-        assert SemverTier.MINOR == "minor"
-        assert SemverTier.MAJOR == "major"
-        assert SemverTier.UNKNOWN == "unknown"
+    assert load_scan_results("project-ready") == result
 
 
 def test_historical_results_without_gradle_fields_still_load():

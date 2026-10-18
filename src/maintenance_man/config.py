@@ -47,7 +47,6 @@ def load_config(config_path: Path | None = None) -> MmConfig:
         msg = f"Invalid config in {config_path}\n{e}"
         raise ConfigError(msg) from e
 
-    # Resolve relative project paths against config file's parent directory
     config_dir = config_path.parent.resolve()
     for project in config.projects.values():
         if not project.path.is_absolute():

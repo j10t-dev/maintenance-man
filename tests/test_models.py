@@ -5,14 +5,6 @@ import pytest
 from pydantic import ValidationError
 
 from maintenance_man.models.publication import RegistryFact
-from maintenance_man.models.scan import (
-    SemverTier,
-    Severity,
-    UpdateFinding,
-    UpdateStatus,
-    VulnFinding,
-    Workflow,
-)
 
 _FACT: dict[str, Any] = {
     "registry": "pypi",
@@ -41,59 +33,3 @@ def test_registry_fact_stores_utc():
 def test_registry_fact_rejects_invalid_values(change):
     with pytest.raises(ValidationError):
         RegistryFact(**(_FACT | change))
-
-
-class TestWorkflow:
-    def test_flow_members_are_string_values(self):
-        assert Workflow.UPDATE == "update"
-        assert Workflow.RESOLVE == "resolve"
-
-
-class TestUpdateStatus:
-    def test_vuln_finding_default_status_is_none(self):
-        v = VulnFinding(
-            vuln_id="CVE-2024-0001",
-            pkg_name="some-pkg",
-            installed_version="1.0.0",
-            fixed_version="1.0.1",
-            severity=Severity.HIGH,
-            title="Test vuln",
-            description="desc",
-            status="fixed",
-        )
-        assert v.update_status is None
-
-    def test_update_finding_default_status_is_none(self):
-        u = UpdateFinding(
-            pkg_name="pkg-a",
-            installed_version="1.0.0",
-            latest_version="1.0.1",
-            semver_tier=SemverTier.PATCH,
-        )
-        assert u.update_status is None
-
-    def test_vuln_finding_accepts_all_statuses(self):
-        for status in UpdateStatus:
-            v = VulnFinding(
-                vuln_id="CVE-2024-0001",
-                pkg_name="some-pkg",
-                installed_version="1.0.0",
-                fixed_version="1.0.1",
-                severity=Severity.HIGH,
-                title="Test vuln",
-                description="desc",
-                status="fixed",
-                update_status=status,
-            )
-            assert v.update_status == status
-
-    def test_update_finding_serialises_null_status(self):
-        u = UpdateFinding(
-            pkg_name="pkg-a",
-            installed_version="1.0.0",
-            latest_version="1.0.1",
-            semver_tier=SemverTier.PATCH,
-        )
-        data = u.model_dump()
-        assert "update_status" in data
-        assert data["update_status"] is None

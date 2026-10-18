@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, BaseModel, ConfigDict
 
 type Registry = Literal["pypi", "npm"]
-type PublicationSource = Literal["pypi", "npm", "central"]
+type PublicationSource = Registry | Literal["central"]
 
 
 def _utc_date(value: datetime) -> datetime:

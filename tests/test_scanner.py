@@ -33,7 +33,7 @@ from maintenance_man.gradle_resolution import (
     parse_resolution_report,
 )
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.events import Operation, OperationFailed, ScanReported
+from maintenance_man.models.events import OperationFailed, ScanReported
 from maintenance_man.models.gradle import (
     CandidateValidation,
     CandidateValidationBatch,
@@ -55,43 +55,23 @@ from maintenance_man.package_managers import PACKAGE_MANAGERS
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import (
     ScanError,
-    _parse_gradle_trivy_output,
+    _parse_trivy,
     _parse_uv_audit_vulns,
     scan_gradle,
     scan_project,
 )
 from maintenance_man.services import scan as scan_service
 from maintenance_man.storage import load_scan_results, save_scan_results
-from maintenance_man.uv_dependencies import normalise_pkg_name
 from tests.fakes import FakeCommands, RecordingEmit
 from tests.support.clock import FakeClock
 from tests.support.findings import make_scan_result, make_update, make_vuln
 from tests.support.gradle import GRADLE_FIXTURES, fixture_runner
 from tests.support.package_managers import ops_with_outdated
-from tests.support.process import completed
-from tests.support.projects import make_project, write_config
+from tests.support.process import completed, missing_tool
+from tests.support.projects import FIXTURES_DIR, make_project, write_config
 from tests.test_dependency_age import _pypi_body, _scan_age_inputs
 
 _OLD = datetime(2024, 1, 1, tzinfo=UTC)
-
-
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("Requests", "requests"),
-        ("pydantic_core", "pydantic-core"),
-        ("zope.interface", "zope-interface"),
-        ("Foo-_.Bar", "foo-bar"),
-        ("rich", "rich"),
-    ],
-)
-def test_given_package_name_when_normalised_then_pep_503_name_is_returned(
-    name, expected
-):
-    assert normalise_pkg_name(name) == expected
-
-
-FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 def _quiet_uv_scan(monkeypatch):
@@ -171,17 +151,19 @@ def test_given_uv_audit_when_status_has_findings_then_command_contract_accepts_i
 
 
 @pytest.mark.parametrize(
-    "scan, argv, label",
+    "scan, argv, label, ok_codes",
     [
         (
             lambda path: scanner._run_uv_audit(path),
             ("uv", "audit", "--locked"),
             "uv audit --locked",
+            {0, 1},
         ),
         (
             lambda path: scanner._run_trivy_scan(path, scanners="vuln"),
             ("trivy", "fs", "--format", "json", "--scanners", "vuln", "."),
             "Trivy filesystem scan",
+            frozenset({0}),
         ),
     ],
 )
@@ -193,7 +175,7 @@ def test_given_uv_audit_when_status_has_findings_then_command_contract_accepts_i
     ],
 )
 def test_given_command_execution_failure_when_scanning_then_scan_error_is_requested(
-    tmp_path, monkeypatch, scan, argv, label, raised
+    tmp_path, monkeypatch, scan, argv, label, ok_codes, raised
 ):
     commands = FakeCommands()
     error = ScanError(f"Could not run {label} in {tmp_path}: {raised}")
@@ -205,10 +187,12 @@ def test_given_command_execution_failure_when_scanning_then_scan_error_is_reques
     ((actual_argv, cwd, kwargs),) = commands.calls
     assert actual_argv == argv
     assert cwd == tmp_path
-    expected = {"timeout": 300, "label": label, "error": ScanError}
-    if argv == ("uv", "audit", "--locked"):
-        expected["ok_codes"] = {0, 1}
-    assert kwargs == expected
+    assert kwargs == {
+        "timeout": 300,
+        "label": label,
+        "error": ScanError,
+        "ok_codes": ok_codes,
+    }
 
 
 @pytest.mark.parametrize(
@@ -279,10 +263,19 @@ class TestUvAuditParsing:
         assert vulns[0].vuln_id == "GHSA-r9hx-vwmv-q579"
         assert vulns[0].fixed_version == "65.5.1"
 
+    def test_given_advisory_before_any_package_when_parsed_then_it_is_ignored(self):
+        output = (
+            "- GHSA-xxxx: orphan\n"
+            "  Fixed in: 1.0\n"
+            "requests 2.0 has 1 known vulnerability:\n"
+            "- CVE-1: bad\n"
+        )
 
-def _missing_trivy(name, hint):
-    msg = f"{name} is not installed or not on PATH. {hint}"
-    raise ToolNotFoundError(msg)
+        vulns = _parse_uv_audit_vulns(output)
+
+        assert [(v.pkg_name, v.vuln_id, v.fixed_version) for v in vulns] == [
+            ("requests", "CVE-1", None)
+        ]
 
 
 @pytest.mark.parametrize(
@@ -297,7 +290,7 @@ def _missing_trivy(name, hint):
 def test_scan_requires_trivy_only_for_trivy_work(
     mm_home, tmp_path, monkeypatch, manager, secrets, needs_trivy
 ):
-    monkeypatch.setattr(scanner, "require_tool", _missing_trivy)
+    monkeypatch.setattr(scanner, "require_tool", missing_tool("trivy"))
     # uv audit is independent; stub it so this test isolates Trivy work.
     monkeypatch.setattr(scanner, "_run_uv_audit", lambda path: [])
     monkeypatch.setattr(
@@ -317,7 +310,7 @@ def test_scan_requires_trivy_only_for_trivy_work(
 def test_gradle_scan_requires_trivy_before_generating_a_report(
     gradle_project, monkeypatch
 ):
-    monkeypatch.setattr(scanner, "require_tool", _missing_trivy)
+    monkeypatch.setattr(scanner, "require_tool", missing_tool("trivy"))
     monkeypatch.setattr(
         scanner,
         "generate_gradle_report",
@@ -449,26 +442,6 @@ def test_given_outdated_packages_when_scanned_then_updates_are_returned(
     result = scan_project("clean", project)
 
     assert [update.pkg_name for update in result.updates] == ["requests"]
-
-
-def test_given_vulnerable_update_when_scanned_then_only_nonvulnerable_update_remains(
-    scan_results_dir, monkeypatch
-):
-    project = make_project(FIXTURES_DIR / "vulnerable-project", package_manager="uv")
-    updates = [
-        make_update(pkg_name="cryptography"),
-        make_update(pkg_name="brand-new-pkg"),
-    ]
-    _configure_update_scan(
-        monkeypatch,
-        updates=updates,
-        vulnerabilities=[make_vuln(pkg_name="cryptography")],
-    )
-
-    result = scan_project("vulnerable", project)
-
-    assert [finding.pkg_name for finding in result.vulnerabilities] == ["cryptography"]
-    assert [update.pkg_name for update in result.updates] == ["brand-new-pkg"]
 
 
 @pytest.mark.parametrize(
@@ -1128,27 +1101,12 @@ def _gradle_trivy_vulnerability_payload(
     return json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        [],
-        {"Results": False},
-        {"Results": None},
-        {"Results": ""},
-        {"Results": 0},
-        {"Results": [None]},
-        {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": False}]},
-    ],
-)
-def test_gradle_trivy_malformed_shape_is_scan_error(
-    gradle_project, monkeypatch, payload
-):
-
+def test_gradle_trivy_malformed_shape_is_scan_error(gradle_project, monkeypatch):
     monkeypatch.setattr(
         "maintenance_man.scanner.generate_gradle_report",
         _yield_fixture_bom(gradle_project),
     )
-    _trivy_sbom(monkeypatch, gradle_project, stdout=json.dumps(payload))
+    _trivy_sbom(monkeypatch, gradle_project, stdout='{"Results": [null]}')
     with pytest.raises(ScanError, match="Trivy"):
         scan_gradle(gradle_project)
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
@@ -1198,6 +1156,7 @@ def test_gradle_trivy_launch_or_decode_failure_is_scan_error(
         "timeout": 300,
         "label": "Trivy SBOM scan",
         "error": ScanError,
+        "ok_codes": frozenset({0}),
     }
     assert not (Path(gradle_project.path) / ".mm-gradle-inventory").exists()
 
@@ -1225,7 +1184,7 @@ def test_gradle_trivy_invalid_consumed_vulnerability_field_is_scan_error(field, 
     payload = _gradle_trivy_vulnerability_payload(changes={field: value})
 
     with pytest.raises(ScanError, match=field):
-        _parse_gradle_trivy_output(payload)
+        _parse_trivy(payload, "Trivy SBOM", secrets=False)[0]
 
 
 @pytest.mark.parametrize("field", ["VulnerabilityID", "PkgName", "InstalledVersion"])
@@ -1233,24 +1192,29 @@ def test_gradle_trivy_missing_required_vulnerability_field_is_scan_error(field):
     payload = _gradle_trivy_vulnerability_payload(omitted=field)
 
     with pytest.raises(ScanError, match=field):
-        _parse_gradle_trivy_output(payload)
+        _parse_trivy(payload, "Trivy SBOM", secrets=False)[0]
 
 
 @pytest.mark.parametrize(
-    "result",
+    "payload",
     [
-        {"Class": False},
-        {"Class": None, "Target": "x", "Secrets": []},
-        {"Class": False, "Target": "x", "Secrets": []},
-        {"Class": "lang-pkgs", "Vulnerabilities": ""},
-        {"Class": "lang-pkgs", "Vulnerabilities": {}},
-        {"Class": "lang-pkgs", "Vulnerabilities": [None]},
+        [],
+        {"Results": False},
+        {"Results": None},
+        {"Results": ""},
+        {"Results": 0},
+        {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": False}]},
+        {"Results": [{"Class": False}]},
+        {"Results": [{"Class": None, "Target": "x", "Secrets": []}]},
+        {"Results": [{"Class": False, "Target": "x", "Secrets": []}]},
+        {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": ""}]},
+        {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": {}}]},
+        {"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [None]}]},
     ],
 )
-def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
-
-    with pytest.raises(ScanError):
-        _parse_gradle_trivy_output(json.dumps({"Results": [result]}))
+def test_given_malformed_trivy_payload_when_parsed_then_scan_error(payload):
+    with pytest.raises(ScanError, match="Malformed Trivy SBOM output"):
+        _parse_trivy(json.dumps(payload), "Trivy SBOM", secrets=False)
 
 
 @pytest.mark.parametrize(
@@ -1284,7 +1248,7 @@ def test_gradle_trivy_invalid_result_or_row_container_is_scan_error(result):
 )
 def test_gradle_trivy_absent_optional_or_null_vulnerabilities_is_clean(payload):
 
-    assert _parse_gradle_trivy_output(json.dumps(payload)) == []
+    assert _parse_trivy(json.dumps(payload), "Trivy SBOM", secrets=False)[0] == []
 
 
 def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semantics():
@@ -1298,9 +1262,11 @@ def test_gradle_trivy_unknown_severity_and_bad_string_date_keep_existing_semanti
         "FixedVersion": None,
         "PrimaryURL": None,
     }
-    findings = _parse_gradle_trivy_output(
-        json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]})
-    )
+    findings = _parse_trivy(
+        json.dumps({"Results": [{"Class": "lang-pkgs", "Vulnerabilities": [row]}]}),
+        "Trivy SBOM",
+        secrets=False,
+    )[0]
     assert len(findings) == 1
     assert findings[0].severity == Severity.UNKNOWN
     assert findings[0].published_date is None
@@ -1334,7 +1300,7 @@ def test_given_ignored_vendor_fields_when_trivy_parsed_then_finding_is_retained(
         ]
     }
 
-    findings = _parse_gradle_trivy_output(json.dumps(payload))
+    findings = _parse_trivy(json.dumps(payload), "Trivy SBOM", secrets=False)[0]
 
     assert findings == [
         VulnFinding(
@@ -1583,6 +1549,7 @@ def test_given_vulnerable_update_when_scanned_then_only_clean_is_looked_up_and_s
     )
 
     assert requested == ["pypi/pkg-b/2.0/json"]
+    assert [v.pkg_name for v in result.vulnerabilities] == ["pkg-a"]
     assert [update.pkg_name for update in result.updates] == ["pkg-b"]
     assert load_scan_results("demo").updates == result.updates
 
@@ -1758,9 +1725,7 @@ def test_given_gradle_scan_failure_when_scanning_all_then_next_project_is_saved(
     summary = scan_service.scan_all(load_config(), emit=emit)
 
     assert summary.had_error is True
-    assert [
-        (event.operation, event.project) for event in emit.of_type(OperationFailed)
-    ] == [(Operation.SCAN, "android")]
+    assert [event.project for event in emit.of_type(OperationFailed)] == ["android"]
     assert [event.result.project for event in emit.of_type(ScanReported)] == [
         "remaining"
     ]

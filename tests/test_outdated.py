@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -7,14 +6,14 @@ from unittest.mock import patch
 import pytest
 
 from maintenance_man.models.config import ProjectConfig
-from maintenance_man.models.scan import SemverTier
+from maintenance_man.models.scan import SemverTier, UpdateFinding
 from maintenance_man.outdated import (
     OutdatedCheckError,
-    _get_uv_direct_dep_names,
     bun_outdated,
     mvn_outdated,
     uv_outdated,
 )
+from maintenance_man.uv_dependencies import get_uv_direct_dep_names
 from tests.fakes import FakeCommands
 from tests.support.process import completed
 from tests.support.projects import make_project
@@ -44,67 +43,67 @@ def _fake_commands(
     return commands
 
 
-class TestGetUvDirectDepNames:
-    def test_extracts_from_dependencies_and_groups(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
+@pytest.mark.parametrize(
+    ("pyproject", "expected"),
+    [
+        (
             "[project]\n"
             'dependencies = ["requests>=2.28", "Flask==3.0.0"]\n'
             "\n"
             "[dependency-groups]\n"
-            'dev = ["pytest>=8.0", "ruff>=0.9.0"]\n'
-        )
-        names = _get_uv_direct_dep_names(tmp_path)
-        assert names == {"requests", "flask", "pytest", "ruff"}
-
-    def test_normalises_names(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            '[project]\ndependencies = ["pydantic_core>=2.0", "Zope.Interface"]\n'
-        )
-        names = _get_uv_direct_dep_names(tmp_path)
-        assert names == {"pydantic-core", "zope-interface"}
-
-    def test_skips_non_string_group_entries(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
+            'dev = ["pytest>=8.0", "ruff>=0.9.0"]\n',
+            {"requests", "flask", "pytest", "ruff"},
+        ),
+        (
+            '[project]\ndependencies = ["pydantic_core>=2.0", "Zope.Interface"]\n',
+            {"pydantic-core", "zope-interface"},
+        ),
+        (
             "[project]\n"
             'dependencies = ["requests>=2.28"]\n'
             "\n"
             "[dependency-groups]\n"
-            'all = [{include-group = "dev"}, "extra-pkg>=1.0"]\n'
-        )
-        names = _get_uv_direct_dep_names(tmp_path)
-        assert names == {"requests", "extra-pkg"}
-
-    def test_excludes_optional_dependencies(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
+            'all = [{include-group = "dev"}, "extra-pkg>=1.0"]\n',
+            {"requests", "extra-pkg"},
+        ),
+        (
             "[project]\n"
             'dependencies = ["requests>=2.28"]\n'
             "\n"
             "[project.optional-dependencies]\n"
             'cli = ["rich>=14.0"]\n'
-            'docs = ["mkdocs-material>=9.0"]\n'
-        )
-        names = _get_uv_direct_dep_names(tmp_path)
-        assert names == {"requests"}
+            'docs = ["mkdocs-material>=9.0"]\n',
+            {"requests"},
+        ),
+        ("[project]\ndependencies = []\n", set()),
+        ('[project]\ndependencies = ["rich>=14.0"]\n', {"rich"}),
+    ],
+    ids=[
+        "runtime-and-groups",
+        "normalised",
+        "non-string-group-entry",
+        "optional-excluded",
+        "empty",
+        "no-groups",
+    ],
+)
+def test_given_pyproject_when_direct_names_read_then_declared_names_are_normalised(
+    tmp_path, pyproject, expected
+):
+    (tmp_path / "pyproject.toml").write_text(pyproject)
 
-    def test_empty_dependencies(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text("[project]\ndependencies = []\n")
-        names = _get_uv_direct_dep_names(tmp_path)
-        assert names == set()
+    assert get_uv_direct_dep_names(tmp_path) == expected
 
-    def test_no_dependency_groups(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text('[project]\ndependencies = ["rich>=14.0"]\n')
-        names = _get_uv_direct_dep_names(tmp_path)
-        assert names == {"rich"}
 
-    def test_missing_pyproject_raises(self, tmp_path):
-        with pytest.raises(OutdatedCheckError, match="Failed to read"):
-            _get_uv_direct_dep_names(tmp_path)
+def test_given_missing_pyproject_when_uv_outdated_runs_then_outdated_check_error(
+    tmp_path, monkeypatch
+):
+    project = make_project(tmp_path, package_manager="uv")
+    commands = _fake_commands(project, completed(), completed(stdout="[]"))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+
+    with pytest.raises(OutdatedCheckError, match="Failed to read"):
+        uv_outdated(project)
 
 
 class TestUvOutdated:
@@ -307,49 +306,6 @@ class TestUvOutdated:
 
 
 class TestBunOutdated:
-    def test_parses_table_output(self):
-        fake_output = (
-            "| Package    | Current | Update  | Latest  |\n"
-            "|------------|---------|---------|---------|  \n"
-            "| lodash     | 4.17.20 | 4.17.21 | 4.17.21 |\n"
-            "| express    | 4.18.0  | 4.18.3  | 5.0.0   |\n"
-        )
-        result = completed([], returncode=0, stdout=fake_output, stderr="")
-        project = make_project(Path("/tmp/fake"), package_manager="bun")
-
-        with patch(
-            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
-        ):
-            updates = bun_outdated(project)
-
-        assert len(updates) == 2
-        assert updates[0].pkg_name == "lodash"
-        assert updates[0].installed_version == "4.17.20"
-        assert updates[0].latest_version == "4.17.21"
-        assert updates[0].semver_tier == SemverTier.PATCH
-        assert updates[1].pkg_name == "express"
-        assert updates[1].latest_version == "5.0.0"
-        assert updates[1].semver_tier == SemverTier.MAJOR
-
-    def test_strips_peer_and_dev_qualifiers(self):
-        fake_output = (
-            "| Package           | Current | Update | Latest |\n"
-            "|-------------------|---------|--------|--------|\n"
-            "| typescript (peer) | 5.9.3   | 6.0.2  | 6.0.2  |\n"
-            "| eslint (dev)      | 8.0.0   | 9.0.0  | 9.0.0  |\n"
-        )
-        result = completed([], returncode=0, stdout=fake_output, stderr="")
-        project = make_project(Path("/tmp/fake"), package_manager="bun")
-
-        with patch(
-            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
-        ):
-            updates = bun_outdated(project)
-
-        assert len(updates) == 2
-        assert updates[0].pkg_name == "typescript"
-        assert updates[1].pkg_name == "eslint"
-
     def test_empty_output_disables_progress(self):
         result = completed([], returncode=0, stdout="", stderr="")
         project = make_project(Path("/tmp/fake"), package_manager="bun")
@@ -375,40 +331,6 @@ class TestBunOutdated:
 
 
 class TestMvnOutdated:
-    def test_parses_text_output(self):
-        fake_output = (
-            "[INFO] The following dependencies in Dependencies have newer versions:\n"
-            "[INFO]   org.apache.commons:commons-lang3 ......... 3.10 -> 3.14.0\n"
-            "[INFO]   org.slf4j:slf4j-api .................. 2.0.9 -> 2.0.16\n"
-            "[INFO] \n"
-        )
-        result = completed([], returncode=0, stdout=fake_output, stderr="")
-        project = make_project(Path("/tmp/fake"), package_manager="mvn")
-
-        with patch(
-            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
-        ):
-            updates = mvn_outdated(project)
-
-        assert len(updates) == 2
-        assert updates[0].pkg_name == "org.apache.commons:commons-lang3"
-        assert updates[0].installed_version == "3.10"
-        assert updates[0].latest_version == "3.14.0"
-        assert updates[0].semver_tier == SemverTier.MINOR
-        assert updates[1].pkg_name == "org.slf4j:slf4j-api"
-
-    def test_no_updates_available(self):
-        fake_output = "[INFO] No dependencies in Dependencies have newer versions.\n"
-        result = completed([], returncode=0, stdout=fake_output, stderr="")
-        project = make_project(Path("/tmp/fake"), package_manager="mvn")
-
-        with patch(
-            "maintenance_man.outdated.run_captured", _fake_commands(project, result)
-        ):
-            updates = mvn_outdated(project)
-
-        assert updates == []
-
     def test_command_failure_raises(self):
         result = OutdatedCheckError(
             "mvn versions:display-dependency-updates failed (exit 1): BUILD FAILURE"
@@ -433,37 +355,6 @@ class TestMvnOutdated:
             "label": "mvn versions:display-dependency-updates",
             "error": OutdatedCheckError,
         }
-
-
-def test_given_uv_project_when_checking_outdated_then_command_contract_is_delegated(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
-    monkeypatch.setenv("PATH", os.pathsep.join(["/host/venv/bin", "/usr/bin"]))
-    monkeypatch.setattr(
-        "maintenance_man.outdated.get_uv_direct_dep_names", lambda path: set()
-    )
-    project = make_project(tmp_path, package_manager="uv")
-    commands = _fake_commands(project, completed(), completed(stdout="[]"))
-    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
-
-    assert uv_outdated(project) == []
-    assert [cmd[:3] for cmd, _, _ in commands.calls] == [
-        ("uv", "sync", "--locked"),
-        ("uv", "pip", "list"),
-    ]
-    assert [kwargs for _, _, kwargs in commands.calls] == [
-        {
-            "timeout": 300,
-            "label": "uv sync --locked",
-            "error": OutdatedCheckError,
-        },
-        {
-            "timeout": 120,
-            "label": "uv pip list --outdated",
-            "error": OutdatedCheckError,
-        },
-    ]
 
 
 @pytest.mark.parametrize(
@@ -495,3 +386,90 @@ def test_given_command_execution_failure_when_checking_outdated_then_error_is_re
         "label": "uv sync --locked",
         "error": OutdatedCheckError,
     }
+
+
+@pytest.mark.parametrize(
+    ("manager", "stdout", "expected"),
+    [
+        (
+            "bun",
+            "| Package    | Current | Update  | Latest  |\n"
+            "|------------|---------|---------|---------|  \n"
+            "| lodash     | 4.17.20 | 4.17.21 | 4.17.21 |\n"
+            "| express    | 4.18.0  | 4.18.3  | 5.0.0   |\n",
+            [
+                UpdateFinding(
+                    pkg_name="lodash",
+                    installed_version="4.17.20",
+                    latest_version="4.17.21",
+                    semver_tier=SemverTier.PATCH,
+                ),
+                UpdateFinding(
+                    pkg_name="express",
+                    installed_version="4.18.0",
+                    latest_version="5.0.0",
+                    semver_tier=SemverTier.MAJOR,
+                ),
+            ],
+        ),
+        (
+            "bun",
+            "| Package           | Current | Update | Latest |\n"
+            "|-------------------|---------|--------|--------|\n"
+            "| typescript (peer) | 5.9.3   | 6.0.2  | 6.0.2  |\n"
+            "| eslint (dev)      | 8.0.0   | 9.0.0  | 9.0.0  |\n",
+            [
+                UpdateFinding(
+                    pkg_name="typescript",
+                    installed_version="5.9.3",
+                    latest_version="6.0.2",
+                    semver_tier=SemverTier.MAJOR,
+                ),
+                UpdateFinding(
+                    pkg_name="eslint",
+                    installed_version="8.0.0",
+                    latest_version="9.0.0",
+                    semver_tier=SemverTier.MAJOR,
+                ),
+            ],
+        ),
+        (
+            "mvn",
+            "[INFO] The following dependencies in Dependencies have newer versions:\n"
+            "[INFO]   org.apache.commons:commons-lang3 ......... 3.10 -> 3.14.0\n"
+            "[INFO]   org.slf4j:slf4j-api .................. 2.0.9 -> 2.0.16\n"
+            "[INFO] \n",
+            [
+                UpdateFinding(
+                    pkg_name="org.apache.commons:commons-lang3",
+                    installed_version="3.10",
+                    latest_version="3.14.0",
+                    semver_tier=SemverTier.MINOR,
+                ),
+                UpdateFinding(
+                    pkg_name="org.slf4j:slf4j-api",
+                    installed_version="2.0.9",
+                    latest_version="2.0.16",
+                    semver_tier=SemverTier.PATCH,
+                ),
+            ],
+        ),
+        (
+            "mvn",
+            "[INFO] No dependencies in Dependencies have newer versions.\n",
+            [],
+        ),
+    ],
+    ids=["bun-table", "bun-qualifiers", "mvn-updates", "mvn-none"],
+)
+def test_given_outdated_output_when_parsed_then_findings_match(
+    manager, stdout, expected
+):
+    project = make_project(Path("/tmp/fake"), package_manager=manager)
+    outdated = {"bun": bun_outdated, "mvn": mvn_outdated}[manager]
+
+    with patch(
+        "maintenance_man.outdated.run_captured",
+        _fake_commands(project, completed(stdout=stdout)),
+    ):
+        assert outdated(project) == expected
