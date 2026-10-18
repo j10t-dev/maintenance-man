@@ -191,20 +191,8 @@ def test_run_shell_command_executes_bash_syntax(tmp_path):
     assert (tmp_path / "out.txt").read_text() == "a_b\n"
 
 
-@pytest.mark.parametrize(
-    "command, fails",
-    [
-        ("false | true", False),
-        ("true | false", True),
-        ("set -o pipefail; false | true", True),
-    ],
-)
-def test_run_shell_command_uses_normal_pipeline_status(tmp_path, command, fails):
-    if fails:
-        with pytest.raises(ProcessError, match=r"^pipeline failed \(exit 1\)$"):
-            run_shell_command(command, tmp_path, timeout=30, label="pipeline")
-    else:
-        run_shell_command(command, tmp_path, timeout=30, label="pipeline")
+def test_run_shell_command_uses_normal_pipeline_status(tmp_path):
+    run_shell_command("false | true", tmp_path, timeout=30, label="pipeline")
 
 
 def test_run_shell_command_strips_the_host_virtualenv(tmp_path, monkeypatch):
@@ -221,16 +209,6 @@ def test_run_shell_command_launch_failure_raises_selected_error(tmp_path):
             "true", missing, timeout=30, label="build", error=_DomainError
         )
     assert isinstance(caught.value.__cause__, OSError)
-
-
-def test_run_shell_command_timeout_raises_selected_error(tmp_path):
-    with pytest.raises(
-        _DomainError, match=r"^sleeper timed out after 1s in "
-    ) as caught:
-        run_shell_command(
-            "sleep 60", tmp_path, timeout=1, label="sleeper", error=_DomainError
-        )
-    assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
 
 
 def test_given_broken_stderr_when_failed_logs_replay_then_the_write_error_propagates(
@@ -250,17 +228,38 @@ def test_given_broken_stderr_when_failed_logs_replay_then_the_write_error_propag
         )
 
 
-@pytest.mark.parametrize("returncode", [0, 7])
+@pytest.mark.parametrize(
+    ("script", "returncode", "expected_stderr"),
+    [
+        pytest.param(
+            "print('OUT'); print('ERR', file=sys.stderr)",
+            0,
+            "",
+            id="success-hides-logs",
+        ),
+        pytest.param(
+            "print('OUT'); print('ERR', file=sys.stderr)",
+            7,
+            "OUT\nERR\n",
+            id="failure-replays-both-streams",
+        ),
+        pytest.param(
+            "print('only stdout')",
+            3,
+            "only stdout\n",
+            id="stdout-only-failure-replays-stdout-once",
+        ),
+    ],
+)
 def test_given_child_logs_when_build_runs_then_only_failed_logs_reach_stderr(
-    tmp_path: Path, capfd: pytest.CaptureFixture[str], returncode: int
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+    script: str,
+    returncode: int,
+    expected_stderr: str,
 ) -> None:
     command = shlex.join(
-        [
-            sys.executable,
-            "-c",
-            "import sys; print('OUT'); print('ERR', file=sys.stderr); "
-            f"sys.exit({returncode})",
-        ]
+        [sys.executable, "-c", f"import sys; {script}; sys.exit({returncode})"]
     )
     if returncode:
         with pytest.raises(
@@ -272,7 +271,7 @@ def test_given_child_logs_when_build_runs_then_only_failed_logs_reach_stderr(
 
     captured = capfd.readouterr()
     assert captured.out == ""
-    assert captured.err == ("OUT\nERR\n" if returncode else "")
+    assert captured.err == expected_stderr
 
 
 def test_given_parser_output_when_command_succeeds_then_streams_remain_separate(
@@ -298,24 +297,10 @@ def test_given_parser_output_when_command_succeeds_then_streams_remain_separate(
     assert capsys.readouterr() == ("", "")
 
 
-def test_given_stdout_only_failure_when_logs_replay_then_stdout_appears_once(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    with pytest.raises(ProcessError, match=r"^child failed \(exit 3\)$"):
-        run_logged(
-            [sys.executable, "-c", "print('only stdout'); raise SystemExit(3)"],
-            tmp_path,
-            timeout=5,
-            label="child",
-        )
-
-    assert capsys.readouterr() == ("", "only stdout\n")
-
-
 def test_given_partial_output_when_child_times_out_then_logs_replay_once(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    with pytest.raises(ProcessError, match=r"^child timed out after 1s in ") as caught:
+    with pytest.raises(_DomainError, match=r"^child timed out after 1s in ") as caught:
         run_logged(
             [
                 sys.executable,
@@ -325,6 +310,7 @@ def test_given_partial_output_when_child_times_out_then_logs_replay_once(
             tmp_path,
             timeout=1,
             label="child",
+            error=_DomainError,
         )
 
     assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)

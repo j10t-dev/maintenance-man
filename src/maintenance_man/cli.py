@@ -64,7 +64,7 @@ from maintenance_man.models.scan import (
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import OutdatedCheckError
-from maintenance_man.process import ToolNotFoundError
+from maintenance_man.process import ToolNotFoundError, require_tool
 from maintenance_man.scanner import ScanError
 from maintenance_man.services import WorkflowError
 from maintenance_man.services import deploy as deploy_service
@@ -78,8 +78,7 @@ from maintenance_man.storage import (
     load_scan_results,
 )
 from maintenance_man.updater import run_test_phases
-from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import make_vcs_services
+from maintenance_man.vcs import JJ_INSTALL_HINT, RevisionError
 
 _HANDLED_ERRORS = (
     WorkflowError,
@@ -468,9 +467,8 @@ def update(
 
     _exit_if_no_update_targets(cfg, targets, config)
 
-    vcs_workflow.require_vcs_tools()
+    require_tool("jj", JJ_INSTALL_HINT)
 
-    vcs = make_vcs_services()
     if mode == "single":
         name = targets[0]
         proj_config = resolve_project(cfg, name)
@@ -478,7 +476,6 @@ def update(
             name,
             proj_config,
             choose=_choose_findings,
-            vcs=vcs,
             emit=_Renderer(batch=False, project=name),
         )
         sys.exit(
@@ -487,9 +484,7 @@ def update(
             else ExitCode.UPDATE_FAILED
         )
 
-    batch = update_service.update_projects(
-        cfg, targets, vcs=vcs, emit=_Renderer(batch=True)
-    )
+    batch = update_service.update_projects(cfg, targets, emit=_Renderer(batch=True))
     results = [result for project in batch.projects for result in project.results]
     blocked = sum(project.blocked for project in batch.projects)
     if results or blocked:
@@ -517,13 +512,7 @@ def sync(
     if not cfg.projects:
         _exit_without_projects(config)
 
-    vcs_services = make_vcs_services()
-    outcome = scan_service.sync_projects(
-        cfg,
-        projects,
-        vcs=vcs_services,
-        emit=_Renderer(batch=True),
-    )
+    outcome = scan_service.sync_projects(cfg, projects, emit=_Renderer(batch=True))
     sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
 
@@ -574,7 +563,6 @@ def deploy(
         could not be resolved.
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
-    vcs = make_vcs_services()
     batch = not project
     renderer = _Renderer(batch=batch, flow="deploy")
 
@@ -587,7 +575,6 @@ def deploy(
             cfg,
             check=check,
             force=force,
-            vcs=vcs,
             emit=renderer,
         )
         _print_deploy_summary(results)
@@ -606,7 +593,6 @@ def deploy(
         build=build,
         check=check,
         force=force,
-        vcs=vcs,
         emit=renderer,
     )
     if result.build_status == "failed":
@@ -668,7 +654,6 @@ def build(
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
     proj_config = resolve_project(cfg, project)
-    vcs = make_vcs_services()
 
     if not proj_config.build_command:
         _fatal(
@@ -680,7 +665,7 @@ def build(
 
     output.heading(project)
     try:
-        deploy_service.build_project(project, proj_config, vcs=vcs)
+        deploy_service.build_project(project, proj_config)
     except BuildError as exc:
         output.outcome(project, "build", "failed", "build", reason=str(exc))
         sys.exit(ExitCode.BUILD_FAILED)
@@ -1095,13 +1080,11 @@ def resolve(
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
     proj_config = resolve_project(cfg, project)
-    vcs_workflow.require_vcs_tools()
-    vcs = make_vcs_services()
+    require_tool("jj", JJ_INSTALL_HINT)
     outcome = resolve_service.resolve_project(
         project,
         proj_config,
         continue_=continue_,
-        vcs=vcs,
         emit=_Renderer(batch=False, project=project, flow="resolve"),
     )
     sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)

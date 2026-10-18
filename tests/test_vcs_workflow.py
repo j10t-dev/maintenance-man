@@ -1,9 +1,10 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from maintenance_man import paths
-from maintenance_man.vcs import RevisionError
+from maintenance_man.vcs import JjRepository, RevisionError
 from maintenance_man.vcs_workflow import (
     SyncAction,
     create_workspace,
@@ -75,52 +76,141 @@ def test_ensure_main_refuses_when_local_and_origin_are_absent(
     assert repo.bookmark_exists(bookmark="main") is False
 
 
+def _no_arrangement(case: RepositoryCase) -> None:
+    pass
+
+
+def _delete_main(case: RepositoryCase) -> None:
+    case.repo.delete_bookmark(bookmark="main")
+
+
+def _untracked_remote_advance(case: RepositoryCase) -> None:
+    track_main(case.repo, enabled=False)
+    case.peer.rebase_working_copy(revision="main")
+    commit_file(case.peer, "dep.txt", "version=2\n", "remote advance")
+    push_peer_main(case.peer)
+
+
+def _unpushed_local_advance(case: RepositoryCase) -> None:
+    tip = commit_file(case.repo, "dep.txt", "version=2\n", "local advance")
+    case.repo.set_bookmark(bookmark="main", revision=tip)
+
+
+def _main_ahead_of_working_copy(case: RepositoryCase) -> None:
+    base = case.repo.resolve_revision(revision="main")
+    _unpushed_local_advance(case)
+    case.repo.new_change(revision=base)
+
+
+def _state(repo: JjRepository) -> tuple[str | None, str, str, str]:
+    main = (
+        repo.resolve_revision(revision="main")
+        if repo.bookmark_exists(bookmark="main")
+        else None
+    )
+    return (
+        main,
+        repo.change_id(),
+        repo.resolve_revision(revision="@"),
+        (repo.path / "dep.txt").read_text(encoding="utf-8"),
+    )
+
+
+_OPERATIONS: dict[str, Callable[..., object]] = {
+    "ensure": ensure_main_bookmark,
+    "sync": sync_main,
+    "refresh": refresh_working_copy_from_main,
+}
+
+
 @pytest.mark.parametrize(
-    ("method", "delete_main_first", "main_exists_after"),
-    [("bookmark_exists", False, True), ("resolve_revision", True, False)],
+    ("operation", "method", "call", "arrange", "pushed"),
+    [
+        pytest.param(
+            "ensure", "bookmark_exists", 1, _no_arrangement, False, id="ensure-lookup"
+        ),
+        pytest.param(
+            "ensure", "resolve_revision", 1, _delete_main, False, id="ensure-origin"
+        ),
+        pytest.param("sync", "fetch", 1, _no_arrangement, False, id="sync-fetch"),
+        pytest.param(
+            "sync", "bookmark_conflicted", 1, _no_arrangement, False, id="sync-conflict"
+        ),
+        pytest.param(
+            "sync", "same_revision", 1, _no_arrangement, False, id="sync-comparison"
+        ),
+        pytest.param(
+            "sync",
+            "set_bookmark",
+            1,
+            _untracked_remote_advance,
+            False,
+            id="sync-remote-advance-move",
+        ),
+        pytest.param(
+            "sync",
+            "fetch",
+            2,
+            _unpushed_local_advance,
+            True,
+            id="sync-post-push-fetch",
+        ),
+        pytest.param(
+            "sync",
+            "same_revision",
+            2,
+            _unpushed_local_advance,
+            True,
+            id="sync-post-push-comparison",
+        ),
+        pytest.param(
+            "refresh",
+            "is_blank_working_copy",
+            1,
+            _main_ahead_of_working_copy,
+            False,
+            id="refresh-blank-check",
+        ),
+        pytest.param(
+            "refresh",
+            "is_ancestor",
+            1,
+            _main_ahead_of_working_copy,
+            False,
+            id="refresh-ancestry",
+        ),
+        pytest.param(
+            "refresh",
+            "rebase_working_copy",
+            1,
+            _main_ahead_of_working_copy,
+            False,
+            id="refresh-rebase",
+        ),
+    ],
 )
-def test_given_inspection_failure_when_ensuring_main_then_failure_propagates_unchanged(
+def test_given_step_failure_when_syncing_or_refreshing_then_it_propagates_unchanged(
     repository_case: RepositoryCase,
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
     method: str,
-    delete_main_first: bool,
-    main_exists_after: bool,
-) -> None:
-    repo = repository_case.repo
-    if delete_main_first:
-        repo.delete_bookmark(bookmark="main")
-    failure = RevisionError(f"{method} failed")
-    fail_repository_method(monkeypatch, repo.path, method, failure)
-
-    with pytest.raises(RevisionError) as caught:
-        ensure_main_bookmark(repo=repo)
-
-    assert caught.value is failure
-    assert repo.bookmark_exists(bookmark="main") is main_exists_after
-
-
-@pytest.mark.parametrize("method", ["fetch", "bookmark_conflicted", "same_revision"])
-def test_sync_inspection_failure_preserves_the_repository(
-    repository_case: RepositoryCase,
-    monkeypatch: pytest.MonkeyPatch,
-    method: str,
+    call: int,
+    arrange: Callable[[RepositoryCase], None],
+    pushed: bool,
 ) -> None:
     c = repository_case
-    main_before = c.repo.resolve_revision(revision="main")
-    change_before = c.repo.change_id()
-    working_copy_before = c.repo.resolve_revision(revision="@")
-    file_before = (c.repo.path / "dep.txt").read_text(encoding="utf-8")
+    arrange(c)
+    before = _state(c.repo)
     failure = RevisionError(f"{method} failed")
-    fail_repository_method(monkeypatch, c.repo.path, method, failure)
+    fail_repository_method(monkeypatch, c.repo.path, method, failure, call=call)
 
     with pytest.raises(RevisionError) as caught:
-        sync_main(repo=c.repo)
+        _OPERATIONS[operation](repo=c.repo)
 
     assert caught.value is failure
-    assert c.repo.resolve_revision(revision="main") == main_before
-    assert c.repo.change_id() == change_before
-    assert c.repo.resolve_revision(revision="@") == working_copy_before
-    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == file_before
+    assert _state(c.repo) == before
+    if pushed:
+        assert remote_bookmark_target(c.peer, "main") == before[0]
 
 
 def test_sync_pulls_remote_advance_when_main_is_untracked(
@@ -135,27 +225,6 @@ def test_sync_pulls_remote_advance_when_main_is_untracked(
     assert sync_main(repo=c.repo) is SyncAction.PULLED
     assert c.repo.resolve_revision(revision="main") == peer_tip
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
-
-
-def test_sync_remote_advance_move_failure_preserves_local_main(
-    repository_case: RepositoryCase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    c = repository_case
-    repo = c.repo
-    base = repo.resolve_revision(revision="main")
-    track_main(c.repo, enabled=False)
-    c.peer.rebase_working_copy(revision="main")
-    commit_file(c.peer, "dep.txt", "version=2\n", "remote advance")
-    push_peer_main(c.peer)
-    failure = RevisionError("cannot move local main")
-    fail_repository_method(monkeypatch, c.repo.path, "set_bookmark", failure)
-
-    with pytest.raises(RevisionError) as caught:
-        sync_main(repo=repo)
-
-    assert caught.value is failure
-    assert repo.resolve_revision(revision="main") == base
-    assert (repo.path / "dep.txt").read_text(encoding="utf-8") == "version=1\n"
 
 
 def test_sync_tracked_main_remote_advance_is_already_reconciled_by_fetch(
@@ -180,7 +249,7 @@ def test_sync_pushes_local_advance_then_fetches_before_refresh(
 
     assert sync_main(repo=c.repo) is SyncAction.PUSHED
     assert c.repo.resolve_revision(revision="main@origin") == tip
-    c.peer.fetch(main_only=True)
+    c.peer.fetch()
     assert c.peer.resolve_revision(revision="main") == tip
 
 
@@ -204,39 +273,6 @@ def test_sync_rechecks_remote_before_refresh(
     assert c.repo.resolve_revision(revision="main") == observed["main"]
     assert c.repo.resolve_revision(revision="main@origin") == tip
     assert c.repo.change_id() == observed["change"]
-
-
-@pytest.mark.parametrize(
-    ("method", "message"),
-    [
-        ("fetch", "second fetch failed"),
-        ("same_revision", "post-push comparison failed"),
-    ],
-)
-def test_sync_post_push_failure_prevents_refresh(
-    repository_case: RepositoryCase,
-    monkeypatch: pytest.MonkeyPatch,
-    method: str,
-    message: str,
-) -> None:
-    c = repository_case
-    repo = c.repo
-    tip = commit_file(repo, "dep.txt", "version=2\n", "local advance")
-    repo.set_bookmark(bookmark="main", revision=tip)
-    change_before = repo.change_id()
-    working_copy_before = repo.resolve_revision(revision="@")
-    file_before = (repo.path / "dep.txt").read_text(encoding="utf-8")
-    failure = RevisionError(message)
-    fail_repository_method(monkeypatch, repo.path, method, failure, call=2)
-
-    with pytest.raises(RevisionError) as caught:
-        sync_main(repo=repo)
-
-    assert caught.value is failure
-    assert remote_bookmark_target(c.peer, "main") == tip
-    assert repo.change_id() == change_before
-    assert repo.resolve_revision(revision="@") == working_copy_before
-    assert (repo.path / "dep.txt").read_text(encoding="utf-8") == file_before
 
 
 def test_given_local_and_remote_main_diverge_when_syncing_then_repository_is_preserved(
@@ -308,7 +344,7 @@ def test_refresh_empty_change_preserves_change_identity(
     c.peer.rebase_working_copy(revision="main")
     commit_file(c.peer, "dep.txt", "version=2\n", "peer advance")
     push_peer_main(c.peer)
-    c.repo.fetch(main_only=True)
+    c.repo.fetch()
     c.repo.set_bookmark(bookmark="main", revision="main@origin")
 
     refresh_working_copy_from_main(repo=c.repo)
@@ -349,7 +385,7 @@ def test_refresh_protected_change_starts_new_child_and_preserves_old_content(
     c.peer.rebase_working_copy(revision="main")
     commit_file(c.peer, "dep.txt", "version=2\n", "peer advance")
     push_peer_main(c.peer)
-    c.repo.fetch(main_only=True)
+    c.repo.fetch()
     c.repo.set_bookmark(bookmark="main", revision="main@origin")
 
     refresh_working_copy_from_main(repo=c.repo)
@@ -357,35 +393,10 @@ def test_refresh_protected_change_starts_new_child_and_preserves_old_content(
     assert c.repo.resolve_revision(revision="@-") == c.repo.resolve_revision(
         revision="main"
     )
-    assert c.repo.revision_file(revision=old, filename="dep.txt").is_regular is True
+    assert c.repo.has_regular_file(revision=old, filename="dep.txt") is True
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
     c.repo.new_change(revision=old)
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == expected_old_content
-
-
-@pytest.mark.parametrize(
-    "failure_method", ["is_blank_working_copy", "is_ancestor", "rebase_working_copy"]
-)
-def test_given_refresh_step_failure_when_refreshing_then_working_copy_is_unchanged(
-    repository_case: RepositoryCase,
-    monkeypatch: pytest.MonkeyPatch,
-    failure_method: str,
-) -> None:
-    c = repository_case
-    base = c.repo.resolve_revision(revision="main")
-    tip = commit_file(c.repo, "dep.txt", "version=2\n", "advance main")
-    c.repo.set_bookmark(bookmark="main", revision=tip)
-    c.repo.new_change(revision=base)
-    before = c.repo.resolve_revision(revision="@")
-    failure = RevisionError(f"{failure_method} failed")
-    fail_repository_method(monkeypatch, c.repo.path, failure_method, failure)
-
-    with pytest.raises(RevisionError) as caught:
-        refresh_working_copy_from_main(repo=c.repo)
-
-    assert caught.value is failure
-    assert c.repo.resolve_revision(revision="@") == before
-    assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=1\n"
 
 
 def test_workspace_policy_creates_and_removes_registered_path(
@@ -437,59 +448,99 @@ def test_workspace_removal_rejects_final_symlink_and_preserves_sibling(
     keep.write_text("recovery", encoding="utf-8")
     (root / "project-a").symlink_to(sibling, target_is_directory=True)
 
-    with pytest.raises(RevisionError, match="symlink") as caught:
+    with pytest.raises(
+        RevisionError, match=r"Cannot remove workspace path .*: \[Errno None\] None: "
+    ) as caught:
         remove_workspace(repo=repo, project="project-a")
 
-    assert isinstance(caught.value.__cause__, ValueError)
+    assert isinstance(caught.value.__cause__, OSError)
     assert keep.read_text(encoding="utf-8") == "recovery"
     assert sibling.is_dir()
     assert (root / "project-a").is_symlink()
 
 
-def test_workspace_path_computation_failure_is_typed_with_cause(
-    repository_case: RepositoryCase, monkeypatch: pytest.MonkeyPatch
+_PATH_FAILURE = OSError("path resolution failed")
+
+
+def _create_recovery_workspace(repo: JjRepository) -> None:
+    create_workspace(repo=repo, project="recovery", revision="main")
+
+
+def _remove_recovery_workspace(repo: JjRepository) -> None:
+    remove_workspace(repo=repo, project="recovery")
+
+
+@pytest.mark.parametrize(
+    (
+        "operation",
+        "owner",
+        "name",
+        "failure",
+        "expected_cause",
+        "registered",
+        "message",
+    ),
+    [
+        pytest.param(
+            _create_recovery_workspace,
+            paths,
+            "project_file",
+            _PATH_FAILURE,
+            _PATH_FAILURE,
+            False,
+            "workspace path",
+            id="path-computation",
+        ),
+        pytest.param(
+            _remove_recovery_workspace,
+            JjRepository,
+            "workspace_names",
+            RevisionError("inspection failed"),
+            None,
+            False,
+            "inspection failed",
+            id="listing",
+        ),
+        pytest.param(
+            _remove_recovery_workspace,
+            JjRepository,
+            "forget_workspace",
+            RevisionError("forget failed"),
+            None,
+            True,
+            "forget failed",
+            id="forget",
+        ),
+    ],
+)
+def test_given_workspace_step_failure_when_managed_then_typed_error_and_files_survive(
+    repository_case: RepositoryCase,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: Callable[[JjRepository], None],
+    owner: object,
+    name: str,
+    failure: Exception,
+    expected_cause: Exception | None,
+    registered: bool,
+    message: str,
 ) -> None:
     repo = repository_case.repo
-    failure = OSError("path resolution failed")
+    workspace = paths.workspaces_dir() / "recovery"
+    if registered:
+        _create_recovery_workspace(repo)
+    else:
+        workspace.mkdir(parents=True)
+    (workspace / "keep.txt").write_text("recovery", encoding="utf-8")
 
-    def fail_path(*_args, **_kwargs):
+    def fail(*_args: object, **_kwargs: object) -> None:
         raise failure
 
-    monkeypatch.setattr(paths, "project_file", fail_path)
+    monkeypatch.setattr(owner, name, fail)
 
-    with pytest.raises(RevisionError, match="workspace path") as caught:
-        create_workspace(repo=repo, project="project-a", revision="main")
-    assert caught.value.__cause__ is failure
+    with pytest.raises(RevisionError, match=message) as caught:
+        operation(repo)
 
-
-def test_workspace_listing_failure_preserves_unregistered_files(
-    repository_case: RepositoryCase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo = repository_case.repo
-    recovery = paths.workspaces_dir() / "recovery"
-    recovery.mkdir(parents=True)
-    (recovery / "keep.txt").write_text("recovery", encoding="utf-8")
-    fail_repository_method(
-        monkeypatch, repo.path, "workspace_names", RevisionError("inspection failed")
-    )
-
-    with pytest.raises(RevisionError, match="inspection failed"):
-        remove_workspace(repo=repo, project="recovery")
-    assert (recovery / "keep.txt").read_text(encoding="utf-8") == "recovery"
-
-
-def test_workspace_forget_failure_preserves_registered_files(
-    repository_case: RepositoryCase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo = repository_case.repo
-    workspace = create_workspace(repo=repo, project="recovery", revision="main")
-    (workspace / "keep.txt").write_text("recovery", encoding="utf-8")
-    fail_repository_method(
-        monkeypatch, repo.path, "forget_workspace", RevisionError("forget failed")
-    )
-
-    with pytest.raises(RevisionError, match="forget failed"):
-        remove_workspace(repo=repo, project="recovery")
+    assert caught.value.__cause__ is expected_cause
     assert (workspace / "keep.txt").read_text(encoding="utf-8") == "recovery"
 
 

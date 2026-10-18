@@ -1,9 +1,7 @@
 import re
 import shlex
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 from maintenance_man import paths
 from maintenance_man.process import run_captured
@@ -18,59 +16,8 @@ class RevisionError(Exception):
 _READ_ONLY = ("--ignore-working-copy", "--color", "never")
 
 
-@dataclass(frozen=True, slots=True)
-class RevisionFile:
-    commit_id: str
-    is_regular: bool
-
-
-class Repository(Protocol):
-    @property
-    def path(self) -> Path: ...
-
-    def bookmark_exists(self, *, bookmark: str) -> bool: ...
-    def bookmark_conflicted(self, *, bookmark: str) -> bool: ...
-    def resolve_revision(self, *, revision: str, read_only: bool = False) -> str: ...
-    def revision_file(self, *, revision: str, filename: str) -> RevisionFile: ...
-    def same_revision(self, *, left: str, right: str) -> bool: ...
-    def is_ancestor(self, *, ancestor: str, descendant: str) -> bool: ...
-    def revision_bookmarks(self, *, revision: str) -> tuple[str, ...]: ...
-    def change_id(self, *, revision: str = "@") -> str: ...
-    def is_blank_working_copy(self) -> bool: ...
-    def has_changes(self) -> bool: ...
-    def create_bookmark(self, *, bookmark: str, revision: str) -> None: ...
-    def set_bookmark(self, *, bookmark: str, revision: str) -> None: ...
-    def delete_bookmark(self, *, bookmark: str) -> None: ...
-    def new_change(self, *, revision: str) -> None: ...
-    def commit(self, *, message: str) -> None: ...
-    def discard(self) -> None: ...
-    def rebase_working_copy(self, *, revision: str) -> None: ...
-    def promote_bookmark_to_main(self, *, bookmark: str) -> None: ...
-    def fetch(self, *, main_only: bool = False) -> None: ...
-    def push_bookmark(self, *, bookmark: str) -> None: ...
-    def workspace_names(self) -> frozenset[str]: ...
-    def add_workspace(self, *, name: str, path: Path, revision: str) -> None: ...
-    def forget_workspace(self, *, name: str) -> None: ...
-
-
 def workspace_path_for_project(project: str) -> Path:
     return paths.project_file(paths.workspaces_dir(), project)
-
-
-def assert_safe_workspace_path(path: Path) -> Path:
-    if path.is_symlink():
-        msg = f"refusing to remove symlink workspace path: {path}"
-        raise ValueError(msg)
-
-    root = paths.workspaces_dir().resolve()
-    target = path.resolve()
-    if target.parent != root:
-        msg = (
-            f"refusing to remove {target}: "
-            f"not a project workspace directly under {root}"
-        )
-        raise ValueError(msg)
-    return target
 
 
 _COMMIT_ID = re.compile(r"[0-9a-f]{40,64}")
@@ -118,12 +65,9 @@ class JjRepository:
             error=RevisionError,
         )
 
-    def _log(self, revision: str, template: str, *, read_only: bool = False) -> str:
+    def _log(self, revision: str, template: str) -> str:
         """Render *template* for each commit in *revision*; returns jj's stdout."""
-        prefix = _READ_ONLY if read_only else ()
-        return self._run(
-            [*prefix, "log", "-r", revision, "--no-graph", "-T", template]
-        ).stdout
+        return self._run(["log", "-r", revision, "--no-graph", "-T", template]).stdout
 
     def bookmark_exists(self, *, bookmark: str) -> bool:
         result = self._run(
@@ -136,11 +80,7 @@ class JjRepository:
                 bookmark,
             ]
         )
-        listed = _lines(result.stdout)
-        if any(name != bookmark for name in listed):
-            msg = f"Unexpected bookmark listing for {bookmark}"
-            raise RevisionError(msg)
-        return bool(listed)
+        return bool(_lines(result.stdout))
 
     def bookmark_conflicted(self, *, bookmark: str) -> bool:
         result = self._run(
@@ -162,36 +102,30 @@ class JjRepository:
             raise RevisionError(msg)
         return states == ["true"]
 
-    def resolve_revision(self, *, revision: str, read_only: bool = False) -> str:
-        output = self._log(revision, 'commit_id ++ "\\n"', read_only=read_only)
+    def resolve_revision(self, *, revision: str) -> str:
+        output = self._log(revision, 'commit_id ++ "\\n"')
         return _exact_commit(output, revision=revision)
 
-    def revision_file(self, *, revision: str, filename: str) -> RevisionFile:
-        commit_id = self.resolve_revision(revision=revision, read_only=True)
-        result = self._run(
+    def has_regular_file(self, *, revision: str, filename: str) -> bool:
+        """Whether *filename* at the repository root is a regular file in *revision*.
+
+        Reads without snapshotting the working copy. An absent path and a
+        directory both list nothing, so neither counts. Raises RevisionError
+        when *revision* names no commit or several.
+        """
+        listing = self._run(
             [
                 *_READ_ONLY,
                 "file",
                 "list",
                 "-r",
-                commit_id,
+                revision,
                 "-T",
                 'file_type ++ "\\n"',
                 f"root-file:{filename}",
             ]
-        )
-        kinds = result.stdout.splitlines()
-        if kinds not in (
-            [],
-            ["file"],
-            ["symlink"],
-            ["tree"],
-            ["git-submodule"],
-            ["conflict"],
-        ):
-            msg = "Unexpected revision file listing"
-            raise RevisionError(msg)
-        return RevisionFile(commit_id=commit_id, is_regular=kinds == ["file"])
+        ).stdout
+        return listing.splitlines() == ["file"]
 
     def same_revision(self, *, left: str, right: str) -> bool:
         return self.resolve_revision(revision=left) == self.resolve_revision(
@@ -235,11 +169,15 @@ class JjRepository:
     def has_changes(self) -> bool:
         return bool(self._run(["diff", "--summary"]).stdout.strip())
 
-    def create_bookmark(self, *, bookmark: str, revision: str) -> None:
-        self._run(["bookmark", "create", bookmark, "-r", revision])
+    def set_bookmark(
+        self, *, bookmark: str, revision: str, allow_backwards: bool = False
+    ) -> None:
+        """Create or move *bookmark* to *revision*.
 
-    def set_bookmark(self, *, bookmark: str, revision: str) -> None:
-        self._run(["bookmark", "set", bookmark, "-r", revision])
+        A backwards or sideways move needs *allow_backwards*.
+        """
+        backwards = ["--allow-backwards"] if allow_backwards else []
+        self._run(["bookmark", "set", bookmark, "-r", revision, *backwards])
 
     def delete_bookmark(self, *, bookmark: str) -> None:
         self._run(["bookmark", "delete", bookmark])
@@ -259,11 +197,11 @@ class JjRepository:
     def promote_bookmark_to_main(self, *, bookmark: str) -> None:
         self._run(["bookmark", "set", "main", "-r", bookmark])
 
-    def fetch(self, *, main_only: bool = False) -> None:
-        arguments = ["git", "fetch", "--remote", "origin"]
-        if main_only:
-            arguments.extend(["--branch", "main"])
-        self._run(arguments, timeout=120)
+    def fetch(self) -> None:
+        """Fetch main from origin."""
+        self._run(
+            ["git", "fetch", "--remote", "origin", "--branch", "main"], timeout=120
+        )
 
     def push_bookmark(self, *, bookmark: str) -> None:
         self._run(
@@ -272,11 +210,7 @@ class JjRepository:
 
     def workspace_names(self) -> frozenset[str]:
         result = self._run(["workspace", "list", "-T", 'name ++ "\\n"'])
-        names = _lines(result.stdout)
-        if len(names) != len(set(names)):
-            msg = "Unexpected duplicate workspace listing"
-            raise RevisionError(msg)
-        return frozenset(names)
+        return frozenset(_lines(result.stdout))
 
     def add_workspace(self, *, name: str, path: Path, revision: str) -> None:
         self._run(["workspace", "add", "--name", name, str(path), "-r", revision])

@@ -157,9 +157,7 @@ class TestSharedCommandPrerequisites:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         request.getfixturevalue(deps_fixture)
-        monkeypatch.setattr(
-            "maintenance_man.vcs_workflow.require_tool", missing_tool("jj")
-        )
+        monkeypatch.setattr("maintenance_man.cli.require_tool", missing_tool("jj"))
         refuse_jj_commands(monkeypatch)
 
         assert run_mm(command, "vulnerable") == 1
@@ -366,7 +364,7 @@ class TestUpdatePreChecks:
         write_config(mm_home, "[defaults]\nmin_version_age_days = 7\n")
 
         monkeypatch.setattr(
-            "maintenance_man.vcs_workflow.require_tool",
+            "maintenance_man.cli.require_tool",
             missing_tool("jj"),
         )
 
@@ -843,7 +841,7 @@ class TestUpdateTargetSelection:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         monkeypatch.setattr(
-            "maintenance_man.vcs_workflow.require_tool",
+            "maintenance_man.cli.require_tool",
             missing_tool("jj"),
         )
 

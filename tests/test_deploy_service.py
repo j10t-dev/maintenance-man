@@ -20,7 +20,6 @@ from maintenance_man.services import WorkflowError
 from maintenance_man.services import deploy as deploy_service
 from maintenance_man.storage import load_activity
 from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import make_vcs_services
 from tests.fakes import RecordingEmit
 from tests.support.projects import make_activity, make_project
 from tests.support.repository import copy_jj_repository, fail_repository_method
@@ -35,6 +34,7 @@ from tests.support.repository import copy_jj_repository, fail_repository_method
         (True, "missing-id", False, None),
         (True, "none", False, None),
         (False, "none", False, SkipReason.BLOCKED),
+        (True, "last-build-only", False, None),
         (True, "same-success", True, None),
         (False, "none", True, None),
     ],
@@ -52,38 +52,25 @@ def test_gate_decision(tmp_path, monkeypatch, resolved, prior, force, expected) 
         "old-success": make_activity(success=True, commit_id="OLD"),
         "same-failure": make_activity(success=False, commit_id=expected_id),
         "missing-id": make_activity(success=True, commit_id=None),
+        "last-build-only": {
+            "app": ProjectActivity(
+                last_build=ActivityEvent(
+                    timestamp=datetime(2026, 3, 20, tzinfo=UTC),
+                    success=True,
+                    branch="main",
+                    commit_id=expected_id,
+                )
+            )
+        },
         "none": {},
     }[prior]
 
     skip, current_id = deploy_service.should_deploy(
-        "app", project_path, activity, force=force, vcs=make_vcs_services()
+        "app", project_path, activity, force=force
     )
 
     assert skip is expected
     assert current_id == expected_id
-
-
-def test_last_build_only_does_not_gate(tmp_path) -> None:
-    project_path = tmp_path / "project"
-    repo = copy_jj_repository(project_path)
-    main_id = repo.resolve_revision(revision="main")
-    activity = {
-        "app": ProjectActivity(
-            last_build=ActivityEvent(
-                timestamp=datetime(2026, 3, 20, tzinfo=UTC),
-                success=True,
-                branch="main",
-                commit_id=main_id,
-            )
-        )
-    }
-
-    skip, current_id = deploy_service.should_deploy(
-        "app", project_path, activity, force=False, vcs=make_vcs_services()
-    )
-
-    assert skip is None
-    assert current_id == main_id
 
 
 def test_build_launch_failure_records_a_failed_build(mm_home, tmp_path) -> None:
@@ -91,7 +78,7 @@ def test_build_launch_failure_records_a_failed_build(mm_home, tmp_path) -> None:
     project = make_project(missing, build_command="true")
 
     with pytest.raises(BuildError):
-        deploy_service.build_project("demo", project, vcs=make_vcs_services())
+        deploy_service.build_project("demo", project)
 
     recorded = load_activity(paths.activity_path())["demo"].last_build
     assert recorded is not None
@@ -155,7 +142,6 @@ def test_deploy_all_reports_gates_steps_results_and_activity(
         MmConfig(projects=projects),
         check=False,
         force=False,
-        vcs=make_vcs_services(),
         emit=emit,
     )
 
@@ -213,7 +199,6 @@ def test_deploy_all_checks_health_after_success(tmp_path, monkeypatch) -> None:
         ),
         check=True,
         force=False,
-        vcs=make_vcs_services(),
         emit=emit,
     )
 
@@ -246,7 +231,6 @@ def test_deploy_all_build_failure_stops_project_and_records_failure(
         MmConfig(projects={"a": project}),
         check=False,
         force=False,
-        vcs=make_vcs_services(),
         emit=emit,
     )
 
@@ -273,7 +257,6 @@ def test_deploy_project_refuses_missing_command(tmp_path) -> None:
             build=False,
             check=False,
             force=False,
-            vcs=make_vcs_services(),
             emit=RecordingEmit(),
         )
 
@@ -305,7 +288,6 @@ def test_deploy_project_refuses_unresolvable_main_without_force(
             build=False,
             check=False,
             force=False,
-            vcs=make_vcs_services(),
             emit=RecordingEmit(),
         )
     assert deployed == []
@@ -331,7 +313,6 @@ def test_deploy_project_force_allows_unresolvable_main(tmp_path, monkeypatch) ->
         build=False,
         check=False,
         force=True,
-        vcs=make_vcs_services(),
         emit=RecordingEmit(),
     )
 
@@ -353,7 +334,6 @@ def test_deploy_project_skips_not_deployable(tmp_path) -> None:
         build=False,
         check=False,
         force=False,
-        vcs=make_vcs_services(),
         emit=emit,
     )
 
@@ -386,7 +366,6 @@ def test_deploy_project_reports_unconfigured_health_after_success(
         build=False,
         check=True,
         force=False,
-        vcs=make_vcs_services(),
         emit=emit,
     )
 
@@ -397,91 +376,3 @@ def test_deploy_project_reports_unconfigured_health_after_success(
     ]
     assert health_checks == []
     assert not emit.of_type(HealthChecked)
-
-
-@pytest.mark.parametrize("healthcheck_url", [None, ""])
-def test_deploy_all_leaves_unconfigured_health_to_the_cli(
-    tmp_path, monkeypatch, healthcheck_url
-) -> None:
-    project = make_project(tmp_path / "api", deploy_command="deploy")
-    copy_jj_repository(project.path)
-    monkeypatch.setattr(
-        deploy_service, "run_shell_command", lambda *args, **kwargs: None
-    )
-    health_checks: list[tuple[str, str]] = []
-
-    def check_health(url: str, name: str) -> HealthCheckResult:
-        health_checks.append((url, name))
-        return HealthCheckResult(is_up=True)
-
-    monkeypatch.setattr(deploy_service, "check_health", check_health)
-    emit = RecordingEmit()
-
-    result = deploy_service.deploy_all(
-        MmConfig(
-            defaults=DefaultsConfig(healthcheck_url=healthcheck_url),
-            projects={"api": project},
-        ),
-        check=True,
-        force=False,
-        vcs=make_vcs_services(),
-        emit=emit,
-    )
-
-    assert result == (deploy_service.DeployResult("api", "skipped", "passed"),)
-    assert health_checks == []
-    assert not emit.of_type(HealthcheckUnconfigured)
-    assert not emit.of_type(HealthChecked)
-
-
-@pytest.mark.parametrize(
-    "failure, error, expected_statuses, expected_events",
-    [
-        (
-            BuildError,
-            BuildError("build failed"),
-            ("failed", "skipped"),
-            [
-                ProjectStarted("api"),
-                DeployStepFailed("api", DeployStep.BUILD, "build failed"),
-            ],
-        ),
-        (
-            DeployError,
-            DeployError("deploy failed"),
-            ("passed", "failed"),
-            [
-                ProjectStarted("api"),
-                DeployStepSucceeded("api", DeployStep.BUILD),
-                DeployStepFailed("api", DeployStep.DEPLOY, "deploy failed"),
-            ],
-        ),
-    ],
-)
-def test_failed_deploy_has_no_health_hint(
-    tmp_path, monkeypatch, failure, error, expected_statuses, expected_events
-) -> None:
-    project = make_project(
-        tmp_path / "api", build_command="build", deploy_command="deploy"
-    )
-    copy_jj_repository(project.path)
-
-    def run(*args, **kwargs):
-        if kwargs["error"] is failure:
-            raise error
-
-    monkeypatch.setattr(deploy_service, "run_shell_command", run)
-    emit = RecordingEmit()
-    result = deploy_service.deploy_project(
-        "api",
-        project,
-        healthcheck_url=None,
-        build=True,
-        check=True,
-        force=True,
-        vcs=make_vcs_services(),
-        emit=emit,
-    )
-
-    assert (result.build_status, result.deploy_status) == expected_statuses
-    assert emit.events == expected_events

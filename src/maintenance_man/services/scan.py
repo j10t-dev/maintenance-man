@@ -18,8 +18,8 @@ from maintenance_man.models.scan import ScanResult
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import ScanError, scan_project
-from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import VcsServices, sync_main
+from maintenance_man.vcs import JjRepository, RevisionError
+from maintenance_man.vcs_workflow import sync_main
 
 SCAN_ERRORS = (
     ScanError,
@@ -92,7 +92,6 @@ def sync_projects(
     cfg: MmConfig,
     names: Sequence[str],
     *,
-    vcs: VcsServices,
     emit: Emit,
 ) -> Outcome:
     targets = ordered_unique_project_names(cfg, names) or sorted(cfg.projects)
@@ -104,7 +103,7 @@ def sync_projects(
             failed = True
             continue
         try:
-            action = sync_main(repo=vcs.repository(project.path))
+            action = sync_main(repo=JjRepository(project.path))
         except RevisionError as exc:
             emit(OperationFailed("sync", name, str(exc)))
             failed = True

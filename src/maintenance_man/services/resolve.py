@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from maintenance_man.gradle import validate_gradle_recovery
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
@@ -26,21 +24,15 @@ from maintenance_man.storage import save_scan_results
 from maintenance_man.updater import (
     Finding,
     group_findings,
-    is_eligible,
     process_findings,
     run_test_phases,
 )
-from maintenance_man.vcs import Repository, RevisionError
-from maintenance_man.vcs_workflow import VcsServices, ensure_main_bookmark
+from maintenance_man.vcs import JjRepository, RevisionError
+from maintenance_man.vcs_workflow import ensure_main_bookmark
 
 
 def resolve_project(
-    name: str,
-    project: ProjectConfig,
-    *,
-    continue_: bool,
-    vcs: VcsServices,
-    emit: Emit,
+    name: str, project: ProjectConfig, *, continue_: bool, emit: Emit
 ) -> Outcome:
     scan_result = flows.load_validated_scan(name, project, Workflow.RESOLVE, emit=emit)
     if scan_result is None:
@@ -48,63 +40,53 @@ def resolve_project(
     if flows.report_missing_test_config(name, project, emit=emit):
         return Outcome.FAILED
     if continue_:
-        return _handle_continue(name, project, scan_result, vcs=vcs, emit=emit)
+        return _handle_continue(name, project, scan_result, emit=emit)
     _refuse_mixed_ownership(name, scan_result)
-    if any(
-        flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
-        for finding in scan_result.findings
-    ):
+    if flows.has_owned(scan_result, Workflow.RESOLVE, UpdateStatus.FAILED):
         msg = f"resolve already paused for {name} — rerun with --continue"
         raise WorkflowError(msg)
+    takes_over = flows.has_owned(
+        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
+    )
+    if not takes_over and not flows.has_work(scan_result, Workflow.RESOLVE):
+        _report_blocked(scan_result.blocked_findings, emit=emit)
+        return Outcome.SUCCEEDED
 
-    repo = vcs.repository(project.path)
+    repo = JjRepository(project.path)
     try:
         ensure_main_bookmark(repo=repo)
     except RevisionError as exc:
         raise WorkflowError(str(exc)) from exc
-    if _has_update_progress(scan_result):
+    if takes_over:
         _take_over_update_progress(name, repo, scan_result)
-        candidates = _select_resolve_candidates(scan_result)
-    else:
-        candidates = _select_resolve_candidates(scan_result)
-        if not _prepare_resolve_bookmark(
-            name,
-            project.path,
-            scan_result,
-            candidates,
-            vcs=vcs,
-            emit=emit,
-        ):
-            msg = f"aborted resolve for {name}"
-            raise WorkflowError(msg)
-    return _run_candidates(name, project, scan_result, candidates, vcs=vcs, emit=emit)
+    candidates = _select_resolve_candidates(scan_result)
+    if not takes_over and not _prepare_resolve_bookmark(
+        name, repo, scan_result, candidates, emit=emit
+    ):
+        msg = f"aborted resolve for {name}"
+        raise WorkflowError(msg)
+    return _run_candidates(name, project, scan_result, candidates, emit=emit)
 
 
 def _select_resolve_candidates(scan_result: ScanResult) -> list[Finding]:
     vulns = [
         finding
         for finding in scan_result.vulnerabilities
-        if _is_resolve_candidate(finding)
+        if flows.is_candidate(finding, Workflow.RESOLVE)
     ]
     updates = [
-        finding for finding in scan_result.updates if _is_resolve_candidate(finding)
+        finding
+        for finding in scan_result.updates
+        if flows.is_candidate(finding, Workflow.RESOLVE)
     ]
     return group_findings([*vulns, *updates])
 
 
-def _is_resolve_candidate(finding: VulnFinding | UpdateFinding) -> bool:
-    return is_eligible(finding) and (
-        finding.update_status is None
-        or flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
-    )
-
-
 def _refuse_mixed_ownership(name: str, scan_result: ScanResult) -> None:
-    if _has_update_progress(scan_result) and any(
-        flows.is_owned(
-            finding, Workflow.RESOLVE, UpdateStatus.READY, UpdateStatus.FAILED
-        )
-        for finding in scan_result.findings
+    if flows.has_owned(
+        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
+    ) and flows.has_owned(
+        scan_result, Workflow.RESOLVE, UpdateStatus.READY, UpdateStatus.FAILED
     ):
         msg = (
             "Resolve cannot take over pending updates while resolve progress also "
@@ -113,17 +95,8 @@ def _refuse_mixed_ownership(name: str, scan_result: ScanResult) -> None:
         raise WorkflowError(msg)
 
 
-def _has_update_progress(scan_result: ScanResult) -> bool:
-    return any(
-        flows.is_owned(
-            finding, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
-        )
-        for finding in scan_result.findings
-    )
-
-
 def _take_over_update_progress(
-    name: str, repo: Repository, scan_result: ScanResult
+    name: str, repo: JjRepository, scan_result: ScanResult
 ) -> None:
     """Move the accepted update tip and every update-owned row to resolve.
 
@@ -135,13 +108,9 @@ def _take_over_update_progress(
     update_bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
     resolve_bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
     try:
-        if repo.has_changes():
-            msg = (
-                "Resolve cannot take over pending updates while "
-                f"{repo.path} has uncommitted changes. Commit or discard them, "
-                f"then run mm resolve {name} again."
-            )
-            raise WorkflowError(msg)
+        _require_clean_working_copy(
+            name, repo, "Resolve cannot take over pending updates"
+        )
         if not repo.bookmark_exists(bookmark=update_bookmark):
             msg = (
                 "Resolve cannot take over pending updates: bookmark "
@@ -149,9 +118,9 @@ def _take_over_update_progress(
                 "from main."
             )
             raise WorkflowError(msg)
-        if repo.bookmark_exists(bookmark=resolve_bookmark):
-            repo.delete_bookmark(bookmark=resolve_bookmark)
-        repo.create_bookmark(bookmark=resolve_bookmark, revision=update_bookmark)
+        repo.set_bookmark(
+            bookmark=resolve_bookmark, revision=update_bookmark, allow_backwards=True
+        )
         repo.new_change(revision=resolve_bookmark)
         for finding in scan_result.findings:
             if finding.flow is Workflow.UPDATE:
@@ -166,22 +135,27 @@ def _take_over_update_progress(
         raise WorkflowError(msg) from exc
 
 
+def _require_clean_working_copy(name: str, repo: JjRepository, action: str) -> None:
+    """Refuse to move the source working copy while it holds uncommitted changes."""
+    if repo.has_changes():
+        msg = (
+            f"{action} while {repo.path} has uncommitted changes. Commit or discard "
+            f"them, then run mm resolve {name} again."
+        )
+        raise WorkflowError(msg)
+
+
 def _prepare_resolve_bookmark(
     name: str,
-    project_path: Path,
+    repo: JjRepository,
     scan_result: ScanResult,
     candidates: list[Finding],
     *,
-    vcs: VcsServices,
     emit: Emit,
 ) -> bool:
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
-    repo = vcs.repository(project_path)
     try:
-        if any(
-            flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.READY)
-            for finding in scan_result.findings
-        ):
+        if flows.has_owned(scan_result, Workflow.RESOLVE, UpdateStatus.READY):
             if not repo.bookmark_exists(bookmark=bookmark):
                 msg = (
                     f"resolve bookmark '{bookmark}' is missing but in-progress "
@@ -189,12 +163,11 @@ def _prepare_resolve_bookmark(
                 )
                 raise WorkflowError(msg)
             if candidates:
+                _require_clean_working_copy(name, repo, "Resolve cannot start")
                 repo.new_change(revision=bookmark)
             return True
-
-        if repo.bookmark_exists(bookmark=bookmark):
-            repo.delete_bookmark(bookmark=bookmark)
-        repo.create_bookmark(bookmark=bookmark, revision="main")
+        _require_clean_working_copy(name, repo, "Resolve cannot start")
+        repo.set_bookmark(bookmark=bookmark, revision="main", allow_backwards=True)
         repo.new_change(revision=bookmark)
     except RevisionError as exc:
         emit(OperationFailed("resolve setup", name, str(exc)))
@@ -208,7 +181,6 @@ def _run_candidates(
     scan_result: ScanResult,
     candidates: list[Finding],
     *,
-    vcs: VcsServices,
     emit: Emit,
 ) -> Outcome:
     blocked_before_run = scan_result.blocked_findings
@@ -217,38 +189,29 @@ def _run_candidates(
         project,
         flow=Workflow.RESOLVE,
         scan_result=scan_result,
-        on_failure="stop",
-        vcs=vcs,
         emit=emit,
     )
-    if any(not result.passed for result in results) or any(
-        flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
-        for finding in scan_result.findings
+    if any(not result.passed for result in results) or flows.has_owned(
+        scan_result, Workflow.RESOLVE, UpdateStatus.FAILED
     ):
         emit(ResolvePaused(name))
         return Outcome.FAILED
+    _report_blocked(blocked_before_run, emit=emit)
+    return flows.finalise_local_changes(
+        project.path, scan_result, name, Workflow.RESOLVE, emit=emit
+    )
 
-    if blocked_before_run:
+
+def _report_blocked(findings: list[VulnFinding | UpdateFinding], *, emit: Emit) -> None:
+    if findings:
         emit(
             FindingsBlocked(
                 tuple(
                     (finding.pkg_name, finding.blocked_reason or "")
-                    for finding in blocked_before_run
+                    for finding in findings
                 )
             )
         )
-    if not any(
-        flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.READY)
-        for finding in scan_result.findings
-    ):
-        return Outcome.SUCCEEDED
-    return (
-        Outcome.SUCCEEDED
-        if flows.finalise_local_changes(
-            project.path, scan_result, name, Workflow.RESOLVE, vcs=vcs, emit=emit
-        )
-        else Outcome.FAILED
-    )
 
 
 def _handle_continue(
@@ -256,11 +219,12 @@ def _handle_continue(
     project: ProjectConfig,
     scan_result: ScanResult,
     *,
-    vcs: VcsServices,
     emit: Emit,
 ) -> Outcome:
     _refuse_mixed_ownership(name, scan_result)
-    if _has_update_progress(scan_result):
+    if flows.has_owned(
+        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
+    ):
         msg = (
             f"Pending update work exists for {name}. Run mm resolve {name} "
             "without --continue to take it over first."
@@ -279,7 +243,7 @@ def _handle_continue(
             f"{name} to start resolving."
         )
         raise WorkflowError(msg)
-    repo = vcs.repository(project.path)
+    repo = JjRepository(project.path)
     repair_base = _check_resumable(
         name,
         repo,
@@ -301,13 +265,12 @@ def _handle_continue(
         project,
         scan_result,
         _select_resolve_candidates(scan_result),
-        vcs=vcs,
         emit=emit,
     )
 
 
 def _check_resumable(
-    name: str, repo: Repository, bookmark: str, saved: str | None
+    name: str, repo: JjRepository, bookmark: str, saved: str | None
 ) -> str:
     try:
         repair_base = saved or repo.resolve_revision(revision=bookmark)
@@ -340,7 +303,7 @@ def _retest_blockers(
     failed: list[Finding],
     *,
     repair_base: str,
-    repo: Repository,
+    repo: JjRepository,
     emit: Emit,
 ) -> bool:
     if not _repair_sets_saved_targets(project, failed, emit=emit):

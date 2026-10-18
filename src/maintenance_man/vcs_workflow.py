@@ -1,27 +1,10 @@
 import shutil
-from collections.abc import Callable
-from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 from maintenance_man import vcs
 from maintenance_man.paths import sanitise_project_name
-from maintenance_man.process import require_tool
-from maintenance_man.vcs import (
-    JJ_INSTALL_HINT,
-    JjRepository,
-    Repository,
-    RevisionError,
-)
-
-
-def require_vcs_tools() -> None:
-    require_tool("jj", JJ_INSTALL_HINT)
-
-
-@dataclass(frozen=True, slots=True)
-class VcsServices:
-    repository: Callable[[Path], Repository]
+from maintenance_man.vcs import JjRepository, RevisionError
 
 
 class SyncAction(StrEnum):
@@ -30,18 +13,14 @@ class SyncAction(StrEnum):
     PUSHED = "pushed to remote"
 
 
-def make_vcs_services() -> VcsServices:
-    return VcsServices(repository=JjRepository)
-
-
-def ensure_main_bookmark(*, repo: Repository) -> None:
+def ensure_main_bookmark(*, repo: JjRepository) -> None:
     if repo.bookmark_exists(bookmark="main"):
         return
     repo.resolve_revision(revision="main@origin")
     repo.set_bookmark(bookmark="main", revision="main@origin")
 
 
-def refresh_working_copy_from_main(*, repo: Repository) -> None:
+def refresh_working_copy_from_main(*, repo: JjRepository) -> None:
     if repo.is_ancestor(ancestor="main", descendant="@"):
         return
     if repo.is_blank_working_copy():
@@ -50,8 +29,8 @@ def refresh_working_copy_from_main(*, repo: Repository) -> None:
     repo.new_change(revision="main")
 
 
-def sync_main(*, repo: Repository) -> SyncAction:
-    repo.fetch(main_only=True)
+def sync_main(*, repo: JjRepository) -> SyncAction:
+    repo.fetch()
     ensure_main_bookmark(repo=repo)
     if repo.bookmark_conflicted(bookmark="main"):
         msg = (
@@ -71,7 +50,7 @@ def sync_main(*, repo: Repository) -> SyncAction:
 
     if repo.is_ancestor(ancestor="main@origin", descendant="main"):
         repo.push_bookmark(bookmark="main")
-        repo.fetch(main_only=True)
+        repo.fetch()
         if not repo.same_revision(left="main", right="main@origin"):
             msg = "pushed main but origin/main did not update to match"
             raise RevisionError(msg)
@@ -82,7 +61,7 @@ def sync_main(*, repo: Repository) -> SyncAction:
     raise RevisionError(msg)
 
 
-def current_label(*, repo: Repository) -> str:
+def current_label(*, repo: JjRepository) -> str:
     try:
         current = repo.revision_bookmarks(revision="@")
         if current:
@@ -101,13 +80,13 @@ def _workspace_name(project: str) -> str:
 
 def _safe_workspace_path(project: str) -> Path:
     try:
-        return vcs.assert_safe_workspace_path(vcs.workspace_path_for_project(project))
+        return vcs.workspace_path_for_project(project)
     except (OSError, ValueError) as exc:
         msg = f"Cannot inspect workspace path: {exc}"
         raise RevisionError(msg) from exc
 
 
-def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
+def create_workspace(*, repo: JjRepository, project: str, revision: str) -> Path:
     workspace_path = _safe_workspace_path(project)
     try:
         workspace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +99,7 @@ def create_workspace(*, repo: Repository, project: str, revision: str) -> Path:
     return workspace_path
 
 
-def remove_workspace(*, repo: Repository, project: str) -> None:
+def remove_workspace(*, repo: JjRepository, project: str) -> None:
     names = repo.workspace_names()
     workspace_name = _workspace_name(project)
     workspace_path = _safe_workspace_path(project)

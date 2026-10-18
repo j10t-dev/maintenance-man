@@ -26,8 +26,8 @@ from maintenance_man.models.events import (
 from maintenance_man.process import run_shell_command
 from maintenance_man.services import WorkflowError
 from maintenance_man.storage import load_activity, record_activity
-from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import VcsServices, current_label
+from maintenance_man.vcs import JjRepository, RevisionError
+from maintenance_man.vcs_workflow import current_label
 
 
 @dataclass(slots=True)
@@ -45,7 +45,6 @@ def deploy_project(
     build: bool,
     check: bool,
     force: bool,
-    vcs: VcsServices,
     emit: Emit,
 ) -> DeployResult:
     if not project.deployable:
@@ -63,7 +62,6 @@ def deploy_project(
         project.path,
         load_activity(paths.activity_path()),
         force=force,
-        vcs=vcs,
     )
     if skip is SkipReason.UNCHANGED:
         emit(ProjectSkipped(name, SkipReason.UNCHANGED))
@@ -82,7 +80,6 @@ def deploy_project(
         current_id,
         build=build,
         healthcheck_url=healthcheck_url if check else None,
-        vcs=vcs,
         emit=emit,
     )
     if result.deploy_status == "passed" and check and not healthcheck_url:
@@ -95,7 +92,6 @@ def deploy_all(
     *,
     check: bool,
     force: bool,
-    vcs: VcsServices,
     emit: Emit,
 ) -> tuple[DeployResult, ...]:
     activity = load_activity(paths.activity_path())
@@ -114,9 +110,7 @@ def deploy_all(
             results.append(DeployResult(name, "skipped", "failed"))
             continue
 
-        skip, current_id = should_deploy(
-            name, project.path, activity, force=force, vcs=vcs
-        )
+        skip, current_id = should_deploy(name, project.path, activity, force=force)
         if skip is not None:
             emit(ProjectSkipped(name, skip))
             status = "unchanged" if skip is SkipReason.UNCHANGED else "blocked"
@@ -131,7 +125,6 @@ def deploy_all(
                 current_id,
                 build=True,
                 healthcheck_url=healthcheck_url,
-                vcs=vcs,
                 emit=emit,
             )
         )
@@ -145,11 +138,10 @@ def should_deploy(
     activity: Mapping[str, ProjectActivity],
     *,
     force: bool,
-    vcs: VcsServices,
 ) -> tuple[Literal[SkipReason.UNCHANGED, SkipReason.BLOCKED] | None, str | None]:
     """Return why the deploy is skipped (None to deploy) and the main revision used."""
     try:
-        current_id = vcs.repository(project_path).resolve_revision(revision="main")
+        current_id = JjRepository(project_path).resolve_revision(revision="main")
     except RevisionError:
         current_id = None
 
@@ -165,66 +157,42 @@ def should_deploy(
     return None, current_id
 
 
-def _record_activity(
-    project: str,
-    event_type: Literal["build", "deploy"],
-    *,
-    success: bool,
-    project_path: Path,
-    commit_id: str | None = None,
-    vcs: VcsServices,
-) -> None:
-    record_activity(
-        paths.activity_path(),
-        project,
-        event_type,
-        success=success,
-        branch=current_label(repo=vcs.repository(project_path)),
-        commit_id=commit_id,
-    )
-
-
-def build_project(name: str, project: ProjectConfig, *, vcs: VcsServices) -> None:
+def build_project(name: str, project: ProjectConfig) -> None:
     """Run a configured build and record its result."""
-    _run_recorded(name, project, "build", None, vcs=vcs)
+    _run_recorded(name, project, DeployStep.BUILD, None)
 
 
 def _run_recorded(
-    name: str,
-    project: ProjectConfig,
-    kind: Literal["build", "deploy"],
-    commit_id: str | None,
-    *,
-    vcs: VcsServices,
+    name: str, project: ProjectConfig, step: DeployStep, commit_id: str | None
 ) -> None:
-    command = project.build_command if kind == "build" else project.deploy_command
+    """Run the step's configured command and record its result; a failure is
+    recorded, then re-raised. An interrupt records nothing."""
+    build = step is DeployStep.BUILD
+    command = project.build_command if build else project.deploy_command
     assert command is not None
-    error = BuildError if kind == "build" else DeployError
+
+    def record(success: bool) -> None:
+        record_activity(
+            paths.activity_path(),
+            name,
+            "build" if build else "deploy",
+            success=success,
+            branch=current_label(repo=JjRepository(project.path)),
+            commit_id=commit_id if success and not build else None,
+        )
+
     try:
         run_shell_command(
             command,
             project.path,
             timeout=600,
-            label=f"{kind.capitalize()} for {name}",
-            error=error,
+            label=f"{'Build' if build else 'Deploy'} for {name}",
+            error=BuildError if build else DeployError,
         )
     except BuildError, DeployError:
-        _record_activity(
-            name,
-            kind,
-            success=False,
-            project_path=project.path,
-            vcs=vcs,
-        )
+        record(False)
         raise
-    _record_activity(
-        name,
-        kind,
-        success=True,
-        project_path=project.path,
-        commit_id=commit_id if kind == "deploy" else None,
-        vcs=vcs,
-    )
+    record(True)
 
 
 def _run_steps(
@@ -234,13 +202,12 @@ def _run_steps(
     *,
     build: bool,
     healthcheck_url: str | None,
-    vcs: VcsServices,
     emit: Emit,
 ) -> DeployResult:
     build_status: Literal["passed", "failed", "skipped"] = "skipped"
     if build and project.build_command:
         try:
-            build_project(name, project, vcs=vcs)
+            build_project(name, project)
         except BuildError as exc:
             emit(DeployStepFailed(name, DeployStep.BUILD, str(exc)))
             return DeployResult(name, "failed", "skipped")
@@ -248,7 +215,7 @@ def _run_steps(
         emit(DeployStepSucceeded(name, DeployStep.BUILD))
 
     try:
-        _run_recorded(name, project, "deploy", commit_id, vcs=vcs)
+        _run_recorded(name, project, DeployStep.DEPLOY, commit_id)
     except DeployError as exc:
         emit(DeployStepFailed(name, DeployStep.DEPLOY, str(exc)))
         return DeployResult(name, build_status, "failed")

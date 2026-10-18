@@ -3,7 +3,7 @@ import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 
 from maintenance_man import gradle
 from maintenance_man.gradle import GradleError
@@ -38,10 +38,7 @@ from maintenance_man.package_managers import (
 )
 from maintenance_man.process import ProcessError, run_logged, run_shell_command
 from maintenance_man.storage import save_scan_results
-from maintenance_man.vcs import Repository, RevisionError
-from maintenance_man.vcs_workflow import VcsServices
-
-FailureStrategy = Literal["continue", "stop"]
+from maintenance_man.vcs import JjRepository, RevisionError
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,12 +74,7 @@ _COMMIT_FORMATS: dict[UpdateKind, str] = {
     "update": "chore: bump {pkg} {old} -> {new} ({detail})",
 }
 
-_RISK_ORDER = {
-    SemverTier.PATCH: 0,
-    SemverTier.MINOR: 1,
-    SemverTier.MAJOR: 2,
-    SemverTier.UNKNOWN: 3,
-}
+_RISK_ORDER = {tier: rank for rank, tier in enumerate(SemverTier)}
 
 
 def _first_non_none(values: Sequence[str | Workflow | None]):
@@ -93,7 +85,7 @@ def _consolidated_lifecycle_state(
     group: Sequence[VulnFinding | UpdateFinding],
 ) -> tuple[UpdateStatus | None, str | None, Workflow | None]:
     """FAILED if any row failed, else READY if any is ready, each with the first
-    such row's phase and flow; COMPLETED when every row completed; else none."""
+    such row's phase and flow; else none."""
     for status in (UpdateStatus.FAILED, UpdateStatus.READY):
         rows = [row for row in group if row.update_status is status]
         if rows:
@@ -102,9 +94,10 @@ def _consolidated_lifecycle_state(
                 _first_non_none([row.failed_phase for row in rows]),
                 _first_non_none([row.flow for row in rows]),
             )
-    if group and all(row.update_status is UpdateStatus.COMPLETED for row in group):
-        return (UpdateStatus.COMPLETED, None, None)
     return (None, None, None)
+
+
+_FANNED_OUT = frozenset({"update_status", "failed_phase", "flow", "blocked_reason"})
 
 
 @dataclass
@@ -114,68 +107,21 @@ class _FindingGroup:
 
     pkg_name: str
     installed_version: str
-    _target_version: str
-    _detail: str
-    _originals: Sequence[VulnFinding | UpdateFinding] = field(repr=False)
+    target_version: str
+    detail: str
+    originals: Sequence[VulnFinding | UpdateFinding] = field(repr=False)
     kind: UpdateKind = "vuln"
     gradle_target: GradleUpdateTarget | None = None
-    _update_status: UpdateStatus | None = None
-    _failed_phase: str | None = None
-    _flow: Workflow | None = None
-    _blocked_reason: str | None = None
+    update_status: UpdateStatus | None = None
+    failed_phase: str | None = None
+    flow: Workflow | None = None
+    blocked_reason: str | None = None
 
-    def __post_init__(self) -> None:
-        self.update_status = self._update_status
-        self.failed_phase = self._failed_phase
-        self.flow = self._flow
-
-    @property
-    def target_version(self) -> str:
-        return self._target_version
-
-    @property
-    def detail(self) -> str:
-        return self._detail
-
-    @property
-    def update_status(self) -> UpdateStatus | None:
-        return self._update_status
-
-    @update_status.setter
-    def update_status(self, value: UpdateStatus | None) -> None:
-        self._update_status = value
-        for orig in self._originals:
-            orig.update_status = value
-
-    @property
-    def failed_phase(self) -> str | None:
-        return self._failed_phase
-
-    @failed_phase.setter
-    def failed_phase(self, value: str | None) -> None:
-        self._failed_phase = value
-        for orig in self._originals:
-            orig.failed_phase = value
-
-    @property
-    def flow(self) -> Workflow | None:
-        return self._flow
-
-    @flow.setter
-    def flow(self, value: Workflow | None) -> None:
-        self._flow = value
-        for orig in self._originals:
-            orig.flow = value
-
-    @property
-    def blocked_reason(self) -> str | None:
-        return self._blocked_reason
-
-    @blocked_reason.setter
-    def blocked_reason(self, value: str | None) -> None:
-        self._blocked_reason = value
-        for orig in self._originals:
-            orig.blocked_reason = value
+    def __setattr__(self, name: str, value: object) -> None:
+        super().__setattr__(name, value)
+        if name in _FANNED_OUT:
+            for original in self.originals:
+                setattr(original, name, value)
 
 
 def consolidate_vulns(
@@ -186,39 +132,21 @@ def consolidate_vulns(
     for v in vulns:
         by_pkg.setdefault(v.pkg_name, []).append(v)
 
-    consolidated: list[_FindingGroup] = []
-    for pkg, group in by_pkg.items():
-        best_version = highest_fix_version(group)
-        detail = ", ".join(v.vuln_id for v in group)
-        update_status, failed_phase, flow = _consolidated_lifecycle_state(group)
-        consolidated.append(
-            _FindingGroup(
-                pkg_name=pkg,
-                installed_version=group[0].installed_version,
-                _target_version=best_version,
-                _detail=detail,
-                _originals=group,
-                _update_status=update_status,
-                _failed_phase=failed_phase,
-                _flow=flow,
-            )
+    return [
+        _group(
+            group,
+            pkg_name=pkg,
+            installed_version=group[0].installed_version,
+            target_version=highest_fix_version(group),
+            detail=", ".join(v.vuln_id for v in group),
         )
-    return consolidated
+        for pkg, group in by_pkg.items()
+    ]
 
 
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
     """Sort updates risk-ascending: PATCH < MINOR < MAJOR < UNKNOWN."""
     return sorted(updates, key=lambda u: _RISK_ORDER[u.semver_tier])
-
-
-def _keep_incomplete[F: Finding](findings: list[F]) -> list[F]:
-    return [f for f in findings if f.update_status != UpdateStatus.COMPLETED]
-
-
-def remove_completed_findings(scan_result: ScanResult) -> None:
-    """Remove findings with COMPLETED status from the scan result in place."""
-    scan_result.vulnerabilities = _keep_incomplete(scan_result.vulnerabilities)
-    scan_result.updates = _keep_incomplete(scan_result.updates)
 
 
 def run_test_phases(
@@ -324,23 +252,15 @@ def process_findings(
     project_config: ProjectConfig,
     *,
     flow: Workflow,
-    on_failure: FailureStrategy = "continue",
     scan_result: ScanResult,
-    vcs: VcsServices,
     emit: Emit,
 ) -> list[UpdateResult]:
     """Process findings on the current jj change.
 
-    *on_failure* controls behaviour when an update or test fails:
-
-    * ``"continue"`` — discard changes and move on to the next finding
-      (used by ``mm update``).
-    * ``"stop"`` — preserve changes for debugging and stop processing
-      (used by ``mm resolve``).
+    Update discards a failed finding and continues; resolve keeps it and stops.
     """
     results: list[UpdateResult] = []
-    project_path = Path(project_config.path)
-    repo = vcs.repository(project_path)
+    repo = JjRepository(Path(project_config.path))
     for finding in findings:
         kind = _kind(finding)
         emit(
@@ -379,7 +299,7 @@ def process_findings(
         )
         if step.passed:
             continue
-        if not (on_failure == "continue" and step.discardable and _discard(repo, emit)):
+        if not (flow is Workflow.UPDATE and step.discardable and _discard(repo, emit)):
             break
 
     return results
@@ -394,18 +314,39 @@ def _kind(finding: Finding) -> UpdateKind:
 def _target_group(
     target: GradleUpdateTarget, rows: list[VulnFinding | UpdateFinding]
 ) -> _FindingGroup:
-    update_status, failed_phase, flow = _consolidated_lifecycle_state(rows)
-    return _FindingGroup(
+    return _group(
+        rows,
         pkg_name=target.display_name,
         installed_version=target.members[0].installed_version,
-        _target_version=target.target_version,
-        _detail=", ".join(dict.fromkeys(row.detail for row in rows)),
-        _originals=rows,
+        target_version=target.target_version,
+        detail=", ".join(dict.fromkeys(row.detail for row in rows)),
         kind="vuln" if any(isinstance(row, VulnFinding) for row in rows) else "update",
         gradle_target=target,
-        _update_status=update_status,
-        _failed_phase=failed_phase,
-        _flow=flow,
+    )
+
+
+def _group(
+    rows: Sequence[VulnFinding | UpdateFinding],
+    *,
+    pkg_name: str,
+    installed_version: str,
+    target_version: str,
+    detail: str,
+    kind: UpdateKind = "vuln",
+    gradle_target: GradleUpdateTarget | None = None,
+) -> _FindingGroup:
+    update_status, failed_phase, flow = _consolidated_lifecycle_state(rows)
+    return _FindingGroup(
+        pkg_name=pkg_name,
+        installed_version=installed_version,
+        target_version=target_version,
+        detail=detail,
+        originals=rows,
+        kind=kind,
+        gradle_target=gradle_target,
+        update_status=update_status,
+        failed_phase=failed_phase,
+        flow=flow,
     )
 
 
@@ -435,7 +376,7 @@ def _test_and_commit(
     finding: Finding,
     kind: UpdateKind,
     project_config: ProjectConfig,
-    repo: Repository,
+    repo: JjRepository,
     flow: Workflow,
     emit: Emit,
 ) -> FindingStep:
@@ -466,7 +407,7 @@ def _test_and_commit(
 def _commit_finding(
     finding: Finding,
     kind: UpdateKind,
-    repo: Repository,
+    repo: JjRepository,
     flow: Workflow,
     emit: Emit,
 ) -> FindingStep:
@@ -494,7 +435,7 @@ def _commit_finding(
     return FindingStep(None)
 
 
-def _discard(repo: Repository, emit: Emit) -> bool:
+def _discard(repo: JjRepository, emit: Emit) -> bool:
     try:
         repo.discard()
     except RevisionError as exc:

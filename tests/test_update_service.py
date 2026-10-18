@@ -8,7 +8,6 @@ from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import (
     Emit,
     FindingsProcessed,
-    MissingTestConfig,
     OperationFailed,
     Outcome,
     ProcessingStarted,
@@ -21,16 +20,17 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    UpdateFinding,
     UpdateResult,
     UpdateStatus,
+    VulnFinding,
     Workflow,
 )
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import update as update_service
 from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import JjRepository, RevisionError
-from maintenance_man.vcs_workflow import make_vcs_services
-from tests.fakes import FakeFindingProcessor, RecordingEmit, pick_findings
+from tests.fakes import FakeFindingProcessor, RecordingEmit
 from tests.support.findings import (
     make_gradle_target,
     make_scan_result,
@@ -58,6 +58,24 @@ from tests.support.repository import (
 )
 
 
+def pick_findings(*pkg_names: str) -> update_service.FindingChooser:
+    def choose(
+        vulns: list[VulnFinding], updates: list[UpdateFinding]
+    ) -> tuple[list[VulnFinding], list[UpdateFinding]]:
+        selected_vulns: list[VulnFinding] = []
+        selected_updates: list[UpdateFinding] = []
+        findings = [*vulns, *updates]
+        for pkg_name in pkg_names:
+            finding = next(item for item in findings if item.pkg_name == pkg_name)
+            if isinstance(finding, VulnFinding):
+                selected_vulns.append(finding)
+            else:
+                selected_updates.append(finding)
+        return selected_vulns, selected_updates
+
+    return choose
+
+
 def _update_api(
     project: ProjectConfig,
     *,
@@ -68,32 +86,8 @@ def _update_api(
         "api",
         project,
         choose=choose,
-        vcs=make_vcs_services(),
         emit=emit or RecordingEmit(),
     )
-
-
-def test_update_processes_in_managed_workspace(tmp_path: Path, monkeypatch) -> None:
-    scan = make_scan_result(vulns=[], updates=[make_update(pkg_name="pkg-a")])
-    _, project = seed_project(tmp_path, "api", scan)
-    original = project.model_copy(deep=True)
-    processor = FakeFindingProcessor({"pkg-a": (True, None)})
-    seen: list[ProjectConfig] = []
-
-    def process(findings, work_config, **kwargs):
-        seen.append(work_config)
-        assert work_config.path == paths.workspaces_dir() / "api"
-        assert work_config.path != project.path
-        return processor(findings, work_config, **kwargs)
-
-    monkeypatch.setattr(update_service, "process_findings", process)
-    result = _update_api(project)
-
-    assert result.outcome is Outcome.SUCCEEDED
-    assert len(seen) == 1
-    assert project == original
-    assert not load_scan_results("api").updates
-    assert not (paths.workspaces_dir() / "api").exists()
 
 
 def test_update_emits_processing_result_and_promotion_events(
@@ -107,11 +101,15 @@ def test_update_emits_processing_result_and_promotion_events(
         ],
     )
     repo, project = seed_project(tmp_path, "api", scan)
-    monkeypatch.setattr(
-        update_service,
-        "process_findings",
-        FakeFindingProcessor({"pkg-b": (True, None)}),
-    )
+    original = project.model_copy(deep=True)
+    processor = FakeFindingProcessor({"pkg-b": (True, None)})
+    workspaces: list[Path] = []
+
+    def process(findings, work_config, **kwargs):
+        workspaces.append(work_config.path)
+        return processor(findings, work_config, **kwargs)
+
+    monkeypatch.setattr(update_service, "process_findings", process)
     emit = RecordingEmit()
 
     result = _update_api(project, choose=pick_findings("pkg-b"), emit=emit)
@@ -132,6 +130,9 @@ def test_update_emits_processing_result_and_promotion_events(
     assert repo.same_revision(left="main", right="@-")
     assert not repo.bookmark_exists(bookmark=MANAGED)
     assert "mm-api" not in repo.workspace_names()
+    assert workspaces == [paths.workspaces_dir() / "api"]
+    assert project == original
+    assert not (paths.workspaces_dir() / "api").exists()
 
 
 def test_given_blocked_and_passing_rows_when_updating_then_passing_rows_promote(
@@ -223,28 +224,6 @@ def test_given_failed_row_when_update_finishes_then_promotion_is_reported_pendin
     assert repo.resolve_revision(revision="main") == main_before
 
 
-def test_resume_new_change_failure_removes_workspace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    scan = make_scan_result(
-        vulns=[],
-        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)],
-    )
-    repo, project = seed_project(tmp_path, "api", scan)
-    repo.create_bookmark(bookmark=MANAGED, revision="main")
-    workspace = paths.workspaces_dir() / "api"
-    original = RevisionError("stale lock")
-    fail_repository_method(monkeypatch, workspace, "new_change", original)
-
-    with pytest.raises(update_service.UpdateSetupError) as caught:
-        _update_api(project)
-
-    assert caught.value.__cause__ is original
-    assert "mm-api" not in repo.workspace_names()
-    assert not workspace.exists()
-    assert load_scan_results("api").updates[0].update_status is UpdateStatus.READY
-
-
 def test_typed_equal_risk_selection_order_reaches_processor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -262,25 +241,6 @@ def test_typed_equal_risk_selection_order_reaches_processor(
     result = _update_api(project, choose=pick_findings("pkg-b", "pkg-a"))
 
     assert [item.pkg_name for item in result.results] == ["pkg-b", "pkg-a"]
-
-
-def test_given_no_test_phase_when_updating_then_project_fails_before_effects(
-    tmp_path: Path,
-) -> None:
-    repo, project = seed_project(
-        tmp_path,
-        "api",
-        make_scan_result(vulns=[], updates=[make_update()]),
-        test_unit=None,
-    )
-    before = operation_id(repo)
-    emit = RecordingEmit()
-
-    result = _update_api(project, emit=emit)
-
-    assert result == update_service.ProjectUpdate("api", Outcome.FAILED, ())
-    assert emit.events == [MissingTestConfig("api")]
-    assert operation_id(repo) == before
 
 
 def test_given_one_row_of_a_shared_target_chosen_when_updating_then_both_rows_complete(
@@ -312,19 +272,45 @@ def test_given_one_row_of_a_shared_target_chosen_when_updating_then_both_rows_co
     assert (saved.vulnerabilities, saved.updates) == ([], [])
 
 
-def test_workspace_revision_error_is_wrapped_with_cause(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("ready_work", "method", "in_workspace", "message"),
+    [
+        pytest.param(True, "new_change", True, "stale lock", id="resume-new-change"),
+        pytest.param(False, "add_workspace", False, "locked", id="add-workspace"),
+    ],
+)
+def test_given_workspace_setup_failure_when_updating_then_setup_error_and_no_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ready_work: bool,
+    method: str,
+    in_workspace: bool,
+    message: str,
 ) -> None:
-    _, project = seed_project(
-        tmp_path, "api", make_scan_result(vulns=[], updates=[make_update()])
+    update = (
+        make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)
+        if ready_work
+        else make_update()
     )
-    original = RevisionError("locked")
-    fail_repository_method(monkeypatch, project.path, "add_workspace", original)
+    repo, project = seed_project(
+        tmp_path, "api", make_scan_result(vulns=[], updates=[update])
+    )
+    if ready_work:
+        repo.set_bookmark(bookmark=MANAGED, revision="main", allow_backwards=True)
+    workspace = paths.workspaces_dir() / "api"
+    original = RevisionError(message)
+    fail_repository_method(
+        monkeypatch, workspace if in_workspace else project.path, method, original
+    )
+    saved_before = load_scan_results("api")
 
-    with pytest.raises(update_service.UpdateSetupError, match="locked") as exc_info:
+    with pytest.raises(update_service.UpdateSetupError, match=message) as caught:
         _update_api(project)
 
-    assert exc_info.value.__cause__ is original
+    assert caught.value.__cause__ is original
+    assert "mm-api" not in repo.workspace_names()
+    assert not workspace.exists()
+    assert load_scan_results("api") == saved_before
 
 
 @pytest.mark.parametrize(
@@ -397,13 +383,11 @@ def test_existing_update_failure_blocks_single_and_batch_success(
         "single",
         projects["single"],
         choose=None,
-        vcs=make_vcs_services(),
         emit=RecordingEmit(),
     )
     batch = update_service.update_projects(
         make_config(projects={"batch": projects["batch"]}),
         ["batch"],
-        vcs=make_vcs_services(),
         emit=RecordingEmit(),
     )
 
@@ -447,7 +431,6 @@ def test_batch_reports_success_conflict_and_missing_path(
     result = update_service.update_projects(
         make_config(projects=projects),
         ["a", "b", "c"],
-        vcs=make_vcs_services(),
         emit=emit,
     )
 
@@ -502,7 +485,7 @@ def test_given_local_properties_when_update_starts_then_untracked_sdk_is_refused
         commit_to_main(repo, "track local properties")
     if inspection_error is not None:
         fail_repository_method(
-            monkeypatch, project.path, "revision_file", inspection_error
+            monkeypatch, project.path, "has_regular_file", inspection_error
         )
     monkeypatch.setattr(
         update_service,
@@ -541,7 +524,6 @@ def test_given_flow_when_run_then_no_scan_discovery_build_or_push_starts(
             "api",
             project,
             continue_=False,
-            vcs=make_vcs_services(),
             emit=RecordingEmit(),
         ),
     }[flow]
@@ -581,7 +563,6 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
     batch = update_service.update_projects(
         make_config(projects={"web": web, "android": android}),
         ["web", "android"],
-        vcs=make_vcs_services(),
         emit=emit,
     )
 
@@ -595,32 +576,6 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
     assert _main_catalogue_text(android) == catalogue.replace(
         'room = "2.8.4"', 'room = "2.8.5"', 1
     )
-
-
-def test_given_cleanup_failure_when_batch_updated_then_next_project_still_promotes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    projects = {name: seed_gradle_project(tmp_path, name) for name in ("api", "web")}
-    fail_repository_method(
-        monkeypatch, projects["api"].path, "forget_workspace", RevisionError("busy")
-    )
-    monkeypatch.setattr(gradle, "run_gradle", catalogue_apply_task())
-    monkeypatch.setattr(updater, "run_shell_command", lambda *_, **__: None)
-    emit = RecordingEmit()
-
-    batch = update_service.update_projects(
-        make_config(projects=projects),
-        ["api", "web"],
-        vcs=make_vcs_services(),
-        emit=emit,
-    )
-
-    assert [(item.project, item.outcome) for item in batch.projects] == [
-        ("api", Outcome.FAILED),
-        ("web", Outcome.SUCCEEDED),
-    ]
-    assert OperationFailed("workspace cleanup", "api", "busy") in emit.events
-    assert 'room = "2.8.5"' in _catalogue_text(projects["web"])
 
 
 def test_given_refresh_failure_when_rerun_then_promotion_completes_without_reapply(

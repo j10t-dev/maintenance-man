@@ -5,6 +5,7 @@ from maintenance_man.models.events import (
     Emit,
     MissingTestConfig,
     OperationFailed,
+    Outcome,
     ProjectSkipped,
     Promoted,
     PromotionFailed,
@@ -13,7 +14,9 @@ from maintenance_man.models.events import (
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
     ScanResult,
+    UpdateFinding,
     UpdateStatus,
+    VulnFinding,
     Workflow,
 )
 from maintenance_man.services import WorkflowError
@@ -22,9 +25,9 @@ from maintenance_man.storage import (
     load_scan_results,
     save_scan_results,
 )
-from maintenance_man.updater import Finding, remove_completed_findings
-from maintenance_man.vcs import RevisionError
-from maintenance_man.vcs_workflow import VcsServices, refresh_working_copy_from_main
+from maintenance_man.updater import Finding, is_eligible
+from maintenance_man.vcs import JjRepository, RevisionError
+from maintenance_man.vcs_workflow import refresh_working_copy_from_main
 
 
 class FlowConflictError(WorkflowError):
@@ -69,14 +72,40 @@ def is_owned(finding: Finding, flow: Workflow, *statuses: UpdateStatus) -> bool:
     return finding.flow is flow and finding.update_status in statuses
 
 
+def has_owned(scan_result: ScanResult, flow: Workflow, *statuses: UpdateStatus) -> bool:
+    """Whether any saved finding is owned by the flow in one of the statuses."""
+    return any(is_owned(finding, flow, *statuses) for finding in scan_result.findings)
+
+
+def is_candidate(finding: VulnFinding | UpdateFinding, flow: Workflow) -> bool:
+    """Whether the flow may apply the finding: eligible, and new or failed under it."""
+    return is_eligible(finding) and (
+        finding.update_status is None or is_owned(finding, flow, UpdateStatus.FAILED)
+    )
+
+
+def has_work(scan_result: ScanResult, flow: Workflow) -> bool:
+    """Whether the flow has a finding to apply or READY work to promote."""
+    return any(
+        is_candidate(finding, flow) or is_owned(finding, flow, UpdateStatus.READY)
+        for finding in scan_result.findings
+    )
+
+
 def complete_ready_findings(
     scan_result: ScanResult, name: str, *, flow: Workflow
 ) -> None:
-    """Complete and remove a flow's ready findings, then persist the mutated scan."""
-    for finding in scan_result.findings:
-        if is_owned(finding, flow, UpdateStatus.READY):
-            finding.update_status = UpdateStatus.COMPLETED
-    remove_completed_findings(scan_result)
+    """Remove the flow's READY findings, then persist the scan."""
+    scan_result.vulnerabilities = [
+        finding
+        for finding in scan_result.vulnerabilities
+        if not is_owned(finding, flow, UpdateStatus.READY)
+    ]
+    scan_result.updates = [
+        finding
+        for finding in scan_result.updates
+        if not is_owned(finding, flow, UpdateStatus.READY)
+    ]
     save_scan_results(name, scan_result)
 
 
@@ -86,18 +115,20 @@ def finalise_local_changes(
     name: str,
     flow: Workflow,
     *,
-    vcs: VcsServices,
     emit: Emit,
-) -> bool:
+) -> Outcome:
     """Promote the flow's bookmark to local main, then complete its READY findings.
 
-    Each failure is emitted as OperationFailed and returns False. A promotion or
-    refresh failure leaves the READY findings and the bookmark for a later retry;
-    a bookmark-cleanup failure after completion is reported and the next run
+    Succeeds without effects when the flow has no READY finding. Each failure is
+    emitted as OperationFailed and returns FAILED. A promotion or refresh failure
+    leaves the READY findings and the bookmark for a later retry; a
+    bookmark-cleanup failure after completion is reported and the next run
     recreates the bookmark.
     """
+    if not has_owned(scan_result, flow, UpdateStatus.READY):
+        return Outcome.SUCCEEDED
     bookmark = WORKFLOW_BOOKMARKS[flow]
-    repo = vcs.repository(project_path)
+    repo = JjRepository(project_path)
     try:
         repo.promote_bookmark_to_main(bookmark=bookmark)
     except RevisionError as exc:
@@ -107,20 +138,20 @@ def finalise_local_changes(
                 f"{exc} · rebase with jj rebase -b {bookmark} -d main, then rerun",
             )
         )
-        return False
+        return Outcome.FAILED
     try:
         refresh_working_copy_from_main(repo=repo)
     except RevisionError as exc:
         emit(OperationFailed("workspace refresh", name, str(exc)))
-        return False
+        return Outcome.FAILED
     complete_ready_findings(scan_result, name, flow=flow)
     emit(Promoted())
     try:
         repo.delete_bookmark(bookmark=bookmark)
     except RevisionError as exc:
         emit(OperationFailed("bookmark cleanup", name, str(exc)))
-        return False
-    return True
+        return Outcome.FAILED
+    return Outcome.SUCCEEDED
 
 
 def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:

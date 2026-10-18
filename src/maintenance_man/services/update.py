@@ -33,10 +33,9 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.services import WorkflowError, flows
 from maintenance_man.services.flows import FlowConflictError
-from maintenance_man.updater import group_findings, is_eligible, process_findings
-from maintenance_man.vcs import Repository, RevisionError, workspace_path_for_project
+from maintenance_man.updater import group_findings, process_findings
+from maintenance_man.vcs import JjRepository, RevisionError, workspace_path_for_project
 from maintenance_man.vcs_workflow import (
-    VcsServices,
     create_workspace,
     ensure_main_bookmark,
     remove_workspace,
@@ -79,13 +78,12 @@ def update_project(
     project: ProjectConfig,
     *,
     choose: FindingChooser | None,
-    vcs: VcsServices,
     emit: Emit,
 ) -> ProjectUpdate:
     scan_result = flows.load_validated_scan(name, project, Workflow.UPDATE, emit=emit)
     if scan_result is None:
         return ProjectUpdate(name, Outcome.SUCCEEDED, ())
-    if not _has_update_work(scan_result):
+    if not flows.has_work(scan_result, Workflow.UPDATE):
         emit(ScanReported(scan_result))
         return ProjectUpdate(
             name, Outcome.SUCCEEDED, (), blocked=len(scan_result.blocked_findings)
@@ -93,7 +91,7 @@ def update_project(
     if flows.report_missing_test_config(name, project, emit=emit):
         return ProjectUpdate(name, Outcome.FAILED, ())
     try:
-        workspace = _enter_update_workspace(name, project, scan_result, vcs=vcs)
+        workspace = _enter_update_workspace(name, project, scan_result)
     except RevisionError as exc:
         raise UpdateSetupError(str(exc)) from exc
 
@@ -102,21 +100,15 @@ def update_project(
     cleaned = True
     try:
         emit(ScanReported(scan_result))
-        results = _process_selected(
-            scan_result,
-            work_config,
-            choose=choose,
-            vcs=vcs,
-            emit=emit,
-        )
+        results = _process_selected(scan_result, work_config, choose=choose, emit=emit)
     finally:
         try:
-            remove_workspace(repo=vcs.repository(project.path), project=name)
+            remove_workspace(repo=JjRepository(project.path), project=name)
         except RevisionError as exc:
             emit(OperationFailed("workspace cleanup", name, str(exc)))
             cleaned = False
 
-    outcome = _finish_update(project.path, scan_result, name, vcs=vcs, emit=emit)
+    outcome = _finish_update(project.path, scan_result, name, emit=emit)
     return ProjectUpdate(
         name,
         outcome if cleaned else Outcome.FAILED,
@@ -129,7 +121,6 @@ def update_projects(
     cfg: MmConfig,
     names: Sequence[str],
     *,
-    vcs: VcsServices,
     emit: Emit,
 ) -> BatchUpdate:
     projects: list[ProjectUpdate] = []
@@ -142,13 +133,7 @@ def update_projects(
             continue
         emit(ProjectStarted(name))
         try:
-            result = update_project(
-                name,
-                project,
-                choose=None,
-                vcs=vcs,
-                emit=emit,
-            )
+            result = update_project(name, project, choose=None, emit=emit)
         except FlowConflictError as exc:
             emit(ProjectSkipped(name, SkipReason.FLOW_CONFLICT, str(exc)))
             had_errors = True
@@ -177,33 +162,18 @@ def resolve_update_targets(
     return "batch", ordered
 
 
-def _has_update_work(scan_result: ScanResult) -> bool:
-    return any(
-        _is_selectable(finding)
-        or flows.is_owned(finding, Workflow.UPDATE, UpdateStatus.READY)
-        for finding in scan_result.findings
-    )
-
-
-def _has_update_state(scan_result: ScanResult, *statuses: UpdateStatus) -> bool:
-    return any(
-        flows.is_owned(finding, Workflow.UPDATE, *statuses)
-        for finding in scan_result.findings
-    )
-
-
 def _enter_update_workspace(
     project: str,
     project_config: ProjectConfig,
     scan_result: ScanResult,
-    *,
-    vcs: VcsServices,
 ) -> Path:
     bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    repo = vcs.repository(project_config.path)
+    repo = JjRepository(project_config.path)
     remove_workspace(repo=repo, project=project)
 
-    if _has_update_state(scan_result, UpdateStatus.READY, UpdateStatus.FAILED):
+    if flows.has_owned(
+        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
+    ):
         if not repo.bookmark_exists(bookmark=bookmark):
             msg = (
                 f"update bookmark '{bookmark}' is missing but in-progress "
@@ -215,16 +185,14 @@ def _enter_update_workspace(
     else:
         ensure_main_bookmark(repo=repo)
         _require_sdk_in_workspace(project, project_config, repo, "main")
-        if repo.bookmark_exists(bookmark=bookmark):
-            repo.delete_bookmark(bookmark=bookmark)
-        repo.create_bookmark(bookmark=bookmark, revision="main")
+        repo.set_bookmark(bookmark=bookmark, revision="main", allow_backwards=True)
         workspace_revision = "main"
 
     try:
         workspace_path = create_workspace(
             repo=repo, project=project, revision=workspace_revision
         )
-        vcs.repository(workspace_path).new_change(revision=bookmark)
+        JjRepository(workspace_path).new_change(revision=bookmark)
     except RevisionError:
         remove_workspace(repo=repo, project=project)
         raise
@@ -232,7 +200,7 @@ def _enter_update_workspace(
 
 
 def _require_sdk_in_workspace(
-    name: str, project: ProjectConfig, repo: Repository, revision: str
+    name: str, project: ProjectConfig, repo: JjRepository, revision: str
 ) -> None:
     """Refuse a workspace checkout that would lack its local.properties."""
     reason = workspace_environment_reason(
@@ -240,18 +208,10 @@ def _require_sdk_in_workspace(
     )
     if reason is None:
         return
-    inspected = repo.revision_file(
+    if not repo.has_regular_file(
         revision=revision, filename=GRADLE_LOCAL_PROPERTIES_RELPATH
-    )
-    if not inspected.is_regular:
+    ):
         raise UpdateSetupError(reason)
-
-
-def _is_selectable(finding: VulnFinding | UpdateFinding) -> bool:
-    return is_eligible(finding) and (
-        finding.update_status is None
-        or flows.is_owned(finding, Workflow.UPDATE, UpdateStatus.FAILED)
-    )
 
 
 def _process_selected(
@@ -259,14 +219,17 @@ def _process_selected(
     work_config: ProjectConfig,
     *,
     choose: FindingChooser | None,
-    vcs: VcsServices,
     emit: Emit,
 ) -> tuple[UpdateResult, ...]:
     selectable_vulns = [
-        vuln for vuln in scan_result.vulnerabilities if _is_selectable(vuln)
+        vuln
+        for vuln in scan_result.vulnerabilities
+        if flows.is_candidate(vuln, Workflow.UPDATE)
     ]
     selectable_updates = [
-        update for update in scan_result.updates if _is_selectable(update)
+        update
+        for update in scan_result.updates
+        if flows.is_candidate(update, Workflow.UPDATE)
     ]
     if choose is not None and (selectable_vulns or selectable_updates):
         selected_vulns, selected_updates = choose(selectable_vulns, selectable_updates)
@@ -290,7 +253,6 @@ def _process_selected(
             work_config,
             flow=Workflow.UPDATE,
             scan_result=scan_result,
-            vcs=vcs,
             emit=emit,
         )
         if findings
@@ -316,14 +278,9 @@ def _with_shared_targets[F: VulnFinding | UpdateFinding](
 
 
 def _finish_update(
-    project_path: Path,
-    scan_result: ScanResult,
-    name: str,
-    *,
-    vcs: VcsServices,
-    emit: Emit,
+    project_path: Path, scan_result: ScanResult, name: str, *, emit: Emit
 ) -> Outcome:
-    if _has_update_state(scan_result, UpdateStatus.FAILED):
+    if flows.has_owned(scan_result, Workflow.UPDATE, UpdateStatus.FAILED):
         emit(
             PromotionFailed(
                 name,
@@ -332,9 +289,6 @@ def _finish_update(
             )
         )
         return Outcome.FAILED
-    if not _has_update_state(scan_result, UpdateStatus.READY):
-        return Outcome.SUCCEEDED
-    finalised = flows.finalise_local_changes(
-        project_path, scan_result, name, Workflow.UPDATE, vcs=vcs, emit=emit
+    return flows.finalise_local_changes(
+        project_path, scan_result, name, Workflow.UPDATE, emit=emit
     )
-    return Outcome.SUCCEEDED if finalised else Outcome.FAILED

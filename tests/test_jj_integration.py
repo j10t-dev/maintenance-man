@@ -13,7 +13,6 @@ from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import update as update_service
 from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import JjRepository
-from maintenance_man.vcs_workflow import VcsServices
 from tests.fakes import RecordingEmit
 from tests.support.findings import make_scan_result, make_update
 from tests.support.projects import make_config, make_project
@@ -136,6 +135,7 @@ def test_given_pending_stack_when_resolve_takes_over_and_repairs_then_main_gets_
         (Workflow.RESOLVE, UpdateStatus.READY),
     ]
     assert repo.resolve_revision(revision=RESOLVE_BOOKMARK) == update_tip
+    assert repo.same_revision(left="@-", right=RESOLVE_BOOKMARK)
     assert not repo.bookmark_exists(bookmark=MANAGED)
     assert (path / "deps" / "pkg-b").is_file()
 
@@ -180,7 +180,6 @@ def test_given_cleanup_failure_when_batch_updated_then_next_project_promotes(
             projects={name: project for name, (_, project) in projects.items()}
         ),
         ["api", "web"],
-        vcs=VcsServices(repository=JjRepository),
         emit=emit,
     )
 
@@ -219,7 +218,6 @@ def _update(
         "api",
         project,
         choose=None,
-        vcs=VcsServices(repository=JjRepository),
         emit=emit or RecordingEmit(),
     )
 
@@ -229,7 +227,6 @@ def _resolve(project: ProjectConfig, *, continue_: bool) -> Outcome:
         "api",
         project,
         continue_=continue_,
-        vcs=VcsServices(repository=JjRepository),
         emit=RecordingEmit(),
     )
 

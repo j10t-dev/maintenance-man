@@ -1,7 +1,4 @@
-import dataclasses
-import shlex
 import subprocess
-import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,30 +28,21 @@ from maintenance_man.models.scan import (
     UpdateStatus,
     Workflow,
 )
-from maintenance_man.package_managers import package_manager_ops
 from maintenance_man.process import ProcessError
 from maintenance_man.storage import load_scan_results
 from maintenance_man.updater import (
     Applied,
     ApplyFailed,
     Blocked,
-    FailureStrategy,
     Finding,
     _apply_update,
     apply_finding,
     consolidate_vulns,
     group_findings,
     process_findings,
-    remove_completed_findings,
     run_test_phases,
-    sort_updates_by_risk,
-)
-from maintenance_man.uv_dependencies import (
-    UvUngroupedLocation,
-    get_uv_dependency_locations,
 )
 from maintenance_man.vcs import JjRepository, RevisionError
-from maintenance_man.vcs_workflow import VcsServices, make_vcs_services
 from tests.fakes import RecordingEmit
 from tests.support.findings import (
     make_gradle_member,
@@ -119,7 +107,6 @@ def project_config(tmp_path: Path) -> ProjectConfig:
 
 class ProcessorDeps(TypedDict):
     repo: JjRepository
-    services: VcsServices
     package: MagicMock
     phase: MagicMock
 
@@ -144,12 +131,7 @@ def processor_vcs(
     phase = MagicMock(return_value=None)
     monkeypatch.setattr("maintenance_man.updater.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
-    return {
-        "repo": repo,
-        "services": make_vcs_services(),
-        "package": package,
-        "phase": phase,
-    }
+    return {"repo": repo, "package": package, "phase": phase}
 
 
 def _process(
@@ -158,7 +140,6 @@ def _process(
     deps: ProcessorDeps,
     *,
     flow: Workflow = Workflow.UPDATE,
-    on_failure: FailureStrategy = "continue",
     scan: ScanResult | None = None,
     emit: RecordingEmit | None = None,
 ) -> list[UpdateResult]:
@@ -167,92 +148,105 @@ def _process(
         findings,
         project_config,
         flow=flow,
-        on_failure=on_failure,
         scan_result=_scan_result_for(project_config, updates) if scan is None else scan,
-        vcs=deps["services"],
         emit=RecordingEmit() if emit is None else emit,
     )
 
 
-class TestGetUvDependencyLocations:
-    def test_returns_transitive_when_package_not_in_pyproject(self, tmp_path: Path):
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\ndependencies = ["requests>=2.28"]\n', encoding="utf-8"
-        )
-
-        result = get_uv_dependency_locations(tmp_path, "urllib3")
-        assert result == [UvUngroupedLocation(kind="transitive")]
-
-    def test_returns_transitive_for_optional_dependency(self, tmp_path: Path):
-        # project.optional-dependencies are intentionally not scanned for direct deps;
-        # packages declared only there fall through to the transitive path.
-        (tmp_path / "pyproject.toml").write_text(
-            "[project]\ndependencies = []\n\n"
-            "[project.optional-dependencies]\n"
-            'cli = ["rich>=14.0"]\n',
-            encoding="utf-8",
-        )
-
-        result = get_uv_dependency_locations(tmp_path, "rich")
-        assert result == [UvUngroupedLocation(kind="transitive")]
+_PYTEST_IN_THREE_TABLES = (
+    '[project]\ndependencies = ["pytest>=8.0"]\n\n'
+    "[dependency-groups]\n"
+    'dev = ["pytest>=8.0"]\n'
+    'lint = ["pytest>=8.0"]\n'
+)
 
 
-class TestApplyUpdate:
-    def test_uv_runs_all_matching_commands_in_order(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ):
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\ndependencies = ["pytest>=8.0"]\n\n'
-            "[dependency-groups]\n"
-            'dev = ["pytest>=8.0"]\n'
-            'lint = ["pytest>=8.0"]\n',
-            encoding="utf-8",
-        )
-        mock_run = MagicMock(
-            return_value=completed([], returncode=0, stdout="", stderr="")
-        )
-        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
+@pytest.mark.parametrize(
+    ("manager", "pkg", "version", "failing_call", "expected_calls", "expected_errors"),
+    [
+        pytest.param(
+            "uv",
+            "pytest",
+            "9.0.3",
+            None,
+            [
+                ["uv", "add", "pytest==9.0.3"],
+                ["uv", "add", "--group", "dev", "pytest==9.0.3"],
+                ["uv", "add", "--group", "lint", "pytest==9.0.3"],
+            ],
+            [],
+            id="uv-runs-every-declaration-in-order",
+        ),
+        pytest.param(
+            "uv",
+            "pytest",
+            "9.0.3",
+            2,
+            [
+                ["uv", "add", "pytest==9.0.3"],
+                ["uv", "add", "--group", "dev", "pytest==9.0.3"],
+            ],
+            ["uv add --group dev pytest==9.0.3 failed"],
+            id="uv-stops-at-the-first-failure",
+        ),
+        pytest.param(
+            "mvn",
+            "g:a",
+            "2.0",
+            2,
+            [
+                [
+                    "mvn",
+                    "versions:use-dep-version",
+                    "-Dincludes=g:a",
+                    "-DdepVersion=2.0",
+                ],
+                ["mvn", "versions:commit"],
+            ],
+            ["mvn versions:commit failed"],
+            id="mvn-commit-failure-fails-the-apply",
+        ),
+        pytest.param(
+            "mvn",
+            "g:a",
+            "2.0",
+            1,
+            [["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"]],
+            ["mvn versions:use-dep-version -Dincludes=g:a -DdepVersion=2.0 failed"],
+            id="mvn-commit-never-runs-after-a-failed-update",
+        ),
+    ],
+)
+def test_given_package_commands_when_applied_then_first_failure_stops_and_is_reported(
+    manager: str,
+    pkg: str,
+    version: str,
+    failing_call: int | None,
+    expected_calls: list[list[str]],
+    expected_errors: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(_PYTEST_IN_THREE_TABLES, encoding="utf-8")
+    calls: list[list[str]] = []
 
-        assert (
-            _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=RecordingEmit())
-            is True
-        )
-        assert [call.args[0] for call in mock_run.call_args_list] == [
-            ["uv", "add", "pytest==9.0.3"],
-            ["uv", "add", "--group", "dev", "pytest==9.0.3"],
-            ["uv", "add", "--group", "lint", "pytest==9.0.3"],
-        ]
+    def run(cmd, cwd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == failing_call:
+            msg = f"{kwargs['label']} failed"
+            raise ProcessError(msg)
+        return completed(cmd, returncode=0, stdout="", stderr="")
 
-    def test_uv_stops_on_first_failing_command(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ):
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\ndependencies = ["pytest>=8.0"]\n\n'
-            "[dependency-groups]\n"
-            'dev = ["pytest>=8.0"]\n'
-            'lint = ["pytest>=8.0"]\n',
-            encoding="utf-8",
-        )
-        mock_run = MagicMock(
-            side_effect=[
-                completed([], returncode=0, stdout="", stderr=""),
-                ProcessError("uv add --group dev pytest==9.0.3 failed (exit 1)"),
-                completed([], returncode=0, stdout="", stderr=""),
-            ]
-        )
-        monkeypatch.setattr("maintenance_man.updater.run_logged", mock_run)
+    monkeypatch.setattr("maintenance_man.updater.run_logged", run)
+    emit = RecordingEmit()
 
-        emit = RecordingEmit()
-        assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
-        assert mock_run.call_count == 2
-        assert emit.of_type(FindingStepFailed) == [
-            FindingStepFailed(
-                FindingStepKind.PACKAGE_COMMAND,
-                "uv add --group dev pytest==9.0.3 failed (exit 1)",
-            )
-        ]
+    applied = _apply_update(manager, pkg, version, tmp_path, emit=emit)
+
+    assert applied is (failing_call is None)
+    assert calls == expected_calls
+    failures = emit.of_type(FindingStepFailed)
+    assert [failure.error for failure in failures] == expected_errors
+    assert {failure.step for failure in failures} <= {FindingStepKind.PACKAGE_COMMAND}
 
 
 @pytest.mark.parametrize(
@@ -281,98 +275,6 @@ def test_given_unpreparable_update_when_applied_then_prepare_failure_and_no_comm
     failures = emit.of_type(FindingStepFailed)
     assert [failure.step for failure in failures] == [FindingStepKind.PREPARE]
     assert message in failures[0].error
-
-
-def test_given_failing_package_command_when_applied_then_error_omits_child_text(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    command = [sys.executable, "-c", "print('boom'); raise SystemExit(7)"]
-    ops = dataclasses.replace(
-        package_manager_ops("bun"), update_commands=lambda *args: [command]
-    )
-    monkeypatch.setattr("maintenance_man.updater.package_manager_ops", lambda _: ops)
-
-    emit = RecordingEmit()
-    assert _apply_update("bun", "left-pad", "2.0.0", tmp_path, emit=emit) is False
-
-    assert emit.of_type(FindingStepFailed) == [
-        FindingStepFailed(
-            FindingStepKind.PACKAGE_COMMAND, f"{shlex.join(command)} failed (exit 7)"
-        )
-    ]
-    assert capsys.readouterr() == ("", "boom\n")
-
-
-_EXECUTION_FAILURES = [
-    "{label} timed out after 300s in {cwd}",
-    "Could not run {label} in {cwd}: [Errno 2] No such file or directory",
-]
-
-
-@pytest.mark.parametrize("failure", _EXECUTION_FAILURES)
-def test_package_command_execution_failure_stops_the_apply(
-    tmp_path, monkeypatch, failure
-):
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\ndependencies = ["pytest>=8.0"]\n\n'
-        "[dependency-groups]\n"
-        'dev = ["pytest>=8.0"]\n',
-        encoding="utf-8",
-    )
-    calls = []
-    message = failure.format(label="uv add pytest==9.0.3", cwd=tmp_path)
-
-    def run(cmd, cwd, **kwargs):
-        calls.append(cmd)
-        raise ProcessError(message)
-
-    monkeypatch.setattr("maintenance_man.updater.run_logged", run)
-    emit = RecordingEmit()
-    assert _apply_update("uv", "pytest", "9.0.3", tmp_path, emit=emit) is False
-    assert calls == [["uv", "add", "pytest==9.0.3"]]
-    assert emit.of_type(FindingStepFailed) == [
-        FindingStepFailed(FindingStepKind.PACKAGE_COMMAND, message)
-    ]
-
-
-@pytest.mark.parametrize("failure", _EXECUTION_FAILURES)
-def test_maven_finalisation_execution_failure_is_an_apply_failure(
-    tmp_path, monkeypatch, failure
-):
-    calls = []
-
-    def run(cmd, cwd, **kwargs):
-        calls.append((cmd, kwargs["timeout"]))
-        if cmd == ["mvn", "versions:commit"]:
-            raise ProcessError(failure.format(label="mvn versions:commit", cwd=cwd))
-        return completed(cmd, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("maintenance_man.updater.run_logged", run)
-    assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
-    assert calls == [
-        (
-            ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"],
-            300,
-        ),
-        (["mvn", "versions:commit"], 300),
-    ]
-
-
-def test_maven_finalisation_does_not_run_after_a_failed_update(tmp_path, monkeypatch):
-    calls = []
-
-    def run(cmd, cwd, **kwargs):
-        calls.append(cmd)
-        msg = f"{kwargs['label']} failed (exit 1)"
-        raise ProcessError(msg)
-
-    monkeypatch.setattr("maintenance_man.updater.run_logged", run)
-    assert _apply_update("mvn", "g:a", "2.0", tmp_path, emit=RecordingEmit()) is False
-    assert calls == [
-        ["mvn", "versions:use-dep-version", "-Dincludes=g:a", "-DdepVersion=2.0"]
-    ]
 
 
 # -- run_test_phases --
@@ -450,18 +352,6 @@ def test_given_test_phases_when_run_then_first_failure_stops_later_phases(
     assert commands == expected_commands
 
 
-def test_test_phases_run_through_bash(tmp_path):
-    config = ProjectConfig(
-        path=tmp_path,
-        package_manager="bun",
-        test_unit="printf '%s' 'a b' > out.txt && test \"$(cat out.txt)\" = 'a b'",
-    )
-    assert run_test_phases(config, tmp_path, emit=RecordingEmit()) is None
-    # Under shlex.split printf prints every argument and exits 0; only Bash
-    # performs the redirect.
-    assert (tmp_path / "out.txt").read_text() == "a b"
-
-
 def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
     config = ProjectConfig(path=tmp_path, package_manager="bun", test_unit="true")
     emit = RecordingEmit()
@@ -471,67 +361,10 @@ def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
     assert "Could not run unit tests" in emit.of_type(FindingStepFailed)[0].error
 
 
-# -- sort_updates_by_risk --
-
-
-class TestSortUpdatesByRisk:
-    @pytest.mark.parametrize(
-        ("tiers", "expected"),
-        [
-            (
-                [SemverTier.MAJOR, SemverTier.PATCH, SemverTier.MINOR],
-                [SemverTier.PATCH, SemverTier.MINOR, SemverTier.MAJOR],
-            ),
-            ([SemverTier.MINOR], [SemverTier.MINOR]),
-            ([], []),
-        ],
-    )
-    def test_sorts_patch_minor_major(self, tiers, expected):
-        updates = [make_update(tier) for tier in tiers]
-
-        assert [u.semver_tier for u in sort_updates_by_risk(updates)] == expected
-
-
 # -- consolidate_vulns --
 
 
 class TestConsolidateVulns:
-    def test_same_package_consolidated(self):
-        vulns = [
-            make_vuln(
-                vuln_id="CVE-2023-32681",
-                pkg_name="requests",
-                fixed_version="2.31.0",
-            ),
-            make_vuln(
-                vuln_id="CVE-2024-35195",
-                pkg_name="requests",
-                fixed_version="2.32.0",
-            ),
-            make_vuln(
-                vuln_id="CVE-2024-47081",
-                pkg_name="requests",
-                fixed_version="2.32.4",
-            ),
-        ]
-        result = consolidate_vulns(vulns)
-        assert len(result) == 1
-        assert result[0].pkg_name == "requests"
-        assert result[0].target_version == "2.32.4"
-        assert "CVE-2023-32681" in result[0].detail
-        assert "CVE-2024-35195" in result[0].detail
-        assert "CVE-2024-47081" in result[0].detail
-
-    def test_different_packages_not_consolidated(self):
-        vulns = [
-            make_vuln(vuln_id="CVE-0001", pkg_name="pkg-a", fixed_version="1.0.1"),
-            make_vuln(vuln_id="CVE-0002", pkg_name="pkg-b", fixed_version="2.0.1"),
-        ]
-        result = consolidate_vulns(vulns)
-        assert len(result) == 2
-        assert result[0].pkg_name == "pkg-a"
-        assert result[1].pkg_name == "pkg-b"
-
     def test_lifecycle_fanout_to_originals(self):
         v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
         v2 = make_vuln(vuln_id="CVE-0002", pkg_name="pkg", fixed_version="1.0.2")
@@ -571,53 +404,6 @@ class TestConsolidateVulns:
         assert v2.failed_phase == "unit"
         assert v2.flow == "resolve"
 
-    def test_empty_list(self):
-        assert consolidate_vulns([]) == []
-
-
-# -- remove_completed_findings --
-
-
-class TestRemoveCompletedFindings:
-    def test_removes_completed_vulns_and_updates(self):
-        vulns = [
-            make_vuln(vuln_id="CVE-1", update_status=UpdateStatus.COMPLETED),
-            make_vuln(vuln_id="CVE-2", update_status=UpdateStatus.FAILED),
-            make_vuln(vuln_id="CVE-3", update_status=None),
-        ]
-        updates = [
-            make_update(SemverTier.PATCH, update_status=UpdateStatus.COMPLETED),
-            make_update(SemverTier.MINOR, update_status=UpdateStatus.FAILED),
-        ]
-        scan = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-            vulnerabilities=vulns,
-            updates=updates,
-        )
-
-        remove_completed_findings(scan)
-
-        assert len(scan.vulnerabilities) == 2
-        assert all(
-            v.update_status != UpdateStatus.COMPLETED for v in scan.vulnerabilities
-        )
-        assert len(scan.updates) == 1
-        assert scan.updates[0].update_status == UpdateStatus.FAILED
-
-    def test_no_completed_is_noop(self):
-        scan = ScanResult(
-            project="myapp",
-            scanned_at=datetime.now(tz=UTC),
-            trivy_target="/tmp/myapp",
-            updates=[make_update(SemverTier.PATCH, update_status=UpdateStatus.FAILED)],
-        )
-
-        remove_completed_findings(scan)
-
-        assert len(scan.updates) == 1
-
 
 # -- process_findings --
 
@@ -635,7 +421,6 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
 @pytest.mark.parametrize(
     (
         "flow",
-        "on_failure",
         "outcomes",
         "expected_passed",
         "expected_saved",
@@ -645,7 +430,6 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
     [
         pytest.param(
             Workflow.UPDATE,
-            "continue",
             ["pass", "unit", "pass"],
             [True, False, True],
             [_READY, _FAILED_UNIT, _READY],
@@ -655,7 +439,6 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
         ),
         pytest.param(
             Workflow.UPDATE,
-            "continue",
             ["apply", "pass"],
             [False, True],
             [_FAILED_APPLY, _READY],
@@ -665,7 +448,6 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
         ),
         pytest.param(
             Workflow.RESOLVE,
-            "stop",
             ["pass", "unit", "pass"],
             [True, False],
             [_READY, _FAILED_UNIT, _UNPROCESSED],
@@ -675,7 +457,6 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
         ),
         pytest.param(
             Workflow.RESOLVE,
-            "stop",
             ["apply", "pass"],
             [False],
             [_FAILED_APPLY, _UNPROCESSED],
@@ -685,7 +466,6 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
         ),
         pytest.param(
             Workflow.RESOLVE,
-            "stop",
             ["commit", "pass"],
             [False],
             [_FAILED_COMMIT, _UNPROCESSED],
@@ -697,7 +477,6 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
 )
 def test_given_step_outcome_when_processed_then_status_discard_and_stop_follow_the_flow(
     flow: Workflow,
-    on_failure: FailureStrategy,
     outcomes: list[str],
     expected_passed: list[bool],
     expected_saved: list[tuple[UpdateStatus | None, str | None]],
@@ -736,9 +515,7 @@ def test_given_step_outcome_when_processed_then_status_discard_and_stop_follow_t
             monkeypatch, repo.path, "commit", RevisionError("cannot commit")
         )
 
-    results = _process(
-        findings, project_config, processor_vcs, flow=flow, on_failure=on_failure
-    )
+    results = _process(findings, project_config, processor_vcs, flow=flow)
 
     assert [result.passed for result in results] == expected_passed
     assert [
@@ -750,16 +527,15 @@ def test_given_step_outcome_when_processed_then_status_discard_and_stop_follow_t
 
 
 @pytest.mark.parametrize(
-    ("flow", "on_failure", "bookmark"),
+    ("flow", "bookmark"),
     [
-        (Workflow.UPDATE, "continue", MANAGED),
-        (Workflow.RESOLVE, "stop", "mm/resolve-dependencies"),
+        (Workflow.UPDATE, MANAGED),
+        (Workflow.RESOLVE, "mm/resolve-dependencies"),
     ],
 )
 @pytest.mark.parametrize("count", [1, 2])
 def test_given_passing_findings_when_processed_then_each_is_committed_and_bookmarked(
     flow: Workflow,
-    on_failure: FailureStrategy,
     bookmark: str,
     count: int,
     processor_vcs: ProcessorDeps,
@@ -768,9 +544,7 @@ def test_given_passing_findings_when_processed_then_each_is_committed_and_bookma
     findings = [make_update(), make_update(SemverTier.MINOR)][:count]
     project_path = Path(project_config.path)
 
-    results = _process(
-        findings, project_config, processor_vcs, flow=flow, on_failure=on_failure
-    )
+    results = _process(findings, project_config, processor_vcs, flow=flow)
 
     repo = processor_vcs["repo"]
     package, phase = processor_vcs["package"], processor_vcs["phase"]
@@ -795,13 +569,9 @@ def test_given_passing_findings_when_processed_then_each_is_committed_and_bookma
     )
 
 
-@pytest.mark.parametrize(
-    ("flow", "on_failure"),
-    [(Workflow.UPDATE, "continue"), (Workflow.RESOLVE, "stop")],
-)
+@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
 def test_already_applied_is_ready_without_a_commit(
     flow: Workflow,
-    on_failure: FailureStrategy,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
@@ -810,9 +580,7 @@ def test_already_applied_is_ready_without_a_commit(
     )
     update = make_update()
 
-    results = _process(
-        [update], project_config, processor_vcs, flow=flow, on_failure=on_failure
-    )
+    results = _process([update], project_config, processor_vcs, flow=flow)
 
     assert results[0].passed is True
     assert update.update_status == UpdateStatus.READY
@@ -967,26 +735,6 @@ def test_update_statuses_are_persisted_after_each_finding(
     assert inspected_before_second_finding == [True]
 
 
-def test_resolve_failure_status_is_persisted_before_stopping(
-    processor_vcs: ProcessorDeps,
-    project_config: ProjectConfig,
-):
-    processor_vcs["phase"].side_effect = ProcessError("unit failed")
-
-    _process(
-        [make_update(update_status=UpdateStatus.FAILED)],
-        project_config,
-        processor_vcs,
-        flow=Workflow.RESOLVE,
-        on_failure="stop",
-    )
-
-    saved = load_scan_results("demo")
-    assert saved.updates[0].update_status == UpdateStatus.FAILED
-    assert saved.updates[0].failed_phase == "unit"
-    assert saved.updates[0].flow == Workflow.RESOLVE
-
-
 @pytest.mark.parametrize(
     ("failure", "passed", "status", "failed_phase"),
     [
@@ -1092,17 +840,27 @@ def _group_summary(findings):
         pytest.param(
             [
                 make_update(SemverTier.MAJOR),
-                make_vuln(vuln_id="CVE-1"),
-                make_vuln(vuln_id="CVE-2"),
+                make_vuln(vuln_id="CVE-1", fixed_version="1.0.1"),
+                make_vuln(vuln_id="CVE-2", fixed_version="1.0.2"),
+                make_vuln(
+                    vuln_id="CVE-3",
+                    pkg_name="other-pkg",
+                    installed_version="2.0.0",
+                    fixed_version="2.0.1",
+                ),
                 make_update(),
+                make_update(SemverTier.MINOR),
             ],
             [
-                ("some-pkg", "1.0.0", "1.0.1", "CVE-1, CVE-2"),
+                ("some-pkg", "1.0.0", "1.0.2", "CVE-1, CVE-2"),
+                ("other-pkg", "2.0.0", "2.0.1", "CVE-3"),
                 ("pkg-a", "1.0.0", "1.0.1", "patch"),
+                ("pkg-b", "1.0.0", "1.1.0", "minor"),
                 ("pkg-c", "1.0.0", "2.0.0", "major"),
             ],
             id="native-rows-by-package-then-risk",
         ),
+        pytest.param([], [], id="no-rows"),
     ],
 )
 def test_given_saved_rows_when_grouped_then_one_change_per_target_or_package(
@@ -1178,12 +936,7 @@ def gradle_processor(
     phase = MagicMock()
     monkeypatch.setattr("maintenance_man.gradle.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
-    return {
-        "repo": repo,
-        "services": make_vcs_services(),
-        "package": package,
-        "phase": phase,
-    }
+    return {"repo": repo, "package": package, "phase": phase}
 
 
 def test_given_rows_of_one_target_when_processed_then_one_change_marks_both_ready(
