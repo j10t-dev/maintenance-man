@@ -134,7 +134,36 @@ _OPERATIONS: dict[str, Callable[..., object]] = {
         ),
         pytest.param("sync", "fetch", 1, _no_arrangement, False, id="sync-fetch"),
         pytest.param(
-            "sync", "bookmark_conflicted", 1, _no_arrangement, False, id="sync-conflict"
+            "sync",
+            "bookmark_conflicted",
+            1,
+            _no_arrangement,
+            False,
+            id="sync-prefetch-conflict",
+        ),
+        pytest.param(
+            "sync",
+            "bookmark_conflicted",
+            2,
+            _no_arrangement,
+            False,
+            id="sync-post-fetch-conflict",
+        ),
+        pytest.param(
+            "sync",
+            "bookmark_exists",
+            1,
+            _no_arrangement,
+            False,
+            id="sync-prefetch-exists",
+        ),
+        pytest.param(
+            "sync",
+            "resolve_revision",
+            1,
+            _no_arrangement,
+            False,
+            id="sync-prefetch-identity",
         ),
         pytest.param(
             "sync", "same_revision", 1, _no_arrangement, False, id="sync-comparison"
@@ -227,7 +256,7 @@ def test_sync_pulls_remote_advance_when_main_is_untracked(
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
 
 
-def test_sync_tracked_main_remote_advance_is_already_reconciled_by_fetch(
+def test_given_tracked_main_moved_by_fetch_when_synced_then_pulled(
     repository_case: RepositoryCase,
 ) -> None:
     c = repository_case
@@ -235,9 +264,19 @@ def test_sync_tracked_main_remote_advance_is_already_reconciled_by_fetch(
     peer_tip = commit_file(c.peer, "dep.txt", "version=2\n", "peer advance")
     push_peer_main(c.peer)
 
-    assert sync_main(repo=c.repo) is SyncAction.UNCHANGED
+    assert sync_main(repo=c.repo) is SyncAction.PULLED
     assert c.repo.resolve_revision(revision="main") == peer_tip
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == "version=2\n"
+
+
+def test_given_no_local_main_when_synced_then_main_is_created_and_pulled(
+    repository_case: RepositoryCase,
+) -> None:
+    c = repository_case
+    _delete_main(c)
+
+    assert sync_main(repo=c.repo) is SyncAction.PULLED
+    assert c.repo.same_revision(left="main", right="main@origin")
 
 
 def test_sync_pushes_local_advance_then_fetches_before_refresh(

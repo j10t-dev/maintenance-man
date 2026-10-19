@@ -295,7 +295,7 @@ def run_after_jj_command(
         if (
             not fired
             and Path(cwd).resolve() == path.resolve()
-            and tuple(command[1 : 1 + len(prefix)]) == prefix
+            and tuple(command[3 : 3 + len(prefix)]) == prefix
         ):
             fired = True
             action()

@@ -13,7 +13,7 @@ class RevisionError(Exception):
     """A jj command could not run, or a revision could not be resolved."""
 
 
-_READ_ONLY = ("--ignore-working-copy", "--color", "never")
+_READ_ONLY = ("--ignore-working-copy",)
 
 
 def workspace_path_for_project(project: str) -> Path:
@@ -56,7 +56,7 @@ class JjRepository:
     def _run(
         self, arguments: list[str], *, timeout: int = 30
     ) -> subprocess.CompletedProcess[str]:
-        command = ["jj", *arguments]
+        command = ["jj", "--color", "never", *arguments]
         return run_captured(
             command,
             self.path,

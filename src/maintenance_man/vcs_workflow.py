@@ -30,6 +30,12 @@ def refresh_working_copy_from_main(*, repo: JjRepository) -> None:
 
 
 def sync_main(*, repo: JjRepository) -> SyncAction:
+    """Fetch, reconcile local main with origin and refresh the working copy.
+
+    PULLED when the sync created or moved main, PUSHED when local main was ahead.
+    Raises RevisionError for a conflicted or diverged main.
+    """
+    before = _main_commit(repo)
     repo.fetch()
     ensure_main_bookmark(repo=repo)
     if repo.bookmark_conflicted(bookmark="main"):
@@ -41,7 +47,7 @@ def sync_main(*, repo: JjRepository) -> SyncAction:
 
     if repo.same_revision(left="main", right="main@origin"):
         refresh_working_copy_from_main(repo=repo)
-        return SyncAction.UNCHANGED
+        return _pulled_or_unchanged(repo, before)
 
     if repo.is_ancestor(ancestor="main", descendant="main@origin"):
         repo.set_bookmark(bookmark="main", revision="main@origin")
@@ -59,6 +65,21 @@ def sync_main(*, repo: JjRepository) -> SyncAction:
 
     msg = "local main and origin/main have diverged; resolve manually before syncing"
     raise RevisionError(msg)
+
+
+def _main_commit(repo: JjRepository) -> str | None:
+    """main's commit, or None when the bookmark is absent or conflicted."""
+    if not repo.bookmark_exists(bookmark="main") or repo.bookmark_conflicted(
+        bookmark="main"
+    ):
+        return None
+    return repo.resolve_revision(revision="main")
+
+
+def _pulled_or_unchanged(repo: JjRepository, before: str | None) -> SyncAction:
+    if before == repo.resolve_revision(revision="main"):
+        return SyncAction.UNCHANGED
+    return SyncAction.PULLED
 
 
 def current_label(*, repo: JjRepository) -> str:

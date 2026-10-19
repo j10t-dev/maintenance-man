@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from maintenance_man.vcs import RevisionError
@@ -162,3 +164,17 @@ def test_given_conflicted_bookmark_when_inspected_then_topic_survives_refresh(
     assert (c.repo.path / "dep.txt").read_text(encoding="utf-8") == (
         "protected local change\n"
     )
+
+
+def test_given_colour_forced_when_jj_reads_then_identities_and_conflict_state_parse(
+    repository_case: RepositoryCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = repository_case.repo.path.parent / "colour.toml"
+    config.write_text('[ui]\ncolor = "always"\n', encoding="utf-8")
+    monkeypatch.setenv("JJ_CONFIG", str(config))
+    repo = repository_case.repo
+
+    commit = repo.resolve_revision(revision="@")
+
+    assert re.fullmatch(r"[0-9a-f]{40,64}", commit)
+    assert repo.bookmark_conflicted(bookmark="main") is False

@@ -6,6 +6,18 @@ from maintenance_man import vcs
 from tests.fakes import FakeCommands
 from tests.support.process import completed
 
+RESOLVE_MAIN = (
+    "jj",
+    "--color",
+    "never",
+    "log",
+    "-r",
+    "main",
+    "--no-graph",
+    "-T",
+    'commit_id ++ "\\n"',
+)
+
 
 def test_given_jj_missing_from_path_when_inspected_then_revision_error_wraps_os_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -24,19 +36,20 @@ def test_given_jj_command_when_run_then_timeout_label_and_error_class_apply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     commands = FakeCommands()
-    argv = ("jj", "log", "-r", "main", "--no-graph", "-T", 'commit_id ++ "\\n"')
-    commands.add(argv, cwd=tmp_path, result=completed(stdout=f"{'a' * 40}\n"))
+    commands.add(RESOLVE_MAIN, cwd=tmp_path, result=completed(stdout=f"{'a' * 40}\n"))
     monkeypatch.setattr(vcs, "run_captured", commands)
 
     vcs.JjRepository(tmp_path).resolve_revision(revision="main")
 
     assert commands.calls == [
         (
-            argv,
+            RESOLVE_MAIN,
             tmp_path,
             {
                 "timeout": 30,
-                "label": "jj log -r main --no-graph -T 'commit_id ++ \"\\n\"'",
+                "label": (
+                    "jj --color never log -r main --no-graph -T 'commit_id ++ \"\\n\"'"
+                ),
                 "error": vcs.RevisionError,
             },
         )
@@ -62,7 +75,7 @@ class TestJjRepositoryBoundary:
     ):
         commands = FakeCommands()
         commands.add(
-            ("jj", "log", "-r", "main", "--no-graph", "-T", 'commit_id ++ "\\n"'),
+            RESOLVE_MAIN,
             cwd=tmp_path,
             result=completed(stdout=stdout),
         )
