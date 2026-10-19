@@ -1,243 +1,235 @@
+"""Update and resolve lifecycles against real jj in disposable repositories."""
+
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from maintenance_man.vcs import (
-    RevisionCheck,
-    bookmark_exists,
-    commit_current_change,
-    create_or_reset_bookmark,
-    current_change_has_changes,
-    delete_bookmark,
-    edit_new_change,
-    exact_commit_id,
-    is_ancestor,
-    main_commit_id,
-    promote_bookmark_to_main,
-    refresh_working_copy_from_main,
-    same_revision,
+from maintenance_man import updater, vcs_workflow
+from maintenance_man.models.config import ProjectConfig
+from maintenance_man.models.events import OperationFailed, Outcome, PromotionFailed
+from maintenance_man.models.scan import Failed, Ready, Workflow
+from maintenance_man.services import resolve as resolve_service
+from maintenance_man.services import update as update_service
+from maintenance_man.storage import load_scan_results, save_scan_results
+from maintenance_man.vcs import JjRepository
+from tests.fakes import RecordingEmit
+from tests.support.findings import make_scan_result, make_update
+from tests.support.projects import make_config, make_project
+from tests.support.repository import (
+    MANAGED,
+    commit_file,
+    commit_to_main,
+    copy_jj_repository,
+    run_jj,
+    write_file,
 )
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(shutil.which("jj") is None, reason="jj not installed"),
-]
+FAILS_B = "test ! -e deps/pkg-b || test -e repair.txt"
+RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
 
-def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, cwd=cwd, check=False, capture_output=True, text=True)
+@pytest.fixture
+def applied(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record each `bun add <pkg>@<version>`; write deps/<pkg> holding the version."""
+    packages: list[str] = []
+
+    def run(command: list[str], cwd: Path, **_: object) -> None:
+        assert command[:2] == ["bun", "add"]
+        package, version = command[2].rsplit("@", 1)
+        packages.append(package)
+        (Path(cwd) / "deps").mkdir(exist_ok=True)
+        (Path(cwd) / "deps" / package).write_text(version, encoding="utf-8")
+
+    monkeypatch.setattr(updater, "run_logged", run)
+    return packages
 
 
-def _jj(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return run(["jj", *args], repo)
+def test_given_b_failing_when_updated_then_a_and_c_stay_pending_retry_applies_b(
+    tmp_path: Path, applied: list[str]
+) -> None:
+    repo, project = _bun_project(tmp_path, "api", FAILS_B)
+    path = repo.path
+    main_before = repo.resolve_revision(revision="main")
+
+    first = _update(project)
+
+    assert first.outcome is Outcome.FAILED
+    assert [row.state for row in load_scan_results("api").updates] == [
+        Ready(flow=Workflow.UPDATE),
+        Failed(flow=Workflow.UPDATE, phase="unit"),
+        Ready(flow=Workflow.UPDATE),
+    ]
+    assert repo.resolve_revision(revision="main") == main_before
+    assert {"deps/pkg-a", "deps/pkg-c"} <= _files(path, MANAGED)
+    assert "deps/pkg-b" not in _files(path, MANAGED)
+
+    second = _update(project.model_copy(update={"test_unit": "true"}))
+
+    assert second.outcome is Outcome.SUCCEEDED
+    assert applied == ["pkg-a", "pkg-b", "pkg-c", "pkg-b"]
+    assert repo.is_ancestor(ancestor=main_before, descendant="main")
+    assert {"deps/pkg-a", "deps/pkg-b", "deps/pkg-c"} <= _files(path, "main")
+    assert load_scan_results("api").updates == []
+    assert not repo.bookmark_exists(bookmark=MANAGED)
+    assert (path / "deps" / "pkg-b").is_file()
 
 
-def init_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    run(["jj", "git", "init", "--colocate"], repo)
-    (repo / "README.md").write_text("initial\n")
-    run(["jj", "commit", "-m", "initial"], repo)
-    run(["jj", "bookmark", "create", "main", "-r", "@-"], repo)
-    return repo
+def test_given_main_moved_sideways_when_promoting_then_work_stays_pending_until_rebased(
+    tmp_path: Path, applied: list[str]
+) -> None:
+    repo, project = _bun_project(tmp_path, "api", FAILS_B)
+    path = repo.path
+    passing = project.model_copy(update={"test_unit": "true"})
+    _update(project)
+    assert run_jj(path, "new", "main").returncode == 0
+    unrelated = commit_file(repo, "unrelated.txt", "x\n", "unrelated")
+    repo.set_bookmark(bookmark="main", revision=unrelated)
+    emit = RecordingEmit()
 
+    second = _update(passing, emit)
 
-def test_commit_then_move_bookmark_to_finished_commit(tmp_path: Path):
-    repo = init_repo(tmp_path)
-    assert create_or_reset_bookmark("mm/update-dependencies", repo, "main") is True
-    assert edit_new_change(repo, "mm/update-dependencies") is True
-    (repo / "README.md").write_text("changed\n")
-    assert current_change_has_changes(repo) is True
-    assert commit_current_change(repo, "change readme") is True
-    assert create_or_reset_bookmark("mm/update-dependencies", repo, "@-") is True
-    assert bookmark_exists("mm/update-dependencies", repo) is True
-    assert delete_bookmark("mm/update-dependencies", repo) is True
-
-
-def test_promote_then_refresh_default_workspace_updates_files(tmp_path: Path):
-    repo = init_repo(tmp_path)
-    workspace = tmp_path / "workspace"
-
-    assert (
-        run(
-            [
-                "jj",
-                "workspace",
-                "add",
-                "--name",
-                "update",
-                str(workspace),
-                "-r",
-                "main",
-            ],
-            repo,
-        ).returncode
-        == 0
+    assert second.outcome is Outcome.FAILED
+    assert emit.of_type(OperationFailed) == []
+    failures = emit.of_type(PromotionFailed)
+    assert [event.project for event in failures] == ["api"]
+    assert failures[0].error.endswith(
+        f" · rebase with jj rebase -b {MANAGED} -d main, then rerun"
     )
-    assert create_or_reset_bookmark("mm/update-dependencies", repo, "main") is True
-    assert edit_new_change(workspace, "mm/update-dependencies") is True
-    (workspace / "README.md").write_text("updated\n")
-    assert commit_current_change(workspace, "update readme") is True
-    assert create_or_reset_bookmark("mm/update-dependencies", workspace, "@-") is True
+    assert [row.state for row in load_scan_results("api").updates] == [
+        Ready(flow=Workflow.UPDATE)
+    ] * 3
+    assert repo.resolve_revision(revision="main") == unrelated
 
-    assert promote_bookmark_to_main(repo, "mm/update-dependencies") is True
-    assert repo.joinpath("README.md").read_text() == "initial\n"
+    rebased = run_jj(path, "rebase", "-b", MANAGED, "-d", "main")
+    assert rebased.returncode == 0, rebased.stderr
+    applications = list(applied)
 
-    assert refresh_working_copy_from_main(repo) is True
+    third = _update(passing)
 
-    assert repo.joinpath("README.md").read_text() == "updated\n"
-
-
-def test_revision_relationship_helpers_with_real_jj_repo(tmp_path: Path):
-    repo = init_repo(tmp_path)
-    assert _jj(repo, "bookmark", "set", "main", "-r", "@").returncode == 0
-    assert _jj(repo, "new", "main").returncode == 0
-    assert _jj(repo, "describe", "-m", "child").returncode == 0
-    assert _jj(repo, "bookmark", "set", "child", "-r", "@").returncode == 0
-
-    assert same_revision(repo, "main", "main") == RevisionCheck(ok=True, value=True)
-    assert same_revision(repo, "main", "child") == RevisionCheck(ok=True, value=False)
-    assert is_ancestor(repo, "main", "child") == RevisionCheck(ok=True, value=True)
-    assert is_ancestor(repo, "child", "main") == RevisionCheck(ok=True, value=False)
-
-
-def test_main_commit_id_tracks_content_changes(tmp_path: Path):
-    repo = init_repo(tmp_path)
-
-    first = main_commit_id(repo)
-    assert first.ok is True
-    assert first.commit_id
-
-    assert _jj(repo, "new", "main").returncode == 0
-    (repo / "README.md").write_text("v2\n")
-    assert _jj(repo, "commit", "-m", "v2").returncode == 0
-    assert _jj(repo, "bookmark", "set", "main", "-r", "@-").returncode == 0
-
-    second = main_commit_id(repo)
-    assert second.ok is True
-    assert second.commit_id != first.commit_id
-
-    # No change between two resolves → stable identity (no spurious redeploy).
-    third = main_commit_id(repo)
-    assert third.commit_id == second.commit_id
-
-
-def test_main_commit_id_changes_on_amend(tmp_path: Path):
-    """Amending the deployed tip changes commit_id (why change_id was rejected)."""
-    repo = init_repo(tmp_path)
-    before = main_commit_id(repo)
-
-    assert _jj(repo, "edit", "main").returncode == 0
-    (repo / "README.md").write_text("amended\n")
-
-    # The next main_commit_id call runs jj, which snapshots the working copy
-    # and auto-amends the edited commit — that is what changes the commit_id.
-    after = main_commit_id(repo)
-    assert after.ok is True
-    assert after.commit_id != before.commit_id
-
-
-def test_main_commit_id_unresolved_without_bookmark(tmp_path: Path):
-    repo = tmp_path / "repo-no-main"
-    repo.mkdir()
-    run(["jj", "git", "init", "--colocate"], repo)
-    result = main_commit_id(repo)
-    assert result.ok is False
-
-
-def test_refresh_rebases_reusable_empty_working_copy(tmp_path: Path):
-    repo = init_repo(tmp_path)
-    assert _jj(repo, "bookmark", "set", "main", "-r", "@").returncode == 0
-    assert _jj(repo, "new", "main").returncode == 0
-    before = _jj(repo, "log", "-r", "@", "--no-graph", "-T", "change_id").stdout.strip()
-
-    assert refresh_working_copy_from_main(repo) is True
-    assert (
-        _jj(repo, "log", "-r", "@", "--no-graph", "-T", "change_id").stdout.strip()
-        == before
+    assert third.outcome is Outcome.SUCCEEDED
+    assert applied == applications
+    assert load_scan_results("api").updates == []
+    assert not repo.bookmark_exists(bookmark=MANAGED)
+    assert {"unrelated.txt", "deps/pkg-a", "deps/pkg-b", "deps/pkg-c"} <= _files(
+        path, "main"
     )
 
-    workspace = tmp_path / "advance-workspace"
-    assert (
-        _jj(
-            repo, "workspace", "add", "--name", "advance", str(workspace), "-r", "main"
-        ).returncode
-        == 0
+
+def test_given_pending_stack_when_resolve_takes_over_and_repairs_then_main_gets_all(
+    tmp_path: Path, applied: list[str]
+) -> None:
+    repo, project = _bun_project(tmp_path, "api", FAILS_B)
+    path = repo.path
+    _update(project)
+    update_tip = repo.resolve_revision(revision=MANAGED)
+
+    paused = _resolve(project, continue_=False)
+
+    assert paused is Outcome.FAILED
+    assert [row.state for row in load_scan_results("api").updates] == [
+        Ready(flow=Workflow.RESOLVE),
+        Failed(flow=Workflow.RESOLVE, phase="unit"),
+        Ready(flow=Workflow.RESOLVE),
+    ]
+    assert repo.resolve_revision(revision=RESOLVE_BOOKMARK) == update_tip
+    assert repo.same_revision(left="@-", right=RESOLVE_BOOKMARK)
+    assert not repo.bookmark_exists(bookmark=MANAGED)
+    assert (path / "deps" / "pkg-b").is_file()
+
+    (path / "repair.txt").write_text("repaired\n", encoding="utf-8")
+    committed = run_jj(path, "commit", "-m", "repair pkg-b")
+    assert committed.returncode == 0, committed.stderr
+    applications = list(applied)
+
+    finished = _resolve(project, continue_=True)
+
+    assert finished is Outcome.SUCCEEDED
+    assert applied == applications == ["pkg-a", "pkg-b", "pkg-c", "pkg-b"]
+    assert {"deps/pkg-a", "deps/pkg-b", "deps/pkg-c", "repair.txt"} <= _files(
+        path, "main"
     )
-    test_file = workspace / "sync.txt"
-    test_file.write_text("sync\n")
-    assert _jj(workspace, "describe", "-m", "advance main").returncode == 0
-    assert _jj(workspace, "bookmark", "set", "main", "-r", "@").returncode == 0
-
-    assert refresh_working_copy_from_main(repo) is True
-
-    after = _jj(repo, "log", "-r", "@", "--no-graph", "-T", "change_id").stdout.strip()
-    parent_bookmarks = _jj(
-        repo, "log", "-r", "@-", "--no-graph", "-T", 'bookmarks.join(" ")'
-    ).stdout.strip()
-
-    assert after == before
-    assert "main" in parent_bookmarks
+    assert repo.is_ancestor(ancestor=update_tip, descendant="main")
+    assert load_scan_results("api").findings == ()
+    assert not repo.bookmark_exists(bookmark=MANAGED)
+    assert not repo.bookmark_exists(bookmark=RESOLVE_BOOKMARK)
 
 
-@pytest.mark.parametrize("mutation", ["none", "main", "tip", "conflict"])
-def test_gradle_promotion_checks_exact_base_and_tip_in_operation(tmp_path, mutation):
-    repo = init_repo(tmp_path)
-    base = exact_commit_id(repo, "main")
-    (repo / "README.md").write_text("accepted update\n")
-    assert commit_current_change(repo, "accepted update")
-    tip = exact_commit_id(repo, "@-")
-    bookmark = "mm/update-dependencies"
-    assert create_or_reset_bookmark(bookmark, repo, tip)
-    if mutation == "main":
-        assert create_or_reset_bookmark("main", repo, tip)
-    elif mutation == "tip":
-        assert (
-            _jj(
-                repo, "bookmark", "set", bookmark, "-r", base, "--allow-backwards"
-            ).returncode
-            == 0
-        )
-    elif mutation == "conflict":
-        assert _jj(repo, "new", base).returncode == 0
-        (repo / "README.md").write_text("side\n")
-        assert commit_current_change(repo, "side")
-        side = exact_commit_id(repo, "@-")
-        op = _jj(
-            repo, "op", "log", "--limit", "1", "--no-graph", "-T", "id"
-        ).stdout.strip()
-        assert _jj(repo, "bookmark", "set", "main", "-r", tip).returncode == 0
-        assert (
-            _jj(repo, "--at-op", op, "bookmark", "set", "main", "-r", side).returncode
-            == 0
-        )
-        reconciled = _jj(repo, "bookmark", "list", "main")
-        assert reconciled.returncode == 0
-        assert "conflict" in reconciled.stdout
-    before = _jj(repo, "bookmark", "list", "main").stdout
-    promoted = promote_bookmark_to_main(
-        repo, bookmark, expected_base=base, expected_tip=tip
+def test_given_cleanup_failure_when_batch_updated_then_next_project_promotes(
+    tmp_path: Path, applied: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects = {
+        name: _bun_project(tmp_path, name, "true", packages="a")
+        for name in ("api", "web")
+    }
+    real_rmtree = shutil.rmtree
+
+    def rmtree(target: Path) -> None:
+        if Path(target).name == "api" and Path(target).exists():
+            msg = "device busy"
+            raise OSError(msg)
+        real_rmtree(target)
+
+    monkeypatch.setattr(vcs_workflow.shutil, "rmtree", rmtree)
+    emit = RecordingEmit()
+
+    batch = update_service.update_projects(
+        make_config(
+            projects={name: project for name, (_, project) in projects.items()}
+        ),
+        ["api", "web"],
+        emit=emit,
     )
-    assert promoted is (mutation == "none")
-    if mutation == "none":
-        assert exact_commit_id(repo, "main") == tip
-    else:
-        assert _jj(repo, "bookmark", "list", "main").stdout == before
+
+    assert [item.project for item in batch.projects] == ["api", "web"]
+    assert [item.outcome for item in batch.projects] == [
+        Outcome.FAILED,
+        Outcome.SUCCEEDED,
+    ]
+    for repo, _ in projects.values():
+        assert "deps/pkg-a" in _files(repo.path, "main")
+    assert [
+        event.operation
+        for event in emit.of_type(OperationFailed)
+        if event.project == "api"
+    ] == ["workspace cleanup"]
 
 
-def test_gradle_revision_tree_identity_tracks_content_not_commit_metadata(tmp_path):
-    from maintenance_man.vcs import revision_tree_id
+def _bun_project(
+    tmp_path: Path, name: str, test_unit: str, packages: str = "abc"
+) -> tuple[JjRepository, ProjectConfig]:
+    repo = copy_jj_repository(tmp_path / name)
+    write_file(repo, "package.json", "{}\n")
+    commit_to_main(repo, "add manifest")
+    scan = make_scan_result(
+        vulns=[], updates=[make_update(pkg_name=f"pkg-{x}") for x in packages]
+    )
+    scan.project = name
+    save_scan_results(name, scan)
+    return repo, make_project(repo.path, package_manager="bun", test_unit=test_unit)
 
-    repo = init_repo(tmp_path)
-    original = revision_tree_id(repo, "main")
-    assert original == revision_tree_id(repo)
-    assert _jj(repo, "describe", "-m", "metadata only").returncode == 0
-    assert original == revision_tree_id(repo)
-    (repo / "README.md").write_text("different content\n")
-    changed = revision_tree_id(repo)
-    assert changed != original
-    assert original == revision_tree_id(repo, "main")
-    (repo / "README.md").write_text("initial\n")
-    assert revision_tree_id(repo) == original
+
+def _update(
+    project: ProjectConfig, emit: RecordingEmit | None = None
+) -> update_service.ProjectUpdate:
+    return update_service.update_project(
+        "api",
+        project,
+        choose=None,
+        emit=emit or RecordingEmit(),
+    )
+
+
+def _resolve(project: ProjectConfig, *, continue_: bool) -> Outcome:
+    return resolve_service.resolve_project(
+        "api",
+        project,
+        continue_=continue_,
+        emit=RecordingEmit(),
+    )
+
+
+def _files(path: Path, revision: str) -> set[str]:
+    listed = run_jj(path, "file", "list", "-r", revision)
+    assert listed.returncode == 0, listed.stderr
+    return set(listed.stdout.split())

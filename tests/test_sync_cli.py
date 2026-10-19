@@ -1,109 +1,50 @@
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-from maintenance_man.cli import ExitCode, app
-from maintenance_man.config import load_config
+from maintenance_man.cli import ExitCode
+from maintenance_man.vcs import RevisionError
+from tests.support.cli import refuse_jj_commands, run_mm
+from tests.support.projects import write_config
+from tests.support.repository import configure_jj_projects, fail_repository_method
 
 
 class TestSyncCommand:
-    def test_syncs_all_projects_by_default(
+    def test_exits_nonzero_on_typed_failure(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        mock_sync = MagicMock(return_value=(True, ""))
-        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
+        path = configure_jj_projects(mm_home_with_projects, tmp_path)["vulnerable"]
+        fail_repository_method(
+            monkeypatch, path, "fetch", RevisionError("fetch failed")
+        )
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync"])
+        assert run_mm("sync", "vulnerable") == ExitCode.SYNC_FAILED
+        assert "fetch failed" in capsys.readouterr().err
 
-        assert exc_info.value.code == ExitCode.OK
-        assert mock_sync.call_count == len(load_config().projects)
-
-    def test_syncs_named_projects_only(
+    def test_reports_successful_action(
         self,
         mm_home_with_projects: Path,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        mock_sync = MagicMock(return_value=(True, ""))
-        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
+        configure_jj_projects(mm_home_with_projects, tmp_path)
 
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable", "clean"])
-
-        assert exc_info.value.code == ExitCode.OK
-        assert mock_sync.call_count == 2
-
-    def test_exits_nonzero_on_failure(
-        self,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        mock_sync = MagicMock(return_value=(False, "fetch failed"))
-        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable"])
-
-        assert exc_info.value.code == ExitCode.SYNC_FAILED
-
-    def test_continues_after_one_failure(
-        self,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # First call fails, second succeeds
-        mock_sync = MagicMock(side_effect=[(False, "fetch failed"), (True, "")])
-        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable", "clean"])
-
-        assert exc_info.value.code == ExitCode.SYNC_FAILED
-        # Both projects were attempted despite the first failure
-        assert mock_sync.call_count == 2
-
-    def test_delegates_to_sync_main_without_extra_vcs_context(
-        self,
-        mm_home_with_projects: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        mock_sync = MagicMock(return_value=(True, ""))
-        mock_label = MagicMock(side_effect=AssertionError("must not inspect label"))
-        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
-        monkeypatch.setattr("maintenance_man.cli.current_label", mock_label)
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync", "vulnerable"])
-
-        assert exc_info.value.code == ExitCode.OK
-        mock_sync.assert_called_once()
-        mock_label.assert_not_called()
-
-    def test_no_configured_projects(
-        self,
-        mm_home: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        mm_home.mkdir(parents=True, exist_ok=True)
-        (mm_home / "config.toml").write_text("[defaults]\nmin_version_age_days = 7\n")
-
-        mock_sync = MagicMock(return_value=(True, ""))
-        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync"])
-
-        assert exc_info.value.code == ExitCode.OK
-        mock_sync.assert_not_called()
+        assert run_mm("sync", "vulnerable") == ExitCode.OK
+        captured = capsys.readouterr()
+        assert captured.out == "vulnerable\tsync\tunchanged\tmain\t-\t-\t-\n"
+        assert captured.err == ""
 
     def test_skips_nonexistent_path(
         self,
         mm_home: Path,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         mm_home.mkdir(parents=True, exist_ok=True)
         missing_path = tmp_path / "does-not-exist"
@@ -116,13 +57,12 @@ path = "{missing_path}"
 package_manager = "uv"
 test_unit = "uv run pytest"
 """
-        (mm_home / "config.toml").write_text(config_text)
+        write_config(mm_home, config_text)
+        refuse_jj_commands(monkeypatch)
 
-        mock_sync = MagicMock(return_value=(True, ""))
-        monkeypatch.setattr("maintenance_man.cli.sync_main", mock_sync)
-
-        with pytest.raises(SystemExit) as exc_info:
-            app(["sync"])
-
-        assert exc_info.value.code == ExitCode.SYNC_FAILED
-        mock_sync.assert_not_called()
+        assert run_mm("sync") == ExitCode.SYNC_FAILED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == (
+            f"warning: ghost · path does not exist: {missing_path}\n"
+        )

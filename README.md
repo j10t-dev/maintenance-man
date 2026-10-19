@@ -36,23 +36,54 @@ mm update -n api worker   # batch update all except api and worker
 mm update api -n worker   # same exclusion mode; flag position does not matter
 ```
 
-```bash
-➜  maintenance-man git:(main) ✗ mm --help
+`mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed.
+
+`mm update` and `mm resolve` require jj.
+
+```text
 Usage: mm COMMAND
 
 Config-driven CLI for routine software project maintenance.
 
-╭─ Commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ build           Build a project's artefacts.                                                                                                   │
-│ deploy          Deploy a project.                                                                                                              │
-│ list            List all configured projects with scan findings summary.                                                                       │
-│ scan            Scan projects for vulnerabilities and available updates.                                                                       │
-│ test            Run a project's test suite.                                                                                                    │
-│ update          Apply updates from scan results to a project.                                                                                  │
-│ --help (-h)     Display this message and exit.                                                                                                 │
-│ --version (-v)  Display application version.                                                                                                   │
-╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Commands:
+  build: Build a project's artefacts.
+  deploy: Deploy a project.
+  init: Initialise the ~/.mm directory and skeleton config.
+  list, status, st: List all configured projects with scan findings summary.
+  resolve: Work through failed findings for a project.
+  scan: Scan projects for vulnerabilities and available updates.
+  sync: Sync local main with remote for one, many, or all configured projects.
+  test: Run a project's test suite.
+  todo: Show TODO.md items for projects.
+  update: Apply updates from scan results to one, many, or all projects.
+  --help, -h: Display this message and exit.
+  --version, -v: Display application version.
 ```
+
+## Output and subprocess logs
+
+Build, test, deploy, update and resolve hide successful subprocess logs by default. Failed commands replay stdout and stderr once on stderr. Add `--verbose` to stream both child streams live to stderr, including successful commands. Timeouts and interruptions expose partial logs and ask the command to terminate, escalating to SIGKILL after two seconds. Successful output is hidden, and so are prompts the command writes to stdout or stderr, because both streams go to temporary files until the command ends; only a prompt that opens `/dev/tty` appears. Ctrl-C still reaches the command. Run interactive scripts with `--verbose`, or have them write their prompt to `/dev/tty`. Logging ends when the command exits; services started in the background should own their log destinations. Protocol queries keep their output captured for parsing.
+
+Terminal output uses grouped, borderless records. Status words remain readable without colour. Narrow terminals abbreviate long fields and omit secondary columns; pipe the command to retain full values. Footers name hidden columns and may wrap to preserve that information. `NO_COLOR`, `TERM=dumb` and an unset `TERM` disable colour. Progress appears only on a stderr terminal after 500 ms, never while the command can read the terminal, and disappears on completion.
+
+When stdout is redirected, records are headerless TSV. Warnings, prompts, errors, progress and totals go to stderr. Help and version remain human-readable text. Field order:
+
+| Command or record | Fields |
+| --- | --- |
+| `mm list` | project, package_manager, vulnerabilities, updates, secrets, scanned_at, built_at, build_status, deployed_at, deploy_status |
+| `mm list --detail`, `mm scan` findings | project, kind, package or path, installed, target, severity or tier, identifier, published_at, status, reason |
+| Outcome (`update`, `resolve`, `build`, `test`, `deploy`, `sync`) | project, operation, status, subject, installed, target, reason |
+| `mm todo` | project, line_number, text |
+
+Timestamps use exact ISO 8601 in pipes and short relative values on a terminal. Unknown counts use `-`; known empty counts use `0`. Other absent values use `-`, with explicit reasons such as `never` or `not deployable` where relevant. TSV fields escape backslash, tab, carriage return and newline as `\\`, `\t`, `\r` and `\n`; other ASCII and C1 controls use `\xNN`, and Unicode line/paragraph separators use `\u2028`/`\u2029`. Bracketed text is literal. The reason field is human-readable explanation and may include `selected fix` for the chosen advisory fix.
+
+A passed package update and promotion to local main are separate outcomes. A failed build records deployment as skipped.
+
+## Breaking changes and upgrading
+
+`mm update` and `mm resolve` no longer open pull requests or need `gh`; resolve promotes to local `main`. A project without a configured test phase now fails `mm update` with exit code 4 instead of warning. `mm resolve --continue` with no saved failure exits 1. `mm scan` no longer prunes bookmarks. Saved scans gain `resolve_repair_base` and Gradle blocked rows. Saved scans hold one lifecycle state per finding, and mm refuses as corrupt a scan with findings saved by an earlier version.
+
+Before the first `mm update` or `mm resolve` after upgrading, run `mm scan` for every project, or delete its saved scan under `~/.mm/scan-results`. `mm update` and `mm resolve` report an older scan as `corrupt scan results` and name the command to run; `mm list` skips it with a warning. Rescanning also replaces Gradle targets that the previous engine never age-checked or validated. If the old pull-request flow left a pull request open, merge or close it before rescanning. `~/.mm/gradle-runs` and `~/.mm/gradle-contexts` are unused and can be deleted.
 
 ## Application contract 
 
@@ -87,6 +118,10 @@ deploy_command = "scripts/deploy.sh" # optional, path to script defining the dep
 scan_skip_dirs = ["tests/fixtures"] # optional, an array of relative directories that trivy should ignore in its scans.
 ```
 
+Test, build and deploy commands run through `/bin/bash` in the project directory, so shell syntax such as `&&`, pipes, redirects and quoting works. A pipeline's status is its last command's status unless the command sets `set -o pipefail`. Test commands were previously split into arguments without a shell, so a test command containing literal shell characters may now need quoting.
+
+Automatic updates need at least one test phase. A project without one fails before mm changes anything.
+
 The following defaults can be globally configured: 
 
 ```toml
@@ -101,41 +136,21 @@ healthcheck_url = "http://healthchecker:8080" # the URL of your healthchecker se
 
 ### Required project setup
 
-The project must apply these two plugins, pinned to these versions, in its root build script:
+The project must apply these two plugins, pinned to these versions, in its root build script. mm sets the CycloneDX output locations itself, so the project configures none:
 
 ```kotlin
-import org.cyclonedx.gradle.CyclonedxDirectTask
-import org.gradle.api.file.RegularFile
-
 plugins {
     id("nl.littlerobots.version-catalog-update") version "1.1.1"
     id("org.cyclonedx.bom") version "3.4.1"
     // Retain the project's existing plugins.
 }
-
-allprojects {
-    tasks.named<CyclonedxDirectTask>("cyclonedxDirectBom") {
-        val relative = if (project.path == ":") "root" else
-            "projects/" + project.path.removePrefix(":").replace(':', '/')
-        jsonOutput = rootProject.layout.projectDirectory.file(
-            ".mm-gradle-inventory/direct/$relative.json"
-        )
-        xmlOutput.convention(null as RegularFile?)
-    }
-}
-tasks.cyclonedxBom {
-    jsonOutput = layout.projectDirectory.file(".mm-gradle-inventory/bom.json")
-    xmlOutput.convention(null as RegularFile?)
-}
 ```
 
 Configure the test commands as for any other project, for example `test_unit = "./gradlew :app:testDebugUnitTest"`.
 
-Standard generated build and cache outputs must already be ignored by the repository; mm verifies that its dependency commits contain no generated reports.
+Standard generated build and cache outputs must already be ignored by the repository, because mm commits every tracked change left after the configured tests pass.
 
-Builds, tests and inventory generation must leave tracked source files unchanged. mm binds their evidence to one source tree and refuses acceptance if these commands change it.
-
-Export the Android SDK location before running `mm update`. `mm update` applies changes inside a throwaway jj workspace under `~/.mm/workspaces/`, and a jj workspace checks out tracked files only. `local.properties` is conventionally untracked, so `sdk.dir` is not available there and an Android build cannot find the SDK. Export `ANDROID_HOME` or `ANDROID_SDK_ROOT` in the environment you run `mm` from. mm refuses to create the workspace and tells you so if neither is set and the project relies on `local.properties`. `mm scan` and `mm resolve` run in the project directory, where `local.properties` is present.
+Export the Android SDK location before running `mm update`. `mm update` applies changes inside a throwaway jj workspace under `~/.mm/workspaces/`, and a jj workspace checks out tracked files only. `local.properties` is conventionally untracked, so `sdk.dir` is not available there and an Android build cannot find the SDK. Export `ANDROID_HOME` or `ANDROID_SDK_ROOT` in the environment you run `mm` from. mm refuses to create the workspace and tells you so if neither is set and the project has an untracked `local.properties`. `mm scan` and `mm resolve` run in the project directory, where `local.properties` is present.
 
 Because the workspace is created fresh and deleted after every run, each `mm update` is a cold Gradle build with no reusable daemon or build cache. Allow for that when choosing test tasks. Gradle commands are given 900 seconds, and each configured test phase 600 seconds.
 
@@ -145,12 +160,12 @@ Because the workspace is created fresh and deleted after every run, each `mm upd
 | --- | --- |
 | Discovery | `./gradlew versionCatalogUpdate --interactive --no-daemon --console=plain` |
 | Application | `./gradlew versionCatalogApplyUpdates --no-daemon --console=plain` |
-| Inventory + resolution | `./gradlew mmGradleReport --init-script <packaged script> --no-daemon --console=plain --rerun-tasks --no-build-cache` |
-| Vulnerabilities | `trivy sbom --format json --scanners vuln .mm-gradle-inventory/bom.json` |
+| Inventory + resolution | `./gradlew mmGradleReport --init-script <packaged script> -Pmm.reportDirectory=<report directory> --no-daemon --console=plain --rerun-tasks --no-build-cache` |
+| Vulnerabilities | `trivy sbom --format json --scanners vuln <report directory>/bom.json` |
 
 `mmGradleReport` is mm's own packaged task, added through an init script rather than a project plugin. It depends on `cyclonedxBom` for the inventory and additionally records, for every selected configuration, the resolved modules, variants and dependency edges Gradle's public resolution APIs report. mm reads both the inventory and this resolution report before removing its owned output, and every vulnerability finding is checked against a module the resolution actually selected.
 
-Each Gradle command runs from the project root with a 900-second timeout, closed standard input and the project environment. mm strips `VIRTUAL_ENV` and inherits the remaining environment. mm owns exactly two temporary paths, `gradle/libs.versions.updates.toml` and `.mm-gradle-inventory/`, and removes both before tests, change detection or a commit. mm reclaims leftovers from interrupted runs only when their ownership markers are intact. It rejects unmarked paths and symlinks and preserves their contents. It never touches your `build` directories.
+Each Gradle command runs from the project root with a 900-second timeout, closed standard input and the project environment. mm strips `VIRTUAL_ENV` and inherits the remaining environment. mm owns one temporary path in the project, `gradle/libs.versions.updates.toml`, and removes it before tests, change detection or a commit; it reclaims a leftover report from an interrupted run only when its ownership marker is intact. The inventory, the resolution report and the packaged init script go to a fresh directory under `~/.mm` that mm passes to Gradle as `-Pmm.reportDirectory` and removes after each task. It rejects unmarked paths and symlinks and preserves their contents. It never touches your `build` directories.
 
 ### What mm changes
 
@@ -158,21 +173,17 @@ mm edits catalogue library and plugin versions through the update plugin. Every 
 
 Simple literal versions and simple `version.ref` declarations are supported. Rich or ambiguous declarations remain blocked. A library without a catalogue version stays under platform or BOM control and never acquires a version. SDK, compileSdk/targetSdk, Gradle-wrapper, dependency-override and hard-coded declaration changes require manual preparation.
 
-A direct security fix requires an exact advisory fix version, or one unambiguous version on the installed major/minor branch, followed by native Gradle validation. Transitive parent, BOM and plugin updates require an independently discovered catalogue proposal and unambiguous ownership in the covered resolution graph. Unsupported ownership remains visible as a prerequisite. Updating a parent or plugin does not by itself mark its child advisories fixed.
+A direct security fix requires an exact advisory fix version, or one unambiguous version on the installed major/minor branch, followed by native Gradle validation. Transitive parent, BOM and plugin updates require an independently discovered catalogue proposal and unambiguous ownership in the covered resolution graph. An advisory links to a catalogue target only when every owner of it under that target is direct: an advisory reached through a parent, platform or plugin owner is withheld with that reason, and an advisory in a group whose discovery is blocked is withheld with the block's reason. Unsupported ownership remains visible as a prerequisite. An advisory with a published fix is completed when the catalogue target that owns it directly is applied and tested; the next `mm scan` reports anything still open. An advisory without a published fix is saved as blocked and never applied.
 
-### Release-age and verification policy
+### Release-age policy
 
-Automatic Gradle publication eligibility requires the project declaration `gradle_repository_routing = "standard-public"`. Set it only when relevant public repositories have no credentials or custom content/exclusive routing. mm relies on this operator declaration and does not infer it from a URL or successful resolution. Existing configurations without the declaration remain valid for scanning and reporting, with automatic candidates withheld.
+Known releases younger than `min_version_age_days` are withheld. For bun, uv and mvn, unknown or unavailable dates do not prevent updates, and `min_version_age_days = 0` skips their lookups. Gradle is fail-closed: a target is eligible only when every member's exact POM proves it at least `min_version_age_days` old, even at 0; an unknown date or failed lookup saves it as blocked with the reason. PyPI dates come from `pypi.org` with the exact package name and version checked, mvn and Gradle dates come from exact POMs, and those dates are cached under `~/.mm/publications` for 24 hours. npm dates come from `bun info` in the project and are looked up on every scan, because bun's registry configuration can change without mm noticing.
 
-Every changed member needs reliable publication evidence from its exact POM on a relevant configured trusted repository. Supported repositories are Maven Central, Google Maven and Plugin Portal. A reliable Last-Modified header is accepted as repository availability evidence; an exact matching Central timestamp is also supported. Missing, invalid or conflicting evidence blocks the group. When identical artifacts have different valid dates, mm uses the youngest. Setting `min_version_age_days = 0` removes the waiting period and still requires evidence. Custom URLs and unsupported redirects remain blocked. Plugin updates require evidence for both the standard marker and its exact implementation artifact.
+Set `gradle_repository_routing = "standard-public"` only when relevant public repositories have no credentials or custom content/exclusive routing. This declaration enables trusted publication lookups from Maven Central, Google Maven and Plugin Portal. Without the declaration every Gradle target is blocked with `Public repository routing has not been declared; automatic publication eligibility requires gradle_repository_routing = 'standard-public'`.
 
-Configure `build_command` and at least one test phase for automatic acceptance. For Android, use debug assembly plus unit tests and lint. Complete before/after scans use one frozen Trivy database and policy context. Failed checks, incomplete or incomparable coverage, and new or worsened findings block acceptance. An ordinary catalogue update may complete with unchanged residual advisories. A candidate proposed solely as a security fix must remove every requested scoped finding. Saved scan results retain residual CVEs without marking them completed.
+POM group and version fields may inherit literal values from a parent with complete coordinates. For mvn and Gradle alike, unresolved properties, ambiguous declarations, mismatched coordinates and non-UTF-8 POMs leave the publication date unknown.
 
-Verified changes can be promoted or submitted while unrelated advisories or withheld candidates remain. An actual failed or interrupted attempt prevents final promotion in that run. mm rechecks publication facts, checked trees, comparison inputs and the expected main/bookmark revisions before finalization. Update failure restores the last accepted workspace tree; resolve failure preserves the repair workspace.
-
-Interrupted work is tracked separately from scans in `~/.mm/gradle-runs`. Update recovery rolls back an unverified attempt before a later fresh invocation. `mm resolve PROJECT --continue` verifies a committed repair, including intended catalogue versions, age, build/tests and a comparable scan, without applying the update again. READY recovery reuses valid evidence or rebuilds it without reapplying. A failed refresh after promotion retries the refresh. Do not delete the ledger to bypass unsafe work; a fresh scan cannot erase it.
-
-Private Trivy database caches are released after a run completes or replacement evidence is durably saved. The ledger retains the recorded snapshots and receipts. Unfinished runs keep the cache needed for recovery.
+`mm scan` prepares each Gradle target once: owner selection, native validation and publication age. `mm update` and `mm resolve` apply saved targets only, each through one `versionCatalogApplyUpdates`, then run the configured test phases; they never scan, rediscover, run `build_command` or push. Blocked findings stay visible and do not stop other updates from being promoted.
 
 ### Inventory coverage
 
@@ -190,19 +201,18 @@ Vulnerability scanning covers the project configurations your CycloneDX configur
 
 ## VCS workflow
 
-Configured projects are expected to be colocated jj/Git repositories with a GitHub `origin` remote and a `main` bookmark. Git detached HEAD is normal under jj and is not treated as an error.
+Configured projects are expected to be colocated jj/Git repositories with an `origin` remote and a `main` bookmark. Git detached HEAD is normal under jj and is not treated as an error.
 
-`mm update` uses the `mm/update-dependencies` bookmark and a temporary jj workspace under `~/.mm/workspaces/<project>`. Passing findings are committed and the bookmark is promoted to `main` locally; run `mm sync` to publish `main`.
+`mm update` uses the `mm/update-dependencies` bookmark and a temporary jj workspace under `~/.mm/workspaces/<project>`. Each eligible finding is applied, tested and committed there. A failed finding is discarded and retried by the next `mm update` against the same saved scan; passing ones are not reapplied. When no attempted finding is failing, the bookmark is promoted to local `main`; run `mm sync` to publish it. A successful `mm scan` replaces the saved findings and their pending statuses.
 
-`mm resolve` uses the `mm/resolve-dependencies` bookmark for manual fixes. When the findings are ready, the bookmark is pushed and a GitHub PR is opened from that bookmark.
+`mm resolve` takes over pending update work on `mm/resolve-dependencies` in the project directory, applies the next failed finding and stops at a failure with its changes in place. Commit the repair, then run `mm resolve PROJECT --continue` to test it without reapplying the update. When every finding passes, resolve promotes to local `main` like update.
 
 `mm sync` fetches and pushes the `main` bookmark directly. It does not switch branches or depend on Git checkout state.
 
 ## Requirements
 
-* trivy
+* trivy, except for uv projects with `scan_secrets = false`
 * jj
-* gh
 * Python 3.14
 * JDK 21 and a project Gradle wrapper for `gradle` projects
 * uv
@@ -217,3 +227,37 @@ Configured projects are expected to be colocated jj/Git repositories with a GitH
 ## Contributing 
 
 Put bluntly - I probably don't want your contribution. This is primarily a personal tool and I have no aspirations of trying to expand it to support every language, tool chain or use-case. You are encouraged to fork the project if you want to use tools I don't. I offer no guarantee of reading your issues or responding to your PRs. I do not wish to interact with your LLM agents or humans regurgitating LLM output. Please communicate in your own words or don't contact me at all.
+
+### Development checks
+
+Run the default test suite and each static check directly before submitting a
+change. The default suite runs against real jj repositories, so it requires `jj`
+0.45.1 and `git` on `PATH` (jj shells out to git for fetch and push). It needs no
+network.
+
+```sh
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check
+uv run lint-imports
+```
+
+Repository functions are limited to a McCabe complexity of 10, six returns,
+12 branches, and 50 statements. Process launches must go through
+`maintenance_man.process`; that owner module and tests are exempt from the
+direct-process import ban so the adapter can be implemented and test fixtures
+can exercise subprocess boundaries. Parameter-count rule PLR0913 stays off
+because the codebase preserves explicit dependency injection. TRY003, TRY004,
+TRY300, and TRY301 stay off because they would change established exception
+boundaries and message contracts. Ruff preview rules are disabled. Deptry is
+deferred until dependency ownership policy is designed.
+
+The real-Gradle producer test is separate from the default suite. It is
+skipped unless `MM_GRADLE_WRAPPER` points to an executable `gradlew` whose
+directory also contains `gradle/wrapper`. It needs JDK 21 and network access to
+the Gradle plugin portal:
+
+```sh
+MM_GRADLE_WRAPPER=/path/to/project/gradlew uv run pytest tests/test_gradle_package.py -m integration -q
+```

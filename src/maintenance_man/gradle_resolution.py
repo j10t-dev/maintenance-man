@@ -1,92 +1,186 @@
 """Structured Gradle resolution and catalogue ownership; no lifecycle state."""
 
-from __future__ import annotations
-
-import hashlib
 import json
-import logging
 import re
-import time
+import shutil
+import tempfile
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import TypedDict
-from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from maintenance_man.dependency_age import publication_request
+from maintenance_man import paths
+from maintenance_man.clock import Clock
+from maintenance_man.dependency_age import (
+    PublicationLookupContext,
+    evaluate_gradle_candidate_age,
+    member_module,
+    publication_request,
+)
 from maintenance_man.gradle import (
-    GRADLE_CATALOGUE_RELPATH,
     Catalogue,
     CatalogueEntry,
     GradleError,
     ReportProposal,
-    _validate_inventory,
     build_update_findings,
-    normalise_alias,
-    owned_gradle_inventory,
+    catalogue_digest,
     run_gradle,
 )
+from maintenance_man.gradle_inventory import inventory_scopes, load_inventory
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     AgeBlock,
+    CandidateValidation,
     CandidateValidationBatch,
     CandidateWithheld,
-    CompleteResolution,
     GradleCandidate,
     GradleFixPlan,
-    IncompleteResolution,
-    KnownOwner,
     ModuleId,
-    OwnerResolution,
-    ResolutionOutcome,
+    ResolutionEdge,
     ResolutionReport,
+    ResolvedComponent,
     ScopeId,
     ScopeResolution,
-    UnknownOwner,
 )
 from maintenance_man.models.scan import (
+    GradleBlock,
     GradleKind,
-    GradleUpdateTarget,
     UpdateFinding,
     VulnFinding,
+    group_key_for,
+)
+
+GRADLE_REPORT_DIRECTORY_PROPERTY = "mm.reportDirectory"
+ROUTING_UNDECLARED = (
+    "Public repository routing has not been declared; automatic publication "
+    "eligibility requires gradle_repository_routing = 'standard-public'"
+)
+NON_DIRECT_OWNER = "advisory reachable only through a parent, platform or plugin owner"
+EXACT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+BRANCH = re.compile(r"^(\d+)\.(\d+)(?:\D|$)")
+
+_INIT_SCRIPT = files("maintenance_man.resources").joinpath("gradle-report.gradle")
+_REPORT_ARGS = (
+    "--no-daemon",
+    "--console=plain",
+    "--rerun-tasks",
+    "--no-build-cache",
+    "--no-configuration-cache",
 )
 
 
-def parse_resolution_report(text: str) -> ResolutionOutcome:
+@contextmanager
+def generate_gradle_report(
+    project: ProjectConfig,
+) -> Iterator[GeneratedGradleReport]:
+    """Capture the CycloneDX inventory and the resolution report in a fresh
+    directory under the mm home, removed on exit.
+
+    Raises GradleError for a failed task, a catalogue changed by the task, a
+    malformed inventory or report, an incomplete resolution and an inventory
+    that does not cover exactly the resolved modules.
+    """
+    with _run_report_task(
+        project,
+        "mmGradleReport",
+        {},
+        catalogue_changed="Catalogue changed during report generation",
+    ) as directory:
+        bom = directory / "bom.json"
+        components = load_inventory(bom)
+        try:
+            text = (directory / "report.json").read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            msg = f"Could not capture Gradle resolution: {exc}"
+            raise GradleError(msg) from exc
+        report = parse_resolution_report(text)
+        yield GeneratedGradleReport(
+            bom_path=bom, report=report, scopes=inventory_scopes(components, report)
+        )
+
+
+@dataclass(frozen=True)
+class GeneratedGradleReport:
+    """One report capture; the path is usable only inside its context."""
+
+    bom_path: Path
+    report: ResolutionReport
+    scopes: dict[ModuleId, frozenset[ScopeId]]
+
+
+@contextmanager
+def _run_report_task(
+    project: ProjectConfig,
+    task: str,
+    inputs: Mapping[str, str],
+    *,
+    catalogue_changed: str,
+) -> Iterator[Path]:
+    """Run one packaged init-script task with its outputs in a fresh directory
+    under the mm home, and yield that directory once the catalogue is proven
+    unchanged. The directory is removed on exit; when the task or the caller
+    raises, that exception propagates and a removal failure is ignored."""
+    root = Path(project.path)
+    before = catalogue_digest(root)
+    home = paths.mm_home()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="gradle-report-", dir=home))
+    except OSError as exc:
+        msg = f"Could not create a Gradle report directory under {home}: {exc}"
+        raise GradleError(msg) from exc
+    try:
+        script = directory / "gradle-report.gradle"
+        try:
+            script.write_bytes(_INIT_SCRIPT.read_bytes())
+            for filename, text in inputs.items():
+                (directory / filename).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            msg = f"Could not prepare {task} in {directory}: {exc}"
+            raise GradleError(msg) from exc
+        run_gradle(
+            root,
+            [
+                task,
+                "--init-script",
+                str(script),
+                f"-P{GRADLE_REPORT_DIRECTORY_PROPERTY}={directory}",
+                *_REPORT_ARGS,
+            ],
+            label=task,
+        )
+        if catalogue_digest(root) != before:
+            raise GradleError(catalogue_changed)
+        yield directory
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    _remove_report_directory(directory)
+
+
+def _remove_report_directory(directory: Path) -> None:
+    try:
+        shutil.rmtree(directory)
+    except OSError as exc:
+        msg = f"Could not remove the Gradle report directory {directory}: {exc}"
+        raise GradleError(msg) from exc
+
+
+def parse_resolution_report(text: str) -> ResolutionReport:
+    """Parse the init script's resolution report.
+
+    Raises GradleError for a malformed report and for an incomplete graph.
+    """
     try:
         report = ResolutionReport.model_validate_json(text)
-        if not re.fullmatch(r"[0-9a-f]{64}", report.catalogue_digest):
-            raise ValueError("invalid catalogue digest")
-        for scope in report.selected_scopes:
-            if not scope.project_path.startswith(":") or not scope.configuration:
-                raise ValueError("invalid scope identity")
-        for repository in report.repositories:
-            if repository.url is not None:
-                url = urlsplit(repository.url)
-                if url.username or url.password or url.query or url.fragment:
-                    raise ValueError(
-                        "repository report contains private or ambiguous URL"
-                    )
-        for scope in report.scopes:
-            for component in scope.components:
-                if not component.id:
-                    raise ValueError("empty component ID")
-                if component.module is not None:
-                    if any(
-                        not value or re.search(r"[\s:/\\]", value)
-                        for value in (
-                            component.module.group,
-                            component.module.artifact,
-                            component.module.version,
-                        )
-                    ):
-                        raise ValueError("invalid Maven identity")
-    except (ValidationError, ValueError) as exc:
-        raise GradleError(f"Malformed Gradle resolution report: {exc}") from exc
+    except ValueError as exc:
+        msg = f"Malformed Gradle resolution report: {exc}"
+        raise GradleError(msg) from exc
     reasons = list(report.selection_errors)
     actual = {scope.scope for scope in report.scopes}
     reasons.extend(
@@ -100,77 +194,77 @@ def parse_resolution_report(text: str) -> ResolutionOutcome:
         for message in scope.unresolved
     )
     if reasons:
-        return IncompleteResolution(report=report, reasons=tuple(reasons))
-    return CompleteResolution(report=report)
+        msg = "Incomplete Gradle resolution: " + "; ".join(reasons)
+        raise GradleError(msg)
+    return report
 
 
-def _script(directory: Path) -> Path:
-    script = directory / "gradle-report.gradle"
-    script.write_bytes(
-        files("maintenance_man.resources").joinpath("gradle-report.gradle").read_bytes()
+def resolve_gradle_owners(
+    catalogue: Catalogue, report: ResolutionReport, module: ModuleId
+) -> tuple[_Owner | None, ...]:
+    """The catalogue group owning *module* in each scope that resolves it, as
+    ``(group_key, direct)``; ``None`` when a scope names no group or several. The
+    tuple is ``(None,)`` when no scope resolves the module."""
+    owners = tuple(
+        _scope_owner(catalogue, scope, affected)
+        for scope in report.scopes
+        if (affected := {c.id for c in scope.components if c.module == module})
     )
-    return script
+    return owners or (None,)
 
 
-@contextmanager
-def generate_gradle_report(
-    project: ProjectConfig,
-) -> Iterator[tuple[Path, ResolutionOutcome]]:
-    root = Path(project.path)
-    before = hashlib.sha256((root / GRADLE_CATALOGUE_RELPATH).read_bytes()).hexdigest()
-    with owned_gradle_inventory(project) as directory:
-        try:
-            script = _script(directory)
-            report_started = time.monotonic()
-            run_gradle(
-                root,
-                [
-                    "mmGradleReport",
-                    "--init-script",
-                    str(script),
-                    "--no-daemon",
-                    "--console=plain",
-                    "--rerun-tasks",
-                    "--no-build-cache",
-                ],
-                label="mmGradleReport",
-            )
-            logging.getLogger(__name__).info(
-                "Gradle graph/inventory %.3fs", time.monotonic() - report_started
-            )
-            bom = directory / "bom.json"
-            report_path = directory / "report.json"
-            if bom.is_symlink() or report_path.is_symlink():
-                raise GradleError("Gradle report output is a symlink")
-            _validate_inventory(bom)
-            outcome = parse_resolution_report(report_path.read_text(encoding="utf-8"))
-            after = hashlib.sha256(
-                (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
-            ).hexdigest()
-            if before != after or outcome.report.catalogue_digest != before:
-                raise GradleError("Catalogue changed during report generation")
-            yield bom, outcome
-        except (OSError, UnicodeError) as exc:
-            raise GradleError(f"Could not capture Gradle resolution: {exc}") from exc
+type _Owner = tuple[str, bool]
 
 
-def collect_gradle_resolution(
-    project: ProjectConfig, catalogue: Catalogue
-) -> ResolutionOutcome:
-    # The caller's catalogue participates in selection; digest validation binds
-    # this report to the source file. No graph is reconstructed from TOML.
-    with generate_gradle_report(project) as (_, outcome):
-        return outcome
+def _scope_owner(
+    catalogue: Catalogue, scope: ScopeResolution, affected: set[str]
+) -> _Owner | None:
+    components = {component.id: component for component in scope.components}
+    root = next(c.id for c in scope.components if c.kind == "root")
+    direct = tuple(
+        dict.fromkeys(
+            edge.target
+            for edge in scope.edges
+            if edge.source == root and not edge.constraint
+        )
+    )
+    editable = _editable_library_roots(catalogue, components, direct)
+    reached = _ancestors(affected, scope.edges, root)
+    groups = {
+        group for component_id in reached for group in editable.get(component_id, ())
+    }
+    if not groups and scope.scope.domain == "buildscript":
+        groups = _plugin_marker_groups(catalogue, scope, components, direct, reached)
+    if len(groups) != 1:
+        return None
+    (group,) = groups
+    return group, any(
+        group in editable.get(component_id, ()) for component_id in affected
+    )
 
 
-EXACT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
-BRANCH = re.compile(r"^(\d+)\.(\d+)(?:\D|$)")
-
-
-def _entry_group(entry: CatalogueEntry) -> str:
-    if entry.version_ref is not None:
-        return f"ref:{normalise_alias(entry.version_ref)}"
-    return f"{entry.kind}:{normalise_alias(entry.alias)}"
+def _editable_library_roots(
+    catalogue: Catalogue,
+    components: dict[str, ResolvedComponent],
+    direct: tuple[str, ...],
+) -> dict[str, set[str]]:
+    editable: dict[str, set[str]] = {}
+    for component_id in direct:
+        module = components[component_id].module
+        if module is None:
+            continue
+        for entry in catalogue.entries.values():
+            version_value = _editable_version(catalogue, entry)
+            if (
+                entry.kind == "library"
+                and version_value is not None
+                and entry.coordinate == module.coordinate
+                and version_value == module.version
+            ):
+                editable.setdefault(component_id, set()).add(
+                    group_key_for(entry.kind, entry.alias, entry.version_ref)
+                )
+    return editable
 
 
 def _editable_version(catalogue: Catalogue, entry: CatalogueEntry) -> str | None:
@@ -181,132 +275,70 @@ def _editable_version(catalogue: Catalogue, entry: CatalogueEntry) -> str | None
     return version.value
 
 
-def _scope_owners(
-    catalogue: Catalogue, scope: ScopeResolution, module: ModuleId
-) -> tuple[OwnerResolution, ...]:
-    components = {component.id: component for component in scope.components}
-    affected = {
-        key for key, component in components.items() if component.module == module
-    }
-    if not affected:
-        return ()
-    root = next(
-        component.id for component in scope.components if component.kind == "root"
-    )
-    direct = {
-        edge.target
-        for edge in scope.edges
-        if edge.source == root and not edge.constraint
-    }
-    editable = {}
+def _ancestors(
+    affected: set[str], edges: tuple[ResolutionEdge, ...], root: str
+) -> set[str]:
+    """The affected components and every non-root component that depends on them."""
+    parents: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.source != root:
+            parents.setdefault(edge.target, []).append(edge.source)
+    reached = set(affected)
+    queue = deque(affected)
+    while queue:
+        for parent in parents.get(queue.popleft(), ()):
+            if parent not in reached:
+                reached.add(parent)
+                queue.append(parent)
+    return reached
+
+
+def _plugin_marker_groups(
+    catalogue: Catalogue,
+    scope: ScopeResolution,
+    components: dict[str, ResolvedComponent],
+    direct: tuple[str, ...],
+    reached: set[str],
+) -> set[str]:
+    groups: set[str] = set()
     for component_id in direct:
-        component = components[component_id]
-        if component.module is None:
+        marker = components[component_id].module
+        if marker is None:
             continue
         for entry in catalogue.entries.values():
-            version_value = _editable_version(catalogue, entry)
+            version = _editable_version(catalogue, entry)
             if (
-                entry.kind == "library"
-                and version_value is not None
-                and entry.coordinate == component.module.coordinate
-                and version_value == component.module.version
+                entry.kind == "plugin"
+                and version is not None
+                and marker.coordinate
+                == f"{entry.coordinate}:{entry.coordinate}.gradle.plugin"
+                and marker.version == version
+                and _implementation_reached(scope, components, component_id, reached)
             ):
-                editable.setdefault(component_id, set()).add(_entry_group(entry))
-    parents = {}
-    for edge in scope.edges:
-        parents.setdefault(edge.target, []).append(edge)
-    queue = deque((component_id, 0, False) for component_id in affected)
-    visited = set()
-    owners = set()
-    owner_distances = {}
-    while queue:
-        component_id, distance, constrained = queue.popleft()
-        if (component_id, constrained) in visited:
-            continue
-        visited.add((component_id, constrained))
-        if component_id in editable:
-            kind = (
-                "direct" if distance == 0 else ("platform" if constrained else "parent")
-            )
-            for group in editable[component_id]:
-                owner = (group, kind)
-                owners.add(owner)
-                owner_distances[owner] = min(
-                    distance, owner_distances.get(owner, distance)
-                )
-        for edge in parents.get(component_id, ()):
-            if edge.source != root:
-                queue.append(
-                    (edge.source, distance + 1, constrained or edge.constraint)
-                )
-    # Plugin ownership never crosses from a buildscript graph into unrelated
-    # project configurations. Standard marker roots and their exact edge supply
-    # the only marker/implementation link accepted here.
-    if not owners and scope.scope.domain == "buildscript":
-        for component_id in direct:
-            component = components[component_id]
-            if component.module is None:
-                continue
-            for entry in catalogue.entries.values():
-                version_value = _editable_version(catalogue, entry)
-                if not (
-                    entry.kind == "plugin"
-                    and version_value is not None
-                    and component.module.coordinate
-                    == f"{entry.coordinate}:{entry.coordinate}.gradle.plugin"
-                    and component.module.version == version_value
-                ):
-                    continue
-                implementation_edges = [
-                    edge
-                    for edge in scope.edges
-                    if edge.source == component_id and not edge.constraint
-                ]
-                if len(implementation_edges) != 1:
-                    continue
-                implementation = components[implementation_edges[0].target].module
-                requested = implementation_edges[0].requested.split(":")
-                if (
-                    implementation is None
-                    or len(requested) != 3
-                    or not EXACT_VERSION.fullmatch(requested[-1])
-                    or requested[-1] != implementation.version
-                ):
-                    continue
-                reachable = {implementation_edges[0].target}
-                pending = list(reachable)
-                while pending:
-                    current = pending.pop()
-                    for edge in scope.edges:
-                        if edge.source == current and edge.target not in reachable:
-                            reachable.add(edge.target)
-                            pending.append(edge.target)
-                if affected & reachable:
-                    owners.add((_entry_group(entry), "plugin"))
-    if len({group for group, _ in owners}) == 1:
-        # Check every independent root before choosing the nearest evidence
-        # within the one editable group. A shorter path cannot hide ambiguity.
-        group, kind = min(
-            owners, key=lambda owner: (owner_distances.get(owner, 0), owner)
-        )
-        return (KnownOwner(kind=kind, group_key=group, scope=scope.scope),)
-    reason = (
-        "multiple independently versioned catalogue owners"
-        if owners
-        else "no supported catalogue owner in resolved graph"
-    )
-    return (UnknownOwner(reason=reason, scope=scope.scope),)
+                groups.add(group_key_for(entry.kind, entry.alias, entry.version_ref))
+    return groups
 
 
-def resolve_gradle_owners(
-    catalogue: Catalogue, resolution: CompleteResolution, module: ModuleId
-) -> tuple[OwnerResolution, ...]:
-    owners = tuple(
-        owner
-        for scope in resolution.report.scopes
-        for owner in _scope_owners(catalogue, scope, module)
+def _implementation_reached(
+    scope: ScopeResolution,
+    components: dict[str, ResolvedComponent],
+    marker_id: str,
+    reached: set[str],
+) -> bool:
+    """Whether *marker_id* has one exact implementation edge reaching the affected
+    components."""
+    edges = [e for e in scope.edges if e.source == marker_id and not e.constraint]
+    if len(edges) != 1:
+        return False
+    implementation = components[edges[0].target].module
+    requested = edges[0].requested.split(":")
+    return (
+        implementation is not None
+        and len(requested) == 3
+        and EXACT_VERSION.fullmatch(requested[-1]) is not None
+        and requested[-1] == implementation.version
+        and edges[0].target in reached
     )
-    return owners or (UnknownOwner(reason="module absent from selected resolution"),)
 
 
 def exact_fix_candidate(installed: str, fixes: str | None) -> str | None:
@@ -326,50 +358,58 @@ def exact_fix_candidate(installed: str, fixes: str | None) -> str | None:
     return matching[0] if len(matching) == 1 else None
 
 
-def _candidate_scopes(
-    catalogue: Catalogue, resolution: CompleteResolution, target: GradleUpdateTarget
-) -> tuple[ScopeId, ...]:
-    coordinates = {
-        member.coordinate for member in target.members if member.kind == "library"
-    }
-    plugin_markers = {
-        f"{m.coordinate}:{m.coordinate}.gradle.plugin"
-        for m in target.members
-        if m.kind == "plugin"
-    }
-    return tuple(
-        scope.scope
-        for scope in resolution.report.scopes
-        if any(
-            component.module is not None
-            and component.module.coordinate in coordinates | plugin_markers
-            for component in scope.components
-        )
-    )
+type _VulnerabilityLink = tuple[int, VulnFinding, list[_Owner]]
 
 
 def select_gradle_candidates(
     catalogue: Catalogue,
-    resolution: CompleteResolution,
+    report: ResolutionReport,
     vulnerabilities: Sequence[VulnFinding],
     discovered: Sequence[UpdateFinding],
 ) -> GradleFixPlan:
-    candidates = {}
-    withheld = []
-    conflicting = set()
+    """Merge ordinary and security proposals, retaining each withheld reason."""
+    candidates, conflicting = _collect_ordinary_proposals(discovered)
+    linked, withheld = _link_vulnerabilities(catalogue, report, vulnerabilities)
+    blocked = {
+        finding.gradle_target.group_key: finding.state
+        for finding in discovered
+        if isinstance(finding.state, GradleBlock)
+        and finding.state.kind != "age"
+        and finding.gradle_target is not None
+    }
+    security_candidates, security_withheld = _build_security_proposals(
+        catalogue, candidates, linked, blocked
+    )
+    candidates.update(security_candidates)
+    withheld.extend(security_withheld)
+    for key in sorted(conflicting):
+        candidate = candidates.pop(key)
+        withheld.append(
+            CandidateWithheld(
+                group_key=key,
+                block=GradleBlock(
+                    kind="conflict",
+                    reason="conflicting or non-exact catalogue proposals",
+                ),
+                vulnerability_indices=candidate.vulnerability_indices,
+            )
+        )
+    return GradleFixPlan(
+        candidates=tuple(candidates[key] for key in sorted(candidates)),
+        withheld=tuple(withheld),
+    )
+
+
+def _collect_ordinary_proposals(
+    discovered: Sequence[UpdateFinding],
+) -> tuple[dict[str, GradleCandidate], set[str]]:
+    candidates: dict[str, GradleCandidate] = {}
+    conflicting: set[str] = set()
     for finding in discovered:
         target = finding.gradle_target
         if target is None or (
-            finding.blocked_reason and finding.gradle_block_kind != "age"
+            isinstance(finding.state, GradleBlock) and finding.state.kind != "age"
         ):
-            withheld.append(
-                CandidateWithheld(
-                    group_key=target.group_key if target else None,
-                    coordinate=finding.pkg_name,
-                    installed_version=finding.installed_version,
-                    reason=finding.blocked_reason or "no supported catalogue target",
-                )
-            )
             continue
         key = target.group_key
         if not EXACT_VERSION.fullmatch(target.target_version):
@@ -379,132 +419,162 @@ def select_gradle_candidates(
             and candidates[key].target.target_version != target.target_version
         ):
             conflicting.add(key)
-        candidates[key] = GradleCandidate(
-            target=target,
-            origins=frozenset({"ordinary"}),
-            owner_keys=(key,),
-            scopes=_candidate_scopes(catalogue, resolution, target),
-        )
-    linked = {}
-    for finding in vulnerabilities:
+        candidates[key] = GradleCandidate(target=target)
+    return candidates, conflicting
+
+
+def _link_vulnerabilities(
+    catalogue: Catalogue,
+    report: ResolutionReport,
+    vulnerabilities: Sequence[VulnFinding],
+) -> tuple[dict[str, list[_VulnerabilityLink]], list[CandidateWithheld]]:
+    linked: dict[str, list[_VulnerabilityLink]] = {}
+    withheld: list[CandidateWithheld] = []
+    for index, finding in enumerate(vulnerabilities):
+        if finding.fixed_version is None:
+            continue
         parts = finding.pkg_name.split(":")
         if len(parts) != 2:
-            withheld.append(
-                CandidateWithheld(
-                    group_key=None,
-                    coordinate=finding.pkg_name,
-                    installed_version=finding.installed_version,
-                    reason="finding lacks Maven coordinate",
-                    advisory_ids=frozenset({finding.vuln_id}),
-                )
-            )
+            withheld.append(_withheld_finding(index, "finding lacks Maven coordinate"))
             continue
         module = ModuleId(
             group=parts[0], artifact=parts[1], version=finding.installed_version
         )
-        owners = resolve_gradle_owners(catalogue, resolution, module)
-        known = [owner for owner in owners if isinstance(owner, KnownOwner)]
-        groups = {owner.group_key for owner in known}
-        if any(isinstance(owner, UnknownOwner) for owner in owners) or len(groups) != 1:
+        owners = resolve_gradle_owners(catalogue, report, module)
+        known = [owner for owner in owners if owner is not None]
+        if len(known) != len(owners):
             withheld.append(
-                CandidateWithheld(
-                    group_key=None,
-                    coordinate=finding.pkg_name,
-                    installed_version=finding.installed_version,
-                    reason="unknown or ambiguous catalogue ownership",
-                    advisory_ids=frozenset({finding.vuln_id}),
+                _withheld_finding(
+                    index, "cannot identify an unambiguous catalogue entry"
                 )
             )
             continue
-        key = next(iter(groups))
-        linked.setdefault(key, []).append((finding, known))
-    for key, links in linked.items():
-        advisory_ids = frozenset(finding.vuln_id for finding, _ in links)
-        coordinates = frozenset(finding.pkg_name for finding, _ in links)
-        scopes = tuple(
-            dict.fromkeys(owner.scope for _, owners in links for owner in owners)
-        )
-        if key in candidates:
-            existing = candidates[key]
-            candidates[key] = existing.model_copy(
-                update={
-                    "origins": frozenset({"ordinary", "security"}),
-                    "requested_advisories": advisory_ids,
-                    "requested_coordinates": coordinates,
-                    "scopes": tuple(dict.fromkeys((*existing.scopes, *scopes))),
-                }
+        for key in sorted({group for group, _ in known}):
+            linked.setdefault(key, []).append(
+                (index, finding, [owner for owner in known if owner[0] == key])
             )
-            continue
-        entries = [
-            entry for entry in catalogue.entries.values() if _entry_group(entry) == key
-        ]
-        versions = {
-            exact_fix_candidate(finding.installed_version, finding.fixed_version)
-            for finding, _ in links
-        }
-        if (
-            any(owner.kind != "direct" for _, owners in links for owner in owners)
-            or None in versions
-            or len(versions) != 1
-        ):
-            withheld.append(
-                CandidateWithheld(
-                    group_key=key,
-                    coordinate=links[0][0].pkg_name,
-                    installed_version=links[0][0].installed_version,
-                    reason="owner requires one independent exact catalogue proposal",
-                    advisory_ids=advisory_ids,
-                )
-            )
-            continue
-        version = next(v for v in versions if v is not None)
-        proposals = [
-            ReportProposal(
-                kind=entry.kind,
-                alias=entry.alias,
-                coordinate=entry.coordinate,
-                version=version,
-            )
-            for entry in entries
-        ]
-        built = build_update_findings(catalogue, proposals)
-        if len(built) != 1 or built[0].blocked_reason or built[0].gradle_target is None:
-            withheld.append(
-                CandidateWithheld(
-                    group_key=key,
-                    coordinate=links[0][0].pkg_name,
-                    installed_version=links[0][0].installed_version,
-                    reason="incompatible shared catalogue group",
-                    advisory_ids=advisory_ids,
-                )
-            )
-            continue
-        candidates[key] = GradleCandidate(
-            target=built[0].gradle_target,
-            origins=frozenset({"security"}),
-            requested_advisories=advisory_ids,
-            requested_coordinates=coordinates,
-            owner_keys=(key,),
-            scopes=scopes,
-        )
-    for key in sorted(conflicting):
-        candidate = candidates.pop(key)
-        withheld.append(
-            CandidateWithheld(
-                group_key=key,
-                coordinate=candidate.target.display_name,
-                installed_version=candidate.target.members[0].installed_version,
-                reason="conflicting or non-exact catalogue proposals",
-            )
-        )
-    return GradleFixPlan(
-        candidates=tuple(candidates[key] for key in sorted(candidates)),
-        withheld=tuple(withheld),
+    return linked, withheld
+
+
+def _withheld_finding(index: int, reason: str) -> CandidateWithheld:
+    """Withhold one advisory that names no single catalogue owner."""
+    return CandidateWithheld(
+        group_key=None,
+        block=GradleBlock(kind="mapping", reason=reason),
+        vulnerability_indices=(index,),
     )
 
 
+def _security_only_proposal(
+    catalogue: Catalogue,
+    key: str,
+    links: list[_VulnerabilityLink],
+    vulnerability_indices: tuple[int, ...],
+) -> GradleCandidate | CandidateWithheld:
+    entries = [
+        entry
+        for entry in catalogue.entries.values()
+        if group_key_for(entry.kind, entry.alias, entry.version_ref) == key
+    ]
+    versions = {
+        exact_fix_candidate(finding.installed_version, finding.fixed_version)
+        for _, finding, _ in links
+    }
+    if None in versions or len(versions) != 1:
+        return CandidateWithheld(
+            group_key=key,
+            block=GradleBlock(
+                kind="conflict",
+                reason="owner requires one independent exact catalogue proposal",
+            ),
+            vulnerability_indices=vulnerability_indices,
+        )
+    version = next(version for version in versions if version is not None)
+    proposals = [
+        ReportProposal(
+            kind=entry.kind,
+            alias=entry.alias,
+            coordinate=entry.coordinate,
+            version=version,
+        )
+        for entry in entries
+    ]
+    built = build_update_findings(catalogue, proposals)
+    if len(built) != 1 or built[0].state is not None or built[0].gradle_target is None:
+        return CandidateWithheld(
+            group_key=key,
+            block=GradleBlock(
+                kind="mapping", reason="incompatible shared catalogue group"
+            ),
+            vulnerability_indices=vulnerability_indices,
+        )
+    return GradleCandidate(
+        target=built[0].gradle_target, vulnerability_indices=vulnerability_indices
+    )
+
+
+def _build_security_proposals(
+    catalogue: Catalogue,
+    candidates: Mapping[str, GradleCandidate],
+    linked: dict[str, list[_VulnerabilityLink]],
+    blocked: Mapping[str, GradleBlock],
+) -> tuple[dict[str, GradleCandidate], list[CandidateWithheld]]:
+    proposals: dict[str, GradleCandidate] = {}
+    withheld: list[CandidateWithheld] = []
+    for key, links in linked.items():
+        if key in blocked:
+            withheld.append(
+                CandidateWithheld(
+                    group_key=key,
+                    block=blocked[key],
+                    vulnerability_indices=tuple(index for index, _, _ in links),
+                )
+            )
+            continue
+        direct, indirect = _split_by_directness(links)
+        withheld.extend(
+            CandidateWithheld(
+                group_key=key,
+                block=GradleBlock(kind="mapping", reason=NON_DIRECT_OWNER),
+                vulnerability_indices=(index,),
+            )
+            for index, _, _ in indirect
+        )
+        if not direct:
+            continue
+        indices = tuple(index for index, _, _ in direct)
+        if key in candidates:
+            proposals[key] = candidates[key].model_copy(
+                update={"vulnerability_indices": indices}
+            )
+            continue
+        proposal = _security_only_proposal(catalogue, key, direct, indices)
+        if isinstance(proposal, CandidateWithheld):
+            withheld.append(proposal)
+        else:
+            proposals[key] = proposal
+    return proposals, withheld
+
+
+def _split_by_directness(
+    links: list[_VulnerabilityLink],
+) -> tuple[list[_VulnerabilityLink], list[_VulnerabilityLink]]:
+    """The links whose owners are all direct, then the rest."""
+    direct: list[_VulnerabilityLink] = []
+    indirect: list[_VulnerabilityLink] = []
+    for link in links:
+        _, _, owners = link
+        if all(is_direct for _, is_direct in owners):
+            direct.append(link)
+        else:
+            indirect.append(link)
+    return direct, indirect
+
+
 class ValidationRequest(TypedDict):
-    """One native metadata request row, keyed by field for identity checks."""
+    """One native metadata request: a catalogue member of a candidate, resolved from
+    one consuming project to the candidate version. Gradle echoes only the
+    ``request_id``; the other fields stay with the request."""
 
     request_id: str
     group_key: str
@@ -517,19 +587,18 @@ class ValidationRequest(TypedDict):
 
 
 def _validation_requests(
-    candidates: Sequence[GradleCandidate],
-    resolution: CompleteResolution,
+    candidates: Sequence[GradleCandidate], report: ResolutionReport
 ) -> list[ValidationRequest]:
-    # A shared catalogue version can span projects with different repositories.
-    # Candidate scopes also include advisory ownership; resolve each member's
-    # actual consumers independently from that candidate-wide union.
+    """One request per member and consuming project; plugins validate at the root.
+
+    A shared catalogue version can span projects with different repositories,
+    so each member resolves its own consumers.
+    """
     projects: dict[str, set[str]] = {}
-    for scope in resolution.report.scopes:
-        for component in scope.components:
-            if component.module is not None:
-                projects.setdefault(component.module.coordinate, set()).add(
-                    scope.scope.project_path
-                )
+    for module, scopes in report.module_scopes().items():
+        projects.setdefault(module.coordinate, set()).update(
+            scope.project_path for scope in scopes
+        )
     requests: list[ValidationRequest] = []
     for candidate in candidates:
         for member in candidate.target.members:
@@ -552,154 +621,158 @@ def _validation_requests(
     return requests
 
 
+type _Validations = list[tuple[ValidationRequest, CandidateValidation]]
+
+
 def validate_gradle_candidates(
     project: ProjectConfig,
     candidates: Sequence[GradleCandidate],
-    resolution: CompleteResolution,
-) -> CandidateValidationBatch:
-    requests = _validation_requests(candidates, resolution)
+    report: ResolutionReport,
+) -> _Validations:
+    """Resolve every candidate member natively in its consuming projects and pair
+    each request with its result.
+
+    Raises GradleError for a failed task, a modified catalogue and a response
+    that is invalid, incomplete or selects a different version.
+    """
+    requests = _validation_requests(candidates, report)
     if not requests:
-        return CandidateValidationBatch(schema_version=1, results=())
-    root = Path(project.path)
-    before = (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
-    with owned_gradle_inventory(project) as directory:
+        return []
+    payload = json.dumps({"schema_version": 1, "requests": requests})
+    with _run_report_task(
+        project,
+        "mmGradleValidateCandidates",
+        {"candidate-requests.json": payload},
+        catalogue_changed="Candidate metadata resolution modified the catalogue",
+    ) as directory:
         try:
-            script = _script(directory)
-            (directory / "candidate-requests.json").write_text(
-                json.dumps({"schema_version": 1, "requests": requests}),
-                encoding="utf-8",
+            batch = CandidateValidationBatch.model_validate_json(
+                (directory / "candidate-validation.json").read_text(encoding="utf-8")
             )
-            run_gradle(
-                root,
-                [
-                    "mmGradleValidateCandidates",
-                    "--init-script",
-                    str(script),
-                    "--no-daemon",
-                    "--console=plain",
-                    "--rerun-tasks",
-                    "--no-build-cache",
-                ],
-                label="mmGradleValidateCandidates",
-            )
-            logging.getLogger(__name__).info(
-                "Gradle metadata candidates validated: %d requests", len(requests)
-            )
-            response = directory / "candidate-validation.json"
-            if response.is_symlink():
-                raise GradleError("Candidate validation output is a symlink")
-            batch = CandidateValidationBatch.model_validate_json(response.read_text())
-            expected = {request["request_id"]: request for request in requests}
-            actual = {result.request_id: result for result in batch.results}
-            if len(actual) != len(batch.results) or actual.keys() != expected.keys():
-                raise GradleError("Candidate validation response coverage mismatch")
-            for request_id, result in actual.items():
-                request = expected[request_id]
-                if (
-                    result.group_key,
-                    result.alias,
-                    result.project_path,
-                    result.kind,
-                ) != (
-                    request["group_key"],
-                    request["alias"],
-                    request["project_path"],
-                    request["kind"],
-                ):
-                    raise GradleError("Candidate validation identity mismatch")
-                if (
-                    result.reason is None
-                    and result.selected_version != request["candidate_version"]
-                ):
-                    raise GradleError(
-                        "Candidate validation success selected a different version"
-                    )
-                if (
-                    result.reason is None
-                    and request["kind"] == "plugin"
-                    and result.implementation is None
-                ):
-                    raise GradleError("Candidate marker success lacks implementation")
-            if (root / GRADLE_CATALOGUE_RELPATH).read_bytes() != before:
-                raise GradleError(
-                    "Candidate metadata resolution modified the catalogue"
-                )
-            return batch
         except (OSError, UnicodeError, ValidationError) as exc:
-            raise GradleError(f"Invalid candidate validation output: {exc}") from exc
+            msg = f"Invalid candidate validation output: {exc}"
+            raise GradleError(msg) from exc
+    return _checked_validations(requests, batch)
 
 
-def gradle_routing_prerequisite(project: ProjectConfig) -> AgeBlock | None:
-    if project.gradle_repository_routing == "standard-public":
-        return None
-    return AgeBlock(
-        reason=(
-            "Public repository routing has not been declared; automatic "
-            "publication eligibility requires "
-            "gradle_repository_routing = 'standard-public'"
-        )
-    )
+def _checked_validations(
+    requests: list[ValidationRequest], batch: CandidateValidationBatch
+) -> _Validations:
+    expected = {request["request_id"]: request for request in requests}
+    actual = {result.request_id: result for result in batch.results}
+    if len(actual) != len(batch.results) or actual.keys() != expected.keys():
+        msg = "Candidate validation response coverage mismatch"
+        raise GradleError(msg)
+    for request_id, result in actual.items():
+        request = expected[request_id]
+        if result.reason is not None:
+            continue
+        if result.selected_version != request["candidate_version"]:
+            msg = "Candidate validation success selected a different version"
+            raise GradleError(msg)
+        if request["kind"] == "plugin" and result.implementation is None:
+            msg = "Candidate marker success lacks implementation"
+            raise GradleError(msg)
+    return [(request, actual[request_id]) for request_id, request in expected.items()]
 
 
 def attach_gradle_publications(
-    candidate: GradleCandidate,
-    resolution: CompleteResolution,
-    batch: CandidateValidationBatch,
-) -> GradleCandidate | CandidateWithheld:
+    candidate: GradleCandidate, report: ResolutionReport, validations: _Validations
+) -> GradleCandidate | GradleBlock:
+    """Bind publication requests to *candidate*, or return the block withholding it."""
     requests = []
     for member in candidate.target.members:
         rows = [
-            row
-            for row in batch.results
-            if row.group_key == candidate.target.group_key
-            and row.alias == member.alias
-            and row.kind == member.kind
+            (request, result)
+            for request, result in validations
+            if (request["group_key"], request["alias"], request["kind"])
+            == (candidate.target.group_key, member.alias, member.kind)
         ]
-        failure = next((row.reason for row in rows if row.reason), None)
+        failure = next((result.reason for _, result in rows if result.reason), None)
         if not rows or failure:
-            return CandidateWithheld(
-                group_key=candidate.target.group_key,
-                coordinate=member.coordinate,
-                installed_version=member.installed_version,
+            return GradleBlock(
+                kind="mapping",
                 reason=failure or "missing native candidate validation",
-                advisory_ids=candidate.requested_advisories,
             )
-        paths = {row.project_path for row in rows}
+        project_paths = {request["project_path"] for request, _ in rows}
         domain = "plugin" if member.kind == "plugin" else "library"
         repositories = tuple(
             repository
-            for repository in resolution.report.repositories
-            if repository.domain == domain and repository.project_path in paths | {":"}
+            for repository in report.repositories
+            if repository.domain == domain
+            and repository.project_path in project_paths | {":"}
         )
-        if member.kind == "plugin":
-            implementations = {row.implementation for row in rows}
-            if len(implementations) != 1 or None in implementations:
-                return CandidateWithheld(
-                    group_key=candidate.target.group_key,
-                    coordinate=member.coordinate,
-                    installed_version=member.installed_version,
-                    reason="conflicting marker implementations",
-                )
-            module = ModuleId(
-                group=member.coordinate,
-                artifact=f"{member.coordinate}.gradle.plugin",
-                version=candidate.target.target_version,
+        module = member_module(member, candidate.target.target_version)
+        if module is None:
+            return GradleBlock(
+                kind="mapping", reason="unsupported catalogue member coordinate"
             )
+        if member.kind == "plugin":
+            implementations = {result.implementation for _, result in rows}
+            if len(implementations) != 1 or None in implementations:
+                return GradleBlock(
+                    kind="mapping", reason="conflicting marker implementations"
+                )
             requests.append(
                 publication_request(
                     module, repositories, implementation=next(iter(implementations))
                 )
             )
         else:
-            group, artifact = member.coordinate.split(":")
-            requests.append(
-                publication_request(
-                    ModuleId(
-                        group=group,
-                        artifact=artifact,
-                        version=candidate.target.target_version,
-                    ),
-                    repositories,
-                )
-            )
+            requests.append(publication_request(module, repositories))
     return candidate.model_copy(update={"publication_requests": tuple(requests)})
+
+
+def prepare_gradle_candidates(
+    project: ProjectConfig,
+    candidates: Sequence[GradleCandidate],
+    report: ResolutionReport,
+    publication: PublicationLookupContext,
+    minimum_age_days: int,
+    *,
+    clock: Clock,
+) -> tuple[GradleCandidate, ...]:
+    """Validate proposed catalogue changes and apply the release-age policy.
+
+    Each result carries the reason it is withheld, or the date its youngest
+    publication evidence was published. Without declared public routing every
+    candidate is withheld unvalidated.
+    """
+    if project.gradle_repository_routing != "standard-public":
+        return tuple(
+            candidate.model_copy(
+                update={"block": GradleBlock(kind="mapping", reason=ROUTING_UNDECLARED)}
+            )
+            for candidate in candidates
+        )
+    validations = validate_gradle_candidates(project, candidates, report)
+    bound = [
+        attach_gradle_publications(candidate, report, validations)
+        for candidate in candidates
+    ]
+    publication.prefetch(
+        request
+        for item in bound
+        if isinstance(item, GradleCandidate)
+        for request in item.publication_requests
+    )
+    return tuple(
+        _aged(candidate, item, minimum_age_days, publication, clock)
+        for candidate, item in zip(candidates, bound, strict=True)
+    )
+
+
+def _aged(
+    candidate: GradleCandidate,
+    bound: GradleCandidate | GradleBlock,
+    minimum_age_days: int,
+    publication: PublicationLookupContext,
+    clock: Clock,
+) -> GradleCandidate:
+    if isinstance(bound, GradleBlock):
+        return candidate.model_copy(update={"block": bound})
+    age = evaluate_gradle_candidate_age(bound, minimum_age_days, publication, clock())
+    if isinstance(age, AgeBlock):
+        block = GradleBlock(kind="age", reason=age.reason)
+        return bound.model_copy(update={"block": block})
+    return bound.model_copy(update={"published_date": age})

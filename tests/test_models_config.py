@@ -3,116 +3,100 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from maintenance_man.models.config import DefaultsConfig, ProjectConfig
+from maintenance_man.config import ConfigError, load_config
+from maintenance_man.models.config import ProjectConfig
+from tests.support.projects import write_config
 
 
-class TestProjectConfigTestFields:
-    def test_no_test_fields(self):
-        pc = ProjectConfig(path=Path("/tmp/x"), package_manager="bun")
-        assert pc.test_unit is None
-        assert pc.test_integration is None
-        assert pc.test_component is None
-
-    def test_unit_only(self):
-        pc = ProjectConfig(
-            path=Path("/tmp/x"), package_manager="uv", test_unit="uv run pytest"
-        )
-        assert pc.test_unit == "uv run pytest"
-        assert pc.test_integration is None
-
-    def test_all_phases(self):
-        pc = ProjectConfig(
-            path=Path("/tmp/x"),
-            package_manager="bun",
-            test_unit="bun test",
-            test_integration="bun run test:integration",
-            test_component="bun run test:component",
-        )
-        assert pc.test_unit == "bun test"
-        assert pc.test_integration == "bun run test:integration"
-        assert pc.test_component == "bun run test:component"
-
-    def test_rejects_extra_fields(self):
-        with pytest.raises(ValidationError, match="unknown"):
-            ProjectConfig(path=Path("/tmp/x"), package_manager="bun", unknown="bad")  # type: ignore[call-arg]  # ty:ignore[unknown-argument]
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
+        ({}, ()),
+        ({"test_unit": "make unit"}, (("unit", "make unit"),)),
+        (
+            {"test_unit": "u", "test_integration": "i", "test_component": "c"},
+            (("unit", "u"), ("integration", "i"), ("component", "c")),
+        ),
+        ({"test_unit": "", "test_integration": "i"}, (("integration", "i"),)),
+        ({"test_unit": "  ", "test_component": "c"}, (("component", "c"),)),
+    ],
+)
+def test_test_phases(tmp_path, fields, expected):
+    project = ProjectConfig(path=tmp_path, package_manager="uv", **fields)
+    assert project.test_phases == expected
 
 
-class TestProjectConfigScanSkipDirs:
-    def test_defaults_to_empty_list(self):
-        pc = ProjectConfig(path=Path("/tmp/x"), package_manager="uv")
-        assert pc.scan_skip_dirs == []
-
-    def test_accepts_skip_dirs(self):
-        pc = ProjectConfig(
-            path=Path("/tmp/x"),
-            package_manager="uv",
-            scan_skip_dirs=["tests/fixtures", "vendor"],
-        )
-        assert pc.scan_skip_dirs == ["tests/fixtures", "vendor"]
+_PATH = Path("/project")
 
 
-class TestProjectConfigDeployFields:
-    def test_no_deploy_fields(self):
-        pc = ProjectConfig(path=Path("/tmp/x"), package_manager="bun")
-        assert pc.build_command is None
-        assert pc.deploy_command is None
-
-    def test_deploy_only(self):
-        pc = ProjectConfig(
-            path=Path("/tmp/x"),
-            package_manager="uv",
-            deploy_command="scripts/deploy.sh",
-        )
-        assert pc.deploy_command == "scripts/deploy.sh"
-        assert pc.build_command is None
-
-    def test_build_and_deploy(self):
-        pc = ProjectConfig(
-            path=Path("/tmp/x"),
-            package_manager="bun",
-            build_command="scripts/build.sh",
-            deploy_command="scripts/deploy.sh",
-        )
-        assert pc.build_command == "scripts/build.sh"
-        assert pc.deploy_command == "scripts/deploy.sh"
-
-
-def test_gradle_package_manager_is_accepted(tmp_path):
-    project = ProjectConfig(path=tmp_path, package_manager="gradle")
-
-    assert project.package_manager == "gradle"
-
-
-class TestDefaultsConfigHealthcheck:
-    def test_no_healthcheck_url(self):
-        dc = DefaultsConfig()
-        assert dc.healthcheck_url is None
-
-    def test_healthcheck_url(self):
-        dc = DefaultsConfig(healthcheck_url="http://pihost:8080")
-        assert dc.healthcheck_url == "http://pihost:8080"
-
-
-@pytest.mark.parametrize("value", [None, "standard-public"])
-def test_gradle_routing_declaration_values(tmp_path, value):
-    project = ProjectConfig.model_validate(
-        dict(path=tmp_path, package_manager="gradle", gradle_repository_routing=value)
-    )
-    assert project.gradle_repository_routing == value
-
-
-def test_gradle_routing_omission_is_backward_compatible(tmp_path):
-    project = ProjectConfig(path=tmp_path, package_manager="gradle")
-    assert project.gradle_repository_routing is None
-
-
-@pytest.mark.parametrize("value", ["", "custom", "STANDARD-PUBLIC", True, 1, []])
-def test_gradle_routing_rejects_unknown_declarations(tmp_path, value):
-    with pytest.raises(ValidationError, match="gradle_repository_routing"):
-        ProjectConfig.model_validate(
-            dict(
-                path=tmp_path,
-                package_manager="gradle",
-                gradle_repository_routing=value,
+@pytest.mark.parametrize(
+    ("settings", "field"),
+    [
+        ({"package_manager": "bun"}, "path"),
+        ({"path": _PATH}, "package_manager"),
+        ({"path": _PATH, "package_manager": "npm"}, "package_manager"),
+        (
+            {"path": _PATH, "package_manager": "bun", "language": "typescript"},
+            "language",
+        ),
+        *(
+            (
+                {
+                    "path": _PATH,
+                    "package_manager": "gradle",
+                    "gradle_repository_routing": value,
+                },
+                "gradle_repository_routing",
             )
-        )
+            for value in ("", "custom", "STANDARD-PUBLIC", True, 1, [])
+        ),
+    ],
+)
+def test_given_invalid_project_settings_when_validated_then_error_names_the_field(
+    settings, field
+):
+    with pytest.raises(ValidationError, match=field):
+        ProjectConfig.model_validate(settings)
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({}, None),
+        ({"gradle_repository_routing": None}, None),
+        ({"gradle_repository_routing": "standard-public"}, "standard-public"),
+    ],
+    ids=["omitted", "none", "standard-public"],
+)
+def test_given_routing_declaration_when_validated_then_it_is_kept(
+    tmp_path, settings, expected
+):
+    project = ProjectConfig.model_validate(
+        {"path": tmp_path, "package_manager": "gradle"} | settings
+    )
+
+    assert project.gradle_repository_routing == expected
+
+
+def test_given_negative_minimum_age_when_config_loaded_then_config_error(
+    tmp_path: Path,
+) -> None:
+    config_path = write_config(tmp_path, "[defaults]\nmin_version_age_days = -1\n")
+
+    with pytest.raises(ConfigError, match="min_version_age_days"):
+        load_config(config_path)
+
+
+def test_given_two_invalid_values_when_config_loaded_then_one_message_each(
+    tmp_path: Path,
+) -> None:
+    path = write_config(tmp_path, "[defaults]\nmin_version_age_days = -1\nbogus = 1\n")
+
+    with pytest.raises(ConfigError) as raised:
+        load_config(path)
+
+    assert raised.value.messages == (
+        f"{path}: defaults.min_version_age_days: "
+        "Input should be greater than or equal to 0",
+        f"{path}: defaults.bogus: Extra inputs are not permitted",
+    )

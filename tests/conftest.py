@@ -1,69 +1,61 @@
-from datetime import datetime, timedelta, timezone
+"""Pytest fixture registration and per-test environment isolation."""
+
 from pathlib import Path
-from typing import Any
 
 import pytest
 
+from maintenance_man import output
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
-    GradleMember,
-    GradleUpdateTarget,
-    ScanResult,
-    SemverTier,
-    Severity,
-    UpdateFinding,
-    VulnFinding,
+    Workflow,
+)
+from tests.support.cli import CliDeps, cli_deps
+from tests.support.gradle import GRADLE_FIXTURES
+from tests.support.projects import FIXTURES_DIR, write_config
+from tests.support.repository import (
+    RepositoryCase,
+    copy_jj_peer,
+    copy_jj_repository,
+    jj_environment,
 )
 
-FIXTURES_DIR = Path(__file__).parent / "fixtures"
-GRADLE_FIXTURES = FIXTURES_DIR / "gradle"
+
+@pytest.fixture(autouse=True)
+def _plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test starts in pipe mode at 80 columns with no colour overrides."""
+    for name in ("FORCE_COLOR", "NO_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("TERM", "dumb")
+    output.reset_invocation_output(verbose=False)
+
+
+@pytest.fixture(autouse=True)
+def _tools_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve CLI and scanner tool requirements without the host PATH."""
+
+    def found(name: str, hint: str) -> Path:
+        return Path("/usr/bin") / name
+
+    monkeypatch.setattr("maintenance_man.cli.require_tool", found)
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", found)
+
 
 _GRADLEW_STUB = "#!/bin/sh\nexit 0\n"
 
 
-def make_vuln(**overrides: Any) -> VulnFinding:
-    defaults = dict(
-        vuln_id="CVE-2024-0001",
-        pkg_name="some-pkg",
-        installed_version="1.0.0",
-        fixed_version="1.0.1",
-        severity=Severity.HIGH,
-        title="Test vuln",
-        description="desc",
-        status="fixed",
-    )
-    return VulnFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
-
-
-def make_update(**overrides: Any) -> UpdateFinding:
-    defaults = dict(
-        pkg_name="pkg-a",
-        installed_version="1.0.0",
-        latest_version="1.0.1",
-        semver_tier=SemverTier.PATCH,
-    )
-    return UpdateFinding(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
-
-
-def make_scan_result(
-    vulns: list[VulnFinding] | None = None,
-    updates: list[UpdateFinding] | None = None,
-) -> ScanResult:
-    return ScanResult(
-        project="vulnerable",
-        scanned_at=datetime.now(tz=timezone.utc),
-        trivy_target="tests/fixtures/vulnerable-project",
-        vulnerabilities=vulns if vulns is not None else [make_vuln()],
-        updates=updates if updates is not None else [make_update()],
-    )
+@pytest.fixture(autouse=True)
+def _isolated_mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every test gets its own mm home; nothing reaches the real ~/.mm."""
+    home = tmp_path / ".mm"
+    monkeypatch.setattr("maintenance_man.paths.MM_HOME", home)
+    return home
 
 
 @pytest.fixture()
-def mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect MM_HOME to a temp directory (not yet created on disk)."""
-    home = tmp_path / ".mm"
-    monkeypatch.setattr("maintenance_man.config.MM_HOME", home)
-    return home
+def mm_home(_isolated_mm_home: Path) -> Path:
+    """Return the per-test MM_HOME without creating it."""
+    return _isolated_mm_home
 
 
 @pytest.fixture()
@@ -117,7 +109,7 @@ path = "{clean_path}"
 package_manager = "uv"
 test_unit = "uv run pytest"
 """
-    (mm_home / "config.toml").write_text(config_text)
+    write_config(mm_home, config_text)
     return mm_home
 
 
@@ -125,89 +117,27 @@ test_unit = "uv run pytest"
 def scan_results_dir(mm_home: Path) -> Path:
     """MM_HOME with scan-results directory (no config file needed)."""
     mm_home.mkdir(parents=True, exist_ok=True)
-    d = mm_home / "scan-results"
-    d.mkdir(exist_ok=True)
-    return d
+    results_dir = mm_home / "scan-results"
+    results_dir.mkdir(exist_ok=True)
+    return results_dir
 
 
 @pytest.fixture()
-def mock_update_cli_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Patch all update-CLI boundaries so tests focus on orchestration.
-
-    Returns a dict holding the live scan_result object (key: ``scan_result``)
-    so individual tests can mutate lifecycle state before ``app(...)`` runs.
-    """
-    scan_result = make_scan_result()
-    state: dict[str, object] = {"scan_result": scan_result}
-
-    monkeypatch.setattr("maintenance_man.cli.check_gh_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.check_jj_available", lambda: None)
-    monkeypatch.setattr(
-        "maintenance_man.cli.load_scan_results",
-        lambda name, d: state["scan_result"],
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.save_scan_results",
-        lambda name, d, sr: None,
-    )
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda p: True)
-    monkeypatch.setattr("maintenance_man.cli.ensure_main_bookmark", lambda p: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.create_workspace",
-        lambda repo_path, project, revision: True,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.remove_workspace",
-        lambda repo_path, project: None,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.workspace_path_for_project",
-        lambda project: Path("/tmp/mm-workspaces") / project,
-    )
-    monkeypatch.setattr("maintenance_man.cli.bookmark_exists", lambda b, p: False)
-    monkeypatch.setattr(
-        "maintenance_man.cli.create_or_reset_bookmark",
-        lambda b, p, r: True,
-    )
-    monkeypatch.setattr(
-        "maintenance_man.cli.promote_bookmark_to_main",
-        lambda p, b: True,
-    )
-    monkeypatch.setattr("maintenance_man.cli.delete_bookmark", lambda b, p: True)
-    monkeypatch.setattr(
-        "maintenance_man.cli.refresh_working_copy_from_main", lambda p: True
-    )
-    monkeypatch.setattr("maintenance_man.cli.edit_new_change", lambda p, r: True)
-    return state
+def mock_update_cli_deps(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> CliDeps:
+    return cli_deps(Workflow.UPDATE, mm_home_with_projects, tmp_path, monkeypatch)
 
 
-def make_gradle_member(**overrides: Any) -> GradleMember:
-    defaults = dict(
-        kind="library",
-        alias="room-runtime",
-        coordinate="androidx.room:room-runtime",
-        installed_version="2.8.4",
-    )
-    return GradleMember(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
-
-
-def make_gradle_target(**overrides: Any) -> GradleUpdateTarget:
-    defaults = dict(
-        version_ref="room",
-        members=[
-            make_gradle_member(
-                alias="room-runtime", coordinate="androidx.room:room-runtime"
-            ),
-            make_gradle_member(
-                alias="room-compiler", coordinate="androidx.room:room-compiler"
-            ),
-            make_gradle_member(
-                alias="room-testing", coordinate="androidx.room:room-testing"
-            ),
-        ],
-        target_version="2.8.5",
-    )
-    return GradleUpdateTarget(**(defaults | overrides))  # ty:ignore[invalid-argument-type]
+@pytest.fixture()
+def mock_resolve_cli_deps(
+    mm_home_with_projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> CliDeps:
+    return cli_deps(Workflow.RESOLVE, mm_home_with_projects, tmp_path, monkeypatch)
 
 
 @pytest.fixture()
@@ -232,25 +162,25 @@ def mm_home_with_gradle(
     mm_home_with_projects: Path, gradle_project: ProjectConfig
 ) -> Path:
     config_path = mm_home_with_projects / "config.toml"
-    config_path.write_text(
+    write_config(
+        mm_home_with_projects,
         config_path.read_text()
         + f'\n[projects.android]\npath = "{gradle_project.path}"\n'
-        f'package_manager = "gradle"\ntest_unit = "./gradlew testDebugUnitTest"\n'
+        f'package_manager = "gradle"\ntest_unit = "./gradlew testDebugUnitTest"\n',
     )
     return mm_home_with_projects
 
 
-def set_maven_dates(
-    monkeypatch: pytest.MonkeyPatch, *, undated: set[str], days_old: int = 900
-) -> None:
-    """Substitute Maven Central lookups with controlled, relative publication dates.
+@pytest.fixture(autouse=True)
+def _jj_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test runs jj with a fixed identity, empty config, no editor or pager."""
+    for name, value in jj_environment().items():
+        monkeypatch.setenv(name, value)
 
-    Coordinates in *undated* have no evidence at all; every other coordinate was
-    published *days_old* days ago.  The date is relative to now so an age
-    threshold in a test means what it says regardless of the current date.
-    """
-    published = datetime.now(timezone.utc) - timedelta(days=days_old)
-    monkeypatch.setattr(
-        "maintenance_man.dependency_age._get_maven_publish_date",
-        lambda pkg, version: None if pkg in undated else published,
+
+@pytest.fixture()
+def repository_case(tmp_path: Path) -> RepositoryCase:
+    """A copied jj repository with its origin, and a peer checkout of that origin."""
+    return RepositoryCase(
+        repo := copy_jj_repository(tmp_path / "repository"), copy_jj_peer(repo)
     )

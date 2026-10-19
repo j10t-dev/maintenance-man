@@ -1,29 +1,28 @@
-import re
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from maintenance_man.cli import _relative_time, app
-from maintenance_man.models.activity import record_activity
+from maintenance_man.cli import ExitCode
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
     SemverTier,
     Severity,
     UpdateFinding,
-    VulnFinding,
 )
+from maintenance_man.output import relative_time
+from maintenance_man.storage import record_activity, save_scan_results
+from tests.support.cli import run_mm, terminal_stdout
+from tests.support.findings import make_scan_result, make_vuln
+from tests.support.projects import write_config
 
-_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
 
-def _write_scan_result(mm_home: Path, name: str, result: ScanResult) -> None:
-    """Write a scan result JSON to the scan-results dir."""
-    (mm_home / "scan-results" / f"{name}.json").write_text(
-        result.model_dump_json(indent=2),
-        encoding="utf-8",
-    )
+def _records(output: str) -> list[list[str]]:
+    return [line.split("\t") for line in output.splitlines()]
 
 
 @pytest.fixture()
@@ -32,24 +31,13 @@ def list_project_home(mm_home: Path) -> Path:
     project_dir = mm_home.parent / "myproject"
     project_dir.mkdir()
     mm_home.mkdir(parents=True)
-    (mm_home / "scan-results").mkdir()
-    (mm_home / "workspaces").mkdir()
-    (mm_home / "config.toml").write_text(
-        f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "uv"\n'
+    write_config(
+        mm_home, f'[projects.myapp]\npath = "{project_dir}"\npackage_manager = "uv"\n'
     )
     return mm_home
 
 
-_VULN = VulnFinding(
-    vuln_id="CVE-2024-0001",
-    pkg_name="badpkg",
-    installed_version="1.0.0",
-    fixed_version="1.0.1",
-    severity=Severity.HIGH,
-    title="Bad vuln",
-    description="desc",
-    status="fixed",
-)
+_VULN = make_vuln(pkg_name="badpkg", title="Bad vuln")
 _UPDATE = UpdateFinding(
     pkg_name="somepkg",
     installed_version="1.0.0",
@@ -78,324 +66,224 @@ class TestRelativeTime:
         ids=["seconds", "minutes", "1hour", "hours", "1day", "days"],
     )
     def test_relative_time(self, delta: timedelta, expected: str):
-        assert _relative_time(_NOW - delta, _NOW) == expected
+        assert relative_time(_NOW - delta, _NOW) == expected
+
+
+@pytest.mark.parametrize(
+    ("width", "expected_headers", "expected_hidden"),
+    [
+        (69, ["project", "vulns", "updates"], "hidden: type, scanned"),
+        (70, ["project", "type", "vulns", "updates", "scanned"], None),
+    ],
+)
+def test_given_terminal_width_when_listed_then_narrow_overview_names_hidden_columns(
+    mm_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    expected_headers: list[str],
+    expected_hidden: str | None,
+) -> None:
+    write_config(
+        mm_home,
+        f'[projects.api]\npath = "{tmp_path}"\npackage_manager = "uv"\n\n'
+        f'[projects.web]\npath = "{tmp_path}"\npackage_manager = "bun"\n',
+    )
+    save_scan_results("api", make_scan_result())
+    older = make_scan_result(vulns=[], updates=[])
+    older.scanned_at = datetime.now(tz=UTC) - timedelta(days=2)
+    save_scan_results("web", older)
+    stream = terminal_stdout(monkeypatch, width=width)
+
+    assert run_mm("list") == 0
+
+    lines = stream.getvalue().splitlines()
+    assert lines[1].split() == expected_headers
+    if expected_hidden is None:
+        assert "hidden:" not in lines[-1]
+    else:
+        assert lines[-1].endswith(expected_hidden)
 
 
 class TestListCommand:
-    def test_list_no_projects(self, mm_home: Path, capsys: pytest.CaptureFixture[str]):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        assert "no projects" in capsys.readouterr().out.lower()
-
+    @pytest.mark.parametrize("command", ["list", "status", "st"])
     def test_list_shows_projects(
-        self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
+        self, list_project_home: Path, capsys: pytest.CaptureFixture[str], command: str
     ):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "myapp" in output
-        assert "uv" in output
+        assert run_mm(command) == 0
+        assert [row[:2] for row in _records(capsys.readouterr().out)] == [
+            ["myapp", "uv"]
+        ]
 
-    def test_st_alias_shows_projects(
-        self, list_project_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        with pytest.raises(SystemExit) as exc_info:
-            app(["st"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "myapp" in output
-        assert "uv" in output
+
+_COUNTS_SCAN = ScanResult(
+    project="app",
+    scanned_at=datetime(2026, 3, 20, tzinfo=UTC),
+    vulnerabilities=[_VULN, _VULN],
+    updates=[_UPDATE, _UPDATE, _UPDATE],
+    secrets=[_SECRET],
+)
+
+
+def _build_activity(*, success: bool) -> str:
+    event = {
+        "timestamp": "2026-03-20T12:00:00+00:00",
+        "success": success,
+        "branch": "main",
+    }
+    return json.dumps({"app": {"last_build": event}})
+
+
+@pytest.mark.parametrize(
+    ("scan", "activity", "expected_record"),
+    [
+        pytest.param(None, None, "app\tuv\t-\t-\t-\tnever\t-\t-\t-\t-", id="unscanned"),
+        pytest.param(
+            _COUNTS_SCAN,
+            None,
+            "app\tuv\t2\t3\t1\t2026-03-20T00:00:00+00:00\t-\t-\t-\t-",
+            id="counts",
+        ),
+        pytest.param(
+            None,
+            _build_activity(success=True),
+            "app\tuv\t-\t-\t-\tnever\t2026-03-20T12:00:00+00:00\tpassed\t-\t-",
+            id="built-passed",
+        ),
+        pytest.param(
+            None,
+            _build_activity(success=False),
+            "app\tuv\t-\t-\t-\tnever\t2026-03-20T12:00:00+00:00\tfailed\t-\t-",
+            id="built-failed",
+        ),
+    ],
+)
+def test_given_saved_state_when_listed_in_pipe_then_whole_record_matches(
+    mm_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    scan: ScanResult | None,
+    activity: str | None,
+    expected_record: str,
+) -> None:
+    write_config(
+        mm_home,
+        f'[projects.app]\npath = "{tmp_path / "app"}"\npackage_manager = "uv"\n',
+    )
+    if scan is not None:
+        save_scan_results("app", scan)
+    if activity is not None:
+        (mm_home / "activity.json").write_text(activity, encoding="utf-8")
+
+    assert run_mm("list") == 0
+    assert capsys.readouterr().out == f"{expected_record}\n"
 
 
 class TestListFindings:
-    def test_shows_never_for_unscanned_projects(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Projects without scan results show 'never' in scanned column."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        # Look for the table having a Scanned column and a row with "never"
-        assert "Scanned" in output
-        # Match pattern: ends of table rows that should have "never" as last column
-        assert re.search(r"\│\s+never\s+\│", output, re.IGNORECASE)
-
-    def test_summary_shows_counts(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Summary view shows finding counts from saved scan results."""
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            trivy_target=".",
-            vulnerabilities=[_VULN, _VULN],
-            updates=[_UPDATE, _UPDATE, _UPDATE],
-            secrets=[_SECRET],
-        )
-        _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "2" in output  # 2 actionable vulns
-        assert "3" in output  # 3 updates
-
     def test_corrupt_scan_results_skipped(
         self,
         list_project_home: Path,
         capsys: pytest.CaptureFixture[str],
     ):
         """A corrupt scan-results JSON should not crash mm list."""
-        (list_project_home / "scan-results" / "myapp.json").write_text(
-            "NOT VALID JSON",
-            encoding="utf-8",
-        )
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "myapp" in output
-        assert "Warning" in output
+        results = list_project_home / "scan-results"
+        results.mkdir()
+        (results / "myapp.json").write_text("NOT VALID JSON", encoding="utf-8")
+        assert run_mm("list") == 0
+        captured = capsys.readouterr()
+        assert [row[:5] for row in _records(captured.out)] == [
+            ["myapp", "uv", "-", "-", "-"]
+        ]
+        assert captured.err == "warning: corrupt scan results for myapp; skipped\n"
 
-    @pytest.mark.parametrize(
-        "expected_substring",
-        ["CVE-2024-0001", "badpkg"],
-        ids=["vuln_id", "pkg_name"],
+
+_OLD_SHAPE_SCAN = (
+    '{"project": "vulnerable", "scanned_at": "2026-01-15T12:00:00Z", '
+    '"vulnerabilities": [], "updates": [], "secrets": [], "update_status": null}'
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(_OLD_SHAPE_SCAN, id="old-shape"),
+        pytest.param("[]", id="not-an-object"),
+        pytest.param(None, id="directory"),
+    ],
+)
+def test_given_unusable_scan_file_when_listed_then_project_warns_and_list_succeeds(
+    mm_home_with_projects: Path,
+    capsys: pytest.CaptureFixture[str],
+    content: str | None,
+) -> None:
+    path = mm_home_with_projects / "scan-results" / "vulnerable.json"
+    if content is None:
+        path.mkdir()
+    else:
+        path.write_text(content, encoding="utf-8")
+
+    assert run_mm("list") == ExitCode.OK
+
+    err = capsys.readouterr().err.splitlines()
+    assert "warning: corrupt scan results for vulnerable; skipped" in err
+
+
+def test_given_loader_bug_when_listing_then_it_propagates(
+    mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(name):
+        raise RuntimeError(name)
+
+    monkeypatch.setattr("maintenance_man.cli.load_scan_results", explode)
+
+    with pytest.raises(RuntimeError):
+        run_mm("list")
+
+
+def test_given_saved_findings_when_listed_with_detail_then_records_print(
+    list_project_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = ScanResult(project="myapp", scanned_at=_NOW, vulnerabilities=[_VULN])
+    save_scan_results("myapp", result)
+
+    assert run_mm("list", "--detail") == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "myapp\tvuln\tbadpkg\t1.0.0\t1.0.1\tHIGH\tCVE-2024-0001\t-\tfixed\t-\n"
     )
-    def test_detail_shows_findings(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-        expected_substring: str,
-    ):
-        """--detail flag prints full findings (vuln IDs, package names)."""
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            trivy_target=".",
-            vulnerabilities=[_VULN],
-        )
-        _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
-        assert expected_substring in capsys.readouterr().out
+    assert captured.err == ""
 
-    def test_detail_sorts_by_severity(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Findings are sorted CRITICAL > HIGH > LOW in detail output."""
-        vulns = [
-            VulnFinding(
-                vuln_id="CVE-LOW",
-                pkg_name="low-pkg",
-                installed_version="1.0.0",
-                fixed_version="1.0.1",
-                severity=Severity.LOW,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-            VulnFinding(
-                vuln_id="CVE-CRIT",
-                pkg_name="crit-pkg",
-                installed_version="1.0.0",
-                fixed_version="1.0.1",
-                severity=Severity.CRITICAL,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-            VulnFinding(
-                vuln_id="CVE-HIGH",
-                pkg_name="high-pkg",
-                installed_version="1.0.0",
-                fixed_version="1.0.1",
-                severity=Severity.HIGH,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-        ]
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            trivy_target=".",
-            vulnerabilities=vulns,
-        )
-        _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        crit_pos = output.index("CVE-CRIT")
-        high_pos = output.index("CVE-HIGH")
-        low_pos = output.index("CVE-LOW")
-        assert crit_pos < high_pos < low_pos
 
-    def test_detail_fix_marker_on_highest_version(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """'← fix' marks the highest fix version for duplicate-package vulns."""
-        vulns = [
-            VulnFinding(
-                vuln_id="CVE-0001",
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.31.0",
-                severity=Severity.HIGH,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-            VulnFinding(
-                vuln_id="CVE-0002",
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.32.4",
-                severity=Severity.HIGH,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-        ]
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            trivy_target=".",
-            vulnerabilities=vulns,
-        )
-        _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        # The marker should appear on the row with 2.32.4
-        assert "2.32.4" in output
-        # Find lines containing the marker
-        lines_with_marker = [
-            line for line in output.splitlines() if "\u2190 fix" in line
-        ]
-        assert len(lines_with_marker) == 1
-        assert "2.32.4" in lines_with_marker[0]
+def test_given_clean_and_unscanned_projects_when_detail_listed_then_notices_name_them(
+    mm_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_config(
+        mm_home,
+        f'[projects.clean]\npath = "{tmp_path}"\npackage_manager = "uv"\n\n'
+        f'[projects.unscanned]\npath = "{tmp_path}"\npackage_manager = "uv"\n',
+    )
+    save_scan_results("clean", ScanResult(project="clean", scanned_at=_NOW))
 
-    def test_detail_fix_marker_mixed_severity_same_package(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Mixed severities for same package still show marker on highest fix."""
-        vulns = [
-            VulnFinding(
-                vuln_id="CVE-CRIT",
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.31.0",
-                severity=Severity.CRITICAL,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-            VulnFinding(
-                vuln_id="CVE-HIGH",
-                pkg_name="requests",
-                installed_version="2.25.0",
-                fixed_version="2.32.4",
-                severity=Severity.HIGH,
-                title="t",
-                description="d",
-                status="fixed",
-            ),
-        ]
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            trivy_target=".",
-            vulnerabilities=vulns,
-        )
-        _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        # CRITICAL should appear before HIGH
-        assert output.index("CVE-CRIT") < output.index("CVE-HIGH")
-        # Marker on the row with 2.32.4 (the HIGH one)
-        lines_with_marker = [
-            line for line in output.splitlines() if "\u2190 fix" in line
-        ]
-        assert len(lines_with_marker) == 1
-        assert "2.32.4" in lines_with_marker[0]
+    assert run_mm("list", "--detail") == 0
 
-    def test_detail_no_fix_marker_for_single_vuln_package(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Single-vuln packages should not get the '← fix' marker."""
-        result = ScanResult(
-            project="myapp",
-            scanned_at=_NOW,
-            trivy_target=".",
-            vulnerabilities=[_VULN],
-        )
-        _write_scan_result(list_project_home, "myapp", result)
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list", "--detail"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "\u2190 fix" not in output
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "1 projects have no findings: clean",
+        "1 projects have no saved scan: unscanned",
+    ]
 
 
 class TestListActivity:
-    def test_shows_dash_when_never_built(
+    def test_given_failed_build_when_listed_on_terminal_then_row_reads_failed_just_now(
         self,
         list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
     ):
-        """Projects with no activity show dash in Built/Deployed columns."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "Built" in output
-        assert "Deployed" in output
-
-    def test_shows_relative_time_for_build(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Build activity shows relative time."""
-        activity_path = list_project_home / "activity.json"
-        record_activity(activity_path, "myapp", "build", success=True, branch="main")
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "just now" in output.lower() or "0m ago" in output or "1m ago" in output
-
-    def test_shows_failure_marker(
-        self,
-        list_project_home: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Failed build/deploy shows [F] marker."""
+        """On a terminal a failed build reads 'failed just now'."""
         activity_path = list_project_home / "activity.json"
         record_activity(activity_path, "myapp", "build", success=False, branch="main")
-        with pytest.raises(SystemExit) as exc_info:
-            app(["list"])
-        assert exc_info.value.code == 0
-        output = capsys.readouterr().out
-        assert "[F]" in output
+        stream = terminal_stdout(monkeypatch)
+        assert run_mm("list") == 0
+        assert "failed just now" in stream.getvalue()
