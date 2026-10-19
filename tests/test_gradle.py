@@ -16,6 +16,7 @@ from maintenance_man.gradle import (
     _owned_update_report,
     apply_gradle_update,
     discover_gradle_updates,
+    local_properties_required,
     parse_catalogue,
     parse_update_report,
     render_selected_report,
@@ -489,52 +490,6 @@ class TestDiscoverGradleUpdates:
         assert (root / "build" / "caller.txt").read_bytes() == b"caller build output"
 
     @pytest.mark.parametrize(
-        "env, local_properties, workspace_properties, expected",
-        [
-            ({"ANDROID_HOME": "/opt/android"}, True, False, None),
-            ({"ANDROID_SDK_ROOT": "/opt/android"}, True, False, None),
-            ({}, False, False, None),
-            ({}, True, False, "ANDROID_HOME or ANDROID_SDK_ROOT"),
-            ({}, True, True, "ANDROID_HOME or ANDROID_SDK_ROOT"),
-        ],
-        ids=[
-            "android-home",
-            "sdk-root",
-            "no-local-properties",
-            "untracked-local-properties",
-            "leftover-workspace-properties-are-not-evidence",
-        ],
-    )
-    def test_workspace_environment_reason(
-        self,
-        gradle_project: ProjectConfig,
-        monkeypatch,
-        tmp_path,
-        env,
-        local_properties,
-        workspace_properties,
-        expected,
-    ):
-        """The workspace holds tracked files only; local.properties is not one."""
-        monkeypatch.setattr("maintenance_man.gradle.project_env", lambda: dict(env))
-        source = Path(gradle_project.path)
-        if local_properties:
-            (source / "local.properties").write_text(
-                "sdk.dir=/opt/a\n", encoding="utf-8"
-            )
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-        if workspace_properties:
-            (workspace / "local.properties").write_text("sdk.dir=/opt/a\n")
-
-        reason = workspace_environment_reason(source, workspace)
-
-        if expected is None:
-            assert reason is None
-        else:
-            assert reason is not None and expected in reason
-
-    @pytest.mark.parametrize(
         "runner, expected",
         [
             (_fake_gradle(None), "produced no report"),
@@ -669,16 +624,63 @@ def _apply(project):
 
 
 @pytest.mark.parametrize(
+    ("env", "file_present", "expected"),
+    [
+        pytest.param({"ANDROID_HOME": "/opt/android"}, True, False, id="android-home"),
+        pytest.param({"ANDROID_SDK_ROOT": "/opt/android"}, True, False, id="sdk-root"),
+        pytest.param({}, False, False, id="no-file"),
+        pytest.param({}, True, True, id="file-without-variable"),
+    ],
+)
+def test_given_source_checkout_when_sdk_need_is_checked_then_file_and_env_decide(
+    tmp_path, monkeypatch, env, file_present, expected
+):
+    monkeypatch.delenv("ANDROID_HOME", raising=False)
+    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    if file_present:
+        (tmp_path / "local.properties").write_text("sdk.dir=/x\n", encoding="utf-8")
+
+    assert local_properties_required(tmp_path) is expected
+
+
+def test_given_untracked_local_properties_when_refused_then_message_names_both_paths(
+    tmp_path,
+):
+    message = workspace_environment_reason(tmp_path, Path("/mm/workspaces/app"))
+
+    assert message == (
+        f"{tmp_path / 'local.properties'} exists in the source checkout but is not "
+        "tracked in the selected revision, so it is absent from the update workspace "
+        "at /mm/workspaces/app and Gradle cannot resolve sdk.dir there. Export "
+        "ANDROID_HOME or ANDROID_SDK_ROOT before running mm update, or track "
+        "local.properties in the repository."
+    )
+
+
+@pytest.mark.parametrize(
     "operation, arguments",
     [
         pytest.param(
             _discover,
-            ["versionCatalogUpdate", "--interactive", "--no-daemon", "--console=plain"],
+            [
+                "versionCatalogUpdate",
+                "--interactive",
+                "--no-daemon",
+                "--console=plain",
+                "--no-configuration-cache",
+            ],
             id="discovery",
         ),
         pytest.param(
             _apply,
-            ["versionCatalogApplyUpdates", "--no-daemon", "--console=plain"],
+            [
+                "versionCatalogApplyUpdates",
+                "--no-daemon",
+                "--console=plain",
+                "--no-configuration-cache",
+            ],
             id="application",
         ),
     ],

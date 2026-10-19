@@ -450,7 +450,7 @@ def test_batch_reports_success_conflict_and_missing_path(
 @pytest.mark.parametrize(
     "android_home, tracked, inspection_error, refusal",
     [
-        (None, False, None, "is not a tracked regular file"),
+        (None, False, None, "exists in the source checkout but is not tracked"),
         (None, True, None, None),
         ("/opt/android", False, None, None),
         (None, True, RevisionError("inspection failed"), "inspection failed"),

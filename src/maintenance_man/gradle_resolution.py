@@ -60,11 +60,18 @@ ROUTING_UNDECLARED = (
     "Public repository routing has not been declared; automatic publication "
     "eligibility requires gradle_repository_routing = 'standard-public'"
 )
+NON_DIRECT_OWNER = "advisory reachable only through a parent, platform or plugin owner"
 EXACT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 BRANCH = re.compile(r"^(\d+)\.(\d+)(?:\D|$)")
 
 _INIT_SCRIPT = files("maintenance_man.resources").joinpath("gradle-report.gradle")
-_REPORT_ARGS = ("--no-daemon", "--console=plain", "--rerun-tasks", "--no-build-cache")
+_REPORT_ARGS = (
+    "--no-daemon",
+    "--console=plain",
+    "--rerun-tasks",
+    "--no-build-cache",
+    "--no-configuration-cache",
+)
 
 
 @contextmanager
@@ -363,8 +370,15 @@ def select_gradle_candidates(
     """Merge ordinary and security proposals, retaining each withheld reason."""
     candidates, conflicting = _collect_ordinary_proposals(discovered)
     linked, withheld = _link_vulnerabilities(catalogue, report, vulnerabilities)
+    blocked = {
+        finding.gradle_target.group_key: finding.state
+        for finding in discovered
+        if isinstance(finding.state, GradleBlock)
+        and finding.state.kind != "age"
+        and finding.gradle_target is not None
+    }
     security_candidates, security_withheld = _build_security_proposals(
-        catalogue, candidates, linked
+        catalogue, candidates, linked, blocked
     )
     candidates.update(security_candidates)
     withheld.extend(security_withheld)
@@ -466,11 +480,7 @@ def _security_only_proposal(
         exact_fix_candidate(finding.installed_version, finding.fixed_version)
         for _, finding, _ in links
     }
-    if (
-        any(not direct for _, _, owners in links for _, direct in owners)
-        or None in versions
-        or len(versions) != 1
-    ):
+    if None in versions or len(versions) != 1:
         return CandidateWithheld(
             group_key=key,
             block=GradleBlock(
@@ -507,22 +517,58 @@ def _build_security_proposals(
     catalogue: Catalogue,
     candidates: Mapping[str, GradleCandidate],
     linked: dict[str, list[_VulnerabilityLink]],
+    blocked: Mapping[str, GradleBlock],
 ) -> tuple[dict[str, GradleCandidate], list[CandidateWithheld]]:
     proposals: dict[str, GradleCandidate] = {}
     withheld: list[CandidateWithheld] = []
     for key, links in linked.items():
-        indices = tuple(index for index, _, _ in links)
+        if key in blocked:
+            withheld.append(
+                CandidateWithheld(
+                    group_key=key,
+                    block=blocked[key],
+                    vulnerability_indices=tuple(index for index, _, _ in links),
+                )
+            )
+            continue
+        direct, indirect = _split_by_directness(links)
+        withheld.extend(
+            CandidateWithheld(
+                group_key=key,
+                block=GradleBlock(kind="mapping", reason=NON_DIRECT_OWNER),
+                vulnerability_indices=(index,),
+            )
+            for index, _, _ in indirect
+        )
+        if not direct:
+            continue
+        indices = tuple(index for index, _, _ in direct)
         if key in candidates:
             proposals[key] = candidates[key].model_copy(
                 update={"vulnerability_indices": indices}
             )
             continue
-        proposal = _security_only_proposal(catalogue, key, links, indices)
+        proposal = _security_only_proposal(catalogue, key, direct, indices)
         if isinstance(proposal, CandidateWithheld):
             withheld.append(proposal)
         else:
             proposals[key] = proposal
     return proposals, withheld
+
+
+def _split_by_directness(
+    links: list[_VulnerabilityLink],
+) -> tuple[list[_VulnerabilityLink], list[_VulnerabilityLink]]:
+    """The links whose owners are all direct, then the rest."""
+    direct: list[_VulnerabilityLink] = []
+    indirect: list[_VulnerabilityLink] = []
+    for link in links:
+        _, _, owners = link
+        if all(is_direct for _, is_direct in owners):
+            direct.append(link)
+        else:
+            indirect.append(link)
+    return direct, indirect
 
 
 class ValidationRequest(TypedDict):

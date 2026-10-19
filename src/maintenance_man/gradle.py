@@ -43,8 +43,14 @@ _DISCOVER_ARGS = [
     "--interactive",
     "--no-daemon",
     "--console=plain",
+    "--no-configuration-cache",
 ]
-_APPLY_ARGS = ["versionCatalogApplyUpdates", "--no-daemon", "--console=plain"]
+_APPLY_ARGS = [
+    "versionCatalogApplyUpdates",
+    "--no-daemon",
+    "--console=plain",
+    "--no-configuration-cache",
+]
 _UNSAFE_TEXT_RE = re.compile(r"[\x00-\x1f\x7f]")
 _REPORT_TABLES: tuple[tuple[str, GradleKind, int, str], ...] = (
     ("libraries", "library", 2, "group:artifact:version"),
@@ -437,29 +443,24 @@ def run_gradle(
     )
 
 
-def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str | None:
-    """Explain why a workspace build could not resolve the Android SDK.
-
-    ``mm update`` applies inside a jj workspace, which checks out tracked files
-    only.  A gitignored ``local.properties`` — where Android projects keep
-    ``sdk.dir`` — is therefore absent there, and ``project_env()`` adds nothing
-    to the inherited environment. Tracked-file evidence must come from the
-    selected revision, never from a prospective workspace directory. Returns
-    None when that evidence or the environment supplies the SDK, or the source
-    does not depend on ``local.properties``.
-    """
+def local_properties_required(source_root: Path) -> bool:
+    """Whether a workspace build needs local.properties from the source checkout:
+    the file exists there and neither ANDROID_HOME nor ANDROID_SDK_ROOT is set."""
     env = project_env()
     if env.get("ANDROID_HOME") or env.get("ANDROID_SDK_ROOT"):
-        return None
+        return False
+    return (source_root / GRADLE_LOCAL_PROPERTIES_RELPATH).is_file()
+
+
+def workspace_environment_reason(source_root: Path, workspace_root: Path) -> str:
+    """The refusal for a local.properties that is untracked in the selected
+    revision; callers establish that with has_regular_file first."""
     source = source_root / GRADLE_LOCAL_PROPERTIES_RELPATH
-    if not source.is_file():
-        return None
     return (
-        f"{source} is not a tracked regular file in the selected revision, so it is "
-        f"absent from the update workspace at "
-        f"{workspace_root} and Gradle cannot resolve sdk.dir there. Export "
-        f"ANDROID_HOME or ANDROID_SDK_ROOT before running mm update, or track "
-        f"local.properties in the repository."
+        f"{source} exists in the source checkout but is not tracked in the selected "
+        f"revision, so it is absent from the update workspace at {workspace_root} and "
+        "Gradle cannot resolve sdk.dir there. Export ANDROID_HOME or ANDROID_SDK_ROOT "
+        "before running mm update, or track local.properties in the repository."
     )
 
 

@@ -19,6 +19,7 @@ from maintenance_man.gradle import (
     parse_catalogue,
 )
 from maintenance_man.gradle_resolution import (
+    NON_DIRECT_OWNER,
     ROUTING_UNDECLARED,
     _validation_requests,
     attach_gradle_publications,
@@ -33,6 +34,7 @@ from maintenance_man.gradle_resolution import (
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.gradle import (
     CandidateValidation,
+    CandidateWithheld,
     GradleCandidate,
     ModuleId,
     PublicationFact,
@@ -42,7 +44,12 @@ from maintenance_man.models.gradle import (
 )
 from maintenance_man.models.scan import GradleBlock, Severity, VulnFinding
 from tests.support.clock import FakeClock
-from tests.support.findings import make_gradle_member, make_gradle_target, make_vuln
+from tests.support.findings import (
+    make_gradle_member,
+    make_gradle_target,
+    make_update,
+    make_vuln,
+)
 from tests.support.gradle import (
     fixture_runner,
     make_gradle_candidate,
@@ -155,6 +162,7 @@ def test_capture_reads_before_cleanup_and_returns_durable_models(tmp_path):
             "--console=plain",
             "--rerun-tasks",
             "--no-build-cache",
+            "--no-configuration-cache",
         ]
     ]
 
@@ -272,6 +280,10 @@ plugin = { id = "com.example.plugin", version.ref = "plugin" }
 """
 
 
+def _module_version(name):
+    return "2.0.0" if name == "child" else "1.0.0"
+
+
 def resolution_graph(
     tmp_path, edges, *, domain="project", catalogue=_LIBRARY_CATALOGUE, modules=None
 ):
@@ -283,7 +295,7 @@ def resolution_graph(
     (tmp_path / "libs.toml").write_text(catalogue)
     parsed = parse_catalogue(tmp_path / "libs.toml")
     coordinates = {
-        name: f"g:{name}:{'2.0.0' if name == 'child' else '1.0.0'}"
+        name: f"g:{name}:{_module_version(name)}"
         for source, target, *_ in edges
         for name in (source, target)
     } | (modules or {})
@@ -318,6 +330,160 @@ def resolution_graph(
 
     scope["edges"] = [edge(*row) for row in edges]
     return parsed, parse_resolution_report(json.dumps(raw))
+
+
+def _two_scope_graph(tmp_path, first_edges, second_edges, **options):
+    """A report whose second scope resolves *second_edges* in the same project.
+    A module already in the first scope keeps its coordinates; *options* go to
+    resolution_graph."""
+    catalogue, base = resolution_graph(tmp_path, first_edges, **options)
+    raw = base.model_dump(mode="json")
+    first = raw["scopes"][0]
+    second_id = {
+        "project_path": ":",
+        "domain": "project",
+        "configuration": "testRuntimeClasspath",
+    }
+    first_modules = {c["id"]: c["module"] for c in first["components"] if c["module"]}
+    names = dict.fromkeys(n for edge in second_edges for n in edge if n != "root")
+    modules = {
+        name: first_modules.get(name)
+        or {"group": "g", "artifact": name, "version": _module_version(name)}
+        for name in names
+    }
+    second = {
+        "scope": second_id,
+        "unresolved": [],
+        "components": [
+            *(c for c in first["components"] if c["id"] == "root"),
+            *(
+                {"id": name, "kind": "module", "module": module}
+                for name, module in modules.items()
+            ),
+        ],
+        "edges": [
+            {
+                "source": s,
+                "target": t,
+                "requested": f"g:{t}:{modules[t]['version']}",
+                "constraint": False,
+            }
+            for s, t in second_edges
+        ],
+    }
+    raw["selected_scopes"].append(second_id)
+    raw["scopes"].append(second)
+    return catalogue, parse_resolution_report(json.dumps(raw))
+
+
+_SHARED_REF_CATALOGUE = """
+[versions]
+a = "2.0.0"
+[libraries]
+parent = { module = "g:parent", version.ref = "a" }
+child = { module = "g:child", version.ref = "a" }
+"""
+_NON_DIRECT = GradleBlock(kind="mapping", reason=NON_DIRECT_OWNER)
+_CONFLICT = GradleBlock(
+    kind="conflict", reason="conflicting or non-exact catalogue proposals"
+)
+_PARENT_TARGET = make_gradle_target(
+    version_ref="a",
+    members=[
+        make_gradle_member(alias="a", coordinate="g:parent", installed_version="1.0.0")
+    ],
+    target_version="1.0.0",
+)
+
+
+@pytest.mark.parametrize(
+    ("graph", "affected", "discovered", "expected_candidates", "expected_withheld"),
+    [
+        pytest.param(
+            lambda tmp_path: _two_scope_graph(
+                tmp_path, [("root", "parent")], [("root", "other"), ("other", "parent")]
+            ),
+            "parent",
+            [],
+            [("ref:a", (0,))],
+            [
+                CandidateWithheld(
+                    group_key="ref:b", block=_NON_DIRECT, vulnerability_indices=(0,)
+                )
+            ],
+            id="direct-under-a-indirect-under-b",
+        ),
+        pytest.param(
+            lambda tmp_path: resolution_graph(
+                tmp_path, [("root", "parent"), ("parent", "child", "constraint")]
+            ),
+            "child",
+            [],
+            [],
+            [
+                CandidateWithheld(
+                    group_key="ref:a", block=_NON_DIRECT, vulnerability_indices=(0,)
+                )
+            ],
+            id="constraint-owner-only",
+        ),
+        pytest.param(
+            lambda tmp_path: _two_scope_graph(
+                tmp_path,
+                [("root", "child"), ("root", "parent")],
+                [("root", "parent"), ("parent", "child")],
+                catalogue=_SHARED_REF_CATALOGUE,
+                modules={"parent": "g:parent:2.0.0"},
+            ),
+            "child",
+            [],
+            [],
+            [
+                CandidateWithheld(
+                    group_key="ref:a", block=_NON_DIRECT, vulnerability_indices=(0,)
+                )
+            ],
+            id="direct-in-one-scope-indirect-in-another",
+        ),
+        pytest.param(
+            lambda tmp_path: resolution_graph(tmp_path, [("root", "parent")]),
+            "parent",
+            [
+                make_update(
+                    pkg_name="g:parent",
+                    installed_version="1.0.0",
+                    latest_version="1.0.0",
+                    gradle_target=_PARENT_TARGET,
+                    state=_CONFLICT,
+                )
+            ],
+            [],
+            [
+                CandidateWithheld(
+                    group_key="ref:a", block=_CONFLICT, vulnerability_indices=(0,)
+                )
+            ],
+            id="discovery-blocked-group",
+        ),
+    ],
+)
+def test_given_owner_shape_when_candidates_selected_then_only_direct_owners_link(
+    tmp_path, graph, affected, discovered, expected_candidates, expected_withheld
+):
+    catalogue, report = graph(tmp_path)
+    installed = "1.0.0" if affected == "parent" else "2.0.0"
+    advisory = make_vuln(
+        pkg_name=f"g:{affected}",
+        installed_version=installed,
+        fixed_version="1.0.1" if affected == "parent" else "2.0.1",
+    )
+
+    plan = select_gradle_candidates(catalogue, report, [advisory], discovered)
+
+    assert [
+        (c.target.group_key, c.vulnerability_indices) for c in plan.candidates
+    ] == expected_candidates
+    assert list(plan.withheld) == expected_withheld
 
 
 @pytest.mark.parametrize(
@@ -458,10 +624,7 @@ def test_parent_never_invents_version_from_child_fix(tmp_path):
     result = select_gradle_candidates(catalogue, resolution, [finding], [])
     assert result.candidates == ()
     assert result.withheld[0].group_key == "ref:a"
-    assert result.withheld[0].block == GradleBlock(
-        kind="conflict",
-        reason="owner requires one independent exact catalogue proposal",
-    )
+    assert result.withheld[0].block == _NON_DIRECT
 
 
 def test_given_underscored_version_ref_when_selected_then_rows_share_one_candidate(
@@ -522,40 +685,12 @@ def test_given_underscored_version_ref_when_selected_then_rows_share_one_candida
     assert plan.withheld == ()
 
 
-def test_given_advisory_owned_in_two_scopes_when_selected_then_each_owner_lists_it(
+def test_given_indirect_owners_in_two_scopes_when_selected_then_each_withholds_it(
     tmp_path,
 ):
-    catalogue, base = resolution_graph(tmp_path, BASE_EDGES)
-    raw = base.model_dump(mode="json")
-    first = raw["scopes"][0]
-    second_id = {
-        "project_path": ":",
-        "domain": "project",
-        "configuration": "testRuntimeClasspath",
-    }
-    second = json.loads(json.dumps(first))
-    second["scope"] = second_id
-    for component in second["components"]:
-        if component["id"] == "parent":
-            component["id"] = "other"
-            component["module"]["artifact"] = "other"
-    second["edges"] = [
-        {
-            "source": "root",
-            "target": "other",
-            "requested": "g:other:1.0.0",
-            "constraint": False,
-        },
-        {
-            "source": "other",
-            "target": "child",
-            "requested": "g:child:2.0.0",
-            "constraint": False,
-        },
-    ]
-    raw["selected_scopes"].append(second_id)
-    raw["scopes"].append(second)
-    resolution = parse_resolution_report(json.dumps(raw))
+    catalogue, resolution = _two_scope_graph(
+        tmp_path, BASE_EDGES, [("root", "other"), ("other", "child")]
+    )
     discovered = [
         build_update_findings(
             catalogue,
@@ -577,8 +712,12 @@ def test_given_advisory_owned_in_two_scopes_when_selected_then_each_owner_lists_
     plan = select_gradle_candidates(catalogue, resolution, [advisory], discovered)
 
     assert [(c.target.group_key, c.vulnerability_indices) for c in plan.candidates] == [
-        ("ref:a", (0,)),
-        ("ref:b", (0,)),
+        ("ref:a", ()),
+        ("ref:b", ()),
+    ]
+    assert list(plan.withheld) == [
+        CandidateWithheld(group_key=key, block=_NON_DIRECT, vulnerability_indices=(0,))
+        for key in ("ref:a", "ref:b")
     ]
 
 
@@ -714,6 +853,7 @@ def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_r
             "--console=plain",
             "--rerun-tasks",
             "--no-build-cache",
+            "--no-configuration-cache",
         ]
     ]
     assert [

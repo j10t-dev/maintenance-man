@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from maintenance_man.gradle_inventory import inventory_scopes, load_inventory
-from maintenance_man.gradle_resolution import parse_resolution_report
+from maintenance_man.gradle_resolution import _REPORT_ARGS, parse_resolution_report
 from maintenance_man.models.gradle import CandidateValidationBatch, ModuleId
 
 
@@ -166,7 +166,9 @@ def _prepare_gradle_project(root: Path, source: Path, repository: Path) -> None:
         ".configureEach { xmlOutput = "
         "layout.projectDirectory.file('.mm-gradle-inventory/direct.xml') } }\n"
     )
-    (root / "gradle.properties").write_text("org.gradle.parallel=true\n")
+    (root / "gradle.properties").write_text(
+        "org.gradle.parallel=true\norg.gradle.configuration-cache=true\n"
+    )
     (root / "app").mkdir()
     (root / "app/build.gradle").write_text("plugins { id 'java-library' }\n")
     (root / "gradle/libs.versions.toml").write_text(
@@ -208,10 +210,7 @@ def test_real_gradle_producer_and_native_intervals(tmp_path, mm_home):
         "--init-script",
         str(script),
         f"-Pmm.reportDirectory={output}",
-        "--no-daemon",
-        "--console=plain",
-        "--rerun-tasks",
-        "--no-build-cache",
+        *_REPORT_ARGS,
     ]
     subprocess.run(
         command, cwd=root, check=True, capture_output=True, text=True, timeout=900

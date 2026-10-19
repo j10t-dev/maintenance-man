@@ -6,6 +6,7 @@ from typing import Literal
 from maintenance_man import config as config_module
 from maintenance_man.gradle import (
     GRADLE_LOCAL_PROPERTIES_RELPATH,
+    local_properties_required,
     workspace_environment_reason,
 )
 from maintenance_man.models.config import MmConfig, ProjectConfig
@@ -205,15 +206,15 @@ def _require_sdk_in_workspace(
     name: str, project: ProjectConfig, repo: JjRepository, revision: str
 ) -> None:
     """Refuse a workspace checkout that would lack its local.properties."""
-    reason = workspace_environment_reason(
-        project.path, workspace_path_for_project(name)
-    )
-    if reason is None:
+    if not local_properties_required(project.path):
         return
-    if not repo.has_regular_file(
+    if repo.has_regular_file(
         revision=revision, filename=GRADLE_LOCAL_PROPERTIES_RELPATH
     ):
-        raise UpdateSetupError(reason)
+        return
+    raise UpdateSetupError(
+        workspace_environment_reason(project.path, workspace_path_for_project(name))
+    )
 
 
 def _process_selected(
