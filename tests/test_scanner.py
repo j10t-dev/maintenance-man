@@ -25,10 +25,12 @@ from maintenance_man.models.gradle import (
     ModuleId,
 )
 from maintenance_man.models.scan import (
+    Failed,
+    GradleBlock,
+    Ready,
     ScanResult,
     SecretFinding,
     Severity,
-    UpdateStatus,
     VulnFinding,
     Workflow,
 )
@@ -324,18 +326,10 @@ def test_given_pending_statuses_when_scan_succeeds_then_saved_rows_are_fresh(
             vulns=[
                 make_vuln(
                     pkg_name="some-pkg",
-                    update_status=UpdateStatus.FAILED,
-                    failed_phase="unit",
-                    flow=Workflow.UPDATE,
+                    state=Failed(flow=Workflow.UPDATE, phase="unit"),
                 )
             ],
-            updates=[
-                make_update(
-                    pkg_name="pkg-a",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.UPDATE,
-                )
-            ],
+            updates=[make_update(pkg_name="pkg-a", state=Ready(flow=Workflow.UPDATE))],
         ).model_copy(update={"resolve_repair_base": "abc"}),
     )
     _configure_update_scan(
@@ -348,10 +342,10 @@ def test_given_pending_statuses_when_scan_succeeds_then_saved_rows_are_fresh(
     scan_project("demo", project)
 
     saved = load_scan_results("demo")
-    assert [
-        (row.pkg_name, row.update_status, row.failed_phase, row.flow)
-        for row in saved.findings
-    ] == [("some-pkg", None, None, None), ("pkg-a", None, None, None)]
+    assert [(row.pkg_name, row.state) for row in saved.findings] == [
+        ("some-pkg", None),
+        ("pkg-a", None),
+    ]
     assert saved.resolve_repair_base is None
 
 
@@ -544,7 +538,7 @@ def test_gradle_update_findings_are_not_suppressed_by_vuln_package_names(
         "org.example:lib1",
     ]
     assert result.vulnerabilities[0].gradle_target is None
-    assert all(row.blocked_reason is None for row in result.updates)
+    assert all(row.state is None for row in result.updates)
 
 
 def test_gradle_scan_reports_unmapped_update_without_planning_diagnostics(
@@ -553,25 +547,31 @@ def test_gradle_scan_reports_unmapped_update_without_planning_diagnostics(
     state = scoped_publication_scan
     state.findings.append(make_update(pkg_name="unmapped", gradle_target=None))
     result = scan_project("android", state.project, 7, clock=state.clock)
-    assert result.updates[-1].blocked_reason == "no supported catalogue target"
-    assert result.updates[-1].gradle_block_kind is None
+    assert result.updates[-1].state == GradleBlock(
+        kind="mapping", reason="no supported catalogue target"
+    )
 
 
 @pytest.mark.parametrize(
-    ("lib0", "routing", "expected_blocked", "expected_date"),
+    ("lib0", "routing", "expected_state", "expected_date"),
     [
         ("old", "standard-public", None, datetime(2026, 9, 1, tzinfo=UTC)),
         (
             "young",
             "standard-public",
-            "publication younger than required 7 days",
+            GradleBlock(kind="age", reason="publication younger than required 7 days"),
             None,
         ),
-        ("old", None, ROUTING_UNDECLARED, None),
+        (
+            "old",
+            None,
+            GradleBlock(kind="mapping", reason=ROUTING_UNDECLARED),
+            None,
+        ),
     ],
 )
 def test_given_gradle_proposal_when_scanned_then_age_is_fail_closed(
-    scoped_publication_scan, lib0, routing, expected_blocked, expected_date
+    scoped_publication_scan, lib0, routing, expected_state, expected_date
 ):
     state = scoped_publication_scan
     state.lib0 = lib0
@@ -581,13 +581,8 @@ def test_given_gradle_proposal_when_scanned_then_age_is_fail_closed(
 
     saved = {row.pkg_name: row for row in load_scan_results("android").updates}
     first = saved["org.example:lib0"]
-    assert (first.blocked_reason, first.published_date) == (
-        expected_blocked,
-        expected_date,
-    )
-    assert (saved["org.example:lib1"].blocked_reason is None) is (
-        routing == "standard-public"
-    )
+    assert (first.state, first.published_date) == (expected_state, expected_date)
+    assert (saved["org.example:lib1"].state is None) is (routing == "standard-public")
 
 
 def test_given_recorded_plan_when_scanned_then_rows_follow_exact_associations(
@@ -600,7 +595,9 @@ def test_given_recorded_plan_when_scanned_then_rows_follow_exact_associations(
     )
     unowned = CandidateWithheld(
         group_key=None,
-        reason="cannot identify an unambiguous catalogue entry",
+        block=GradleBlock(
+            kind="mapping", reason="cannot identify an unambiguous catalogue entry"
+        ),
         vulnerability_indices=(2,),
     )
     monkeypatch.setattr(
@@ -618,17 +615,23 @@ def test_given_recorded_plan_when_scanned_then_rows_follow_exact_associations(
         (
             v.vuln_id,
             v.gradle_target.group_key if v.gradle_target else None,
-            v.blocked_reason,
+            v.state,
         )
         for v in saved.vulnerabilities
     ] == [
         ("CVE-1", "ref:lib0", None),
         ("CVE-1", "ref:lib1", None),
         ("CVE-2", "ref:lib1", None),
-        ("CVE-3", None, "cannot identify an unambiguous catalogue entry"),
-        ("CVE-4", None, "no published fix"),
+        (
+            "CVE-3",
+            None,
+            GradleBlock(
+                kind="mapping", reason="cannot identify an unambiguous catalogue entry"
+            ),
+        ),
+        ("CVE-4", None, GradleBlock(kind="mapping", reason="no published fix")),
     ]
-    assert [(u.gradle_target, u.blocked_reason) for u in saved.updates] == [
+    assert [(u.gradle_target, u.state) for u in saved.updates] == [
         (first.target, None),
         (second.target, None),
     ]

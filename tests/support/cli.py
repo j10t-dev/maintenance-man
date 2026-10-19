@@ -10,11 +10,7 @@ from typing import NoReturn
 import pytest
 
 from maintenance_man.cli import main
-from maintenance_man.models.scan import (
-    ScanResult,
-    UpdateStatus,
-    Workflow,
-)
+from maintenance_man.models.scan import Failed, ScanResult, Workflow
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import JjRepository
 from tests.fakes import FakeFindingProcessor
@@ -89,18 +85,10 @@ def cli_deps(
     else:
         scan_result = make_scan_result(
             vulns=[
-                make_vuln(
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.RESOLVE,
-                    failed_phase="unit",
-                ),
+                make_vuln(state=Failed(flow=Workflow.RESOLVE, phase="unit")),
             ],
             updates=[
-                make_update(
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.RESOLVE,
-                    failed_phase="unit",
-                ),
+                make_update(state=Failed(flow=Workflow.RESOLVE, phase="unit")),
             ],
         )
         outcomes = {"some-pkg": (True, None), "pkg-a": (True, None)}

@@ -48,6 +48,7 @@ from maintenance_man.models.gradle import (
     ScopeResolution,
 )
 from maintenance_man.models.scan import (
+    GradleBlock,
     GradleKind,
     UpdateFinding,
     VulnFinding,
@@ -372,7 +373,10 @@ def select_gradle_candidates(
         withheld.append(
             CandidateWithheld(
                 group_key=key,
-                reason="conflicting or non-exact catalogue proposals",
+                block=GradleBlock(
+                    kind="conflict",
+                    reason="conflicting or non-exact catalogue proposals",
+                ),
                 vulnerability_indices=candidate.vulnerability_indices,
             )
         )
@@ -390,7 +394,7 @@ def _collect_ordinary_proposals(
     for finding in discovered:
         target = finding.gradle_target
         if target is None or (
-            finding.blocked_reason and finding.gradle_block_kind != "age"
+            isinstance(finding.state, GradleBlock) and finding.state.kind != "age"
         ):
             continue
         key = target.group_key
@@ -441,7 +445,9 @@ def _link_vulnerabilities(
 def _withheld_finding(index: int, reason: str) -> CandidateWithheld:
     """Withhold one advisory that names no single catalogue owner."""
     return CandidateWithheld(
-        group_key=None, reason=reason, vulnerability_indices=(index,)
+        group_key=None,
+        block=GradleBlock(kind="mapping", reason=reason),
+        vulnerability_indices=(index,),
     )
 
 
@@ -467,7 +473,10 @@ def _security_only_proposal(
     ):
         return CandidateWithheld(
             group_key=key,
-            reason="owner requires one independent exact catalogue proposal",
+            block=GradleBlock(
+                kind="conflict",
+                reason="owner requires one independent exact catalogue proposal",
+            ),
             vulnerability_indices=vulnerability_indices,
         )
     version = next(version for version in versions if version is not None)
@@ -481,10 +490,12 @@ def _security_only_proposal(
         for entry in entries
     ]
     built = build_update_findings(catalogue, proposals)
-    if len(built) != 1 or built[0].blocked_reason or built[0].gradle_target is None:
+    if len(built) != 1 or built[0].state is not None or built[0].gradle_target is None:
         return CandidateWithheld(
             group_key=key,
-            reason="incompatible shared catalogue group",
+            block=GradleBlock(
+                kind="mapping", reason="incompatible shared catalogue group"
+            ),
             vulnerability_indices=vulnerability_indices,
         )
     return GradleCandidate(
@@ -621,8 +632,8 @@ def _checked_validations(
 
 def attach_gradle_publications(
     candidate: GradleCandidate, report: ResolutionReport, validations: _Validations
-) -> GradleCandidate | str:
-    """Bind publication requests to *candidate*, or return the reason to withhold it."""
+) -> GradleCandidate | GradleBlock:
+    """Bind publication requests to *candidate*, or return the block withholding it."""
     requests = []
     for member in candidate.target.members:
         rows = [
@@ -633,7 +644,10 @@ def attach_gradle_publications(
         ]
         failure = next((result.reason for _, result in rows if result.reason), None)
         if not rows or failure:
-            return failure or "missing native candidate validation"
+            return GradleBlock(
+                kind="mapping",
+                reason=failure or "missing native candidate validation",
+            )
         project_paths = {request["project_path"] for request, _ in rows}
         domain = "plugin" if member.kind == "plugin" else "library"
         repositories = tuple(
@@ -644,11 +658,15 @@ def attach_gradle_publications(
         )
         module = member_module(member, candidate.target.target_version)
         if module is None:
-            return "unsupported catalogue member coordinate"
+            return GradleBlock(
+                kind="mapping", reason="unsupported catalogue member coordinate"
+            )
         if member.kind == "plugin":
             implementations = {result.implementation for _, result in rows}
             if len(implementations) != 1 or None in implementations:
-                return "conflicting marker implementations"
+                return GradleBlock(
+                    kind="mapping", reason="conflicting marker implementations"
+                )
             requests.append(
                 publication_request(
                     module, repositories, implementation=next(iter(implementations))
@@ -676,7 +694,9 @@ def prepare_gradle_candidates(
     """
     if project.gradle_repository_routing != "standard-public":
         return tuple(
-            candidate.model_copy(update={"reason": ROUTING_UNDECLARED})
+            candidate.model_copy(
+                update={"block": GradleBlock(kind="mapping", reason=ROUTING_UNDECLARED)}
+            )
             for candidate in candidates
         )
     validations = validate_gradle_candidates(project, candidates, report)
@@ -698,14 +718,15 @@ def prepare_gradle_candidates(
 
 def _aged(
     candidate: GradleCandidate,
-    bound: GradleCandidate | str,
+    bound: GradleCandidate | GradleBlock,
     minimum_age_days: int,
     publication: PublicationLookupContext,
     clock: Clock,
 ) -> GradleCandidate:
-    if isinstance(bound, str):
-        return candidate.model_copy(update={"reason": bound})
+    if isinstance(bound, GradleBlock):
+        return candidate.model_copy(update={"block": bound})
     age = evaluate_gradle_candidate_age(bound, minimum_age_days, publication, clock())
     if isinstance(age, AgeBlock):
-        return bound.model_copy(update={"reason": age.reason})
+        block = GradleBlock(kind="age", reason=age.reason)
+        return bound.model_copy(update={"block": block})
     return bound.model_copy(update={"published_date": age})

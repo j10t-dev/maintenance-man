@@ -29,7 +29,7 @@ from maintenance_man.models.events import (
     SkipReason,
     SyncCompleted,
 )
-from maintenance_man.models.scan import ScanResult, UpdateResult
+from maintenance_man.models.scan import GradleBlock, ScanResult, UpdateResult
 from tests.support.cli import TerminalStream, terminal_stdout
 from tests.support.findings import make_scan_result, make_update
 
@@ -41,7 +41,7 @@ def _pipe_scan() -> ScanResult:
                 pkg_name="pkg",
                 installed_version="1.0",
                 latest_version="1.1",
-                blocked_reason="too young",
+                state=GradleBlock(kind="age", reason="too young"),
             )
         ]
     )
@@ -406,7 +406,10 @@ def _blocked_scan() -> ScanResult:
     scan = make_scan_result(vulns=[], updates=[])
     scan.project = "api"
     scan.updates = [
-        make_update(pkg_name="blocked-pkg", blocked_reason="no publication date"),
+        make_update(
+            pkg_name="blocked-pkg",
+            state=GradleBlock(kind="mapping", reason="no publication date"),
+        ),
         make_update(pkg_name="available-pkg"),
     ]
     return scan

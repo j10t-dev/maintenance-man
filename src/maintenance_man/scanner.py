@@ -33,6 +33,7 @@ from maintenance_man.models.gradle import (
     ResolutionReport,
 )
 from maintenance_man.models.scan import (
+    GradleBlock,
     ScanResult,
     SecretFinding,
     Severity,
@@ -154,19 +155,20 @@ def _vulnerability_rows(
     withheld: tuple[CandidateWithheld, ...],
 ) -> Iterator[VulnFinding]:
     if finding.fixed_version is None:
-        yield finding.model_copy(update={"blocked_reason": "no published fix"})
+        no_fix = GradleBlock(kind="mapping", reason="no published fix")
+        yield finding.model_copy(update={"state": no_fix})
         return
     for candidate in prepared:
         if index in candidate.vulnerability_indices:
             yield finding.model_copy(
                 update={
                     "gradle_target": candidate.target,
-                    "blocked_reason": candidate.reason,
+                    "state": candidate.block,
                 }
             )
     for entry in withheld:
         if index in entry.vulnerability_indices:
-            yield finding.model_copy(update={"blocked_reason": entry.reason})
+            yield finding.model_copy(update={"state": entry.block})
 
 
 def _prepared_update(
@@ -174,23 +176,23 @@ def _prepared_update(
     prepared: tuple[GradleCandidate, ...],
     withheld: tuple[CandidateWithheld, ...],
 ) -> UpdateFinding:
-    unsupported = "no supported catalogue target"
-    if update.blocked_reason is not None:
+    unsupported = GradleBlock(kind="mapping", reason="no supported catalogue target")
+    if isinstance(update.state, GradleBlock):
         return update
     if update.gradle_target is None:
-        return update.model_copy(update={"blocked_reason": unsupported})
+        return update.model_copy(update={"state": unsupported})
     key = update.gradle_target.group_key
     for candidate in prepared:
         if candidate.target.group_key == key:
             return update.model_copy(
                 update={
                     "gradle_target": candidate.target,
-                    "blocked_reason": candidate.reason,
+                    "state": candidate.block,
                     "published_date": candidate.published_date,
                 }
             )
-    reason = next((entry.reason for entry in withheld if entry.group_key == key), None)
-    return update.model_copy(update={"blocked_reason": reason or unsupported})
+    block = next((entry.block for entry in withheld if entry.group_key == key), None)
+    return update.model_copy(update={"state": block or unsupported})
 
 
 def _check_outdated(

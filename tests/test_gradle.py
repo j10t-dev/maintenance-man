@@ -25,6 +25,7 @@ from maintenance_man.gradle import (
 from maintenance_man.gradle_resolution import generate_gradle_report
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import (
+    GradleBlock,
     GradleMember,
     GradleUpdateTarget,
     SemverTier,
@@ -346,7 +347,7 @@ class TestDiscoverGradleUpdates:
         assert not (Path(gradle_project.path) / GRADLE_UPDATE_REPORT_RELPATH).exists()
 
         room = by_name["room"]
-        assert room.blocked_reason is None
+        assert room.state is None
         assert room.installed_version == "2.8.4"
         assert room.latest_version == "2.8.5"
         assert room.semver_tier == SemverTier.PATCH
@@ -453,12 +454,13 @@ class TestDiscoverGradleUpdates:
         blocked = {
             f.pkg_name: f
             for f in discover_gradle_updates(gradle_project)
-            if f.blocked_reason
+            if isinstance(f.state, GradleBlock)
         }
 
-        assert blocked[blocked_name].gradle_block_kind == kind
-        assert (reason := blocked[blocked_name].blocked_reason) is not None
-        assert reason_fragment in reason
+        state = blocked[blocked_name].state
+        assert isinstance(state, GradleBlock)
+        assert state.kind == kind
+        assert reason_fragment in state.reason
         target = blocked[blocked_name].gradle_target
         if members is None:
             assert target is None
@@ -1306,11 +1308,12 @@ def test_shared_reference_completeness_distinguishes_library_and_plugin_alias(
         ("plugin", "same"),
     }
     if complete:
-        assert finding.blocked_reason is None
+        assert finding.state is None
         assert finding.gradle_target.target_version == "1.0.1"
     else:
-        assert finding.gradle_block_kind == "conflict"
-        assert finding.blocked_reason and "plugin" in finding.blocked_reason
+        assert isinstance(finding.state, GradleBlock)
+        assert finding.state.kind == "conflict"
+        assert "plugin" in finding.state.reason
         assert finding.gradle_target.target_version == "1.0.0"
 
 

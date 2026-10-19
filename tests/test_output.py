@@ -13,7 +13,7 @@ from rich.cells import cell_len
 
 from maintenance_man import output
 from maintenance_man.cli import ExitCode, _print_scan_result
-from maintenance_man.models.scan import ScanResult
+from maintenance_man.models.scan import GradleBlock, ScanResult
 from maintenance_man.storage import save_scan_results
 from tests.support.cli import TerminalStream, run_mm, terminal_stdout
 from tests.support.findings import make_update, make_vuln
@@ -64,7 +64,7 @@ def test_given_literal_finding_when_detail_is_piped_then_data_stays_in_one_recor
 ) -> None:
     update = make_update(
         pkg_name="literal[red]package[/red]",
-        blocked_reason="needs\treview\nthen repair",
+        state=GradleBlock(kind="mapping", reason="needs\treview\nthen repair"),
     )
     save_scan_results(_LONG_NAME, _scanned_result(updates=[update]))
 

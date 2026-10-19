@@ -40,7 +40,7 @@ from maintenance_man.models.gradle import (
     RepositoryDeclaration,
     ScopeId,
 )
-from maintenance_man.models.scan import Severity, VulnFinding
+from maintenance_man.models.scan import GradleBlock, Severity, VulnFinding
 from tests.support.clock import FakeClock
 from tests.support.findings import make_gradle_member, make_gradle_target, make_vuln
 from tests.support.gradle import (
@@ -458,7 +458,10 @@ def test_parent_never_invents_version_from_child_fix(tmp_path):
     result = select_gradle_candidates(catalogue, resolution, [finding], [])
     assert result.candidates == ()
     assert result.withheld[0].group_key == "ref:a"
-    assert "independent" in result.withheld[0].reason
+    assert result.withheld[0].block == GradleBlock(
+        kind="conflict",
+        reason="owner requires one independent exact catalogue proposal",
+    )
 
 
 def test_given_underscored_version_ref_when_selected_then_rows_share_one_candidate(
@@ -648,7 +651,9 @@ def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
     assert result.candidates == ()
     assert len(result.withheld) == 1
     assert result.withheld[0].group_key == "ref:a"
-    assert result.withheld[0].reason == "conflicting or non-exact catalogue proposals"
+    assert result.withheld[0].block == GradleBlock(
+        kind="conflict", reason="conflicting or non-exact catalogue proposals"
+    )
 
 
 def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_root(
@@ -796,7 +801,9 @@ def test_attach_gradle_publications_withholds_when_a_row_is_missing():
         _group_candidate(_group_member("a")), EMPTY_REPORT, []
     )
 
-    assert result == "missing native candidate validation"
+    assert result == GradleBlock(
+        kind="mapping", reason="missing native candidate validation"
+    )
 
 
 def test_attach_gradle_publications_withholds_conflicting_marker_implementations():
@@ -823,7 +830,9 @@ def test_attach_gradle_publications_withholds_conflicting_marker_implementations
 
     result = attach_gradle_publications(candidate, EMPTY_REPORT, validations)
 
-    assert result == "conflicting marker implementations"
+    assert result == GradleBlock(
+        kind="mapping", reason="conflicting marker implementations"
+    )
 
 
 def test_attach_gradle_publications_builds_plugin_marker_module():
@@ -1005,7 +1014,9 @@ def test_given_unavailable_native_result_when_attached_then_withheld_with_reason
     ):
         validations = validate_gradle_candidates(project, [candidate()], EMPTY_REPORT)
 
-    assert attach_gradle_publications(candidate(), EMPTY_REPORT, validations) == reason
+    assert attach_gradle_publications(
+        candidate(), EMPTY_REPORT, validations
+    ) == GradleBlock(kind="mapping", reason=reason)
 
 
 def _mutate_catalogue(root, rows):
@@ -1218,19 +1229,21 @@ def test_given_undeclared_routing_when_prepared_then_candidate_is_withheld():
             clock=FakeClock(_NOW),
         )
 
-    assert prepared.reason == ROUTING_UNDECLARED
+    assert prepared.block == GradleBlock(kind="mapping", reason=ROUTING_UNDECLARED)
     validate.assert_not_called()
 
 
 def test_candidate_age_reads_the_clock_after_prefetch():
     clock = FakeClock(_NOW)
     published = _NOW - timedelta(days=7) + timedelta(microseconds=1)
-    assert _prepare_with_publication(published, 7, clock).reason is not None
+    assert _prepare_with_publication(published, 7, clock).block == GradleBlock(
+        kind="age", reason="publication younger than required 7 days"
+    )
     advanced = _prepare_with_publication(
         published,
         7,
         clock,
         prefetch=lambda requests: clock.advance(timedelta(microseconds=1)),
     )
-    assert advanced.reason is None
+    assert advanced.block is None
     assert advanced.published_date == published

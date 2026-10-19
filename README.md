@@ -81,9 +81,9 @@ A passed package update and promotion to local main are separate outcomes. A fai
 
 ## Breaking changes and upgrading
 
-`mm update` and `mm resolve` no longer open pull requests or need `gh`; resolve promotes to local `main`. A project without a configured test phase now fails `mm update` with exit code 4 instead of warning. `mm resolve --continue` with no saved failure exits 1. `mm scan` no longer prunes bookmarks. Saved scans gain `resolve_repair_base` and Gradle blocked rows.
+`mm update` and `mm resolve` no longer open pull requests or need `gh`; resolve promotes to local `main`. A project without a configured test phase now fails `mm update` with exit code 4 instead of warning. `mm resolve --continue` with no saved failure exits 1. `mm scan` no longer prunes bookmarks. Saved scans gain `resolve_repair_base` and Gradle blocked rows. Saved scans hold one lifecycle state per finding, and mm refuses as corrupt a scan with findings saved by an earlier version.
 
-Before the first `mm update` after upgrading, run `mm scan` for every Gradle project, or delete its saved scan under `~/.mm/scan-results`. Scans saved by the previous engine hold Gradle targets that were never age-checked or validated, and Gradle advisories without targets. Resolve-owned READY findings left by the old pull-request flow are promoted to local `main` by the next `mm resolve`. If that pull request was already merged, run `mm scan PROJECT` instead, so local `main` does not diverge from `origin`. `~/.mm/gradle-runs` and `~/.mm/gradle-contexts` are unused and can be deleted.
+Before the first `mm update` or `mm resolve` after upgrading, run `mm scan` for every project, or delete its saved scan under `~/.mm/scan-results`. `mm update` and `mm resolve` report an older scan as `corrupt scan results` and name the command to run; `mm list` skips it with a warning. Rescanning also replaces Gradle targets that the previous engine never age-checked or validated. If the old pull-request flow left a pull request open, merge or close it before rescanning. `~/.mm/gradle-runs` and `~/.mm/gradle-contexts` are unused and can be deleted.
 
 ## Application contract 
 

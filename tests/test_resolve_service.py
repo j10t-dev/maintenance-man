@@ -10,13 +10,22 @@ from maintenance_man.models.events import (
     FindingPassed,
     FindingsBlocked,
     FindingStepFailed,
+    MissingTestConfig,
     OperationFailed,
     Outcome,
     Promoted,
     PromotionFailed,
     ResolvePaused,
 )
-from maintenance_man.models.scan import ScanResult, SemverTier, UpdateStatus, Workflow
+from maintenance_man.models.scan import (
+    Failed,
+    FindingState,
+    GradleBlock,
+    Ready,
+    ScanResult,
+    SemverTier,
+    Workflow,
+)
 from maintenance_man.services import WorkflowError
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.storage import load_scan_results, save_scan_results
@@ -80,22 +89,11 @@ def _pending_stack_scan() -> ScanResult:
     return make_scan_result(
         vulns=[],
         updates=[
+            make_update(pkg_name="pkg-a", state=Ready(flow=Workflow.UPDATE)),
             make_update(
-                pkg_name="pkg-a",
-                update_status=UpdateStatus.READY,
-                flow=Workflow.UPDATE,
+                pkg_name="pkg-b", state=Failed(flow=Workflow.UPDATE, phase="unit")
             ),
-            make_update(
-                pkg_name="pkg-b",
-                update_status=UpdateStatus.FAILED,
-                flow=Workflow.UPDATE,
-                failed_phase="unit",
-            ),
-            make_update(
-                pkg_name="pkg-c",
-                update_status=UpdateStatus.READY,
-                flow=Workflow.UPDATE,
-            ),
+            make_update(pkg_name="pkg-c", state=Ready(flow=Workflow.UPDATE)),
         ],
     )
 
@@ -119,16 +117,11 @@ class TestResolveCandidates:
     ) -> None:
         repo, project = seed_project(tmp_path, "api", _pending_stack_scan())
         update_tip = _stack_update_commits(repo, "pkg-a", "pkg-c")
-        rows_after_takeover: list[
-            list[tuple[UpdateStatus | None, Workflow | None]]
-        ] = []
+        rows_after_takeover: list[list[FindingState | None]] = []
 
         def interrupted(findings, project_config, **kwargs):
             rows_after_takeover.append(
-                [
-                    (row.update_status, row.flow)
-                    for row in load_scan_results("api").updates
-                ]
+                [row.state for row in load_scan_results("api").updates]
             )
             raise KeyboardInterrupt
 
@@ -147,11 +140,7 @@ class TestResolveCandidates:
         outcome = _resolve(project)
 
         assert rows_after_takeover == [
-            [
-                (UpdateStatus.READY, Workflow.RESOLVE),
-                (None, Workflow.RESOLVE),
-                (UpdateStatus.READY, Workflow.RESOLVE),
-            ]
+            [Ready(flow=Workflow.RESOLVE), None, Ready(flow=Workflow.RESOLVE)]
         ]
         assert outcome is Outcome.SUCCEEDED
         assert processed == [("pkg-b",)]
@@ -204,10 +193,7 @@ class TestResolveCandidates:
         scan = _pending_stack_scan()
         scan.updates.append(
             make_update(
-                pkg_name="pkg-d",
-                update_status=UpdateStatus.FAILED,
-                flow=Workflow.RESOLVE,
-                failed_phase="unit",
+                pkg_name="pkg-d", state=Failed(flow=Workflow.RESOLVE, phase="unit")
             )
         )
         repo, project = seed_project(tmp_path, "api", scan)
@@ -231,11 +217,7 @@ class TestResolveCandidates:
         scan = make_scan_result(
             vulns=[],
             updates=[
-                make_update(
-                    pkg_name="pkg-a",
-                    update_status=UpdateStatus.READY,
-                    flow=Workflow.RESOLVE,
-                ),
+                make_update(pkg_name="pkg-a", state=Ready(flow=Workflow.RESOLVE)),
             ],
         )
         repo, project = seed_project(tmp_path, "api", scan)
@@ -266,7 +248,7 @@ class TestResolveCandidates:
                         pkg_name="blocked",
                         vuln_id="CVE-blocked",
                         fixed_version="1.0.1",
-                        blocked_reason="too young",
+                        state=GradleBlock(kind="age", reason="too young"),
                     )
                 ],
                 updates=[],
@@ -276,7 +258,10 @@ class TestResolveCandidates:
         ),
         pytest.param(
             make_scan_result(
-                vulns=[], updates=[make_update(blocked_reason="too young")]
+                vulns=[],
+                updates=[
+                    make_update(state=GradleBlock(kind="age", reason="too young"))
+                ],
             ),
             [FindingsBlocked((("pkg-a", "too young"),))],
             id="blocked-update",
@@ -299,6 +284,60 @@ def test_given_only_blocked_rows_when_resolving_then_repository_is_untouched(
 
 
 @pytest.mark.parametrize(
+    ("scan", "continue_", "expected", "events"),
+    [
+        pytest.param(
+            make_scan_result(
+                vulns=[
+                    make_vuln(
+                        fixed_version="1.0.1",
+                        state=GradleBlock(kind="mapping", reason="no owner"),
+                    )
+                ],
+                updates=[],
+            ),
+            False,
+            Outcome.SUCCEEDED,
+            [FindingsBlocked((("some-pkg", "no owner"),))],
+            id="fresh-blocked-only",
+        ),
+        pytest.param(
+            make_scan_result(
+                vulns=[make_vuln(state=Failed(flow=Workflow.RESOLVE, phase="unit"))],
+                updates=[],
+            ),
+            True,
+            Outcome.FAILED,
+            [MissingTestConfig("api")],
+            id="continue-without-tests",
+        ),
+        pytest.param(
+            make_scan_result(
+                vulns=[make_vuln(state=Ready(flow=Workflow.UPDATE))],
+                updates=[make_update()],
+            ),
+            False,
+            Outcome.FAILED,
+            [MissingTestConfig("api")],
+            id="takeover-without-tests",
+        ),
+    ],
+)
+def test_given_no_test_config_when_resolve_runs_then_only_real_work_is_refused(
+    tmp_path, scan, continue_, expected, events
+):
+    repo, project = seed_project(tmp_path, "api", scan, test_unit=None)
+    before = operation_id(repo)
+    emit = RecordingEmit()
+
+    outcome = _resolve(project, continue_=continue_, emit=emit)
+
+    assert outcome is expected
+    assert emit.events == events
+    assert operation_id(repo) == before
+
+
+@pytest.mark.parametrize(
     "ready_work",
     [
         pytest.param(False, id="fresh-start"),
@@ -310,9 +349,7 @@ def test_given_uncommitted_changes_when_resolve_moves_working_copy_then_it_refus
 ) -> None:
     updates = [make_update(SemverTier.MINOR)]
     if ready_work:
-        updates.append(
-            make_update(update_status=UpdateStatus.READY, flow=Workflow.RESOLVE)
-        )
+        updates.append(make_update(state=Ready(flow=Workflow.RESOLVE)))
     repo, project = seed_project(
         tmp_path, "api", make_scan_result(vulns=[], updates=updates)
     )
@@ -382,8 +419,7 @@ def test_failed_candidate_pauses_without_promoting(
     assert outcome is Outcome.FAILED
     assert emit.events[-1] == ResolvePaused("api")
     saved = load_scan_results("api")
-    assert saved.vulnerabilities[0].update_status is UpdateStatus.FAILED
-    assert saved.vulnerabilities[0].failed_phase == "unit"
+    assert saved.vulnerabilities[0].state == Failed(flow=Workflow.RESOLVE, phase="unit")
     assert Promoted() not in emit.events
 
 
@@ -397,7 +433,7 @@ def test_given_blocked_and_ready_rows_when_resolve_completes_then_it_promotes(
                 pkg_name="blocked",
                 vuln_id="CVE-blocked",
                 fixed_version=None,
-                blocked_reason="No published fix",
+                state=GradleBlock(kind="mapping", reason="No published fix"),
             ),
         ],
         updates=[],
@@ -418,9 +454,9 @@ def test_given_blocked_and_ready_rows_when_resolve_completes_then_it_promotes(
         FindingsBlocked((("blocked", "No published fix"),))
     ]
     assert emit.events[-1] == Promoted()
-    assert [
-        (row.pkg_name, row.update_status) for row in load_scan_results("api").findings
-    ] == [("blocked", None)]
+    assert [(row.pkg_name, row.state) for row in load_scan_results("api").findings] == [
+        ("blocked", GradleBlock(kind="mapping", reason="No published fix"))
+    ]
     assert repo.same_revision(left="main", right=resolve_tips[0])
 
 
@@ -439,7 +475,7 @@ def test_given_row_blocked_during_run_when_resolve_completes_then_it_is_reported
 
     def process_and_block_drifted(findings, *args, scan_result, emit, **kwargs):
         drifted = next(row for row in findings if row.pkg_name == "drifted")
-        drifted.blocked_reason = "catalogue drifted"
+        drifted.record(GradleBlock(kind="stale", reason="catalogue drifted"))
         emit(FindingsBlocked((("drifted", "catalogue drifted"),)))
         ready = [row for row in findings if row is not drifted]
         return passing(ready, *args, scan_result=scan_result, emit=emit, **kwargs)
@@ -479,12 +515,9 @@ def test_given_promotion_failure_when_resolve_completes_then_ready_and_bookmark_
             "then rerun",
         )
     ]
-    assert [
-        (row.pkg_name, row.flow, row.update_status)
-        for row in load_scan_results("api").findings
-    ] == [
-        ("some-pkg", Workflow.RESOLVE, UpdateStatus.READY),
-        ("pkg-a", Workflow.RESOLVE, UpdateStatus.READY),
+    assert [(row.pkg_name, row.state) for row in load_scan_results("api").findings] == [
+        ("some-pkg", Ready(flow=Workflow.RESOLVE)),
+        ("pkg-a", Ready(flow=Workflow.RESOLVE)),
     ]
     assert repo.bookmark_exists(bookmark=_BOOKMARK)
 
@@ -493,13 +526,7 @@ def test_continue_failing_retest_persists_phase_and_reports_blockers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result(
-        vulns=[
-            make_vuln(
-                update_status=UpdateStatus.FAILED,
-                failed_phase="apply",
-                flow=Workflow.RESOLVE,
-            )
-        ],
+        vulns=[make_vuln(state=Failed(flow=Workflow.RESOLVE, phase="apply"))],
         updates=[],
     )
     repo, project = seed_project(tmp_path, "api", scan)
@@ -515,24 +542,14 @@ def test_continue_failing_retest_persists_phase_and_reports_blockers(
     assert outcome is Outcome.FAILED
     assert emit.events[-1] == BlockersStillFailing("unit", ("some-pkg",))
     saved = load_scan_results("api").vulnerabilities[0]
-    assert (saved.update_status, saved.failed_phase, saved.flow) == (
-        UpdateStatus.FAILED,
-        "unit",
-        Workflow.RESOLVE,
-    )
+    assert saved.state == Failed(flow=Workflow.RESOLVE, phase="unit")
 
 
 def test_continue_passing_retest_marks_blocker_passed_then_promotes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result(
-        vulns=[
-            make_vuln(
-                update_status=UpdateStatus.FAILED,
-                failed_phase="unit",
-                flow=Workflow.RESOLVE,
-            )
-        ],
+        vulns=[make_vuln(state=Failed(flow=Workflow.RESOLVE, phase="unit"))],
         updates=[make_update(pkg_name="pkg-a")],
     )
     repo, project = seed_project(tmp_path, "api", scan)
@@ -546,11 +563,7 @@ def test_continue_passing_retest_marks_blocker_passed_then_promotes(
 
     def process(findings, project_config, **kwargs):
         persisted = load_scan_results("api").vulnerabilities[0]
-        assert (
-            persisted.update_status,
-            persisted.failed_phase,
-            persisted.flow,
-        ) == (UpdateStatus.READY, None, Workflow.RESOLVE)
+        assert persisted.state == Ready(flow=Workflow.RESOLVE)
         assert repo.same_revision(left=_BOOKMARK, right="@-")
         processed.append(tuple(finding.pkg_name for finding in findings))
         return processor(findings, project_config, **kwargs)
@@ -575,7 +588,7 @@ def test_missing_resume_bookmark_raises_workflow_error(
 ) -> None:
     scan = make_scan_result(
         vulns=[],
-        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.RESOLVE)],
+        updates=[make_update(state=Ready(flow=Workflow.RESOLVE))],
     )
     _, project = seed_project(tmp_path, "api", scan)
     monkeypatch.setattr(resolve_service, "process_findings", FakeFindingProcessor({}))
@@ -595,7 +608,7 @@ def test_continue_wraps_repository_inspection_error(
 ) -> None:
     scan = make_scan_result(
         vulns=[],
-        updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
+        updates=[make_update(state=Failed(flow=Workflow.RESOLVE, phase="unit"))],
     )
     repo, project = seed_project(tmp_path, "api", scan)
     repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
@@ -613,7 +626,7 @@ def test_continue_wraps_repository_inspection_error(
 def test_continue_refuses_dirty_current_change(tmp_path: Path) -> None:
     scan = make_scan_result(
         vulns=[],
-        updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
+        updates=[make_update(state=Failed(flow=Workflow.RESOLVE, phase="unit"))],
     )
     repo, project = seed_project(tmp_path, "api", scan)
     repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
@@ -647,13 +660,7 @@ def test_given_bookmark_move_failure_when_continuing_then_repair_base_is_saved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scan = make_scan_result(
-        vulns=[
-            make_vuln(
-                update_status=UpdateStatus.FAILED,
-                failed_phase="unit",
-                flow=Workflow.RESOLVE,
-            )
-        ],
+        vulns=[make_vuln(state=Failed(flow=Workflow.RESOLVE, phase="unit"))],
         updates=[],
     )
     repo, project = seed_project(tmp_path, "api", scan)
@@ -675,30 +682,27 @@ def test_given_bookmark_move_failure_when_continuing_then_repair_base_is_saved(
     )
     saved = load_scan_results("api")
     assert saved.resolve_repair_base == base
-    assert (
-        saved.vulnerabilities[0].update_status,
-        saved.vulnerabilities[0].failed_phase,
-    ) == (UpdateStatus.FAILED, "unit")
+    assert saved.vulnerabilities[0].state == Failed(flow=Workflow.RESOLVE, phase="unit")
     assert repo.resolve_revision(revision=_BOOKMARK) == base
 
 
 @pytest.mark.parametrize(
-    ("rows", "message"),
+    ("states", "message"),
     [
         pytest.param(
-            [(UpdateStatus.FAILED, Workflow.UPDATE)],
+            [Failed(flow=Workflow.UPDATE, phase="unit")],
             "Pending update work exists for api. Run mm resolve api without "
             "--continue to take it over first.",
             id="update-owned-row",
         ),
         pytest.param(
-            [(UpdateStatus.READY, Workflow.RESOLVE)],
+            [Ready(flow=Workflow.RESOLVE)],
             "No paused resolve failure is saved for api. Run mm resolve api to "
             "start resolving.",
             id="no-saved-failure",
         ),
         pytest.param(
-            [(UpdateStatus.FAILED, Workflow.RESOLVE)],
+            [Failed(flow=Workflow.RESOLVE, phase="unit")],
             "--continue needs a committed repair on top of "
             "mm/resolve-dependencies. Commit the repair with jj commit, then "
             "run mm resolve api --continue again.",
@@ -709,14 +713,14 @@ def test_given_bookmark_move_failure_when_continuing_then_repair_base_is_saved(
 def test_given_unsafe_state_when_continuing_then_resolve_refuses_before_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    rows: list[tuple[UpdateStatus, Workflow]],
+    states: list[FindingState],
     message: str,
 ) -> None:
     scan = make_scan_result(
         vulns=[],
         updates=[
-            make_update(pkg_name=f"pkg-{index}", update_status=status, flow=flow)
-            for index, (status, flow) in enumerate(rows)
+            make_update(pkg_name=f"pkg-{index}", state=state)
+            for index, state in enumerate(states)
         ],
     )
     repo, project = seed_project(tmp_path, "api", scan)
@@ -742,7 +746,7 @@ def test_given_ready_write_interrupted_when_continuing_again_then_same_repair_co
 ) -> None:
     scan = make_scan_result(
         vulns=[],
-        updates=[make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)],
+        updates=[make_update(state=Failed(flow=Workflow.RESOLVE, phase="unit"))],
     )
     repo, project = seed_project(tmp_path, "api", scan)
     repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
@@ -777,9 +781,7 @@ def test_given_repair_missing_saved_target_when_continuing_then_bookmark_stays(
     repo = JjRepository(project.path)
     scan = load_scan_results("api")
     row = scan.updates[0]
-    row.update_status = UpdateStatus.FAILED
-    row.failed_phase = "unit"
-    row.flow = Workflow.RESOLVE
+    row.state = Failed(flow=Workflow.RESOLVE, phase="unit")
     save_scan_results("api", scan)
     repo.set_bookmark(bookmark=_BOOKMARK, revision="main")
     base = repo.resolve_revision(revision="main")
@@ -804,5 +806,5 @@ def test_given_repair_missing_saved_target_when_continuing_then_bookmark_stays(
         )
     ]
     saved = load_scan_results("api").updates[0]
-    assert (saved.update_status, saved.failed_phase) == (UpdateStatus.FAILED, "unit")
+    assert saved.state == Failed(flow=Workflow.RESOLVE, phase="unit")
     assert repo.resolve_revision(revision=_BOOKMARK) == base

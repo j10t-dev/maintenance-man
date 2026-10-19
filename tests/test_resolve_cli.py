@@ -1,11 +1,7 @@
 import pytest
 
 from maintenance_man.cli import ExitCode
-from maintenance_man.models.scan import (
-    ScanResult,
-    UpdateStatus,
-    Workflow,
-)
+from maintenance_man.models.scan import Failed, ScanResult, Workflow
 from maintenance_man.storage import load_scan_results
 from maintenance_man.vcs import JjRepository
 from tests.fakes import FakeFindingProcessor
@@ -18,9 +14,7 @@ _RESOLVE_BOOKMARK = "mm/resolve-dependencies"
 
 def _clear_resolve_progress(scan_result: ScanResult) -> None:
     for f in (*scan_result.vulnerabilities, *scan_result.updates):
-        f.update_status = None
-        f.failed_phase = None
-        f.flow = None
+        f.state = None
 
 
 @pytest.fixture()
@@ -83,11 +77,7 @@ class TestResolveContinue:
         scan_result: ScanResult = mock_resolve_cli_deps.scan_result
         scan_result.updates = []
         scan_result.vulnerabilities = [
-            make_vuln(
-                update_status=UpdateStatus.FAILED,
-                flow=Workflow.RESOLVE,
-                failed_phase=failed_phase,
-            )
+            make_vuln(state=Failed(flow=Workflow.RESOLVE, phase=failed_phase))
         ]
         mock_resolve_cli_deps.save_scan()
         repo = JjRepository(mock_resolve_cli_deps.project_paths["vulnerable"])

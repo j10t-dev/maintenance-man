@@ -9,14 +9,14 @@ from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import Emit, Event
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    Failed,
+    Ready,
     ScanResult,
-    UpdateFinding,
     UpdateResult,
-    UpdateStatus,
     Workflow,
 )
 from maintenance_man.storage import save_scan_results
-from maintenance_man.updater import Finding
+from maintenance_man.updater import FindingGroup
 from maintenance_man.vcs import JjRepository
 
 
@@ -44,7 +44,7 @@ class FakeFindingProcessor:
 
     def __call__(
         self,
-        findings: Sequence[Finding],
+        groups: Sequence[FindingGroup],
         project_config: ProjectConfig,
         *,
         flow: Workflow,
@@ -54,28 +54,25 @@ class FakeFindingProcessor:
         del emit
         repo = JjRepository(project_config.path)
         results: list[UpdateResult] = []
-        for finding in findings:
-            assert finding.pkg_name in self.outcomes, (
-                f"Missing outcome for {finding.pkg_name}"
+        for group in groups:
+            assert group.pkg_name in self.outcomes, (
+                f"Missing outcome for {group.pkg_name}"
             )
-            passed, failed_phase = self.outcomes[finding.pkg_name]
-            kind = "update" if isinstance(finding, UpdateFinding) else "vuln"
+            passed, failed_phase = self.outcomes[group.pkg_name]
             if passed:
-                fixture = project_config.path / f"mm-fixture-{finding.pkg_name}.txt"
-                fixture.write_text(finding.target_version, encoding="utf-8")
-                repo.commit(message=f"fixture: update {finding.pkg_name}")
+                fixture = project_config.path / f"mm-fixture-{group.pkg_name}.txt"
+                fixture.write_text(group.target_version, encoding="utf-8")
+                repo.commit(message=f"fixture: update {group.pkg_name}")
                 repo.set_bookmark(bookmark=WORKFLOW_BOOKMARKS[flow], revision="@-")
-                finding.update_status = UpdateStatus.READY
-                finding.failed_phase = None
+                group.record(Ready(flow=flow))
             else:
-                finding.update_status = UpdateStatus.FAILED
-                finding.failed_phase = failed_phase
-            finding.flow = flow
+                assert failed_phase is not None
+                group.record(Failed(flow=flow, phase=failed_phase))
             save_scan_results(scan_result.project, scan_result)
             results.append(
                 UpdateResult(
-                    pkg_name=finding.pkg_name,
-                    kind=kind,
+                    pkg_name=group.pkg_name,
+                    kind=group.kind,
                     passed=passed,
                     failed_phase=failed_phase,
                 )

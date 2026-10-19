@@ -12,16 +12,18 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    Failed,
+    GradleBlock,
+    Ready,
     ScanResult,
     UpdateFinding,
-    UpdateStatus,
     VulnFinding,
     Workflow,
 )
 from maintenance_man.services import WorkflowError, flows
 from maintenance_man.storage import save_scan_results
 from maintenance_man.updater import (
-    Finding,
+    FindingGroup,
     group_findings,
     process_findings,
     run_test_phases,
@@ -36,20 +38,20 @@ def resolve_project(
     scan_result = flows.load_validated_scan(name, project, Workflow.RESOLVE, emit=emit)
     if scan_result is None:
         return Outcome.SUCCEEDED
-    if flows.report_missing_test_config(name, project, emit=emit):
-        return Outcome.FAILED
     if continue_:
+        if flows.report_missing_test_config(name, project, emit=emit):
+            return Outcome.FAILED
         return _handle_continue(name, project, scan_result, emit=emit)
     _refuse_mixed_ownership(name, scan_result)
-    if flows.has_owned(scan_result, Workflow.RESOLVE, UpdateStatus.FAILED):
+    if flows.has_owned(scan_result, Workflow.RESOLVE, Failed):
         msg = f"resolve already paused for {name} — rerun with --continue"
         raise WorkflowError(msg)
-    takes_over = flows.has_owned(
-        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
-    )
+    takes_over = flows.has_owned(scan_result, Workflow.UPDATE, Ready, Failed)
     if not takes_over and not flows.has_work(scan_result, Workflow.RESOLVE):
         _report_blocked(scan_result.blocked_findings, emit=emit)
         return Outcome.SUCCEEDED
+    if flows.report_missing_test_config(name, project, emit=emit):
+        return Outcome.FAILED
 
     repo = JjRepository(project.path)
     try:
@@ -67,7 +69,7 @@ def resolve_project(
     return _run_candidates(name, project, scan_result, candidates, emit=emit)
 
 
-def _select_resolve_candidates(scan_result: ScanResult) -> list[Finding]:
+def _select_resolve_candidates(scan_result: ScanResult) -> list[FindingGroup]:
     vulns = [
         finding
         for finding in scan_result.vulnerabilities
@@ -82,10 +84,8 @@ def _select_resolve_candidates(scan_result: ScanResult) -> list[Finding]:
 
 
 def _refuse_mixed_ownership(name: str, scan_result: ScanResult) -> None:
-    if flows.has_owned(
-        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
-    ) and flows.has_owned(
-        scan_result, Workflow.RESOLVE, UpdateStatus.READY, UpdateStatus.FAILED
+    if flows.has_owned(scan_result, Workflow.UPDATE, Ready, Failed) and flows.has_owned(
+        scan_result, Workflow.RESOLVE, Ready, Failed
     ):
         msg = (
             "Resolve cannot take over pending updates while resolve progress also "
@@ -99,8 +99,8 @@ def _take_over_update_progress(
 ) -> None:
     """Move the accepted update tip and every update-owned row to resolve.
 
-    Errors before the status save leave the bookmark and rows untouched. After it,
-    every row is resolve-owned (accepted READY or pending), so the next run
+    Errors before the scan is saved leave the bookmark and rows untouched. After it,
+    every row is resolve-owned (accepted Ready or pending), so the next run
     continues from the resolve bookmark; a failed deletion of the update bookmark
     is reported as WorkflowError.
     """
@@ -122,11 +122,11 @@ def _take_over_update_progress(
         )
         repo.new_change(revision=resolve_bookmark)
         for finding in scan_result.findings:
-            if finding.flow is Workflow.UPDATE:
-                finding.flow = Workflow.RESOLVE
-                if finding.update_status is UpdateStatus.FAILED:
-                    finding.update_status = None
-                    finding.failed_phase = None
+            match finding.state:
+                case Ready(flow=Workflow.UPDATE):
+                    finding.state = Ready(flow=Workflow.RESOLVE)
+                case Failed(flow=Workflow.UPDATE):
+                    finding.state = None
         save_scan_results(name, scan_result)
         repo.delete_bookmark(bookmark=update_bookmark)
     except RevisionError as exc:
@@ -148,13 +148,13 @@ def _prepare_resolve_bookmark(
     name: str,
     repo: JjRepository,
     scan_result: ScanResult,
-    candidates: list[Finding],
+    candidates: list[FindingGroup],
     *,
     emit: Emit,
 ) -> bool:
     bookmark = WORKFLOW_BOOKMARKS[Workflow.RESOLVE]
     try:
-        if flows.has_owned(scan_result, Workflow.RESOLVE, UpdateStatus.READY):
+        if flows.has_owned(scan_result, Workflow.RESOLVE, Ready):
             if not repo.bookmark_exists(bookmark=bookmark):
                 msg = (
                     f"resolve bookmark '{bookmark}' is missing but in-progress "
@@ -178,7 +178,7 @@ def _run_candidates(
     name: str,
     project: ProjectConfig,
     scan_result: ScanResult,
-    candidates: list[Finding],
+    candidates: list[FindingGroup],
     *,
     emit: Emit,
 ) -> Outcome:
@@ -191,7 +191,7 @@ def _run_candidates(
         emit=emit,
     )
     if any(not result.passed for result in results) or flows.has_owned(
-        scan_result, Workflow.RESOLVE, UpdateStatus.FAILED
+        scan_result, Workflow.RESOLVE, Failed
     ):
         emit(ResolvePaused(name))
         return Outcome.FAILED
@@ -202,15 +202,13 @@ def _run_candidates(
 
 
 def _report_blocked(findings: list[VulnFinding | UpdateFinding], *, emit: Emit) -> None:
-    if findings:
-        emit(
-            FindingsBlocked(
-                tuple(
-                    (finding.pkg_name, finding.blocked_reason or "")
-                    for finding in findings
-                )
-            )
-        )
+    reasons = tuple(
+        (finding.pkg_name, finding.state.reason)
+        for finding in findings
+        if isinstance(finding.state, GradleBlock)
+    )
+    if reasons:
+        emit(FindingsBlocked(reasons))
 
 
 def _handle_continue(
@@ -221,9 +219,7 @@ def _handle_continue(
     emit: Emit,
 ) -> Outcome:
     _refuse_mixed_ownership(name, scan_result)
-    if flows.has_owned(
-        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
-    ):
+    if flows.has_owned(scan_result, Workflow.UPDATE, Ready, Failed):
         msg = (
             f"Pending update work exists for {name}. Run mm resolve {name} "
             "without --continue to take it over first."
@@ -233,7 +229,7 @@ def _handle_continue(
         [
             finding
             for finding in scan_result.findings
-            if flows.is_owned(finding, Workflow.RESOLVE, UpdateStatus.FAILED)
+            if flows.is_owned(finding, Workflow.RESOLVE, Failed)
         ]
     )
     if not failed:
@@ -299,7 +295,7 @@ def _retest_blockers(
     name: str,
     project: ProjectConfig,
     scan_result: ScanResult,
-    failed: list[Finding],
+    failed: list[FindingGroup],
     *,
     repair_base: str,
     repo: JjRepository,
@@ -308,17 +304,13 @@ def _retest_blockers(
     if not _repair_sets_saved_targets(project, failed, emit=emit):
         return False
     failed_phase = run_test_phases(project, project.path, emit=emit)
-    passed = failed_phase is None
-    for blocker in failed:
-        blocker.flow = Workflow.RESOLVE
-        if not passed:
-            blocker.update_status = UpdateStatus.FAILED
-            blocker.failed_phase = failed_phase
-    if not passed:
+    if failed_phase is not None:
+        for blocker in failed:
+            blocker.record(Failed(flow=Workflow.RESOLVE, phase=failed_phase))
         save_scan_results(name, scan_result)
         emit(
             BlockersStillFailing(
-                failed_phase or "", tuple(blocker.pkg_name for blocker in failed)
+                failed_phase, tuple(blocker.pkg_name for blocker in failed)
             )
         )
         return False
@@ -332,8 +324,7 @@ def _retest_blockers(
         msg = f"could not move {bookmark} to the committed manual fix"
         raise WorkflowError(msg) from exc
     for blocker in failed:
-        blocker.update_status = UpdateStatus.READY
-        blocker.failed_phase = None
+        blocker.record(Ready(flow=Workflow.RESOLVE))
     scan_result.resolve_repair_base = None
     save_scan_results(name, scan_result)
     for blocker in failed:
@@ -349,7 +340,7 @@ def _retest_blockers(
 
 
 def _repair_sets_saved_targets(
-    project: ProjectConfig, failed: list[Finding], *, emit: Emit
+    project: ProjectConfig, failed: list[FindingGroup], *, emit: Emit
 ) -> bool:
     for blocker in failed:
         if blocker.gradle_target is None:

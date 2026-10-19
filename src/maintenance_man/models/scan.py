@@ -2,10 +2,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum, auto
-from typing import Literal
+from typing import Annotated, Literal
 
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Severity(StrEnum):
@@ -48,11 +48,6 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
             return SemverTier.MINOR
         case _:
             return SemverTier.PATCH
-
-
-class UpdateStatus(StrEnum):
-    FAILED = "failed"
-    READY = "ready"
 
 
 class Workflow(StrEnum):
@@ -122,25 +117,45 @@ class GradleUpdateTarget(BaseModel):
         return self.version_ref or self.members[0].coordinate
 
 
+class Ready(BaseModel):
+    """The flow applied and tested the change; it awaits promotion to main."""
+
+    lifecycle: Literal["ready"] = "ready"
+    flow: Workflow
+
+
+class Failed(BaseModel):
+    """The flow's change failed in *phase* and awaits a retry."""
+
+    lifecycle: Literal["failed"] = "failed"
+    flow: Workflow
+    phase: str
+
+
 class GradleBlock(BaseModel):
     """Policy state that withholds an automatic change. Not a failure."""
 
+    lifecycle: Literal["blocked"] = "blocked"
     kind: GradleBlockKind
     reason: str
 
 
+type FindingState = Annotated[
+    Ready | Failed | GradleBlock, Field(discriminator="lifecycle")
+]
+
+
 class _FindingBase(BaseModel):
-    """Fields shared by vulnerability and update findings."""
+    """Fields shared by vulnerability and update findings; a pending finding has
+    no state."""
+
+    model_config = ConfigDict(extra="forbid")
 
     pkg_name: str
     installed_version: str
     published_date: datetime | None = None
-    update_status: UpdateStatus | None = None
-    failed_phase: str | None = None
-    flow: Workflow | None = None
+    state: FindingState | None = None
     gradle_target: GradleUpdateTarget | None = None
-    blocked_reason: str | None = None
-    gradle_block_kind: GradleBlockKind | None = None
 
 
 class VulnFinding(_FindingBase):
@@ -197,7 +212,9 @@ class UpdateFinding(_FindingBase):
 class ScanResult(BaseModel):
     """The last explicit scan's findings and their pending lifecycle;
     resolve_repair_base holds the resolve tip a committed repair sits on until
-    that repair is saved READY."""
+    that repair is saved as Ready."""
+
+    model_config = ConfigDict(extra="forbid")
 
     project: str
     scanned_at: datetime
@@ -220,8 +237,8 @@ class ScanResult(BaseModel):
 
     @property
     def blocked_findings(self) -> list[VulnFinding | UpdateFinding]:
-        """Findings withheld by current policy. Orthogonal to update lifecycle."""
-        return [f for f in self.findings if f.blocked_reason is not None]
+        """Findings withheld by current policy."""
+        return [f for f in self.findings if isinstance(f.state, GradleBlock)]
 
 
 def _fix_version_key(v: VulnFinding) -> Version:

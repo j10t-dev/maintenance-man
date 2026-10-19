@@ -3,7 +3,6 @@ import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
 
 from maintenance_man import gradle
 from maintenance_man.gradle import GradleError
@@ -19,13 +18,16 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    Failed,
+    FindingState,
+    GradleBlock,
     GradleUpdateTarget,
+    Ready,
     ScanResult,
     SemverTier,
     UpdateFinding,
     UpdateKind,
     UpdateResult,
-    UpdateStatus,
     VulnFinding,
     Workflow,
     highest_fix_version,
@@ -46,24 +48,6 @@ class FindingStep:
         return self.failed_phase is None
 
 
-class Finding(Protocol):
-    """Common interface for VulnFinding and UpdateFinding during update processing."""
-
-    pkg_name: str
-    installed_version: str
-    update_status: UpdateStatus | None
-    failed_phase: str | None
-    flow: Workflow | None
-    gradle_target: GradleUpdateTarget | None
-    blocked_reason: str | None
-
-    @property
-    def target_version(self) -> str: ...
-
-    @property
-    def detail(self) -> str: ...
-
-
 _COMMIT_FORMATS: dict[UpdateKind, str] = {
     "vuln": "fix: upgrade {pkg} {old} -> {new} for {detail}",
     "update": "chore: bump {pkg} {old} -> {new} ({detail})",
@@ -72,33 +56,9 @@ _COMMIT_FORMATS: dict[UpdateKind, str] = {
 _RISK_ORDER = {tier: rank for rank, tier in enumerate(SemverTier)}
 
 
-def _first_non_none(values: Sequence[str | Workflow | None]):
-    return next((value for value in values if value is not None), None)
-
-
-def _consolidated_lifecycle_state(
-    group: Sequence[VulnFinding | UpdateFinding],
-) -> tuple[UpdateStatus | None, str | None, Workflow | None]:
-    """FAILED if any row failed, else READY if any is ready, each with the first
-    such row's phase and flow; else none."""
-    for status in (UpdateStatus.FAILED, UpdateStatus.READY):
-        rows = [row for row in group if row.update_status is status]
-        if rows:
-            return (
-                status,
-                _first_non_none([row.failed_phase for row in rows]),
-                _first_non_none([row.flow for row in rows]),
-            )
-    return (None, None, None)
-
-
-_FANNED_OUT = frozenset({"update_status", "failed_phase", "flow", "blocked_reason"})
-
-
 @dataclass
-class _FindingGroup:
-    """Saved rows applied, tested and committed as one change; lifecycle and
-    blocked-reason writes fan out to every original row."""
+class FindingGroup:
+    """Saved rows applied, tested and committed as one change."""
 
     pkg_name: str
     installed_version: str
@@ -107,21 +67,14 @@ class _FindingGroup:
     originals: Sequence[VulnFinding | UpdateFinding] = field(repr=False)
     kind: UpdateKind = "vuln"
     gradle_target: GradleUpdateTarget | None = None
-    update_status: UpdateStatus | None = None
-    failed_phase: str | None = None
-    flow: Workflow | None = None
-    blocked_reason: str | None = None
 
-    def __setattr__(self, name: str, value: object) -> None:
-        super().__setattr__(name, value)
-        if name in _FANNED_OUT:
-            for original in self.originals:
-                setattr(original, name, value)
+    def record(self, state: FindingState) -> None:
+        """Set *state* on every row this group was applied for."""
+        for original in self.originals:
+            original.state = state
 
 
-def consolidate_vulns(
-    vulns: list[VulnFinding],
-) -> list[_FindingGroup]:
+def consolidate_vulns(vulns: list[VulnFinding]) -> list[FindingGroup]:
     """Group actionable vulns by package and pick the highest fix version."""
     by_pkg: dict[str, list[VulnFinding]] = {}
     for v in vulns:
@@ -165,7 +118,7 @@ def run_test_phases(
 
 def is_eligible(finding: VulnFinding | UpdateFinding) -> bool:
     """Whether a saved row can be applied: not blocked, and with a version to apply."""
-    if finding.blocked_reason is not None:
+    if isinstance(finding.state, GradleBlock):
         return False
     return (
         not isinstance(finding, VulnFinding)
@@ -174,7 +127,9 @@ def is_eligible(finding: VulnFinding | UpdateFinding) -> bool:
     )
 
 
-def group_findings(findings: Sequence[VulnFinding | UpdateFinding]) -> list[Finding]:
+def group_findings(
+    findings: Sequence[VulnFinding | UpdateFinding],
+) -> list[FindingGroup]:
     """Group eligible rows into one change each: rows sharing a saved catalogue
     target, other vulnerabilities by package, then other updates risk-ascending.
     Ineligible rows are left out."""
@@ -195,12 +150,22 @@ def group_findings(findings: Sequence[VulnFinding | UpdateFinding]) -> list[Find
             ]
         ),
         *(_target_group(target, rows) for target, rows in targets.values()),
-        *sort_updates_by_risk(
-            [
-                f
-                for f in eligible
-                if isinstance(f, UpdateFinding) and f.gradle_target is None
-            ]
+        *(
+            _group(
+                [update],
+                pkg_name=update.pkg_name,
+                installed_version=update.installed_version,
+                target_version=update.latest_version,
+                detail=update.detail,
+                kind="update",
+            )
+            for update in sort_updates_by_risk(
+                [
+                    f
+                    for f in eligible
+                    if isinstance(f, UpdateFinding) and f.gradle_target is None
+                ]
+            )
         ),
     ]
 
@@ -212,9 +177,9 @@ class Applied:
 
 @dataclass(frozen=True, slots=True)
 class Blocked:
-    """The saved target no longer matches the catalogue; nothing changed."""
+    """The adapter withheld the change; nothing was applied."""
 
-    reason: str
+    block: GradleBlock
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,71 +191,68 @@ type ApplyOutcome = Applied | Blocked | ApplyFailed
 
 
 def apply_finding(
-    project: ProjectConfig, finding: Finding, *, emit: Emit
+    project: ProjectConfig, group: FindingGroup, *, emit: Emit
 ) -> ApplyOutcome:
-    """Apply one finding in the project directory; Blocked means nothing changed,
+    """Apply one group in the project directory; Blocked means nothing changed,
     ApplyFailed means the failure was emitted and partial changes may remain."""
-    if finding.gradle_target is None:
+    if group.gradle_target is None:
         applied = _apply_update(
             project.package_manager,
-            finding.pkg_name,
-            finding.target_version,
+            group.pkg_name,
+            group.target_version,
             project.path,
             emit=emit,
         )
         return Applied() if applied else ApplyFailed()
-    return _apply_gradle_target(project, finding.gradle_target, emit=emit)
+    return _apply_gradle_target(project, group.gradle_target, emit=emit)
 
 
 def process_findings(
-    findings: Sequence[Finding],
+    groups: Sequence[FindingGroup],
     project_config: ProjectConfig,
     *,
     flow: Workflow,
     scan_result: ScanResult,
     emit: Emit,
 ) -> list[UpdateResult]:
-    """Process findings on the current jj change.
+    """Process groups on the current jj change.
 
-    Update discards a failed finding and continues; resolve keeps it and stops.
+    Update discards a failed group and continues; resolve keeps it and stops.
     """
     results: list[UpdateResult] = []
     repo = JjRepository(Path(project_config.path))
-    for finding in findings:
-        kind = _kind(finding)
+    for group in groups:
         emit(
             FindingStarted(
-                finding.pkg_name,
-                finding.installed_version,
-                finding.target_version,
+                group.pkg_name, group.installed_version, group.target_version
             )
         )
-        outcome = apply_finding(project_config, finding, emit=emit)
+        outcome = apply_finding(project_config, group, emit=emit)
         if isinstance(outcome, Blocked):
-            _block(finding, outcome.reason, scan_result, emit)
+            group.record(outcome.block)
+            save_scan_results(scan_result.project, scan_result)
+            emit(FindingsBlocked(((group.pkg_name, outcome.block.reason),)))
             continue
         step = (
             FindingStep("apply")
             if isinstance(outcome, ApplyFailed)
-            else _test_and_commit(finding, kind, project_config, repo, flow, emit)
+            else _test_and_commit(group, project_config, repo, flow, emit)
         )
-        if step.failed_phase is not None:
+        if step.failed_phase is None:
+            group.record(Ready(flow=flow))
+        else:
             emit(
                 FindingFailed(
-                    finding.pkg_name,
+                    group.pkg_name,
                     step.failed_phase,
-                    finding.installed_version,
-                    finding.target_version,
+                    group.installed_version,
+                    group.target_version,
                 )
             )
-        finding.update_status = (
-            UpdateStatus.READY if step.passed else UpdateStatus.FAILED
-        )
-        finding.failed_phase = step.failed_phase
-        finding.flow = flow
+            group.record(Failed(flow=flow, phase=step.failed_phase))
         save_scan_results(scan_result.project, scan_result)
         results.append(
-            UpdateResult(finding.pkg_name, kind, step.passed, step.failed_phase)
+            UpdateResult(group.pkg_name, group.kind, step.passed, step.failed_phase)
         )
         if step.passed:
             continue
@@ -300,15 +262,9 @@ def process_findings(
     return results
 
 
-def _kind(finding: Finding) -> UpdateKind:
-    if isinstance(finding, _FindingGroup):
-        return finding.kind
-    return "vuln" if isinstance(finding, VulnFinding) else "update"
-
-
 def _target_group(
     target: GradleUpdateTarget, rows: list[VulnFinding | UpdateFinding]
-) -> _FindingGroup:
+) -> FindingGroup:
     return _group(
         rows,
         pkg_name=target.display_name,
@@ -329,9 +285,8 @@ def _group(
     detail: str,
     kind: UpdateKind = "vuln",
     gradle_target: GradleUpdateTarget | None = None,
-) -> _FindingGroup:
-    update_status, failed_phase, flow = _consolidated_lifecycle_state(rows)
-    return _FindingGroup(
+) -> FindingGroup:
+    return FindingGroup(
         pkg_name=pkg_name,
         installed_version=installed_version,
         target_version=target_version,
@@ -339,9 +294,6 @@ def _group(
         originals=rows,
         kind=kind,
         gradle_target=gradle_target,
-        update_status=update_status,
-        failed_phase=failed_phase,
-        flow=flow,
     )
 
 
@@ -355,21 +307,11 @@ def _apply_gradle_target(
     except GradleError as exc:
         emit(FindingStepFailed("package command", str(exc)))
         return ApplyFailed()
-    return Applied() if block is None else Blocked(block.reason)
-
-
-def _block(finding: Finding, reason: str, scan_result: ScanResult, emit: Emit) -> None:
-    finding.blocked_reason = reason
-    finding.update_status = None
-    finding.failed_phase = None
-    finding.flow = None
-    save_scan_results(scan_result.project, scan_result)
-    emit(FindingsBlocked(((finding.pkg_name, reason),)))
+    return Applied() if block is None else Blocked(block)
 
 
 def _test_and_commit(
-    finding: Finding,
-    kind: UpdateKind,
+    group: FindingGroup,
     project_config: ProjectConfig,
     repo: JjRepository,
     flow: Workflow,
@@ -388,29 +330,22 @@ def _test_and_commit(
     if not has_changes:
         emit(
             FindingPassed(
-                finding.pkg_name,
-                True,
-                finding.installed_version,
-                finding.target_version,
+                group.pkg_name, True, group.installed_version, group.target_version
             )
         )
         return FindingStep(None)
 
-    return _commit_finding(finding, kind, repo, flow, emit)
+    return _commit_finding(group, repo, flow, emit)
 
 
 def _commit_finding(
-    finding: Finding,
-    kind: UpdateKind,
-    repo: JjRepository,
-    flow: Workflow,
-    emit: Emit,
+    group: FindingGroup, repo: JjRepository, flow: Workflow, emit: Emit
 ) -> FindingStep:
-    message = _COMMIT_FORMATS[kind].format(
-        pkg=finding.pkg_name,
-        old=finding.installed_version,
-        new=finding.target_version,
-        detail=finding.detail,
+    message = _COMMIT_FORMATS[group.kind].format(
+        pkg=group.pkg_name,
+        old=group.installed_version,
+        new=group.target_version,
+        detail=group.detail,
     )
     try:
         repo.commit(message=message)
@@ -424,7 +359,7 @@ def _commit_finding(
         return FindingStep("commit", discardable=False)
     emit(
         FindingPassed(
-            finding.pkg_name, False, finding.installed_version, finding.target_version
+            group.pkg_name, False, group.installed_version, group.target_version
         )
     )
     return FindingStep(None)

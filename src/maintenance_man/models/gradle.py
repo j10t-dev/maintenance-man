@@ -12,7 +12,7 @@ from pydantic import (
     model_validator,
 )
 
-from maintenance_man.models.scan import GradleUpdateTarget
+from maintenance_man.models.scan import GradleBlock, GradleUpdateTarget
 
 
 def _utc_date(value: datetime) -> datetime:
@@ -215,13 +215,13 @@ class GradleCandidate(GradleRecord):
     """Positions, in the vulnerability sequence given to select_gradle_candidates,
     of the advisories this candidate fixes."""
     publication_requests: tuple[PublicationRequest, ...] = ()
-    reason: str | None = None
+    block: GradleBlock | None = None
     published_date: UtcDatetime | None = None
 
 
 class CandidateWithheld(GradleRecord):
     group_key: str | None
-    reason: str
+    block: GradleBlock
     vulnerability_indices: tuple[int, ...] = ()
     """Positions, in the same sequence, of the advisories this withheld entry
     blocks."""

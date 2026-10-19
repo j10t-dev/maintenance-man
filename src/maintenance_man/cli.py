@@ -52,6 +52,7 @@ from maintenance_man.models.events import (
     TestCommandStarted,
 )
 from maintenance_man.models.scan import (
+    GradleBlock,
     ScanResult,
     SecretFinding,
     UpdateFinding,
@@ -1045,7 +1046,8 @@ type _FindingRow = tuple[list[str | Text], list[str]]
 
 def _vulnerability_row(vuln: VulnFinding, wins: dict[str, str]) -> _FindingRow:
     kind = "vuln" if vuln.actionable else "advisory"
-    reason = vuln.blocked_reason or ""
+    blocked = isinstance(vuln.state, GradleBlock)
+    reason = vuln.state.reason if blocked else ""
     if vuln.fixed_version and wins.get(vuln.pkg_name) == vuln.fixed_version:
         reason = " · ".join(filter(None, ["selected fix", reason]))
     versions = (
@@ -1055,8 +1057,8 @@ def _vulnerability_row(vuln: VulnFinding, wins: dict[str, str]) -> _FindingRow:
     )
     row = [
         output.literal(
-            "! blocked" if vuln.blocked_reason else f"! {kind}",
-            "yellow" if kind == "advisory" or vuln.blocked_reason else "red",
+            "! blocked" if blocked else f"! {kind}",
+            "yellow" if kind == "advisory" or blocked else "red",
         ),
         vuln.severity.value.lower(),
         versions,
@@ -1070,7 +1072,7 @@ def _vulnerability_row(vuln: VulnFinding, wins: dict[str, str]) -> _FindingRow:
         vuln.severity.value,
         vuln.vuln_id,
         vuln.published_date.isoformat() if vuln.published_date else "-",
-        "blocked" if vuln.blocked_reason else vuln.status,
+        "blocked" if blocked else vuln.status,
         reason or "-",
     ]
     return row, pipe_row
@@ -1098,7 +1100,8 @@ def _secret_row(secret: SecretFinding) -> _FindingRow:
 
 
 def _update_row(update: UpdateFinding) -> _FindingRow:
-    reason = update.blocked_reason or ""
+    blocked = isinstance(update.state, GradleBlock)
+    reason = update.state.reason if blocked else ""
     age = (
         f"{(utc_now() - update.published_date).days}d old"
         if update.published_date
@@ -1106,7 +1109,7 @@ def _update_row(update: UpdateFinding) -> _FindingRow:
     )
     row = [
         output.literal(
-            "! blocked" if reason else "~ update", "yellow" if reason else ""
+            "! blocked" if blocked else "~ update", "yellow" if blocked else ""
         ),
         update.semver_tier.value,
         f"{update.installed_version} → {update.latest_version}",
@@ -1120,7 +1123,7 @@ def _update_row(update: UpdateFinding) -> _FindingRow:
         update.semver_tier.value,
         "-",
         update.published_date.isoformat() if update.published_date else "-",
-        "blocked" if reason else "available",
+        "blocked" if blocked else "available",
         reason or "-",
     ]
     return row, pipe_row
@@ -1129,6 +1132,8 @@ def _update_row(update: UpdateFinding) -> _FindingRow:
 def _print_blocked_findings(result: ScanResult, flow: str) -> None:
     """Piped update and resolve runs record each blocked package once."""
     for finding in result.blocked_findings:
+        if not isinstance(finding.state, GradleBlock):
+            continue
         target = (
             finding.latest_version
             if isinstance(finding, UpdateFinding)
@@ -1141,5 +1146,5 @@ def _print_blocked_findings(result: ScanResult, flow: str) -> None:
             finding.pkg_name,
             installed=finding.installed_version,
             target=target,
-            reason=finding.blocked_reason or "",
+            reason=finding.state.reason,
         )

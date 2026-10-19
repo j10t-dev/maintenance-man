@@ -8,7 +8,7 @@ import pytest
 from maintenance_man import updater, vcs_workflow
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.events import OperationFailed, Outcome, PromotionFailed
-from maintenance_man.models.scan import UpdateStatus, Workflow
+from maintenance_man.models.scan import Failed, Ready, Workflow
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import update as update_service
 from maintenance_man.storage import load_scan_results, save_scan_results
@@ -55,10 +55,10 @@ def test_given_b_failing_when_updated_then_a_and_c_stay_pending_retry_applies_b(
     first = _update(project)
 
     assert first.outcome is Outcome.FAILED
-    assert [row.update_status for row in load_scan_results("api").updates] == [
-        UpdateStatus.READY,
-        UpdateStatus.FAILED,
-        UpdateStatus.READY,
+    assert [row.state for row in load_scan_results("api").updates] == [
+        Ready(flow=Workflow.UPDATE),
+        Failed(flow=Workflow.UPDATE, phase="unit"),
+        Ready(flow=Workflow.UPDATE),
     ]
     assert repo.resolve_revision(revision="main") == main_before
     assert {"deps/pkg-a", "deps/pkg-c"} <= _files(path, MANAGED)
@@ -96,8 +96,8 @@ def test_given_main_moved_sideways_when_promoting_then_work_stays_pending_until_
     assert failures[0].error.endswith(
         f" · rebase with jj rebase -b {MANAGED} -d main, then rerun"
     )
-    assert [row.update_status for row in load_scan_results("api").updates] == [
-        UpdateStatus.READY
+    assert [row.state for row in load_scan_results("api").updates] == [
+        Ready(flow=Workflow.UPDATE)
     ] * 3
     assert repo.resolve_revision(revision="main") == unrelated
 
@@ -127,12 +127,10 @@ def test_given_pending_stack_when_resolve_takes_over_and_repairs_then_main_gets_
     paused = _resolve(project, continue_=False)
 
     assert paused is Outcome.FAILED
-    assert [
-        (row.flow, row.update_status) for row in load_scan_results("api").updates
-    ] == [
-        (Workflow.RESOLVE, UpdateStatus.READY),
-        (Workflow.RESOLVE, UpdateStatus.FAILED),
-        (Workflow.RESOLVE, UpdateStatus.READY),
+    assert [row.state for row in load_scan_results("api").updates] == [
+        Ready(flow=Workflow.RESOLVE),
+        Failed(flow=Workflow.RESOLVE, phase="unit"),
+        Ready(flow=Workflow.RESOLVE),
     ]
     assert repo.resolve_revision(revision=RESOLVE_BOOKMARK) == update_tip
     assert repo.same_revision(left="@-", right=RESOLVE_BOOKMARK)

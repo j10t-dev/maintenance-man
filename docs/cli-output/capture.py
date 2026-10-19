@@ -17,6 +17,7 @@ from rich.text import Text
 from maintenance_man import cli, paths
 from maintenance_man.cli import ExitCode
 from maintenance_man.models.scan import (
+    GradleBlock,
     ScanResult,
     SemverTier,
     Severity,
@@ -51,7 +52,6 @@ def _build_home(scratch: Path) -> Path:
     scan = ScanResult(
         project="api-gateway",
         scanned_at=datetime.now(tz=UTC),
-        trivy_target=".",
         vulnerabilities=[
             VulnFinding(
                 vuln_id="CVE-2024-0001",
@@ -76,7 +76,7 @@ def _build_home(scratch: Path) -> Path:
                 installed_version="1.10.0",
                 latest_version="2.0.0",
                 semver_tier=SemverTier.MAJOR,
-                blocked_reason="needs migration review",
+                state=GradleBlock(kind="mapping", reason="needs migration review"),
             ),
         ],
     )

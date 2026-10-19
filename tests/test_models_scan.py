@@ -1,12 +1,18 @@
 import pytest
+from pydantic import ValidationError
 
 from maintenance_man.models.scan import (
+    Failed,
+    GradleBlock,
     GradleMember,
     GradleUpdateTarget,
+    Ready,
     ScanResult,
     SecretFinding,
     SemverTier,
     Severity,
+    VulnFinding,
+    Workflow,
     highest_fix_version,
     sort_vulns_by_severity,
 )
@@ -216,3 +222,72 @@ def test_given_vulnerability_when_target_version_read_then_fix_or_saved_target_i
 def test_given_vulnerability_without_fix_or_target_when_read_then_error():
     with pytest.raises(ValueError, match="No fixed version available"):
         _ = make_vuln(fixed_version=None).target_version
+
+
+@pytest.mark.parametrize(
+    ("state", "payload"),
+    [
+        pytest.param(None, None, id="pending"),
+        pytest.param(
+            Ready(flow=Workflow.UPDATE),
+            {"lifecycle": "ready", "flow": "update"},
+            id="ready",
+        ),
+        pytest.param(
+            Failed(flow=Workflow.RESOLVE, phase="unit"),
+            {"lifecycle": "failed", "flow": "resolve", "phase": "unit"},
+            id="failed",
+        ),
+        pytest.param(
+            GradleBlock(kind="stale", reason="catalogue changed"),
+            {"lifecycle": "blocked", "kind": "stale", "reason": "catalogue changed"},
+            id="blocked",
+        ),
+    ],
+)
+def test_given_lifecycle_state_when_saved_then_it_round_trips(state, payload):
+    finding = make_vuln(state=state)
+
+    dumped = finding.model_dump(mode="json")
+
+    assert dumped["state"] == payload
+    assert VulnFinding.model_validate(dumped) == finding
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param(
+            {
+                "update_status": None,
+                "failed_phase": None,
+                "flow": None,
+                "blocked_reason": None,
+                "gradle_block_kind": None,
+            },
+            "update_status",
+            id="old-fields",
+        ),
+        pytest.param(
+            {"state": {"lifecycle": "ready"}}, "flow", id="ready-without-flow"
+        ),
+        pytest.param(
+            {"state": {"lifecycle": "paused"}}, "lifecycle", id="unknown-lifecycle"
+        ),
+        pytest.param({"unexpected": 1}, "unexpected", id="unknown-field"),
+    ],
+)
+def test_given_invalid_lifecycle_payload_when_validated_then_it_is_refused(
+    overrides, message
+):
+    payload = make_vuln().model_dump(mode="json") | overrides
+
+    with pytest.raises(ValidationError, match=message):
+        VulnFinding.model_validate(payload)
+
+
+def test_given_unknown_top_level_key_when_scan_validated_then_it_is_refused():
+    payload = make_scan_result().model_dump(mode="json") | {"unexpected": 1}
+
+    with pytest.raises(ValidationError, match="unexpected"):
+        ScanResult.model_validate(payload)

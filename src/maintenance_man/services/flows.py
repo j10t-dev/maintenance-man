@@ -13,9 +13,10 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    Failed,
+    Ready,
     ScanResult,
     UpdateFinding,
-    UpdateStatus,
     VulnFinding,
     Workflow,
 )
@@ -25,7 +26,7 @@ from maintenance_man.storage import (
     load_scan_results,
     save_scan_results,
 )
-from maintenance_man.updater import Finding, is_eligible
+from maintenance_man.updater import is_eligible
 from maintenance_man.vcs import JjRepository, RevisionError
 from maintenance_man.vcs_workflow import refresh_working_copy_from_main
 
@@ -47,7 +48,6 @@ def load_validated_scan(
         emit(ProjectSkipped(project, SkipReason.NO_SCAN_RESULTS))
         return None
 
-    _assert_supported_in_progress_state(scan_result, project)
     _assert_no_conflicting_flow(scan_result, workflow, project)
 
     if not scan_result.has_actionable_vulns and not scan_result.updates:
@@ -67,27 +67,33 @@ def report_missing_test_config(
     return True
 
 
-def is_owned(finding: Finding, flow: Workflow, *statuses: UpdateStatus) -> bool:
-    """Whether the flow owns the finding and it is in one of the statuses."""
-    return finding.flow is flow and finding.update_status in statuses
+def is_owned(
+    finding: VulnFinding | UpdateFinding,
+    flow: Workflow,
+    *kinds: type[Ready] | type[Failed],
+) -> bool:
+    """Whether *flow* owns the finding in one of the lifecycle kinds."""
+    return isinstance(finding.state, kinds) and finding.state.flow is flow
 
 
-def has_owned(scan_result: ScanResult, flow: Workflow, *statuses: UpdateStatus) -> bool:
-    """Whether any saved finding is owned by the flow in one of the statuses."""
-    return any(is_owned(finding, flow, *statuses) for finding in scan_result.findings)
+def has_owned(
+    scan_result: ScanResult, flow: Workflow, *kinds: type[Ready] | type[Failed]
+) -> bool:
+    """Whether any saved finding is owned by *flow* in one of the lifecycle kinds."""
+    return any(is_owned(finding, flow, *kinds) for finding in scan_result.findings)
 
 
 def is_candidate(finding: VulnFinding | UpdateFinding, flow: Workflow) -> bool:
-    """Whether the flow may apply the finding: eligible, and new or failed under it."""
+    """Whether the flow may apply the finding: eligible, and pending or failed in it."""
     return is_eligible(finding) and (
-        finding.update_status is None or is_owned(finding, flow, UpdateStatus.FAILED)
+        finding.state is None or is_owned(finding, flow, Failed)
     )
 
 
 def has_work(scan_result: ScanResult, flow: Workflow) -> bool:
-    """Whether the flow has a finding to apply or READY work to promote."""
+    """Whether the flow has a finding to apply or Ready work to promote."""
     return any(
-        is_candidate(finding, flow) or is_owned(finding, flow, UpdateStatus.READY)
+        is_candidate(finding, flow) or is_owned(finding, flow, Ready)
         for finding in scan_result.findings
     )
 
@@ -95,16 +101,14 @@ def has_work(scan_result: ScanResult, flow: Workflow) -> bool:
 def complete_ready_findings(
     scan_result: ScanResult, name: str, *, flow: Workflow
 ) -> None:
-    """Remove the flow's READY findings, then persist the scan."""
+    """Remove the flow's Ready findings, then persist the scan."""
     scan_result.vulnerabilities = [
         finding
         for finding in scan_result.vulnerabilities
-        if not is_owned(finding, flow, UpdateStatus.READY)
+        if not is_owned(finding, flow, Ready)
     ]
     scan_result.updates = [
-        finding
-        for finding in scan_result.updates
-        if not is_owned(finding, flow, UpdateStatus.READY)
+        finding for finding in scan_result.updates if not is_owned(finding, flow, Ready)
     ]
     save_scan_results(name, scan_result)
 
@@ -117,15 +121,15 @@ def finalise_local_changes(
     *,
     emit: Emit,
 ) -> Outcome:
-    """Promote the flow's bookmark to local main, then complete its READY findings.
+    """Promote the flow's bookmark to local main, then complete its Ready findings.
 
-    Succeeds without effects when the flow has no READY finding. Each failure is
+    Succeeds without effects when the flow has no Ready finding. Each failure is
     emitted as OperationFailed and returns FAILED. A promotion or refresh failure
-    leaves the READY findings and the bookmark for a later retry; a
+    leaves the Ready findings and the bookmark for a later retry; a
     bookmark-cleanup failure after completion is reported and the next run
     recreates the bookmark.
     """
-    if not has_owned(scan_result, flow, UpdateStatus.READY):
+    if not has_owned(scan_result, flow, Ready):
         return Outcome.SUCCEEDED
     bookmark = WORKFLOW_BOOKMARKS[flow]
     repo = JjRepository(project_path)
@@ -154,16 +158,6 @@ def finalise_local_changes(
     return Outcome.SUCCEEDED
 
 
-def _assert_supported_in_progress_state(scan_result: ScanResult, project: str) -> None:
-    for finding in scan_result.findings:
-        if finding.update_status is not None and finding.flow is None:
-            msg = (
-                f"{project} has in-progress findings without flow ownership — "
-                "please rescan the project."
-            )
-            raise FlowConflictError(msg)
-
-
 def _assert_no_conflicting_flow(
     scan_result: ScanResult,
     active_flow: Workflow,
@@ -173,18 +167,15 @@ def _assert_no_conflicting_flow(
     if active_flow is Workflow.RESOLVE:
         return
     conflicts = [
-        finding
+        state
         for finding in scan_result.findings
-        if finding.update_status is not None
-        and finding.flow is not None
-        and finding.flow is not active_flow
+        if isinstance(state := finding.state, Ready | Failed)
+        and state.flow is not active_flow
     ]
     if conflicts:
-        other_flow = conflicts[0].flow
-        assert other_flow is not None
         msg = (
             f"Cannot run {active_flow.value} on {project}: {len(conflicts)} "
-            f"finding(s) owned by the '{other_flow.value}' flow. Complete or "
+            f"finding(s) owned by the '{conflicts[0].flow.value}' flow. Complete or "
             "abandon that flow first."
         )
         raise FlowConflictError(msg)

@@ -22,11 +22,12 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    Failed,
     GradleUpdateTarget,
+    Ready,
     ScanResult,
     UpdateFinding,
     UpdateResult,
-    UpdateStatus,
     VulnFinding,
     Workflow,
 )
@@ -170,9 +171,7 @@ def _enter_update_workspace(
     repo = JjRepository(project_config.path)
     remove_workspace(repo=repo, project=project)
 
-    if flows.has_owned(
-        scan_result, Workflow.UPDATE, UpdateStatus.READY, UpdateStatus.FAILED
-    ):
+    if flows.has_owned(scan_result, Workflow.UPDATE, Ready, Failed):
         if not repo.bookmark_exists(bookmark=bookmark):
             msg = (
                 f"update bookmark '{bookmark}' is missing but in-progress "
@@ -277,7 +276,7 @@ def _with_shared_targets[F: VulnFinding | UpdateFinding](
 def _finish_update(
     project_path: Path, scan_result: ScanResult, name: str, *, emit: Emit
 ) -> Outcome:
-    if flows.has_owned(scan_result, Workflow.UPDATE, UpdateStatus.FAILED):
+    if flows.has_owned(scan_result, Workflow.UPDATE, Failed):
         emit(
             PromotionFailed(
                 name,

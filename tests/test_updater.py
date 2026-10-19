@@ -20,11 +20,15 @@ from maintenance_man.models.events import (
     TestCommandStarted as CommandStartedEvent,
 )
 from maintenance_man.models.scan import (
+    Failed,
+    FindingState,
+    GradleBlock,
+    Ready,
     ScanResult,
     SemverTier,
     UpdateFinding,
     UpdateResult,
-    UpdateStatus,
+    VulnFinding,
     Workflow,
 )
 from maintenance_man.process import ProcessError
@@ -33,10 +37,9 @@ from maintenance_man.updater import (
     Applied,
     ApplyFailed,
     Blocked,
-    Finding,
+    FindingGroup,
     _apply_update,
     apply_finding,
-    consolidate_vulns,
     group_findings,
     process_findings,
     run_test_phases,
@@ -81,6 +84,7 @@ _DRIFT_REASON = (
     "the scan; note that an uncommitted catalogue edit is not visible in the "
     "update workspace. Rescan required"
 )
+_DRIFT_BLOCK = GradleBlock(kind="stale", reason=_DRIFT_REASON)
 
 
 def _scan_result_for(
@@ -133,7 +137,7 @@ def processor_vcs(
 
 
 def _process(
-    findings: Sequence[Finding],
+    findings: Sequence[FindingGroup | VulnFinding | UpdateFinding],
     project_config: ProjectConfig,
     deps: ProcessorDeps,
     *,
@@ -142,8 +146,12 @@ def _process(
     emit: RecordingEmit | None = None,
 ) -> list[UpdateResult]:
     updates = [item for item in findings if isinstance(item, UpdateFinding)]
+    groups = [
+        item if isinstance(item, FindingGroup) else group_findings([item])[0]
+        for item in findings
+    ]
     return process_findings(
-        findings,
+        groups,
         project_config,
         flow=flow,
         scan_result=_scan_result_for(project_config, updates) if scan is None else scan,
@@ -359,58 +367,16 @@ def test_test_phase_launch_failure_is_a_failed_phase(tmp_path):
     assert "Could not run unit tests" in emit.of_type(FindingStepFailed)[0].error
 
 
-# -- consolidate_vulns --
-
-
-class TestConsolidateVulns:
-    def test_lifecycle_fanout_to_originals(self):
-        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
-        v2 = make_vuln(vuln_id="CVE-0002", pkg_name="pkg", fixed_version="1.0.2")
-        consolidated = consolidate_vulns([v1, v2])
-
-        consolidated[0].update_status = UpdateStatus.READY
-        consolidated[0].failed_phase = "unit"
-        consolidated[0].flow = Workflow.RESOLVE
-
-        assert v1.update_status == UpdateStatus.READY
-        assert v2.update_status == UpdateStatus.READY
-        assert v1.failed_phase == "unit"
-        assert v2.failed_phase == "unit"
-        assert v1.flow == "resolve"
-        assert v2.flow == "resolve"
-
-    def test_initial_lifecycle_state_normalises_across_group(self):
-        v1 = make_vuln(vuln_id="CVE-0001", pkg_name="pkg", fixed_version="1.0.1")
-        v2 = make_vuln(
-            vuln_id="CVE-0002",
-            pkg_name="pkg",
-            fixed_version="1.0.2",
-            update_status=UpdateStatus.FAILED,
-            failed_phase="unit",
-            flow="resolve",
-        )
-
-        consolidated = consolidate_vulns([v1, v2])
-
-        assert consolidated[0].update_status == UpdateStatus.FAILED
-        assert consolidated[0].failed_phase == "unit"
-        assert consolidated[0].flow == "resolve"
-        assert v1.update_status == UpdateStatus.FAILED
-        assert v1.failed_phase == "unit"
-        assert v1.flow == "resolve"
-        assert v2.update_status == UpdateStatus.FAILED
-        assert v2.failed_phase == "unit"
-        assert v2.flow == "resolve"
-
-
 # -- process_findings --
 
 
-_READY = (UpdateStatus.READY, None)
-_FAILED_UNIT = (UpdateStatus.FAILED, "unit")
-_FAILED_APPLY = (UpdateStatus.FAILED, "apply")
-_FAILED_COMMIT = (UpdateStatus.FAILED, "commit")
-_UNPROCESSED = (None, None)
+_UPDATE_READY = Ready(flow=Workflow.UPDATE)
+_UPDATE_FAILED_UNIT = Failed(flow=Workflow.UPDATE, phase="unit")
+_UPDATE_FAILED_APPLY = Failed(flow=Workflow.UPDATE, phase="apply")
+_RESOLVE_READY = Ready(flow=Workflow.RESOLVE)
+_RESOLVE_FAILED_UNIT = Failed(flow=Workflow.RESOLVE, phase="unit")
+_RESOLVE_FAILED_APPLY = Failed(flow=Workflow.RESOLVE, phase="apply")
+_RESOLVE_FAILED_COMMIT = Failed(flow=Workflow.RESOLVE, phase="commit")
 _PATCH_COMMIT = "chore: bump pkg-a 1.0.0 -> 1.0.1 (patch)"
 _MINOR_COMMIT = "chore: bump pkg-b 1.0.0 -> 1.1.0 (minor)"
 _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
@@ -430,7 +396,7 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
             Workflow.UPDATE,
             ["pass", "unit", "pass"],
             [True, False, True],
-            [_READY, _FAILED_UNIT, _READY],
+            [_UPDATE_READY, _UPDATE_FAILED_UNIT, _UPDATE_READY],
             [_PATCH_COMMIT, _MAJOR_COMMIT],
             "version=1\npkg-a@1.0.1\npkg-c@2.0.0\n",
             id="update-discards-the-failed-finding-and-continues",
@@ -439,7 +405,7 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
             Workflow.UPDATE,
             ["apply", "pass"],
             [False, True],
-            [_FAILED_APPLY, _READY],
+            [_UPDATE_FAILED_APPLY, _UPDATE_READY],
             [_MINOR_COMMIT],
             "version=1\npkg-b@1.1.0\n",
             id="update-continues-after-an-apply-failure",
@@ -448,7 +414,7 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
             Workflow.RESOLVE,
             ["pass", "unit", "pass"],
             [True, False],
-            [_READY, _FAILED_UNIT, _UNPROCESSED],
+            [_RESOLVE_READY, _RESOLVE_FAILED_UNIT, None],
             [_PATCH_COMMIT],
             "version=1\npkg-a@1.0.1\npkg-b@1.1.0\n",
             id="resolve-keeps-the-failed-change-and-stops",
@@ -457,7 +423,7 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
             Workflow.RESOLVE,
             ["apply", "pass"],
             [False],
-            [_FAILED_APPLY, _UNPROCESSED],
+            [_RESOLVE_FAILED_APPLY, None],
             [],
             "version=1\npkg-a@1.0.1\n",
             id="resolve-stops-after-an-apply-failure",
@@ -466,7 +432,7 @@ _MAJOR_COMMIT = "chore: bump pkg-c 1.0.0 -> 2.0.0 (major)"
             Workflow.RESOLVE,
             ["commit", "pass"],
             [False],
-            [_FAILED_COMMIT, _UNPROCESSED],
+            [_RESOLVE_FAILED_COMMIT, None],
             [],
             "version=1\npkg-a@1.0.1\n",
             id="resolve-keeps-the-change-after-a-commit-failure",
@@ -477,7 +443,7 @@ def test_given_step_outcome_when_processed_then_status_discard_and_stop_follow_t
     flow: Workflow,
     outcomes: list[str],
     expected_passed: list[bool],
-    expected_saved: list[tuple[UpdateStatus | None, str | None]],
+    expected_saved: list[FindingState | None],
     expected_descriptions: list[str],
     expected_dep: str,
     processor_vcs: ProcessorDeps,
@@ -516,10 +482,7 @@ def test_given_step_outcome_when_processed_then_status_discard_and_stop_follow_t
     results = _process(findings, project_config, processor_vcs, flow=flow)
 
     assert [result.passed for result in results] == expected_passed
-    assert [
-        (row.update_status, row.failed_phase)
-        for row in load_scan_results("demo").updates
-    ] == expected_saved
+    assert [row.state for row in load_scan_results("demo").updates] == expected_saved
     assert commit_descriptions(repo, "main..@-") == expected_descriptions
     assert (repo.path / "dep.txt").read_text(encoding="utf-8") == expected_dep
 
@@ -547,9 +510,7 @@ def test_given_passing_findings_when_processed_then_each_is_committed_and_bookma
     repo = processor_vcs["repo"]
     package, phase = processor_vcs["package"], processor_vcs["phase"]
     assert [result.passed for result in results] == [True] * count
-    assert [(row.update_status, row.failed_phase, row.flow) for row in findings] == [
-        (UpdateStatus.READY, None, flow)
-    ] * count
+    assert [row.state for row in findings] == [Ready(flow=flow)] * count
     assert (
         commit_descriptions(repo, "main..@-") == [_PATCH_COMMIT, _MINOR_COMMIT][:count]
     )
@@ -581,8 +542,7 @@ def test_already_applied_is_ready_without_a_commit(
     results = _process([update], project_config, processor_vcs, flow=flow)
 
     assert results[0].passed is True
-    assert update.update_status == UpdateStatus.READY
-    assert update.flow == flow
+    assert update.state == Ready(flow=flow)
     assert commit_descriptions(processor_vcs["repo"], "main..@-") == []
 
 
@@ -625,8 +585,7 @@ def test_repository_failure_never_saves_ready(
     )
 
     saved = load_scan_results("demo")
-    assert saved.updates[0].update_status == UpdateStatus.FAILED
-    assert saved.updates[0].failed_phase == "commit"
+    assert saved.updates[0].state == Failed(flow=Workflow.UPDATE, phase="commit")
     assert [result.passed for result in results] == expected_passed
     assert commit_descriptions(repo, "main..@-") == expected_descriptions
     assert (repo.path / "dep.txt").read_text(encoding="utf-8") == expected_dep
@@ -673,10 +632,7 @@ def test_failed_discard_persists_original_failure_and_stops(
             original_discard(repository)
             return
         saved = load_scan_results("demo")
-        assert (saved.updates[0].update_status, saved.updates[0].failed_phase) == (
-            UpdateStatus.FAILED,
-            "unit",
-        )
+        assert saved.updates[0].state == _UPDATE_FAILED_UNIT
         msg = "cannot discard"
         raise RevisionError(msg)
 
@@ -692,14 +648,13 @@ def test_failed_discard_persists_original_failure_and_stops(
 
     assert len(results) == 1
     saved = load_scan_results("demo")
-    assert saved.updates[0].failed_phase == "unit"
-    assert saved.updates[0].update_status == UpdateStatus.FAILED
+    assert saved.updates[0].state == _UPDATE_FAILED_UNIT
     assert emit.of_type(FindingStepFailed)[-1] == FindingStepFailed(
         "discard", "cannot discard"
     )
 
 
-def test_update_statuses_are_persisted_after_each_finding(
+def test_given_two_findings_when_processed_then_each_state_is_saved_before_the_next(
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
@@ -710,8 +665,8 @@ def test_update_statuses_are_persisted_after_each_finding(
     def run_package(*args: object, **kwargs: object) -> object:
         if processor_vcs["package"].call_count == 2:
             saved = load_scan_results("demo")
-            assert [finding.update_status for finding in saved.updates] == [
-                UpdateStatus.READY,
+            assert [finding.state for finding in saved.updates] == [
+                _UPDATE_READY,
                 None,
             ]
             inspected_before_second_finding.append(True)
@@ -725,27 +680,25 @@ def test_update_statuses_are_persisted_after_each_finding(
     )
 
     saved = load_scan_results("demo")
-    assert [finding.update_status for finding in saved.updates] == [
-        UpdateStatus.READY,
-        UpdateStatus.FAILED,
+    assert [finding.state for finding in saved.updates] == [
+        _UPDATE_READY,
+        _UPDATE_FAILED_UNIT,
     ]
-    assert saved.updates[1].failed_phase == "unit"
     assert inspected_before_second_finding == [True]
 
 
 @pytest.mark.parametrize(
-    ("failure", "passed", "status", "failed_phase"),
+    ("failure", "passed", "state"),
     [
-        (True, False, UpdateStatus.FAILED, "unit"),
-        (False, True, UpdateStatus.READY, None),
+        (True, False, _UPDATE_FAILED_UNIT),
+        (False, True, _UPDATE_READY),
     ],
     ids=["failure", "success"],
 )
 def test_grouped_vulnerability_result_is_persisted_for_every_original(
     failure: bool,
     passed: bool,
-    status: UpdateStatus,
-    failed_phase: str | None,
+    state: FindingState,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
@@ -762,13 +715,7 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
 
     assert [(result.kind, result.passed) for result in results] == [("vuln", passed)]
     saved = load_scan_results("demo")
-    assert [
-        (finding.update_status, finding.failed_phase, finding.flow)
-        for finding in saved.vulnerabilities
-    ] == [
-        (status, failed_phase, Workflow.UPDATE),
-        (status, failed_phase, Workflow.UPDATE),
-    ]
+    assert [finding.state for finding in saved.vulnerabilities] == [state, state]
 
 
 def _group_summary(findings):
@@ -817,7 +764,9 @@ def _group_summary(findings):
                 make_update(
                     pkg_name="room",
                     gradle_target=_ROOM,
-                    blocked_reason="publication younger than required 7 days",
+                    state=GradleBlock(
+                        kind="age", reason="publication younger than required 7 days"
+                    ),
                 )
             ],
             [],
@@ -829,7 +778,7 @@ def _group_summary(findings):
                 make_vuln(
                     fixed_version=None,
                     gradle_target=_ROOM,
-                    blocked_reason="no published fix",
+                    state=GradleBlock(kind="mapping", reason="no published fix"),
                 )
             ],
             [],
@@ -868,12 +817,51 @@ def test_given_saved_rows_when_grouped_then_one_change_per_target_or_package(
 
 
 @pytest.mark.parametrize(
+    ("rows", "recorded"),
+    [
+        pytest.param(
+            [
+                make_vuln(
+                    vuln_id="CVE-A", state=Failed(flow=Workflow.UPDATE, phase="unit")
+                ),
+                make_vuln(vuln_id="CVE-B"),
+            ],
+            Failed(flow=Workflow.RESOLVE, phase="unit"),
+            id="package-group",
+        ),
+        pytest.param(
+            [
+                make_vuln(vuln_id="CVE-A", gradle_target=make_gradle_target()),
+                make_update(gradle_target=make_gradle_target()),
+                make_vuln(
+                    vuln_id="CVE-C",
+                    gradle_target=make_gradle_target(),
+                    state=Ready(flow=Workflow.UPDATE),
+                ),
+            ],
+            Ready(flow=Workflow.UPDATE),
+            id="target-group",
+        ),
+    ],
+)
+def test_given_rows_when_grouped_then_only_record_writes_their_state(rows, recorded):
+    before = [row.model_copy(deep=True) for row in rows]
+
+    groups = group_findings(rows)
+
+    assert len(groups) == 1
+    assert rows == before
+    groups[0].record(recorded)
+    assert [row.state for row in rows] == [recorded] * len(rows)
+
+
+@pytest.mark.parametrize(
     ("catalogue_room", "edits", "returncode", "expected", "commands", "step_failures"),
     [
         pytest.param("2.8.4", None, 0, Applied(), 1, [], id="report-driven-apply"),
         pytest.param("2.8.5", {}, 0, Applied(), 0, [], id="already-applied"),
         pytest.param(
-            "2.8.7", {}, 0, Blocked(_DRIFT_REASON), 0, [], id="drifted-catalogue"
+            "2.8.7", {}, 0, Blocked(_DRIFT_BLOCK), 0, [], id="drifted-catalogue"
         ),
         pytest.param(
             "2.8.4",
@@ -912,11 +900,9 @@ def test_given_saved_target_when_applied_then_outcome_matches_catalogue_state(
     monkeypatch.setattr("maintenance_man.gradle.run_logged", runner)
     emit = RecordingEmit()
 
-    outcome = apply_finding(
-        gradle_project,
-        make_update(pkg_name="room", gradle_target=_ROOM),
-        emit=emit,
-    )
+    [group] = group_findings([make_update(pkg_name="room", gradle_target=_ROOM)])
+
+    outcome = apply_finding(gradle_project, group, emit=emit)
 
     assert outcome == expected
     assert runner.call_count == commands
@@ -967,10 +953,9 @@ def test_given_rows_of_one_target_when_processed_then_one_change_marks_both_read
         Path(gradle_project.path) / GRADLE_CATALOGUE_RELPATH
     ).read_text(encoding="utf-8")
     saved = load_scan_results("demo")
-    assert [
-        (row.update_status, row.failed_phase, row.flow)
-        for row in (*saved.vulnerabilities, *saved.updates)
-    ] == [(UpdateStatus.READY, None, Workflow.UPDATE)] * 2
+    assert [row.state for row in (*saved.vulnerabilities, *saved.updates)] == [
+        _UPDATE_READY
+    ] * 2
 
 
 def test_given_two_owner_targets_when_one_fails_then_statuses_stay_independent(
@@ -997,9 +982,9 @@ def test_given_two_owner_targets_when_one_fails_then_statuses_stay_independent(
     )
     saved = load_scan_results("demo")
     assert gradle_processor["package"].call_count == 2
-    assert [(row.update_status, row.failed_phase) for row in saved.vulnerabilities] == [
-        (UpdateStatus.READY, None),
-        (UpdateStatus.FAILED, "unit"),
+    assert [row.state for row in saved.vulnerabilities] == [
+        _UPDATE_READY,
+        _UPDATE_FAILED_UNIT,
     ]
     assert 'room = "2.8.5"' in catalogue
     assert 'ksp = "2.3.10"' in catalogue
@@ -1018,9 +1003,7 @@ def test_given_drifted_target_when_processed_then_rows_are_blocked_without_effec
     row = make_update(
         pkg_name="room",
         gradle_target=_ROOM,
-        update_status=UpdateStatus.FAILED,
-        failed_phase="unit",
-        flow=Workflow.UPDATE,
+        state=_UPDATE_FAILED_UNIT,
     )
     scan = make_scan_result(vulns=[], updates=[row])
     scan.project = "demo"
@@ -1035,12 +1018,7 @@ def test_given_drifted_target_when_processed_then_rows_are_blocked_without_effec
     assert results == []
     assert operation_id(gradle_processor["repo"]) == before
     assert gradle_processor["phase"].call_count == 0
-    assert (
-        saved.blocked_reason,
-        saved.update_status,
-        saved.failed_phase,
-        saved.flow,
-    ) == (_DRIFT_REASON, None, None, None)
+    assert saved.state == _DRIFT_BLOCK
     assert emit.of_type(FindingsBlocked) == [
         FindingsBlocked((("room", _DRIFT_REASON),))
     ]

@@ -649,8 +649,7 @@ def _blocked_finding(
         latest_version=proposed,
         semver_tier=SemverTier.UNKNOWN,
         gradle_target=None,
-        blocked_reason=reason,
-        gradle_block_kind=kind,
+        state=GradleBlock(kind=kind, reason=reason),
     )
 
 

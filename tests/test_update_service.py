@@ -19,9 +19,11 @@ from maintenance_man.models.events import (
 )
 from maintenance_man.models.scan import (
     WORKFLOW_BOOKMARKS,
+    Failed,
+    GradleBlock,
+    Ready,
     UpdateFinding,
     UpdateResult,
-    UpdateStatus,
     VulnFinding,
     Workflow,
 )
@@ -140,7 +142,9 @@ def test_given_blocked_and_passing_rows_when_updating_then_passing_rows_promote(
         vulns=[],
         updates=[
             make_update(pkg_name="pkg-a"),
-            make_update(pkg_name="stuck", blocked_reason="too young"),
+            make_update(
+                pkg_name="stuck", state=GradleBlock(kind="age", reason="too young")
+            ),
         ],
     )
     repo, project = seed_project(tmp_path, "api", scan)
@@ -165,7 +169,10 @@ def test_given_blocked_and_passing_rows_when_updating_then_passing_rows_promote(
 def test_given_only_blocked_rows_when_updating_then_success_without_workspace(
     tmp_path: Path,
 ) -> None:
-    scan = make_scan_result(vulns=[], updates=[make_update(blocked_reason="too young")])
+    scan = make_scan_result(
+        vulns=[],
+        updates=[make_update(state=GradleBlock(kind="age", reason="too young"))],
+    )
     repo, project = seed_project(tmp_path, "api", scan, test_unit=None)
     before = operation_id(repo)
     emit = RecordingEmit()
@@ -185,16 +192,9 @@ def test_given_failed_row_when_update_finishes_then_promotion_is_reported_pendin
     scan = make_scan_result(
         vulns=[],
         updates=[
+            make_update(pkg_name="pkg-a", state=Ready(flow=Workflow.UPDATE)),
             make_update(
-                pkg_name="pkg-a",
-                update_status=UpdateStatus.READY,
-                flow=Workflow.UPDATE,
-            ),
-            make_update(
-                pkg_name="pkg-b",
-                update_status=UpdateStatus.FAILED,
-                flow=Workflow.UPDATE,
-                failed_phase="unit",
+                pkg_name="pkg-b", state=Failed(flow=Workflow.UPDATE, phase="unit")
             ),
         ],
     )
@@ -285,9 +285,7 @@ def test_given_workspace_setup_failure_when_updating_then_setup_error_and_no_wor
     message: str,
 ) -> None:
     update = (
-        make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)
-        if ready_work
-        else make_update()
+        make_update(state=Ready(flow=Workflow.UPDATE)) if ready_work else make_update()
     )
     repo, project = seed_project(
         tmp_path, "api", make_scan_result(vulns=[], updates=[update])
@@ -348,7 +346,7 @@ def test_finalisation_failures_emit_operation_and_fail(
     assert expected in emit.events
     if isinstance(expected, PromotionFailed):
         assert repo.bookmark_exists(bookmark=MANAGED)
-        assert load_scan_results("api").updates[0].update_status is UpdateStatus.READY
+        assert load_scan_results("api").updates[0].state == Ready(flow=Workflow.UPDATE)
 
 
 def test_existing_update_failure_blocks_single_and_batch_success(
@@ -361,8 +359,7 @@ def test_existing_update_failure_blocks_single_and_batch_success(
             vulns=[
                 make_vuln(
                     fixed_version=None,
-                    update_status=UpdateStatus.FAILED,
-                    flow=Workflow.UPDATE,
+                    state=Failed(flow=Workflow.UPDATE, phase="unit"),
                 )
             ],
             updates=[make_update()],
@@ -408,9 +405,7 @@ def test_batch_reports_success_conflict_and_missing_path(
         "b",
         make_scan_result(
             vulns=[],
-            updates=[
-                make_update(update_status=UpdateStatus.FAILED, flow=Workflow.RESOLVE)
-            ],
+            updates=[make_update(state=Failed(flow=Workflow.RESOLVE, phase="unit"))],
         ),
     )
     projects = {
@@ -597,8 +592,8 @@ def test_given_refresh_failure_when_rerun_then_promotion_completes_without_reapp
 
     assert first.outcome is Outcome.FAILED
     assert OperationFailed("workspace refresh", "api", "locked") in first_emit.events
-    assert [row.update_status for row in load_scan_results("api").updates] == [
-        UpdateStatus.READY
+    assert [row.state for row in load_scan_results("api").updates] == [
+        Ready(flow=Workflow.UPDATE)
     ]
     assert repo.bookmark_exists(bookmark=MANAGED)
 

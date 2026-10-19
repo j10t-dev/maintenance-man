@@ -9,10 +9,12 @@ from maintenance_man import cli
 from maintenance_man.cli import ExitCode
 from maintenance_man.models.events import Outcome
 from maintenance_man.models.scan import (
+    Failed,
+    GradleBlock,
+    Ready,
     SemverTier,
     UpdateFinding,
     UpdateResult,
-    UpdateStatus,
     VulnFinding,
     Workflow,
 )
@@ -205,27 +207,6 @@ class TestSharedCommandPrerequisites:
 
         assert run_mm(command, "vulnerable") == 1
 
-    def test_legacy_finding_without_flow_exits_one_before_processing(
-        self,
-        command: str,
-        deps_fixture: str,
-        request: pytest.FixtureRequest,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        deps = request.getfixturevalue(deps_fixture)
-        finding = deps.scan_result.updates[0]
-        finding.update_status = UpdateStatus.FAILED
-        finding.flow = None
-        deps.save_scan()
-        repo = JjRepository(deps.project_paths["vulnerable"])
-        before = operation_id(repo)
-
-        assert run_mm(command, "vulnerable") == 1
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert "rescan" in captured.err.lower()
-        assert operation_id(repo) == before
-
 
 def test_given_unreadable_update_bookmark_when_batch_updated_then_setup_error_no_hint(
     mm_home: Path,
@@ -243,9 +224,7 @@ def test_given_unreadable_update_bookmark_when_batch_updated_then_setup_error_no
         "example",
         make_scan_result(
             vulns=[],
-            updates=[
-                make_update(update_status=UpdateStatus.FAILED, flow=Workflow.UPDATE)
-            ],
+            updates=[make_update(state=Failed(flow=Workflow.UPDATE, phase="unit"))],
         ),
     )
     fail_repository_method(
@@ -289,7 +268,10 @@ def test_given_update_noop_when_command_runs_then_it_exits_zero_and_notices_on_s
         save_scan_results(
             "vulnerable",
             make_scan_result(
-                vulns=[], updates=[make_update(blocked_reason="too young")]
+                vulns=[],
+                updates=[
+                    make_update(state=GradleBlock(kind="age", reason="too young"))
+                ],
             ),
         )
 
@@ -331,13 +313,8 @@ def test_given_opposite_workflow_when_run_then_it_is_refused(
 ) -> None:
     deps: CliDeps = request.getfixturevalue(deps_fixture)
     for existing in deps.scan_result.findings:
-        existing.update_status = None
-        existing.failed_phase = None
-        existing.flow = None
-    finding = deps.scan_result.updates[0]
-    finding.update_status = UpdateStatus.FAILED
-    finding.failed_phase = "apply"
-    finding.flow = other_flow
+        existing.state = None
+    deps.scan_result.updates[0].state = Failed(flow=other_flow, phase="apply")
     deps.save_scan()
 
     assert run_mm(command, "vulnerable") == ExitCode.ERROR
@@ -357,9 +334,7 @@ def test_given_missing_test_config_when_run_then_fails_before_effects(
     deps: CliDeps = request.getfixturevalue(deps_fixture)
     if command == "resolve":
         for finding in deps.scan_result.findings:
-            finding.update_status = None
-            finding.failed_phase = None
-            finding.flow = None
+            finding.state = None
         save_scan_results("no-tests", deps.scan_result)
     monkeypatch.setattr("maintenance_man.output.prompt", MagicMock(return_value="all"))
     repo = JjRepository(deps.project_paths["no-tests"])
@@ -378,9 +353,9 @@ def test_given_missing_update_bookmark_when_run_then_exits_one_with_error(
     mock_update_cli_deps: CliDeps,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    finding = mock_update_cli_deps.scan_result.updates[0]
-    finding.update_status = UpdateStatus.FAILED
-    finding.flow = Workflow.UPDATE
+    mock_update_cli_deps.scan_result.updates[0].state = Failed(
+        flow=Workflow.UPDATE, phase="unit"
+    )
     mock_update_cli_deps.save_scan()
 
     assert run_mm("update", "vulnerable") == ExitCode.ERROR
@@ -469,7 +444,7 @@ def test_given_blocked_passing_and_failing_rows_when_updated_then_records_split(
             installed_version="2.0",
             fixed_version=None,
             status="affected",
-            blocked_reason="no fixed version",
+            state=GradleBlock(kind="mapping", reason="no fixed version"),
         )
     )
     save_scan_results("outdated", saved)
@@ -515,10 +490,8 @@ class TestUpdateResume:
         monkeypatch: pytest.MonkeyPatch,
     ):
         scan_result = mock_update_cli_deps.scan_result
-        scan_result.updates[0].update_status = UpdateStatus.READY
-        scan_result.updates[0].flow = Workflow.UPDATE
-        scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
-        scan_result.vulnerabilities[0].flow = Workflow.UPDATE
+        scan_result.updates[0].state = Ready(flow=Workflow.UPDATE)
+        scan_result.vulnerabilities[0].state = Ready(flow=Workflow.UPDATE)
         mock_update_cli_deps.save_scan()
         repo, pending_tip = _seed_pending_update(mock_update_cli_deps)
         origin_main = repo.resolve_revision(revision="main@origin")
@@ -543,12 +516,10 @@ class TestUpdateResume:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
-        """On resume with FAILED findings, READY findings are hidden from prompt."""
+        """On resume with failed findings, ready findings are hidden from prompt."""
         scan_result = mock_update_cli_deps.scan_result
-        scan_result.updates[0].update_status = UpdateStatus.FAILED
-        scan_result.updates[0].flow = Workflow.UPDATE
-        scan_result.vulnerabilities[0].update_status = UpdateStatus.READY
-        scan_result.vulnerabilities[0].flow = Workflow.UPDATE
+        scan_result.updates[0].state = Failed(flow=Workflow.UPDATE, phase="unit")
+        scan_result.vulnerabilities[0].state = Ready(flow=Workflow.UPDATE)
         mock_update_cli_deps.save_scan()
         _seed_pending_update(mock_update_cli_deps)
 

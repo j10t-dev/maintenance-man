@@ -5,10 +5,7 @@ from pathlib import Path
 import pytest
 
 from maintenance_man import paths, storage
-from maintenance_man.models.scan import (
-    UpdateStatus,
-    Workflow,
-)
+from maintenance_man.models.scan import Ready, Workflow
 from maintenance_man.storage import (
     NoScanResultsError,
     atomic_write_text,
@@ -48,22 +45,18 @@ def test_failed_replace_keeps_old_content(tmp_path, monkeypatch):
 
 
 def test_save_creates_directory_and_round_trips():
-    result = make_scan_result(
-        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)]
-    )
+    result = make_scan_result(updates=[make_update(state=Ready(flow=Workflow.UPDATE))])
     save_scan_results("vulnerable", result)
     assert load_scan_results("vulnerable") == result
 
 
-def test_given_ready_update_row_when_saved_then_json_text_names_status_and_flow():
-    result = make_scan_result(
-        updates=[make_update(update_status=UpdateStatus.READY, flow=Workflow.UPDATE)]
-    )
+def test_given_ready_update_row_when_saved_then_json_text_names_lifecycle_and_flow():
+    result = make_scan_result(updates=[make_update(state=Ready(flow=Workflow.UPDATE))])
 
     save_scan_results("vulnerable", result)
 
     text = (paths.scan_results_dir() / "vulnerable.json").read_text(encoding="utf-8")
-    assert '"update_status": "ready"' in text
+    assert '"lifecycle": "ready"' in text
     assert '"flow": "update"' in text
 
 

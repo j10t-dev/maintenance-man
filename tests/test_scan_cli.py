@@ -8,6 +8,7 @@ from maintenance_man import cli, scanner
 from maintenance_man.cli import ExitCode
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.scan import (
+    GradleBlock,
     ScanResult,
     SecretFinding,
     Severity,
@@ -60,11 +61,15 @@ def _scan(
         pytest.param(
             _scan(
                 vulns=[
-                    make_vuln(blocked_reason="Cannot identify catalogue entry"),
+                    make_vuln(
+                        state=GradleBlock(
+                            kind="mapping", reason="Cannot identify catalogue entry"
+                        )
+                    ),
                     make_vuln(
                         pkg_name="unfixed-pkg",
                         vuln_id="CVE-2024-0002",
-                        blocked_reason="No published fix",
+                        state=GradleBlock(kind="mapping", reason="No published fix"),
                         **_ADVISORY,
                     ),
                 ]
@@ -89,8 +94,7 @@ def _scan(
                         pkg_name="ksp",
                         installed_version="2.3.10",
                         latest_version="2.3.12",
-                        blocked_reason="no publication date",
-                        gradle_block_kind="age",
+                        state=GradleBlock(kind="age", reason="no publication date"),
                     ),
                     make_update(),
                 ]
@@ -180,11 +184,13 @@ def test_given_scan_result_when_piped_then_each_finding_is_one_whole_record(
 
 _MIXED_SCAN = _scan(
     vulns=[
-        make_vuln(blocked_reason="Cannot identify catalogue entry"),
+        make_vuln(
+            state=GradleBlock(kind="mapping", reason="Cannot identify catalogue entry")
+        ),
         make_vuln(
             pkg_name="unfixed-pkg",
             vuln_id="CVE-2024-0002",
-            blocked_reason="No published fix",
+            state=GradleBlock(kind="mapping", reason="No published fix"),
             **_ADVISORY,
         ),
     ],
@@ -193,7 +199,7 @@ _MIXED_SCAN = _scan(
             pkg_name="org.x:[lib]",
             installed_version="unknown",
             latest_version="2.0",
-            blocked_reason="cannot render [catalogue]",
+            state=GradleBlock(kind="mapping", reason="cannot render [catalogue]"),
         ),
         make_update(),
     ],
@@ -502,14 +508,13 @@ def test_scan_blocked_no_fix_vulnerability_exit(
                 title="No fix",
                 description="No published fix",
                 status="affected",
-                blocked_reason="no fixed version",
-                gradle_block_kind="mapping",
+                state=GradleBlock(kind="mapping", reason="no fixed version"),
             )
         ]
         if with_vulnerability
         else [],
         updates=[
-            make_update(blocked_reason="no publication date", gradle_block_kind="age")
+            make_update(state=GradleBlock(kind="age", reason="no publication date"))
         ]
         if with_updates
         else [],
