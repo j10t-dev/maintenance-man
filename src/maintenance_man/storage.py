@@ -6,6 +6,8 @@ import secrets
 from pathlib import Path
 from typing import Literal
 
+from pydantic import TypeAdapter, ValidationError
+
 from maintenance_man import paths
 from maintenance_man.clock import utc_now
 from maintenance_man.models.activity import ActivityEvent, ProjectActivity
@@ -14,6 +16,15 @@ from maintenance_man.models.scan import ScanResult
 
 class NoScanResultsError(Exception):
     """Raised when no scan results exist for a project."""
+
+
+class CorruptScanResultsError(Exception):
+    """A scan file that exists but cannot be used; the project needs a rescan."""
+
+    def __init__(self, project: str, detail: str) -> None:
+        super().__init__(f"corrupt scan results for {project}: {detail}")
+        self.project = project
+        self.detail = detail
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -34,17 +45,30 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def load_scan_results(project_name: str) -> ScanResult:
-    """Load scan results JSON for a project. Raises NoScanResultsError if missing."""
+    """Load the saved scan for *project_name*.
+
+    A missing file is NoScanResultsError; a file that cannot be read, decoded or
+    validated is CorruptScanResultsError.
+    """
     results_file = paths.project_file(paths.scan_results_dir(), project_name, ".json")
     try:
-        data = json.loads(results_file.read_text(encoding="utf-8"))
+        return ScanResult.model_validate_json(results_file.read_bytes())
     except FileNotFoundError:
         msg = (
             f"No scan results found for '{project_name}'. "
             f"Run 'mm scan {project_name}' first."
         )
         raise NoScanResultsError(msg) from None
-    return ScanResult.model_validate(data)
+    except ValidationError as e:
+        raise CorruptScanResultsError(project_name, _first_error(e)) from e
+    except OSError as e:
+        raise CorruptScanResultsError(project_name, str(e)) from e
+
+
+def _first_error(error: ValidationError) -> str:
+    first = error.errors()[0]
+    location = ".".join(str(part) for part in first["loc"])
+    return f"{location}: {first['msg']}" if location else first["msg"]
 
 
 def save_scan_results(project_name: str, scan_result: ScanResult) -> None:
@@ -57,8 +81,7 @@ def save_scan_results(project_name: str, scan_result: ScanResult) -> None:
 def load_activity(path: Path) -> dict[str, ProjectActivity]:
     """Load activity data, returning empty data for I/O or validation failures."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return {k: ProjectActivity(**v) for k, v in raw.items()}
+        return _ACTIVITY.validate_json(path.read_bytes())
     except OSError, ValueError:
         return {}
 
@@ -92,3 +115,6 @@ def record_activity(
         atomic_write_text(path, json.dumps(serialised, indent=2))
     except OSError, ValueError:
         pass
+
+
+_ACTIVITY = TypeAdapter(dict[str, ProjectActivity])

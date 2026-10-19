@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from maintenance_man.cli import ExitCode
 from maintenance_man.models.scan import (
     ScanResult,
     SecretFinding,
@@ -194,6 +195,49 @@ class TestListFindings:
             ["myapp", "uv", "-", "-", "-"]
         ]
         assert captured.err == "warning: corrupt scan results for myapp; skipped\n"
+
+
+_OLD_SHAPE_SCAN = (
+    '{"project": "vulnerable", "scanned_at": "2026-01-15T12:00:00Z", '
+    '"vulnerabilities": [], "updates": [], "secrets": [], "update_status": null}'
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(_OLD_SHAPE_SCAN, id="old-shape"),
+        pytest.param("[]", id="not-an-object"),
+        pytest.param(None, id="directory"),
+    ],
+)
+def test_given_unusable_scan_file_when_listed_then_project_warns_and_list_succeeds(
+    mm_home_with_projects: Path,
+    capsys: pytest.CaptureFixture[str],
+    content: str | None,
+) -> None:
+    path = mm_home_with_projects / "scan-results" / "vulnerable.json"
+    if content is None:
+        path.mkdir()
+    else:
+        path.write_text(content, encoding="utf-8")
+
+    assert run_mm("list") == ExitCode.OK
+
+    err = capsys.readouterr().err.splitlines()
+    assert "warning: corrupt scan results for vulnerable; skipped" in err
+
+
+def test_given_loader_bug_when_listing_then_it_propagates(
+    mm_home_with_projects: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(name):
+        raise RuntimeError(name)
+
+    monkeypatch.setattr("maintenance_man.cli.load_scan_results", explode)
+
+    with pytest.raises(RuntimeError):
+        run_mm("list")
 
 
 def test_given_saved_findings_when_listed_with_detail_then_records_print(

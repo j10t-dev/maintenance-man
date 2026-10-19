@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 from pathlib import Path
@@ -7,6 +8,7 @@ import pytest
 from maintenance_man import paths, storage
 from maintenance_man.models.scan import Ready, Workflow
 from maintenance_man.storage import (
+    CorruptScanResultsError,
     NoScanResultsError,
     atomic_write_text,
     load_activity,
@@ -48,6 +50,56 @@ def test_save_creates_directory_and_round_trips():
     result = make_scan_result(updates=[make_update(state=Ready(flow=Workflow.UPDATE))])
     save_scan_results("vulnerable", result)
     assert load_scan_results("vulnerable") == result
+
+
+@pytest.mark.parametrize(
+    ("content", "detail"),
+    [
+        pytest.param(
+            json.dumps(
+                {
+                    "project": "api",
+                    "scanned_at": "2026-01-15T12:00:00Z",
+                    "vulnerabilities": [],
+                    "updates": [
+                        {
+                            "pkg_name": "pkg-a",
+                            "installed_version": "1.0.0",
+                            "latest_version": "1.0.1",
+                            "semver_tier": "patch",
+                            "update_status": None,
+                            "failed_phase": None,
+                            "flow": None,
+                            "blocked_reason": None,
+                            "gradle_block_kind": None,
+                        }
+                    ],
+                }
+            ),
+            "updates.0.update_status: Extra inputs are not permitted",
+            id="old-shape",
+        ),
+        pytest.param("[]", "Input should be an object", id="not-an-object"),
+        pytest.param("{", "Invalid JSON", id="truncated-json"),
+        pytest.param(None, "Is a directory", id="directory"),
+    ],
+)
+def test_given_unusable_scan_file_when_loaded_then_corrupt_error_names_the_cause(
+    mm_home, content, detail
+):
+    path = mm_home / "scan-results" / "api.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if content is None:
+        path.mkdir()
+    else:
+        path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(CorruptScanResultsError) as raised:
+        load_scan_results("api")
+
+    assert raised.value.project == "api"
+    assert str(raised.value).startswith("corrupt scan results for api: ")
+    assert detail in raised.value.detail
 
 
 def test_given_ready_update_row_when_saved_then_json_text_names_lifecycle_and_flow():
@@ -126,14 +178,13 @@ def test_given_bad_json_when_loading_then_load_activity_returns_empty_on_invalid
     assert load_activity(path) == {}
 
 
-def test_given_invalid_shape_when_activity_is_loaded_then_type_error_propagates(
+def test_given_invalid_shape_when_activity_is_loaded_then_empty_data_is_returned(
     tmp_path,
 ):
     path = tmp_path / "activity.json"
     path.write_text('{"x": 1}', encoding="utf-8")
 
-    with pytest.raises(TypeError):
-        load_activity(path)
+    assert load_activity(path) == {}
 
 
 def test_given_invalid_fields_when_activity_is_loaded_then_empty_data_is_returned(

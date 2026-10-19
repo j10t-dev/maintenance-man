@@ -71,6 +71,7 @@ from maintenance_man.services import scan as scan_service
 from maintenance_man.services import update as update_service
 from maintenance_man.services.scan import ScanSummary
 from maintenance_man.storage import (
+    CorruptScanResultsError,
     NoScanResultsError,
     load_activity,
     load_scan_results,
@@ -93,7 +94,8 @@ class ExitCode(IntEnum):
 
 _HANDLED_ERRORS = (
     WorkflowError,
-    ConfigError,
+    CorruptScanResultsError,
+    EOFError,
     ProjectNotFoundError,
     ToolNotFoundError,
     ScanError,
@@ -155,6 +157,12 @@ class _Renderer:
                 output.notice(f"No scan results for {event.project}")
             case SkipReason.NOTHING_TO_DO:
                 output.notice(f"Nothing to {event.detail} in {event.project}")
+            case SkipReason.CORRUPT_SCAN_RESULTS:
+                output.diagnostic(
+                    "warning",
+                    f"{event.project} · corrupt scan results; "
+                    f"run mm scan {event.project}",
+                )
 
     @__call__.register
     def _render_operation_failed(self, event: OperationFailed) -> None:
@@ -324,9 +332,22 @@ def main(argv: Sequence[str] | None = None) -> None:
         app(argv, exit_on_error=False)
     except cyclopts.CycloptsError:
         sys.exit(ExitCode.ERROR)
+    except ConfigError as exc:
+        for message in exc.messages:
+            output.diagnostic("error", message)
+        sys.exit(ExitCode.ERROR)
     except _HANDLED_ERRORS as exc:
-        hint = "mm list" if isinstance(exc, UnknownProjectError) else None
-        _fatal(str(exc), hint=hint)
+        _fatal(str(exc), hint=_hint_for(exc))
+
+
+def _hint_for(exc: Exception) -> str | None:
+    match exc:
+        case UnknownProjectError():
+            return "mm list"
+        case CorruptScanResultsError(project=project):
+            return f"mm scan {project}"
+        case _:
+            return None
 
 
 type ConfigOption = Annotated[
@@ -651,7 +672,7 @@ def list_projects(
             scan_results[name] = load_scan_results(name)
         except NoScanResultsError:
             pass
-        except Exception:
+        except CorruptScanResultsError:
             output.diagnostic("warning", f"corrupt scan results for {name}; skipped")
 
     if detail:
@@ -975,7 +996,7 @@ def resolve(
     Applies each failed finding on ``mm/resolve-dependencies``, runs tests, and
     stops on the first failure so the operator can debug manually. Rerun with
     ``--continue`` after committing a manual fix to re-test and advance. Promotes
-    the resolve bookmark to local main once all candidates reach READY. Takes
+    the resolve bookmark to local main once every candidate is Ready. Takes
     over pending update work when it exists.
 
     Parameters

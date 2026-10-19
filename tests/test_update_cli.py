@@ -208,6 +208,66 @@ class TestSharedCommandPrerequisites:
         assert run_mm(command, "vulnerable") == 1
 
 
+_OLD_SHAPE_SCAN = (
+    '{"project": "vulnerable", "scanned_at": "2026-01-15T12:00:00Z", '
+    '"vulnerabilities": [], "updates": [], "secrets": [], "update_status": null}'
+)
+
+
+@pytest.mark.parametrize("command", ["update", "resolve"])
+def test_given_corrupt_scan_file_when_project_command_runs_then_one_line_and_hint(
+    mm_home_with_projects: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    (mm_home_with_projects / "scan-results" / "vulnerable.json").write_text(
+        _OLD_SHAPE_SCAN, encoding="utf-8"
+    )
+
+    assert run_mm(command, "vulnerable") == ExitCode.ERROR
+
+    err = capsys.readouterr().err.splitlines()
+    assert err[0].startswith("error: corrupt scan results for vulnerable: ")
+    assert err[1:] == ["hint: mm scan vulnerable"]
+
+
+def test_given_corrupt_scan_file_when_batch_updated_then_skipped_and_exit_failed(
+    mm_home_with_projects: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (mm_home_with_projects / "scan-results" / "vulnerable.json").write_text(
+        _OLD_SHAPE_SCAN, encoding="utf-8"
+    )
+    real_update_project = update_service.update_project
+
+    def only_vulnerable_runs(name, project, *, choose, emit):
+        if name == "vulnerable":
+            return real_update_project(name, project, choose=choose, emit=emit)
+        return update_service.ProjectUpdate(name, Outcome.SUCCEEDED, ())
+
+    monkeypatch.setattr(update_service, "update_project", only_vulnerable_runs)
+
+    assert run_mm("update") == ExitCode.UPDATE_FAILED
+
+    expected = "warning: vulnerable · corrupt scan results; run mm scan vulnerable"
+    assert expected in capsys.readouterr().err.splitlines()
+
+
+def test_given_closed_stdin_when_findings_prompted_then_one_line_error(
+    mock_update_cli_deps: CliDeps,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("sys.stdin", StringIO(""))
+
+    assert run_mm("update", "vulnerable") == ExitCode.ERROR
+
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        "error: input closed before a selection was made"
+    )
+
+
 def test_given_unreadable_update_bookmark_when_batch_updated_then_setup_error_no_hint(
     mm_home: Path,
     tmp_path: Path,

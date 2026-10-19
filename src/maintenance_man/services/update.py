@@ -33,6 +33,7 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.services import WorkflowError, flows
 from maintenance_man.services.flows import FlowConflictError
+from maintenance_man.storage import CorruptScanResultsError
 from maintenance_man.updater import group_findings, process_findings
 from maintenance_man.vcs import JjRepository, RevisionError, workspace_path_for_project
 from maintenance_man.vcs_workflow import (
@@ -136,6 +137,9 @@ def update_projects(
             result = update_project(name, project, choose=None, emit=emit)
         except FlowConflictError as exc:
             emit(ProjectSkipped(name, SkipReason.FLOW_CONFLICT, str(exc)))
+            had_errors = True
+        except CorruptScanResultsError as exc:
+            emit(ProjectSkipped(name, SkipReason.CORRUPT_SCAN_RESULTS, exc.detail))
             had_errors = True
         except UpdateSetupError as exc:
             emit(OperationFailed("update setup", name, str(exc)))

@@ -21,6 +21,7 @@ class SkipReason(StrEnum):
     NOT_DEPLOYABLE = "not_deployable"
     UNCHANGED = "unchanged"
     BLOCKED = "blocked"
+    CORRUPT_SCAN_RESULTS = "corrupt_scan_results"
 
 
 class DeployStep(StrEnum):

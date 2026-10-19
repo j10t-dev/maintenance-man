@@ -3,13 +3,14 @@
 import os
 import shutil
 import sys
+import textwrap
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from threading import Timer
 from typing import Literal, TextIO
 
-from cyclopts.help import HelpPanel, PlainFormatter
+from cyclopts.help import HelpEntry, HelpPanel, PlainFormatter
 from rich.cells import cell_len, set_cell_size
 from rich.console import Console, ConsoleOptions
 from rich.live import Live
@@ -200,7 +201,8 @@ def prompt(message: str, *, default: str) -> str:
     )
     reply = sys.stdin.readline()
     if not reply:
-        msg = "Input closed before a selection was made"
+        console(stderr=True).print()
+        msg = "input closed before a selection was made"
         raise EOFError(msg)
     return reply.strip() or default
 
@@ -301,21 +303,61 @@ def _pipe_line(fields: Sequence[str]) -> str:
 
 
 class HelpFormatter(PlainFormatter):
-    """Keep command aliases on the same line as their shared description."""
+    """Keep command aliases on the same line as their shared description and wrap
+    parameter text under a hanging indent."""
 
     def __call__(
         self, console: Console, options: ConsoleOptions, panel: HelpPanel
     ) -> None:
-        if panel.format == "command":
-            panel = panel.copy(
-                entries=[
-                    entry.copy(positive_names=(", ".join(entry.positive_names),))
-                    if entry.positive_names
-                    else entry
-                    for entry in panel.entries
-                ]
-            )
+        if panel.format == "parameter":
+            _print_parameter_panel(console, options, panel)
+            return
+        panel = panel.copy(
+            entries=[
+                entry.copy(positive_names=(", ".join(entry.positive_names),))
+                if entry.positive_names
+                else entry
+                for entry in panel.entries
+            ]
+        )
         super().__call__(console, options, panel)
+
+
+def _print_parameter_panel(
+    console: Console, options: ConsoleOptions, panel: HelpPanel
+) -> None:
+    if not panel.entries:
+        return
+    if panel.title:
+        console.print(literal(f"{panel.title}:"), soft_wrap=True)
+    for entry in panel.entries:
+        for line in textwrap.wrap(
+            _parameter_text(entry, console, options),
+            width=console.width,
+            initial_indent="  ",
+            subsequent_indent="    ",
+            break_long_words=False,
+        ):
+            console.print(literal(line), soft_wrap=True)
+    console.print()
+
+
+def _parameter_text(entry: HelpEntry, console: Console, options: ConsoleOptions) -> str:
+    description = "".join(
+        segment.text for segment in console.render(entry.description, options)
+    )
+    tags = []
+    if entry.choices:
+        tags.append(f"[choices: {', '.join(entry.choices)}]")
+    if entry.env_var:
+        tags.append(f"[env var: {', '.join(entry.env_var)}]")
+    if entry.default is not None:
+        tags.append(f"[default: {entry.default}]")
+    if entry.required:
+        tags.append("[required]")
+    labels = ", ".join(entry.display_labels_with_metavar)
+    detail = " ".join([*description.split(), *tags])
+    return f"{labels}: {detail}" if detail else labels
 
 
 _consoles: dict[TextIO, Console] = {}

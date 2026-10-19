@@ -584,3 +584,24 @@ def test_given_unchanged_outcome_when_rendered_on_terminal_then_subject_is_separ
     cli._Renderer(batch=True)(event)
 
     assert Text.from_ansi(stream.getvalue()).plain.splitlines() == expected
+
+
+def test_given_every_event_class_when_rendered_then_a_handler_is_registered():
+    registered = set(cli._Renderer.__dict__["__call__"].dispatcher.registry)
+    event_classes = {
+        value
+        for value in vars(events).values()
+        if isinstance(value, type) and issubclass(value, Event) and value is not Event
+    }
+
+    assert event_classes <= registered
+
+
+def test_given_corrupt_scan_skip_when_rendered_then_warning_names_the_rescan(capsys):
+    cli._Renderer(batch=True, flow="update")(
+        ProjectSkipped("api", SkipReason.CORRUPT_SCAN_RESULTS, "update_status")
+    )
+
+    assert capsys.readouterr().err.splitlines() == [
+        "warning: api · corrupt scan results; run mm scan api"
+    ]

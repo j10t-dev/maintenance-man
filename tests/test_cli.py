@@ -209,6 +209,27 @@ class TestHelp:
         assert "--bogus" in captured.err
         assert not set("╭╮╰╯│─") & set(captured.err)
 
+    @pytest.mark.parametrize("width", [80, 120])
+    def test_given_help_when_printed_then_parameter_text_wraps_under_its_column(
+        self,
+        width: int,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv("COLUMNS", str(width))
+
+        run_mm("deploy", "--help")
+
+        lines = capsys.readouterr().out.splitlines()
+        assert all(len(line) <= width for line in lines)
+        assert all(not line.endswith(" ") for line in lines)
+        body = [line for line in lines[lines.index("Parameters:") + 1 :] if line]
+        entries = [line for line in body if line.startswith("  ") and line[2] != " "]
+        continuation = [line for line in body if line.startswith("    ")]
+        assert entries
+        assert continuation
+        assert len(entries) + len(continuation) == len(body)
+
 
 class TestVersion:
     def test_version_prints_version(self, capsys: pytest.CaptureFixture[str]):
@@ -259,6 +280,34 @@ def test_fatal_prints_bracketed_plain_text_literally(
     assert captured.err == "error: bad [projects.x]\n"
 
 
+def test_given_two_invalid_config_values_when_run_then_one_error_line_each(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_config(tmp_path, "[defaults]\nmin_version_age_days = -1\nbogus = 1\n")
+
+    assert run_mm("list", "--config", str(path)) == ExitCode.ERROR
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        f"error: {path}: defaults.min_version_age_days: "
+        "Input should be greater than or equal to 0",
+        f"error: {path}: defaults.bogus: Extra inputs are not permitted",
+    ]
+
+
+def test_given_toml_syntax_error_when_run_then_one_error_line_names_the_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_config(tmp_path, "[defaults\n")
+
+    assert run_mm("list", "--config", str(path)) == ExitCode.ERROR
+
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith(f"error: {path}: ")
+
+
 @pytest.mark.parametrize(
     ("project", "expects_hint"),
     [("unlisted", True), ("ghost", False)],
@@ -285,15 +334,16 @@ def test_given_unresolvable_project_when_build_runs_then_only_unknown_name_hints
     assert ("hint: mm list" in captured.err.splitlines()) is expects_hint
 
 
-def test_config_validation_error_keeps_pydantic_type_suffix(
+def test_given_missing_required_field_when_run_then_error_line_names_the_field(
     mm_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    mm_home.mkdir(parents=True)
     write_config(mm_home, '[projects.api]\npackage_manager = "uv"\n')
 
-    assert run_mm("scan") == 1
+    assert run_mm("scan") == ExitCode.ERROR
 
-    assert "[type=missing" in capsys.readouterr().err
+    assert capsys.readouterr().err.splitlines() == [
+        f"error: {mm_home / 'config.toml'}: projects.api.path: Field required"
+    ]
 
 
 @pytest.mark.parametrize("use_config_flag", [False, True], ids=["default", "flag"])

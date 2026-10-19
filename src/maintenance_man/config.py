@@ -9,7 +9,14 @@ from maintenance_man.models.config import MmConfig, ProjectConfig
 
 
 class ConfigError(Exception):
-    """Raised when the configuration file is invalid or cannot be parsed."""
+    """The configuration file is missing, unparseable or invalid.
+
+    Each of *messages* is one printable line; str() joins them with newlines.
+    """
+
+    def __init__(self, *messages: str) -> None:
+        super().__init__("\n".join(messages))
+        self.messages = messages
 
 
 class ProjectNotFoundError(Exception):
@@ -38,14 +45,13 @@ def load_config(config_path: Path | None = None) -> MmConfig:
         with config_path.open("rb") as f:
             raw = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
-        msg = f"Failed to parse {config_path}\n{e}"
+        msg = f"{config_path}: {e}"
         raise ConfigError(msg) from e
 
     try:
         config = MmConfig(**raw)
     except ValidationError as e:
-        msg = f"Invalid config in {config_path}\n{e}"
-        raise ConfigError(msg) from e
+        raise ConfigError(*_validation_messages(config_path, e)) from e
 
     config_dir = config_path.parent.resolve()
     for project in config.projects.values():
@@ -53,6 +59,13 @@ def load_config(config_path: Path | None = None) -> MmConfig:
             project.path = (config_dir / project.path).resolve()
 
     return config
+
+
+def _validation_messages(config_path: Path, error: ValidationError) -> list[str]:
+    return [
+        f"{config_path}: {'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+        for item in error.errors()
+    ]
 
 
 def resolve_project(config: MmConfig, name: str) -> ProjectConfig:

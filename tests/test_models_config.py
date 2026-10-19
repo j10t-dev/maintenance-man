@@ -85,3 +85,18 @@ def test_given_negative_minimum_age_when_config_loaded_then_config_error(
 
     with pytest.raises(ConfigError, match="min_version_age_days"):
         load_config(config_path)
+
+
+def test_given_two_invalid_values_when_config_loaded_then_one_message_each(
+    tmp_path: Path,
+) -> None:
+    path = write_config(tmp_path, "[defaults]\nmin_version_age_days = -1\nbogus = 1\n")
+
+    with pytest.raises(ConfigError) as raised:
+        load_config(path)
+
+    assert raised.value.messages == (
+        f"{path}: defaults.min_version_age_days: "
+        "Input should be greater than or equal to 0",
+        f"{path}: defaults.bogus: Extra inputs are not permitted",
+    )
