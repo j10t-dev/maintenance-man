@@ -53,7 +53,7 @@ def _uv_update_commands(pkg: str, version: str, workspace: Path) -> list[list[st
     except UvDependencyError as e:
         raise UpdateCommandError(str(e)) from e
     if not groups:
-        return [["uv", "lock", "--upgrade-package", pkg]]
+        return [["uv", "lock", "--upgrade-package", f"{pkg}=={version}"]]
     return [
         ["uv", "add", f"{pkg}=={version}"]
         if group is None

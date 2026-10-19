@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from maintenance_man import paths
@@ -319,7 +320,7 @@ class _TrivyResponse(BaseModel):
 def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
     """Run uv's native lockfile-based audit against a project."""
     completed = _run_scan_command(
-        ["uv", "audit", "--locked"],
+        ["uv", "audit", "--locked", "--color", "never"],
         project_path,
         "uv audit --locked",
         ok_codes={0, 1},
@@ -328,14 +329,23 @@ def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
 
 
 def _parse_uv_audit_vulns(output: str) -> list[VulnFinding]:
-    """Parse uv audit's human-readable vulnerability output."""
+    """Parse uv audit's human-readable vulnerability output.
+
+    Each package header declares its advisory count. A package whose parsed
+    advisories differ from that count raises ``ScanError`` instead of
+    returning a partial list.
+    """
     findings: list[VulnFinding] = []
     package: tuple[str, str] | None = None
+    declared = parsed = 0
     current: VulnFinding | None = None
 
     for line in output.splitlines():
         if match := _UV_AUDIT_PACKAGE_RE.match(line):
+            if package is not None:
+                _check_declared(package[0], declared, parsed)
             package = (match.group("pkg"), match.group("version"))
+            declared, parsed = int(match.group("count")), 0
             current = None
         elif (match := _UV_AUDIT_VULN_RE.match(line)) and package is not None:
             current = VulnFinding(
@@ -348,22 +358,52 @@ def _parse_uv_audit_vulns(output: str) -> list[VulnFinding]:
                 status="affected",
             )
             findings.append(current)
+            parsed += 1
         elif current is None:
             continue
         elif match := _UV_AUDIT_FIXED_RE.match(line):
-            current.fixed_version = match.group("version")
+            current.fixed_version = _select_fixed_version(
+                current.installed_version, match.group("versions")
+            )
         elif match := _UV_AUDIT_URL_RE.match(line):
             current.primary_url = match.group("url")
+    if package is not None:
+        _check_declared(package[0], declared, parsed)
     return findings
 
 
+def _select_fixed_version(installed: str, listed: str) -> str | None:
+    """Return a single listed version unchanged, else the lowest one above installed.
+
+    Several versions yield None when none is above it or it does not parse.
+    """
+    tokens = re.split(r",\s*", listed)
+    if len(tokens) == 1:
+        return listed
+    try:
+        installed_version = Version(installed)
+    except InvalidVersion:
+        return None
+    fixes: list[tuple[Version, str]] = []
+    for token in tokens:
+        with contextlib.suppress(InvalidVersion):
+            fixes.append((Version(token), token))
+    above_installed = sorted(fix for fix in fixes if fix[0] > installed_version)
+    return above_installed[0][1] if above_installed else None
+
+
+def _check_declared(package: str, declared: int, parsed: int) -> None:
+    if declared != parsed:
+        msg = f"uv audit: {package} declares {declared} advisories, parsed {parsed}"
+        raise ScanError(msg)
+
+
 _UV_AUDIT_PACKAGE_RE = re.compile(
-    r"^(?P<pkg>\S+)\s+(?P<version>\S+)\s+has\s+\d+\s+known vulnerabilit(?:y|ies):$"
+    r"^(?P<pkg>\S+)\s+(?P<version>\S+)\s+has\s+(?P<count>\d+)\s+known "
+    r"vulnerabilit(?:y|ies):$"
 )
-_UV_AUDIT_VULN_RE = re.compile(
-    r"^-\s+(?P<id>(?:GHSA|CVE|PYSEC)-[^:]+):\s+(?P<title>.+)$"
-)
-_UV_AUDIT_FIXED_RE = re.compile(r"^\s+Fixed in:\s+(?P<version>\S+)\s*$")
+_UV_AUDIT_VULN_RE = re.compile(r"^-\s+(?P<id>[A-Z]+-[^:]+):\s+(?P<title>.+)$")
+_UV_AUDIT_FIXED_RE = re.compile(r"^\s+Fixed in:\s+(?P<versions>\S+(?:,\s+\S+)*)\s*$")
 _UV_AUDIT_URL_RE = re.compile(r"^\s+Advisory information:\s+(?P<url>\S+)\s*$")
 
 

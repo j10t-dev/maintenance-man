@@ -76,6 +76,7 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         "mvn",
         "versions:display-dependency-updates",
         "-DprocessDependencyManagement=false",
+        "-Dversions.outputLineWidth=1000",
     ]
     completed = _run(
         cmd, project, timeout=300, label="mvn versions:display-dependency-updates"

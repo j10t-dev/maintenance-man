@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -160,6 +161,98 @@ def test_given_uv_audit_output_when_parsed_then_advisories_belong_to_their_packa
     ] == expected
 
 
+_AUDIT_HEADER = "Found 2 known vulnerabilities in 2 packages\n\nVulnerabilities:\n\n"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_message"),
+    [
+        pytest.param(
+            _AUDIT_HEADER + "setuptools 65.5.0 has 2 known vulnerabilities:\n\n"
+            "- GHSA-r9hx-vwmv-q579: ReDoS\n\n  Fixed in: 65.5.1\n",
+            "uv audit: setuptools declares 2 advisories, parsed 1",
+            id="fewer-parsed-than-declared",
+        ),
+        pytest.param(
+            _AUDIT_HEADER + "requests 2.0.0 has 2 known vulnerabilities:\n\n"
+            "- CVE-2026-1: One\n\n  Fixed in: 2.0.1\n\n"
+            "urllib3 1.0.0 has 1 known vulnerability:\n\n"
+            "- GHSA-x: Two\n\n  Fixed in: 1.0.1\n",
+            "uv audit: requests declares 2 advisories, parsed 1",
+            id="first-package-mismatch",
+        ),
+        pytest.param(
+            _AUDIT_HEADER + "requests 2.0.0 has 1 known vulnerability:\n\n"
+            "- CVE-2026-1: One\n\n  Fixed in: 2.0.1\n\n"
+            "urllib3 1.0.0 has 1 known vulnerability:\n\n"
+            "- GHSA-x: Two\n- GHSA-y: Three\n\n  Fixed in: 1.0.1\n",
+            "uv audit: urllib3 declares 1 advisories, parsed 2",
+            id="second-package-mismatch",
+        ),
+    ],
+)
+def test_given_uv_audit_text_when_counts_differ_then_scan_error_names_package(
+    output, expected_message
+):
+    with pytest.raises(ScanError, match=f"^{re.escape(expected_message)}$"):
+        _parse_uv_audit_vulns(output)
+
+
+def test_given_uv_audit_advisory_with_unfamiliar_prefix_when_parsed_then_kept():
+    output = (
+        _AUDIT_HEADER + "left-pad 1.0.0 has 1 known vulnerability:\n\n"
+        "- MAL-2026-1: Malicious package\n\n  Fixed in: 1.0.1\n"
+    )
+
+    assert _parse_uv_audit_vulns(output) == [
+        VulnFinding(
+            vuln_id="MAL-2026-1",
+            pkg_name="left-pad",
+            installed_version="1.0.0",
+            fixed_version="1.0.1",
+            severity=Severity.UNKNOWN,
+            title="Malicious package",
+            description="Malicious package",
+            status="affected",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("installed", "fixed_in", "expected_fixed_version"),
+    [
+        pytest.param("1.26.5", "2.0.7, 1.26.18", "1.26.18", id="lowest-listed-last"),
+        pytest.param("1.26.5", "1.26.18, 2.0.7", "1.26.18", id="order-independent"),
+        pytest.param("1.25.0", "2.2.2, 2.0.7", "2.0.7", id="lowest-above-installed"),
+        pytest.param("3.0.0", "2.0.7, 1.26.18", None, id="nothing-above-installed"),
+        pytest.param("1.26.20", "1.26.18, 2.0.7", "2.0.7", id="no-downgrade"),
+        pytest.param("1.26.5", "1.26.18", "1.26.18", id="single-version-unchanged"),
+        pytest.param("1.26.5", "2.0.7,1.26.18", "1.26.18", id="unspaced-separator"),
+    ],
+)
+def test_given_uv_audit_advisory_with_fix_versions_when_parsed_then_one_is_stored(
+    installed, fixed_in, expected_fixed_version
+):
+    output = (
+        f"urllib3 {installed} has 1 known vulnerability:\n\n"
+        "- GHSA-34jh-p97f-mpxf: Cookie header leaks on redirect\n\n"
+        f"  Fixed in: {fixed_in}\n"
+    )
+
+    assert _parse_uv_audit_vulns(output) == [
+        VulnFinding(
+            vuln_id="GHSA-34jh-p97f-mpxf",
+            pkg_name="urllib3",
+            installed_version=installed,
+            fixed_version=expected_fixed_version,
+            severity=Severity.UNKNOWN,
+            title="Cookie header leaks on redirect",
+            description="Cookie header leaks on redirect",
+            status="affected",
+        )
+    ]
+
+
 def test_gradle_scan_requires_trivy_before_generating_a_report(
     gradle_project, monkeypatch
 ):
@@ -208,12 +301,14 @@ _SCAN_COMMAND_OPTIONS = {
 @pytest.mark.parametrize(
     ("manager", "scan_secrets", "expected_commands"),
     [
-        pytest.param("uv", False, [("uv", "audit", "--locked")], id="uv"),
+        pytest.param(
+            "uv", False, [("uv", "audit", "--locked", "--color", "never")], id="uv"
+        ),
         pytest.param(
             "uv",
             True,
             [
-                ("uv", "audit", "--locked"),
+                ("uv", "audit", "--locked", "--color", "never"),
                 ("trivy", "fs", "--format", "json", "--scanners", "secret", "."),
             ],
             id="uv-with-secrets",
@@ -1128,6 +1223,7 @@ _MVN_UPDATES = (
     "mvn",
     "versions:display-dependency-updates",
     "-DprocessDependencyManagement=false",
+    "-Dversions.outputLineWidth=1000",
 )
 
 

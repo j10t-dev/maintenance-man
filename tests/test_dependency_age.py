@@ -163,6 +163,7 @@ def _publication_fixture(
         ("https://user:secret@repo.maven.apache.org/maven2", None),
         ("https://repo.maven.apache.org.evil/maven2", None),
         ("https://repo.maven.apache.org/maven2?token=secret", None),
+        (None, None),
     ],
 )
 def test_given_repository_url_when_trusted_then_policy_id_or_none(url, expected):
@@ -1170,7 +1171,11 @@ def _update(name="pkg", version="1.0"):
             1, 7, pypi_body(uploads=("2026-09-17T00:00:00Z",)), [], id="young"
         ),
         pytest.param(
-            1, 7, pypi_body(uploads=("2026-09-11T00:00:00Z",)), [], id="exactly-cutoff"
+            1,
+            7,
+            pypi_body(uploads=("2026-09-11T00:00:00Z",)),
+            [datetime(2026, 9, 11, tzinfo=UTC)],
+            id="exactly-cutoff",
         ),
         pytest.param(
             1,

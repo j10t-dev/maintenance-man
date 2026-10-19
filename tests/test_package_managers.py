@@ -38,7 +38,7 @@ def test_bun_update_refuses_a_workspace_without_a_manifest(tmp_path: Path):
             '[project.optional-dependencies]\ncli = ["rich>=14.0"]\n',
             "rich",
             "14.3.3",
-            [["uv", "lock", "--upgrade-package", "rich"]],
+            [["uv", "lock", "--upgrade-package", "rich==14.3.3"]],
         ),
         (
             '[project]\ndependencies = ["pytest>=8.0"]\n\n'
@@ -54,7 +54,7 @@ def test_bun_update_refuses_a_workspace_without_a_manifest(tmp_path: Path):
             '[project]\ndependencies = ["requests>=2.28"]\n',
             "urllib3",
             "2.7.0",
-            [["uv", "lock", "--upgrade-package", "urllib3"]],
+            [["uv", "lock", "--upgrade-package", "urllib3==2.7.0"]],
         ),
     ],
 )

@@ -35,6 +35,7 @@ def _fake_commands(
                 "mvn",
                 "versions:display-dependency-updates",
                 "-DprocessDependencyManagement=false",
+                "-Dversions.outputLineWidth=1000",
             ),
         ),
     }[project.package_manager]
@@ -317,6 +318,7 @@ class TestBunOutdated:
                     "mvn",
                     "versions:display-dependency-updates",
                     "-DprocessDependencyManagement=false",
+                    "-Dversions.outputLineWidth=1000",
                 ),
                 Path("/tmp/fake"),
                 {
@@ -335,6 +337,7 @@ class TestBunOutdated:
                     "mvn",
                     "versions:display-dependency-updates",
                     "-DprocessDependencyManagement=false",
+                    "-Dversions.outputLineWidth=1000",
                 ),
                 Path("/tmp/fake"),
                 {

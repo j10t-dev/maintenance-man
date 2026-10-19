@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -24,10 +24,12 @@ from pydantic import BaseModel, ConfigDict, StrictStr
 from maintenance_man.clock import Clock, utc_now
 from maintenance_man.models.gradle import (
     AgeBlock,
+    GradleCandidate,
     ModuleId,
     PublicationEvidence,
     PublicationFact,
     PublicationRequest,
+    RepositoryDeclaration,
     RepositoryId,
     UtcDatetime,
 )
@@ -249,12 +251,17 @@ def filter_registry_updates_by_age(
             if isinstance(result, PublicationFact | RegistryFact)
             else None
         )
-        if published is None or published < cutoff:
+        if published is None or published <= cutoff:
             kept.append(update.model_copy(update={"published_date": published}))
     return kept
 
 
-def publication_request(module, repositories, *, implementation=None):
+def publication_request(
+    module: ModuleId,
+    repositories: Sequence[RepositoryDeclaration],
+    *,
+    implementation: ModuleId | None = None,
+) -> PublicationRequest:
     """Build a ``PublicationRequest`` from resolved repository declarations.
 
     Any repository outside the trusted roots withholds routing support for
@@ -269,7 +276,12 @@ def publication_request(module, repositories, *, implementation=None):
     )
 
 
-def evaluate_gradle_candidate_age(candidate, minimum_age_days, context, now):
+def evaluate_gradle_candidate_age(
+    candidate: GradleCandidate,
+    minimum_age_days: int,
+    context: PublicationLookupContext,
+    now: datetime,
+) -> AgeBlock | datetime:
     """Return an ``AgeBlock`` unless every publication request is proven old enough,
     else the youngest evidence timestamp across the requests.
 
@@ -305,7 +317,9 @@ def member_module(member: GradleMember, version: str) -> ModuleId | None:
     return _maven_module(member.coordinate, version)
 
 
-def lookup_gradle_publication(request, context):
+def lookup_gradle_publication(
+    request: PublicationRequest, context: PublicationLookupContext
+) -> AgeBlock | PublicationEvidence:
     """Resolve *request* to aggregate evidence, or an ``AgeBlock`` withholding it."""
     if not request.routing_supported or not request.repositories:
         return AgeBlock(reason="unsupported or missing scoped repository routing")
@@ -347,9 +361,9 @@ def lookup_gradle_publication(request, context):
     return PublicationEvidence(facts=tuple(facts))
 
 
-def trusted_repository(url):
+def trusted_repository(url: str | None) -> RepositoryId | None:
     """Return the trust-policy repository id for an exact-root URL, or None."""
-    if not isinstance(url, str):
+    if url is None:
         return None
     parsed = urllib.parse.urlsplit(url)
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -400,7 +414,7 @@ _ROOTS = {
     "google": "https://dl.google.com/dl/android/maven2",
     "portal": "https://plugins.gradle.org/m2",
 }
-_ALIASES = {
+_ALIASES: dict[str, RepositoryId] = {
     "https://repo.maven.apache.org/maven2": "central",
     "https://repo1.maven.org/maven2": "central",
     "https://dl.google.com/dl/android/maven2": "google",
@@ -444,7 +458,7 @@ def _fact_key(fact: PublicationFact | RegistryFact) -> _CacheKey:
     return _registry_key(fact.registry, fact.package, fact.version)
 
 
-def _artifact_suffix(module):
+def _artifact_suffix(module: ModuleId) -> str:
     """Return the exact Maven-layout POM path for *module*."""
     parts = (module.group, module.artifact, module.version)
     if any(
@@ -487,7 +501,7 @@ def _public_url(url: str, repository: str, suffix: str) -> None:
         raise PublicationError(msg)
 
 
-def _pom_identity(body, module):
+def _pom_identity(body: bytes, module: ModuleId) -> ModuleId | None:
     """Validate literal POM coordinates, including group/version from a parent.
 
     Property expansion is unsupported, and so is any encoding but UTF-8: UTF-16
@@ -518,7 +532,9 @@ def _pom_identity(body, module):
     return implementation
 
 
-def _pom_coordinate(node, namespace, *, inherit=False):
+def _pom_coordinate(
+    node: ET.Element, namespace: str, *, inherit: bool = False
+) -> ModuleId:
     values = []
     for field in ("groupId", "artifactId", "version"):
         matches = node.findall(namespace + field)
@@ -585,7 +601,7 @@ def _as_utc(value: str) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _npm_timestamp(package, version, project_path):
+def _npm_timestamp(package: str, version: str, project_path: Path) -> datetime | None:
     completed = run_captured(
         ["bun", "info", f"{package}@{version}"],
         project_path,
