@@ -47,6 +47,7 @@ _GRADLEW_STUB = "#!/bin/sh\nexit 0\n"
 @pytest.fixture(autouse=True)
 def _isolated_mm_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Every test gets its own mm home; nothing reaches the real ~/.mm."""
+    monkeypatch.delenv("MM_HOME", raising=False)
     home = tmp_path / ".mm"
     monkeypatch.setattr("maintenance_man.paths.MM_HOME", home)
     return home

@@ -352,7 +352,12 @@ def _hint_for(exc: Exception) -> str | None:
 
 type ConfigOption = Annotated[
     Path | None,
-    cyclopts.Parameter(help="Path to config file. Uses ~/.mm/config.toml if omitted."),
+    cyclopts.Parameter(
+        help=(
+            "Path to config file. Uses config.toml in MM_HOME "
+            "(default ~/.mm) if omitted."
+        )
+    ),
 ]
 type VerboseOption = Annotated[
     bool,
@@ -374,7 +379,7 @@ def _reset_output_and_load_config(
 
 @app.command
 def init() -> None:
-    """Initialise the ~/.mm directory and skeleton config."""
+    """Initialise MM_HOME (default ~/.mm) and its skeleton config."""
     output.reset_invocation_output(verbose=False)
     ensure_mm_home()
     output.notice(f"Initialised {paths.mm_home()}")

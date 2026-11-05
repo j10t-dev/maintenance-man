@@ -48,7 +48,7 @@ Config-driven CLI for routine software project maintenance.
 Commands:
   build: Build a project's artefacts.
   deploy: Deploy a project.
-  init: Initialise the ~/.mm directory and skeleton config.
+  init: Initialise MM_HOME (default ~/.mm) and its skeleton config.
   list, status, st: List all configured projects with scan findings summary.
   resolve: Work through failed findings for a project.
   scan: Scan projects for vulnerabilities and available updates.
@@ -103,6 +103,8 @@ Not strictly enforced by tool but expected as best practice:
 ## Configuration
 
 Configuration defaults to your user home - `~/.mm/` - run `mm init` to create this and a minimal `config.toml`
+
+Set `MM_HOME` before starting mm to use a separate configuration and state directory, for example `MM_HOME=/tmp/mm-demo uv run mm init`. This redirects saved scans, activity, publication caches and update workspaces as well as `config.toml`. Relative paths resolve from the invocation directory. An unset or empty value uses `~/.mm`.
 
 Configuration is done per project - with a header of `[projects.project-name]`
 

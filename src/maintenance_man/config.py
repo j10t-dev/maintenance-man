@@ -30,7 +30,8 @@ class UnknownProjectError(ProjectNotFoundError):
 def load_config(config_path: Path | None = None) -> MmConfig:
     """Load and validate config from a TOML file.
 
-    If config_path is None, reads from ~/.mm/config.toml (creating it if needed).
+    If config_path is None, reads config.toml from MM_HOME (default ~/.mm),
+    creating it if needed.
     Relative project paths are resolved against the config file's parent directory.
     """
     if config_path is None:
@@ -98,7 +99,7 @@ def _configured_project(config: MmConfig, name: str) -> ProjectConfig:
 
 
 def ensure_mm_home() -> None:
-    """Create ~/.mm/ and its skeleton config if missing."""
+    """Create MM_HOME (default ~/.mm) and its skeleton config if missing."""
     paths.mm_home().mkdir(parents=True, exist_ok=True)
 
     config_path = paths.config_path()

@@ -1,11 +1,15 @@
 """Where mm keeps its files under its home directory."""
 
+import os
 from pathlib import Path
 
 MM_HOME: Path = Path.home() / ".mm"
+if _home_override := os.environ.get("MM_HOME"):
+    MM_HOME = Path(_home_override).expanduser().resolve()
 
 
 def mm_home() -> Path:
+    """Return the state root, set by MM_HOME when this process starts."""
     return MM_HOME
 
 

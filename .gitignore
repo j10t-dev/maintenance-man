@@ -11,3 +11,8 @@ build/
 .serena/
 TODO
 TODO.md
+!.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/verify-mm/
