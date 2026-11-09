@@ -21,7 +21,7 @@ mm = "maintenance_man.cli:main"
 [dependency-groups]
 dev = [
     "import-linter==2.15",
-    "pytest==9.1.1",
+    "pytest==9.2.0",
     "ruff==0.15.20",
     "ty==0.0.84",
 ]
