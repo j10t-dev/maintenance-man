@@ -416,6 +416,7 @@ def test_given_two_clean_projects_when_batch_scanned_then_one_notice_names_both(
         "maintenance_man.services.scan.scan_project",
         lambda name, project, days: ScanResult(
             project=name,
+            package_manager=project.package_manager,
             scanned_at=datetime(2026, 1, 15, 12, tzinfo=UTC),
         ),
     )

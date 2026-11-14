@@ -10,6 +10,7 @@ from typing import NoReturn
 import pytest
 
 from maintenance_man.cli import main
+from maintenance_man.config import load_config
 from maintenance_man.models.scan import Failed, ScanResult, Workflow
 from maintenance_man.storage import save_scan_results
 from maintenance_man.vcs import JjRepository
@@ -104,11 +105,13 @@ def cli_deps(
         save_scan_results("vulnerable", scan_result)
 
     save_scan()
+    projects = load_config(mm_home / "config.toml").projects
     for project_name in project_paths:
         if project_name == "vulnerable":
             continue
         project_scan = deepcopy(scan_result)
         project_scan.project = project_name
+        project_scan.package_manager = projects[project_name].package_manager
         save_scan_results(project_name, project_scan)
     monkeypatch.setattr(processor_path, FakeFindingProcessor(outcomes))
     return CliDeps(scan_result, project_paths, save_scan)

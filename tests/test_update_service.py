@@ -29,7 +29,11 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.services import resolve as resolve_service
 from maintenance_man.services import update as update_service
-from maintenance_man.storage import load_scan_results, save_scan_results
+from maintenance_man.storage import (
+    CorruptScanResultsError,
+    load_scan_results,
+    save_scan_results,
+)
 from maintenance_man.vcs import JjRepository, RevisionError
 from tests.fakes import FakeFindingProcessor, RecordingEmit
 from tests.support.findings import (
@@ -133,6 +137,19 @@ def test_update_emits_processing_result_and_promotion_events(
     assert workspaces == [paths.workspaces_dir() / "api"]
     assert project == original
     assert not (paths.workspaces_dir() / "api").exists()
+
+
+def test_given_scan_saved_under_another_manager_when_loaded_then_corrupt(
+    tmp_path: Path,
+) -> None:
+    scan = make_scan_result(package_manager="bun")
+    _, project = seed_project(tmp_path, "api", scan)
+
+    with pytest.raises(CorruptScanResultsError) as raised:
+        _update_api(project)
+
+    assert raised.value.detail == "saved under bun, but the project is configured as uv"
+    assert load_scan_results("api") == scan
 
 
 def test_given_blocked_and_passing_rows_when_updating_then_passing_rows_promote(
@@ -538,7 +555,9 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
     web_repo = copy_jj_repository(web.path)
     write_file(web_repo, "package.json", "{}\n")
     commit_to_main(web_repo, "bun project")
-    scan = make_scan_result(vulns=[], updates=[make_update(pkg_name="pkg-a")])
+    scan = make_scan_result(
+        vulns=[], updates=[make_update(pkg_name="pkg-a")], package_manager="bun"
+    )
     scan.project = "web"
     save_scan_results("web", scan)
     monkeypatch.setattr(gradle, "run_gradle", catalogue_apply_task())

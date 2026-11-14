@@ -28,7 +28,11 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.services import WorkflowError
 from maintenance_man.services import resolve as resolve_service
-from maintenance_man.storage import load_scan_results, save_scan_results
+from maintenance_man.storage import (
+    CorruptScanResultsError,
+    load_scan_results,
+    save_scan_results,
+)
 from maintenance_man.vcs import JjRepository, RevisionError
 from tests.fakes import FakeFindingProcessor, RecordingEmit
 from tests.support.findings import (
@@ -281,6 +285,19 @@ def test_given_only_blocked_rows_when_resolving_then_repository_is_untouched(
     assert emit.events == expected_events
     assert operation_id(repo) == before
     assert not repo.bookmark_exists(bookmark=_BOOKMARK)
+
+
+def test_given_scan_saved_under_another_manager_when_loaded_then_corrupt(
+    tmp_path: Path,
+) -> None:
+    scan = make_scan_result(package_manager="bun")
+    _, project = seed_project(tmp_path, "api", scan)
+
+    with pytest.raises(CorruptScanResultsError) as raised:
+        _resolve(project)
+
+    assert raised.value.detail == "saved under bun, but the project is configured as uv"
+    assert load_scan_results("api") == scan
 
 
 @pytest.mark.parametrize(

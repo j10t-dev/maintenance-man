@@ -202,7 +202,9 @@ def _bun_project(
     write_file(repo, "package.json", "{}\n")
     commit_to_main(repo, "add manifest")
     scan = make_scan_result(
-        vulns=[], updates=[make_update(pkg_name=f"pkg-{x}") for x in packages]
+        vulns=[],
+        updates=[make_update(pkg_name=f"pkg-{x}") for x in packages],
+        package_manager="bun",
     )
     scan.project = name
     save_scan_results(name, scan)

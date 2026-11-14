@@ -59,6 +59,7 @@ def test_save_creates_directory_and_round_trips():
             json.dumps(
                 {
                     "project": "api",
+                    "package_manager": "uv",
                     "scanned_at": "2026-01-15T12:00:00Z",
                     "vulnerabilities": [],
                     "updates": [
@@ -78,6 +79,18 @@ def test_save_creates_directory_and_round_trips():
             ),
             "updates.0.update_status: Extra inputs are not permitted",
             id="old-shape",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "project": "api",
+                    "scanned_at": "2026-01-15T12:00:00Z",
+                    "vulnerabilities": [],
+                    "updates": [],
+                }
+            ),
+            "package_manager: Field required",
+            id="no-package-manager",
         ),
         pytest.param("[]", "Input should be an object", id="not-an-object"),
         pytest.param("{", "Invalid JSON", id="truncated-json"),

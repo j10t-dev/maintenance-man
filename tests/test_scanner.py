@@ -352,6 +352,8 @@ def test_given_manager_when_scanned_then_its_scanners_run(
     assert required == ["trivy"] * sum(argv[0] == "trivy" for argv in expected_commands)
     assert result.vulnerabilities == []
     assert result.secrets == ([_SECRET] if scan_secrets else [])
+    assert result.package_manager == manager
+    assert load_scan_results("demo").package_manager == manager
 
 
 @pytest.mark.integration

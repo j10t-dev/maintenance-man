@@ -102,6 +102,7 @@ def scan_project(
 
     scan_result = ScanResult(
         project=name,
+        package_manager=project.package_manager,
         scanned_at=utc_now(),
         vulnerabilities=vulns,
         secrets=secrets,

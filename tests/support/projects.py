@@ -85,6 +85,7 @@ def seed_gradle_project(tmp_path: Path, name: str, **overrides: Any) -> ProjectC
     scan = make_scan_result(
         vulns=[],
         updates=[make_update(pkg_name="room", gradle_target=make_gradle_target())],
+        package_manager="gradle",
     )
     scan.project = name
     save_scan_results(name, scan)

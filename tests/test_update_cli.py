@@ -161,7 +161,7 @@ def _use_real_mixed_processor(
 ) -> tuple[MagicMock, MagicMock]:
     from maintenance_man import updater
 
-    scan_result = make_scan_result()
+    scan_result = make_scan_result(package_manager="bun")
     scan_result.project = "outdated"
     save_scan_results(scan_result.project, scan_result)
     repo = JjRepository(deps.project_paths["outdated"])
@@ -285,6 +285,7 @@ def test_given_unreadable_update_bookmark_when_batch_updated_then_setup_error_no
         make_scan_result(
             vulns=[],
             updates=[make_update(state=Failed(flow=Workflow.UPDATE, phase="unit"))],
+            package_manager="bun",
         ),
     )
     fail_repository_method(

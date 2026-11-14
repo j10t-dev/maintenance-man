@@ -7,6 +7,8 @@ from typing import Annotated, Literal
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field
 
+from maintenance_man.models.config import PackageManager
+
 
 class Severity(StrEnum):
     """Declared from least to most severe."""
@@ -217,6 +219,7 @@ class ScanResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project: str
+    package_manager: PackageManager
     scanned_at: datetime
     vulnerabilities: list[VulnFinding] = []
     secrets: list[SecretFinding] = []

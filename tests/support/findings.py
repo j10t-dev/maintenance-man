@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
+from maintenance_man.models.config import PackageManager
 from maintenance_man.models.scan import (
     GradleMember,
     GradleUpdateTarget,
@@ -50,12 +51,15 @@ def make_scan_result(
     vulns: list[VulnFinding] | None = None,
     updates: list[UpdateFinding] | None = None,
     secrets: list[SecretFinding] | None = None,
+    *,
+    package_manager: PackageManager = "uv",
 ) -> ScanResult:
     """Build a saved scan with the supplied findings, or one vulnerability and one
     update by default and no secrets.
     """
     return ScanResult(
         project="vulnerable",
+        package_manager=package_manager,
         scanned_at=datetime.now(tz=UTC),
         vulnerabilities=vulns if vulns is not None else [make_vuln()],
         updates=updates if updates is not None else [make_update()],

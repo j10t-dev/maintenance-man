@@ -26,6 +26,7 @@ def _scanned_result(**overrides: object) -> ScanResult:
     return ScanResult.model_validate(
         {
             "project": _LONG_NAME,
+            "package_manager": "uv",
             "scanned_at": datetime(2026, 1, 15, 12, tzinfo=UTC),
         }
         | overrides

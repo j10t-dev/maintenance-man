@@ -51,6 +51,7 @@ def _build_home(scratch: Path) -> Path:
     )
     scan = ScanResult(
         project="api-gateway",
+        package_manager="uv",
         scanned_at=datetime.now(tz=UTC),
         vulnerabilities=[
             VulnFinding(

@@ -22,6 +22,7 @@ from maintenance_man.models.scan import (
 )
 from maintenance_man.services import WorkflowError
 from maintenance_man.storage import (
+    CorruptScanResultsError,
     NoScanResultsError,
     load_scan_results,
     save_scan_results,
@@ -47,6 +48,13 @@ def load_validated_scan(
     except NoScanResultsError:
         emit(ProjectSkipped(project, SkipReason.NO_SCAN_RESULTS))
         return None
+
+    if scan_result.package_manager != project_config.package_manager:
+        detail = (
+            f"saved under {scan_result.package_manager}, but the project is "
+            f"configured as {project_config.package_manager}"
+        )
+        raise CorruptScanResultsError(project, detail)
 
     _assert_no_conflicting_flow(scan_result, workflow, project)
 

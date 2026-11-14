@@ -92,6 +92,7 @@ def _scan_result_for(
 ) -> ScanResult:
     return ScanResult(
         project="demo",
+        package_manager=project_config.package_manager,
         scanned_at=datetime.now(tz=UTC),
         updates=updates,
     )
