@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
-from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from maintenance_man import paths
@@ -16,6 +15,7 @@ from maintenance_man.dependency_age import (
     PublicationSource,
     filter_registry_updates_by_age,
 )
+from maintenance_man.fix_versions import select_package_fixes
 from maintenance_man.gradle import (
     GRADLE_CATALOGUE_RELPATH,
     GradleError,
@@ -86,6 +86,7 @@ def scan_project(
                 secrets = _requested_secrets(project)
             case "uv":
                 vulns = _run_uv_audit(project_path)
+                _select_fixes(vulns, project)
                 secrets = _requested_secrets(project)
                 updates = _check_outdated(
                     project, vulns, min_version_age_days, publication
@@ -96,6 +97,7 @@ def scan_project(
                     project.scan_skip_dirs,
                     scanners="vuln,secret" if project.scan_secrets else "vuln",
                 )
+                _select_fixes(vulns, project)
                 updates = _check_outdated(
                     project, vulns, min_version_age_days, publication
                 )
@@ -205,7 +207,7 @@ def _check_outdated(
 ) -> list[UpdateFinding]:
     """Run the manager's outdated check and return aged, de-duplicated findings."""
     outdated, source = _OUTDATED[project.package_manager]
-    vuln_pkgs = {v.pkg_name for v in vulns}
+    vuln_pkgs = {v.pkg_name for v in vulns if v.actionable}
     eligible_updates = [u for u in outdated(project) if u.pkg_name not in vuln_pkgs]
     return filter_registry_updates_by_age(
         eligible_updates,
@@ -214,6 +216,23 @@ def _check_outdated(
         min_age_days=min_version_age_days,
         context=publication,
     )
+
+
+def _select_fixes(vulns: list[VulnFinding], project: ProjectConfig) -> None:
+    """Rewrite each advisory's fix to its package's target, or to none."""
+    by_package: dict[str, list[VulnFinding]] = {}
+    for vuln in vulns:
+        by_package.setdefault(vuln.pkg_name, []).append(vuln)
+    for group in by_package.values():
+        fixes: list[str | None] = [None] * len(group)
+        if len({vuln.installed_version for vuln in group}) == 1:
+            fixes = select_package_fixes(
+                group[0].installed_version,
+                [vuln.fixed_version for vuln in group],
+                project.package_manager,
+            )
+        for vuln, fix in zip(group, fixes, strict=True):
+            vuln.fixed_version = fix
 
 
 _OUTDATED: dict[
@@ -363,34 +382,12 @@ def _parse_uv_audit_vulns(output: str) -> list[VulnFinding]:
         elif current is None:
             continue
         elif match := _UV_AUDIT_FIXED_RE.match(line):
-            current.fixed_version = _select_fixed_version(
-                current.installed_version, match.group("versions")
-            )
+            current.fixed_version = match.group("versions")
         elif match := _UV_AUDIT_URL_RE.match(line):
             current.primary_url = match.group("url")
     if package is not None:
         _check_declared(package[0], declared, parsed)
     return findings
-
-
-def _select_fixed_version(installed: str, listed: str) -> str | None:
-    """Return a single listed version unchanged, else the lowest one above installed.
-
-    Several versions yield None when none is above it or it does not parse.
-    """
-    tokens = re.split(r",\s*", listed)
-    if len(tokens) == 1:
-        return listed
-    try:
-        installed_version = Version(installed)
-    except InvalidVersion:
-        return None
-    fixes: list[tuple[Version, str]] = []
-    for token in tokens:
-        with contextlib.suppress(InvalidVersion):
-            fixes.append((Version(token), token))
-    above_installed = sorted(fix for fix in fixes if fix[0] > installed_version)
-    return above_installed[0][1] if above_installed else None
 
 
 def _check_declared(package: str, declared: int, parsed: int) -> None:

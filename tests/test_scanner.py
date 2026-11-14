@@ -218,33 +218,19 @@ def test_given_uv_audit_advisory_with_unfamiliar_prefix_when_parsed_then_kept():
     ]
 
 
-@pytest.mark.parametrize(
-    ("installed", "fixed_in", "expected_fixed_version"),
-    [
-        pytest.param("1.26.5", "2.0.7, 1.26.18", "1.26.18", id="lowest-listed-last"),
-        pytest.param("1.26.5", "1.26.18, 2.0.7", "1.26.18", id="order-independent"),
-        pytest.param("1.25.0", "2.2.2, 2.0.7", "2.0.7", id="lowest-above-installed"),
-        pytest.param("3.0.0", "2.0.7, 1.26.18", None, id="nothing-above-installed"),
-        pytest.param("1.26.20", "1.26.18, 2.0.7", "2.0.7", id="no-downgrade"),
-        pytest.param("1.26.5", "1.26.18", "1.26.18", id="single-version-unchanged"),
-        pytest.param("1.26.5", "2.0.7,1.26.18", "1.26.18", id="unspaced-separator"),
-    ],
-)
-def test_given_uv_audit_advisory_with_fix_versions_when_parsed_then_one_is_stored(
-    installed, fixed_in, expected_fixed_version
-):
+def test_given_uv_audit_advisory_with_fix_versions_when_parsed_then_list_is_stored():
     output = (
-        f"urllib3 {installed} has 1 known vulnerability:\n\n"
+        "urllib3 1.26.5 has 1 known vulnerability:\n\n"
         "- GHSA-34jh-p97f-mpxf: Cookie header leaks on redirect\n\n"
-        f"  Fixed in: {fixed_in}\n"
+        "  Fixed in: 2.0.7, 1.26.18\n"
     )
 
     assert _parse_uv_audit_vulns(output) == [
         VulnFinding(
             vuln_id="GHSA-34jh-p97f-mpxf",
             pkg_name="urllib3",
-            installed_version=installed,
-            fixed_version=expected_fixed_version,
+            installed_version="1.26.5",
+            fixed_version="2.0.7, 1.26.18",
             severity=Severity.UNKNOWN,
             title="Cookie header leaks on redirect",
             description="Cookie header leaks on redirect",
@@ -1279,10 +1265,16 @@ def test_non_gradle_scan_filters_through_one_publication_context(
     assert filtered == [(source, tmp_path, 9, True)]
 
 
-def test_given_vulnerable_update_when_scanned_then_only_clean_is_looked_up_and_saved(
-    mm_home, tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("advisory_fix", "expected_updates"),
+    [
+        pytest.param("1.0.1", ["pkg-b"], id="actionable-advisory-suppresses"),
+        pytest.param("0.9", ["pkg-a", "pkg-b"], id="no-fix-above-installed-keeps"),
+    ],
+)
+def test_given_vulnerable_update_when_scanned_then_only_unfixable_ones_are_kept(
+    mm_home, tmp_path, monkeypatch, advisory_fix, expected_updates
 ):
-
     vulnerable, _, _ = scan_age_inputs(tmp_path)
     clean, _, _ = scan_age_inputs(tmp_path)
     raw_updates = [
@@ -1297,11 +1289,13 @@ def test_given_vulnerable_update_when_scanned_then_only_clean_is_looked_up_and_s
 
     def transport(url, repository, suffix):
         requested.append(suffix)
-        return pypi_body("pkg-b", "2.0"), {}, url
+        return pypi_body(suffix.split("/")[1], "2.0"), {}, url
 
     monkeypatch.setattr(dependency_age, "_publication_http", transport)
     monkeypatch.setattr(
-        scanner, "_run_uv_audit", lambda path: [make_vuln(pkg_name="pkg-a")]
+        scanner,
+        "_run_uv_audit",
+        lambda path: [make_vuln(pkg_name="pkg-a", fixed_version=advisory_fix)],
     )
     _stub_outdated(monkeypatch, lambda project: raw_updates)
     project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
@@ -1313,7 +1307,121 @@ def test_given_vulnerable_update_when_scanned_then_only_clean_is_looked_up_and_s
         clock=FakeClock(datetime(2026, 9, 18, tzinfo=UTC)),
     )
 
-    assert requested == ["pypi/pkg-b/2.0/json"]
+    assert sorted(requested) == [f"pypi/{name}/2.0/json" for name in expected_updates]
     assert [v.pkg_name for v in result.vulnerabilities] == ["pkg-a"]
-    assert [update.pkg_name for update in result.updates] == ["pkg-b"]
+    assert [update.pkg_name for update in result.updates] == expected_updates
     assert load_scan_results("demo").updates == result.updates
+
+
+def _stub_advisories(monkeypatch, vulnerabilities: list[VulnFinding]) -> None:
+    monkeypatch.setattr(scanner, "_run_uv_audit", lambda _path: vulnerabilities)
+    monkeypatch.setattr(
+        scanner, "_run_trivy_scan", lambda *args, **kwargs: (vulnerabilities, [])
+    )
+    _stub_outdated(monkeypatch, lambda _project: [])
+
+
+def _advisories(pkg_name: str, installed: str, *fix_lists: str) -> list[VulnFinding]:
+    return [
+        make_vuln(
+            vuln_id=f"CVE-{index}",
+            pkg_name=pkg_name,
+            installed_version=installed,
+            fixed_version=fix_list,
+        )
+        for index, fix_list in enumerate(fix_lists, start=1)
+    ]
+
+
+@pytest.mark.parametrize("manager", ["bun", "mvn"])
+@pytest.mark.parametrize(
+    ("pkg_name", "installed", "fix_lists", "expected_fixes"),
+    [
+        pytest.param(
+            "jackson",
+            "2.13.0",
+            ("2.12.7.1, 2.13.4.2", "2.13.2.1"),
+            ["2.13.4.2", "2.13.4.2"],
+            id="list-between-fixes",
+        ),
+        pytest.param(
+            "jackson",
+            "2.14.0",
+            ("2.12.7.1, 2.13.4.2",),
+            [None],
+            id="above-every-fix",
+        ),
+        pytest.param(
+            "guava", "31.1-jre", ("32.0.0-android",), [None], id="qualifier-differs"
+        ),
+        pytest.param(
+            "netty",
+            "4.1.94.Final",
+            ("4.1.100.Final",),
+            ["4.1.100.Final"],
+            id="qualifier-matches",
+        ),
+    ],
+)
+def test_given_trivy_fix_lists_when_scanned_then_one_known_fix_is_saved(
+    mm_home,
+    tmp_path,
+    monkeypatch,
+    manager,
+    pkg_name,
+    installed,
+    fix_lists,
+    expected_fixes,
+):
+    _stub_advisories(monkeypatch, _advisories(pkg_name, installed, *fix_lists))
+    project = ProjectConfig(path=tmp_path, package_manager=manager, scan_secrets=False)
+
+    result = scan_project("demo", project)
+
+    assert [v.fixed_version for v in result.vulnerabilities] == expected_fixes
+
+
+@pytest.mark.parametrize("manager", ["uv", "bun", "mvn"])
+def test_given_package_at_two_installed_versions_when_scanned_then_no_fix_is_saved(
+    mm_home, tmp_path, monkeypatch, manager
+):
+    _stub_advisories(
+        monkeypatch,
+        [
+            *_advisories("lodash", "1.0.0", "1.0.1"),
+            *_advisories("lodash", "2.0.0", "2.0.1"),
+        ],
+    )
+    project = ProjectConfig(path=tmp_path, package_manager=manager, scan_secrets=False)
+
+    result = scan_project("demo", project)
+
+    assert [v.fixed_version for v in result.vulnerabilities] == [None, None]
+
+
+def test_given_uv_fix_lists_when_scanned_then_every_advisory_gets_the_target(
+    mm_home, tmp_path, monkeypatch
+):
+    _stub_advisories(
+        monkeypatch,
+        _advisories(
+            "urllib3",
+            "1.24.1",
+            "1.24.2",
+            "2.0.7, 1.26.18",
+            "1.26.19, 2.2.2",
+            "2.8.0",
+            "1.24.3",
+            "1.25.9",
+            "2.0.6, 1.26.17",
+            "2.5.0",
+            "2.6.0",
+            "2.6.3",
+            "2.7.0",
+        ),
+    )
+    project = ProjectConfig(path=tmp_path, package_manager="uv", scan_secrets=False)
+
+    result = scan_project("demo", project)
+
+    assert [v.fixed_version for v in result.vulnerabilities] == ["2.8.0"] * 11

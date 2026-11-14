@@ -1,7 +1,7 @@
 import functools
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
@@ -58,7 +58,6 @@ from maintenance_man.models.scan import (
     UpdateFinding,
     UpdateResult,
     VulnFinding,
-    highest_fix_version,
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import OutdatedCheckError
@@ -1024,12 +1023,8 @@ def resolve(
 
 
 def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
-    wins = _selected_fix_versions(result.vulnerabilities)
     found = [
-        *(
-            _vulnerability_row(vuln, wins)
-            for vuln in sort_vulns_by_severity(result.vulnerabilities)
-        ),
+        *map(_vulnerability_row, sort_vulns_by_severity(result.vulnerabilities)),
         *map(_secret_row, result.secrets),
         *map(_update_row, result.updates),
     ]
@@ -1054,28 +1049,13 @@ def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> No
         output.notice(f"Scanned {result.project} in {elapsed_s:.1f}s")
 
 
-def _selected_fix_versions(vulnerabilities: list[VulnFinding]) -> dict[str, str]:
-    """For packages with several actionable fixes, the one version that fixes all."""
-    groups = defaultdict(list)
-    for vuln in vulnerabilities:
-        if vuln.actionable:
-            groups[vuln.pkg_name].append(vuln)
-    return {
-        package: highest_fix_version(group)
-        for package, group in groups.items()
-        if len(group) > 1
-    }
-
-
 type _FindingRow = tuple[list[str | Text], list[str]]
 
 
-def _vulnerability_row(vuln: VulnFinding, wins: dict[str, str]) -> _FindingRow:
+def _vulnerability_row(vuln: VulnFinding) -> _FindingRow:
     kind = "vuln" if vuln.actionable else "advisory"
     blocked = isinstance(vuln.state, GradleBlock)
     reason = vuln.state.reason if blocked else ""
-    if vuln.fixed_version and wins.get(vuln.pkg_name) == vuln.fixed_version:
-        reason = " · ".join(filter(None, ["selected fix", reason]))
     versions = (
         f"{vuln.installed_version} → {vuln.fixed_version}"
         if vuln.fixed_version

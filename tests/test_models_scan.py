@@ -13,7 +13,6 @@ from maintenance_man.models.scan import (
     Severity,
     VulnFinding,
     Workflow,
-    highest_fix_version,
     sort_vulns_by_severity,
 )
 from maintenance_man.outdated import classify_semver
@@ -90,25 +89,6 @@ def test_given_vulnerabilities_when_sorted_then_severity_groups_then_fix_descend
     vulns, expected
 ):
     assert [v.vuln_id for v in sort_vulns_by_severity(vulns)] == expected
-
-
-@pytest.mark.parametrize(
-    "versions, expected",
-    [
-        (["2.0.0", "10.0.0", "1.5"], "10.0.0"),
-        (["1.0", "bad", "2.0"], "2.0"),
-        (["bad-first", "bad-last"], "bad-first"),
-        ([None, "bad"], "bad"),
-        ([None], ""),
-        (["2.31.0", "2.32.4", "2.32.0"], "2.32.4"),
-        (["1.0.1"], "1.0.1"),
-        (["not-a-version", "2.0.0"], "2.0.0"),
-        (["2.0.0", "not-a-version"], "2.0.0"),
-    ],
-)
-def test_highest_fix_version(versions, expected):
-    vulns = [make_vuln(fixed_version=v) for v in versions]
-    assert highest_fix_version(vulns) == expected
 
 
 def test_findings_lists_vulnerabilities_then_updates():

@@ -706,7 +706,7 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
     if failure:
         processor_vcs["phase"].side_effect = ProcessError("unit failed")
     vulns = [
-        make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.31.0"),
+        make_vuln(vuln_id="CVE-1", pkg_name="requests", fixed_version="2.32.4"),
         make_vuln(vuln_id="CVE-2", pkg_name="requests", fixed_version="2.32.4"),
     ]
     scan = _scan_result_for(project_config, [])
@@ -717,6 +717,50 @@ def test_grouped_vulnerability_result_is_persisted_for_every_original(
     assert [(result.kind, result.passed) for result in results] == [("vuln", passed)]
     saved = load_scan_results("demo")
     assert [finding.state for finding in saved.vulnerabilities] == [state, state]
+
+
+@pytest.mark.parametrize(
+    "selected",
+    [(0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)],
+)
+def test_given_selected_advisories_when_processed_then_only_they_are_ready(
+    selected: tuple[int, ...],
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+):
+    vulns = [
+        make_vuln(
+            vuln_id=vuln_id,
+            pkg_name="requests",
+            fixed_version="2.32.4",
+            state=_UPDATE_FAILED_UNIT,
+        )
+        for vuln_id in ("CVE-1", "CVE-2", "CVE-3")
+    ]
+    scan = _scan_result_for(project_config, [])
+    scan.vulnerabilities = vulns
+
+    groups = group_findings([vulns[index] for index in selected])
+    _process(groups, project_config, processor_vcs, scan=scan)
+
+    assert [group.target_version for group in groups] == ["2.32.4"]
+    assert [finding.state for finding in load_scan_results("demo").vulnerabilities] == [
+        _UPDATE_READY if index in selected else _UPDATE_FAILED_UNIT
+        for index in range(3)
+    ]
+
+
+def test_given_advisories_of_one_package_with_different_fixes_when_grouped_then_error():
+    vulns = [
+        make_vuln(vuln_id="CVE-1", fixed_version="1.0.1"),
+        make_vuln(vuln_id="CVE-2", fixed_version="1.0.2"),
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"^some-pkg advisories hold different fixes: 1\.0\.1, 1\.0\.2$",
+    ):
+        group_findings(vulns)
 
 
 def _group_summary(findings):
@@ -788,7 +832,7 @@ def _group_summary(findings):
         pytest.param(
             [
                 make_update(SemverTier.MAJOR),
-                make_vuln(vuln_id="CVE-1", fixed_version="1.0.1"),
+                make_vuln(vuln_id="CVE-1", fixed_version="1.0.2"),
                 make_vuln(vuln_id="CVE-2", fixed_version="1.0.2"),
                 make_vuln(
                     vuln_id="CVE-3",

@@ -30,7 +30,6 @@ from maintenance_man.models.scan import (
     UpdateResult,
     VulnFinding,
     Workflow,
-    highest_fix_version,
 )
 from maintenance_man.package_managers import UpdateCommandError, update_commands
 from maintenance_man.process import ProcessError, run_logged, run_shell_command
@@ -75,7 +74,8 @@ class FindingGroup:
 
 
 def consolidate_vulns(vulns: list[VulnFinding]) -> list[FindingGroup]:
-    """Group actionable vulns by package and pick the highest fix version."""
+    """One group per package, targeting the fix its advisories share. Raises
+    ValueError when a package's advisories hold different fixes."""
     by_pkg: dict[str, list[VulnFinding]] = {}
     for v in vulns:
         by_pkg.setdefault(v.pkg_name, []).append(v)
@@ -85,11 +85,19 @@ def consolidate_vulns(vulns: list[VulnFinding]) -> list[FindingGroup]:
             group,
             pkg_name=pkg,
             installed_version=group[0].installed_version,
-            target_version=highest_fix_version(group),
+            target_version=_shared_fix(pkg, group),
             detail=", ".join(v.vuln_id for v in group),
         )
         for pkg, group in by_pkg.items()
     ]
+
+
+def _shared_fix(pkg: str, group: list[VulnFinding]) -> str:
+    fixes = {v.target_version for v in group}
+    if len(fixes) > 1:
+        msg = f"{pkg} advisories hold different fixes: {', '.join(sorted(fixes))}"
+        raise ValueError(msg)
+    return fixes.pop()
 
 
 def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:

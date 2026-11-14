@@ -115,14 +115,14 @@ def _scan(
                         installed_version="2.25.0",
                         fixed_version=fixed,
                     )
-                    for vuln_id, fixed in (("CVE-OLD", "2.31.0"), ("CVE-NEW", "2.32.4"))
+                    for vuln_id, fixed in (("CVE-OLD", "2.32.4"), ("CVE-NEW", "2.32.4"))
                 ]
             ),
             [
-                "vuln\trequests\t2.25.0\t2.32.4\tHIGH\tCVE-NEW\t-\tfixed\tselected fix",
-                "vuln\trequests\t2.25.0\t2.31.0\tHIGH\tCVE-OLD\t-\tfixed\t-",
+                "vuln\trequests\t2.25.0\t2.32.4\tHIGH\tCVE-OLD\t-\tfixed\t-",
+                "vuln\trequests\t2.25.0\t2.32.4\tHIGH\tCVE-NEW\t-\tfixed\t-",
             ],
-            id="selected-fix-marks-the-highest-version",
+            id="one-package-shows-one-fix",
         ),
         pytest.param(
             _scan(

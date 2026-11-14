@@ -252,16 +252,6 @@ def _fix_version_key(v: VulnFinding) -> Version:
         return Version("0")
 
 
-def highest_fix_version(vulns: list[VulnFinding]) -> str:
-    """Return the ``fixed_version`` of the first finding with the highest version.
-
-    Missing and unparsable versions rank as ``0``. When that finding has no
-    ``fixed_version``, fall back to the last finding's, then ``""``.
-    """
-    best = max(vulns, key=_fix_version_key)
-    return best.fixed_version or vulns[-1].fixed_version or ""
-
-
 def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
     """Sort by package (grouped), with groups ordered by worst severity.
 
