@@ -39,6 +39,26 @@ def test_given_unpromoted_main_when_checking_update_then_proof_is_rejected(
         verification._assert_updated(tmp_path)
 
 
+@pytest.mark.parametrize("journey", ["update", "recovery", "noop"])
+def test_given_journey_argument_when_driving_then_that_journey_is_driven(
+    monkeypatch: pytest.MonkeyPatch, journey: str
+) -> None:
+    run = Path("/tmp/verify-mm-journey-argument")
+    driven: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        "sys.argv", ["verify.py", "drive", str(run), "--journey", journey]
+    )
+    monkeypatch.setattr(verification, "_require_owned", lambda _run: None)
+    monkeypatch.setattr(verification, "_set_environment", lambda _run: None)
+    monkeypatch.setattr(
+        verification, "_drive", lambda *arguments: driven.append(arguments)
+    )
+
+    verification.main()
+
+    assert driven == [(run, journey)]
+
+
 @pytest.mark.parametrize("existing", ["before.json", "verdict.json"])
 def test_given_consumed_run_when_driving_again_then_evidence_is_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: str

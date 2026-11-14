@@ -61,8 +61,10 @@ from tests.support.repository import (
     commit_descriptions,
     commit_to_main,
     copy_jj_repository,
+    describe,
     fail_repository_method,
     operation_id,
+    write_file,
 )
 
 _ROOM = make_gradle_target()
@@ -539,22 +541,95 @@ def test_given_passing_findings_when_processed_then_each_is_committed_and_bookma
     )
 
 
-@pytest.mark.parametrize("flow", [Workflow.UPDATE, Workflow.RESOLVE])
-def test_already_applied_is_ready_without_a_commit(
+@pytest.mark.parametrize(
+    ("flow", "already_uncommitted", "describes"),
+    [
+        pytest.param(Workflow.UPDATE, False, False, id="update"),
+        pytest.param(Workflow.UPDATE, True, False, id="update-already-uncommitted"),
+        pytest.param(Workflow.RESOLVE, False, False, id="resolve"),
+        pytest.param(Workflow.RESOLVE, True, False, id="resolve-already-uncommitted"),
+        pytest.param(Workflow.UPDATE, False, True, id="update-description-only"),
+    ],
+)
+def test_given_package_commands_changing_no_files_when_processed_then_apply_fails(
     flow: Workflow,
+    already_uncommitted: bool,
+    describes: bool,
     processor_vcs: ProcessorDeps,
     project_config: ProjectConfig,
 ):
-    processor_vcs["package"].side_effect = lambda cmd, cwd, **kwargs: completed(
-        cmd, returncode=0, stdout="", stderr=""
-    )
+    repo = processor_vcs["repo"]
+
+    def run_package(cmd, cwd, **kwargs):
+        if describes:
+            describe(repo, "changed by the command")
+        return completed(cmd, returncode=0, stdout="", stderr="")
+
+    processor_vcs["package"].side_effect = run_package
+    if already_uncommitted:
+        write_file(repo, "local.txt", "left by an earlier step\n")
     update = make_update()
+    emit = RecordingEmit()
 
-    results = _process([update], project_config, processor_vcs, flow=flow)
+    results = _process([update], project_config, processor_vcs, flow=flow, emit=emit)
 
-    assert results[0].passed is True
-    assert update.state == Ready(flow=flow)
-    assert commit_descriptions(processor_vcs["repo"], "main..@-") == []
+    assert results[0].passed is False
+    assert results[0].failed_phase == "apply"
+    assert update.state == Failed(flow=flow, phase="apply")
+    assert emit.of_type(FindingStepFailed) == [
+        FindingStepFailed(
+            "package command",
+            "Package commands for pkg-a changed no files; it may be transitive or "
+            "already at 1.0.1. Run mm scan again.",
+        )
+    ]
+    assert processor_vcs["phase"].call_count == 0
+    assert commit_descriptions(repo, "main..@-") == []
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_package_calls", "expected_dep"),
+    [
+        pytest.param("resolve_revision", 0, "version=1\n", id="read-before"),
+        pytest.param(
+            "has_file_changes_since", 1, "version=1\npkg-a@1.0.1\n", id="comparison"
+        ),
+    ],
+)
+def test_given_jj_failure_when_checking_for_file_changes_then_nothing_is_discarded(
+    method: str,
+    expected_package_calls: int,
+    expected_dep: str,
+    processor_vcs: ProcessorDeps,
+    project_config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = processor_vcs["repo"]
+    fail_repository_method(monkeypatch, repo.path, method, RevisionError("jj failed"))
+    discard = MagicMock()
+    monkeypatch.setattr(JjRepository, "discard", discard)
+    emit = RecordingEmit()
+
+    results = _process(
+        [make_update(), make_update(SemverTier.MINOR)],
+        project_config,
+        processor_vcs,
+        emit=emit,
+    )
+
+    assert [(result.passed, result.failed_phase) for result in results] == [
+        (False, "apply")
+    ]
+    assert emit.of_type(FindingStepFailed) == [
+        FindingStepFailed("inspect", "jj failed")
+    ]
+    assert [row.state for row in load_scan_results("demo").updates] == [
+        _UPDATE_FAILED_APPLY,
+        None,
+    ]
+    assert discard.call_count == 0
+    assert processor_vcs["package"].call_count == expected_package_calls
+    assert (repo.path / "dep.txt").read_text(encoding="utf-8") == expected_dep
 
 
 @pytest.mark.parametrize(
@@ -957,7 +1032,9 @@ def test_given_saved_target_when_applied_then_outcome_matches_catalogue_state(
 
     [group] = group_findings([make_update(pkg_name="room", gradle_target=_ROOM)])
 
-    outcome = apply_finding(gradle_project, group, emit=emit)
+    outcome = apply_finding(
+        gradle_project, group, JjRepository(Path(gradle_project.path)), emit=emit
+    )
 
     assert outcome == expected
     assert runner.call_count == commands

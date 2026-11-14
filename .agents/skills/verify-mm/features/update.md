@@ -24,6 +24,7 @@ Preconditions: a fresh launched run with the saved `mm-proof-dep` update, local 
 - Choose and cancel: `uv run python .agents/skills/verify-mm/scripts/verify.py drive "$MM_VERIFY_RUN"`. The first PTY sends `invalid`, requires `Invalid selection: invalid`, then sends `none`. `before.json` and `cancelled.json` must agree on scan, dependencies, lock and main/origin IDs; no test log exists yet.
 - Apply: the same command starts a second `mm update fixture`, sends `1` at `Select updates` and requires exit `0`. `update.terminal.txt` records the selected package and promotion. `test-runs.jsonl` records `1.0.1` from the throwaway workspace. `updated.json` has the committed new manifest, changed main, empty update rows and no registered fixture workspace; the peer still sees the old origin main.
 - Confirm installation: the helper runs the real configured test from the promoted project before syncing. Its action record must exit `0` with installed version `1.0.1`.
+- A package-command apply that changes no files fails in `apply`: on a fresh launch, `uv run python .agents/skills/verify-mm/scripts/verify.py drive "$MM_VERIFY_RUN" --journey noop`. The helper commits `mm-proof-dep==1.0.1` to local main first, then selects `1`. `update-noop.terminal.txt` must hold `changed no files` and the run must exit `4`. `update-noop.json` has the saved state `failed/update/apply` and the main recorded before the update.
 
 ## Gotchas
 

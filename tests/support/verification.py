@@ -32,7 +32,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("launch", "doctor", "drive", "cleanup"))
     parser.add_argument("run", type=Path)
-    parser.add_argument("--journey", choices=("update", "recovery"), default="update")
+    parser.add_argument(
+        "--journey", choices=("update", "recovery", "noop"), default="update"
+    )
     arguments = parser.parse_args()
     run = arguments.run.absolute()
     _validate_run_path(run)
@@ -221,25 +223,31 @@ def _drive(run: Path, journey: str) -> None:
         _pty_command(run, "picker-cancel", ["update", "fixture"], ["invalid", "none"])
         _snapshot(run, "cancelled")
         _assert_cancelled(run)
-        if journey == "recovery":
-            _drive_recovery(run)
+        if journey == "noop":
+            _drive_noop(run)
         else:
-            _pty_command(run, "update", ["update", "fixture"], ["1"])
-        _snapshot(run, "updated")
-        _assert_updated(run)
-        _pty_command(run, "sync", ["sync", "fixture"], [])
-        _jj(run, "project-peer", "git", "fetch", "--remote", "origin")
-        _snapshot(run, "synced")
-        assert _revision(run, "project-peer", "main@origin") == _saved_main(
-            run, "updated"
-        )
+            _drive_promotion(run, journey)
         _write_json(
             run / "evidence" / "verdict.json", {"verdict": "PROVED", "journey": journey}
         )
     except BaseException:
         _cleanup(run)
         raise
-    print(f"PROVED {journey}, picker cancellation and local sync: {run / 'evidence'}")
+    proved = "the failed no-op apply" if journey == "noop" else "local sync"
+    print(f"PROVED {journey}, picker cancellation and {proved}: {run / 'evidence'}")
+
+
+def _drive_promotion(run: Path, journey: str) -> None:
+    if journey == "recovery":
+        _drive_recovery(run)
+    else:
+        _pty_command(run, "update", ["update", "fixture"], ["1"])
+    _snapshot(run, "updated")
+    _assert_updated(run)
+    _pty_command(run, "sync", ["sync", "fixture"], [])
+    _jj(run, "project-peer", "git", "fetch", "--remote", "origin")
+    _snapshot(run, "synced")
+    assert _revision(run, "project-peer", "main@origin") == _saved_main(run, "updated")
 
 
 def _assert_cancelled(run: Path) -> None:
@@ -281,6 +289,26 @@ def _drive_recovery(run: Path) -> None:
     (project / "repair.txt").write_text("synthetic compatibility repair\n")
     _jj(run, "project", "commit", "-m", "repair synthetic dependency compatibility")
     _pty_command(run, "resolve-continue", ["resolve", "fixture", "--continue"], [])
+
+
+def _drive_noop(run: Path) -> None:
+    project = run / "state" / "project"
+    _command(run, "apply-by-hand", ["uv", "add", "mm-proof-dep==1.0.1"], cwd=project)
+    _jj(run, "project", "commit", "-m", "apply the saved update by hand")
+    _jj(run, "project", "bookmark", "set", "main", "-r", "@-")
+    before = _revision(run, "project", "main")
+    _pty_command(run, "update-noop", ["update", "fixture"], ["1"], expected=4)
+    _snapshot(run, "update-noop")
+    transcript = (run / "evidence" / "update-noop.terminal.txt").read_text()
+    assert "changed no files" in transcript, transcript
+    scan = _read_scan(run)
+    assert scan.updates[0].state is not None
+    assert scan.updates[0].state.model_dump() == {
+        "lifecycle": "failed",
+        "flow": "update",
+        "phase": "apply",
+    }
+    assert _revision(run, "project", "main") == before
 
 
 def _assert_updated(run: Path) -> None:

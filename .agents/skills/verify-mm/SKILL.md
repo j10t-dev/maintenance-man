@@ -52,15 +52,23 @@ uv run python .agents/skills/verify-mm/scripts/verify.py drive "$MM_VERIFY_RUN" 
 
 This journey makes the synthetic project's compatibility test require `repair.txt`, selects the real update and requires exit `4` with a saved failed `unit` phase and unchanged main. `mm resolve fixture` must also exit `4` with the saved state `failed/resolve/unit` and the failed changes present. The helper writes and commits the synthetic repair through jj, then runs `mm resolve fixture --continue`. It requires promotion, an empty pending scan, successful installed-version tests and local sync. These fixture commits and pushes affect only the disposable repositories.
 
-Each launch supports one drive. Reusing a completed scan is not a second proof. Both journeys require `PROVED ...` and `evidence/verdict.json`. A failed launch or drive removes its owned scratch state automatically and retains diagnostic evidence. Inspect the failed command and terminal transcript, fix the cause, then launch a new path.
+For an apply that changes no files, use a separate fresh launch and substitute:
+
+```sh
+uv run python .agents/skills/verify-mm/scripts/verify.py drive "$MM_VERIFY_RUN" --journey noop
+```
+
+This journey runs `uv add mm-proof-dep==1.0.1` in the synthetic project, commits it through jj and moves local `main` onto it, so the saved `1.0.0` to `1.0.1` update is already applied. It selects the update and requires exit `4`, `changed no files` in the transcript, the saved state `failed/update/apply` and local `main` unchanged. It records no updated state and runs no sync.
+
+Each launch supports one drive. Reusing a completed scan is not a second proof. All three journeys require `PROVED ...` and `evidence/verdict.json`. A failed launch or drive removes its owned scratch state automatically and retains diagnostic evidence. Inspect the failed command and terminal transcript, fix the cause, then launch a new path.
 
 ## Evidence
 
 Evidence lives at `"$MM_VERIFY_RUN/evidence"`, beside `state/`, which cleanup removes. Capture these files when reporting a proof:
 
 - `actions.jsonl`: exact commands, working directories, stdout/stderr and exit codes for captured commands; PTY PIDs, prompt replies, expected/actual exit and reaped PIDs for interactive commands.
-- `picker-cancel.terminal.txt`, `update.terminal.txt` and `sync.terminal.txt`: real merged PTY streams, including input echo. Recovery uses `update-fails`, `resolve-pauses` and `resolve-continue` transcripts instead of `update`.
-- `baseline.json`, `before.json`, `cancelled.json`, `updated.json`, `synced.json`: saved scan, manifest, lock, manifest committed on main, local/remote commit IDs, bookmarks and registered workspaces. Recovery also captures `update-failed.json` and `resolve-paused.json`.
+- `picker-cancel.terminal.txt`, `update.terminal.txt` and `sync.terminal.txt`: real merged PTY streams, including input echo. Recovery uses `update-fails`, `resolve-pauses` and `resolve-continue` transcripts instead of `update`. No-op uses `update-noop` instead of `update` and `sync`.
+- `baseline.json`, `before.json`, `cancelled.json`, `updated.json`, `synced.json`: saved scan, manifest, lock, manifest committed on main, local/remote commit IDs, bookmarks and registered workspaces. Recovery also captures `update-failed.json` and `resolve-paused.json`. No-op captures `update-noop.json` instead of `updated.json` and `synced.json`.
 - `test-runs.jsonl`: actual installed package versions and test working directories, including the throwaway mm update workspace.
 - `doctor.json`, `verdict.json`, `cleanup.json`: instance health, journey verdict and retained artefacts after teardown.
 

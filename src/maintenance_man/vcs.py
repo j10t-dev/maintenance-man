@@ -169,6 +169,14 @@ class JjRepository:
     def has_changes(self) -> bool:
         return bool(self._run(["diff", "--summary"]).stdout.strip())
 
+    def has_file_changes_since(self, *, revision: str) -> bool:
+        """Whether the working copy's files differ from *revision*'s.
+
+        Snapshots the working copy. Raises RevisionError when jj fails.
+        """
+        args = ["diff", "--from", revision, "--to", "@", "--summary"]
+        return bool(self._run(args).stdout.strip())
+
     def set_bookmark(
         self, *, bookmark: str, revision: str, allow_backwards: bool = False
     ) -> None:

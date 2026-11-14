@@ -36,7 +36,9 @@ mm update -n api worker   # batch update all except api and worker
 mm update api -n worker   # same exclusion mode; flag position does not matter
 ```
 
-`mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed.
+`mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed. `mm scan` also fails a project when `bun outdated`, Maven or `uv audit` output is not in a shape mm recognises, or when `uv audit` reports a different number of advisories than mm read.
+
+mm saves one fix per package. For each advisory it takes the lowest listed fix above the installed version, and for the package the highest of those. That version is saved only on the advisories it is known to fix, meaning it equals one of the advisory's listed fixes or is at or above every one of them. Versions are compared only when their qualifiers match, such as `-jre` or `.Final`; uv versions follow PEP 440. An advisory mm cannot fix is listed without a fix. Completing an advisory is provisional: the next `mm scan` is the proof.
 
 `mm update` and `mm resolve` require jj.
 
@@ -75,15 +77,15 @@ When stdout is redirected, records are headerless TSV. Warnings, prompts, errors
 | Outcome (`update`, `resolve`, `build`, `test`, `deploy`, `sync`) | project, operation, status, subject, installed, target, reason |
 | `mm todo` | project, line_number, text |
 
-Timestamps use exact ISO 8601 in pipes and short relative values on a terminal. Unknown counts use `-`; known empty counts use `0`. Other absent values use `-`, with explicit reasons such as `never` or `not deployable` where relevant. TSV fields escape backslash, tab, carriage return and newline as `\\`, `\t`, `\r` and `\n`; other ASCII and C1 controls use `\xNN`, and Unicode line/paragraph separators use `\u2028`/`\u2029`. Bracketed text is literal. The reason field is human-readable explanation and may include `selected fix` for the chosen advisory fix.
+Timestamps use exact ISO 8601 in pipes and short relative values on a terminal. Unknown counts use `-`; known empty counts use `0`. Other absent values use `-`, with explicit reasons such as `never` or `not deployable` where relevant. TSV fields escape backslash, tab, carriage return and newline as `\\`, `\t`, `\r` and `\n`; other ASCII and C1 controls use `\xNN`, and Unicode line/paragraph separators use `\u2028`/`\u2029`. Bracketed text is literal. The reason field is a human-readable explanation.
 
 A passed package update and promotion to local main are separate outcomes. A failed build records deployment as skipped.
 
 ## Breaking changes and upgrading
 
-`mm update` and `mm resolve` no longer open pull requests or need `gh`; resolve promotes to local `main`. A project without a configured test phase now fails `mm update` with exit code 4 instead of warning. `mm resolve --continue` with no saved failure exits 1. `mm scan` no longer prunes bookmarks. Saved scans gain `resolve_repair_base` and Gradle blocked rows. Saved scans hold one lifecycle state per finding, and mm refuses as corrupt a scan with findings saved by an earlier version.
+`mm update` and `mm resolve` no longer open pull requests or need `gh`; resolve promotes to local `main`. A project without a configured test phase now fails `mm update` with exit code 4 instead of warning. `mm resolve --continue` with no saved failure exits 1. `mm scan` no longer prunes bookmarks. Saved scans gain `resolve_repair_base` and Gradle blocked rows. Saved scans hold one lifecycle state per finding and record the package manager they were taken with. mm refuses as corrupt scan results any scan saved by an earlier version, and any scan taken under a manager other than the project's, until `mm scan <project>` replaces it.
 
-Before the first `mm update` or `mm resolve` after upgrading, run `mm scan` for every project, or delete its saved scan under `~/.mm/scan-results`. `mm update` and `mm resolve` report an older scan as `corrupt scan results` and name the command to run; `mm list` skips it with a warning. Rescanning also replaces Gradle targets that the previous engine never age-checked or validated. If the old pull-request flow left a pull request open, merge or close it before rescanning. `~/.mm/gradle-runs` and `~/.mm/gradle-contexts` are unused and can be deleted.
+Finish or abandon a paused `mm resolve` before upgrading, because its saved state goes with the old scan. Before the first `mm update` or `mm resolve` after upgrading, run `mm scan` for every project, or delete its saved scan under `~/.mm/scan-results`. `mm update` and `mm resolve` report an older scan as `corrupt scan results` and name the command to run; `mm list` skips it with a warning. Rescanning also replaces Gradle targets that the previous engine never age-checked or validated. If the old pull-request flow left a pull request open, merge or close it before rescanning. `~/.mm/gradle-runs` and `~/.mm/gradle-contexts` are unused and can be deleted.
 
 ## Application contract 
 
@@ -209,6 +211,8 @@ Configured projects are expected to be colocated jj/Git repositories with an `or
 
 `mm resolve` takes over pending update work on `mm/resolve-dependencies` in the project directory, applies the next failed finding and stops at a failure with its changes in place. Commit the repair, then run `mm resolve PROJECT --continue` to test it without reapplying the update. When every finding passes, resolve promotes to local `main` like update.
 
+In both flows, on bun, mvn and uv projects, a package command that changes no files fails the finding in `apply`. On Maven this is what a transitive-only package does. On Gradle, a catalogue target that is already applied still passes without a commit.
+
 `mm sync` fetches and pushes the `main` bookmark directly. It does not switch branches or depend on Git checkout state.
 
 ## Requirements
@@ -225,6 +229,8 @@ Configured projects are expected to be colocated jj/Git repositories with an `or
 * Python - `uv`
 * Typescript / Javascript - `bun`
 * Kotlin / Android - `gradle`
+
+For bun, mm fixes and updates only packages the root `package.json` declares once, in `dependencies` or `devDependencies`, with a registry version range and no entry in `optionalDependencies`, `peerDependencies`, `overrides` or `resolutions`. Workspace members, nested copies, and `file:`, `link:`, `workspace:`, alias, Git and URL sources are reported without a fix.
 
 ## Contributing 
 

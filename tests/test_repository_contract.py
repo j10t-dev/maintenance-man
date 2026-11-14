@@ -53,6 +53,30 @@ def test_given_working_copy_when_inspected_then_only_a_blank_change_is_blank(
     assert repo.is_blank_working_copy() is expected
 
 
+@pytest.mark.parametrize("already_uncommitted", [False, True])
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [("nothing", False), ("describe", False), ("edit", True)],
+)
+def test_given_revision_when_files_compared_then_only_file_edits_count(
+    repository_case: RepositoryCase,
+    already_uncommitted: bool,
+    action: str,
+    expected: bool,
+) -> None:
+    c = repository_case
+    if already_uncommitted:
+        write_file(c.repo, "local.txt", "left by an earlier step\n")
+    before = c.repo.resolve_revision(revision="@")
+
+    if action == "describe":
+        describe(c.repo, "a description only")
+    elif action == "edit":
+        write_file(c.repo, "dep.txt", "changed\n")
+
+    assert c.repo.has_file_changes_since(revision=before) is expected
+
+
 def test_revision_relationship_methods_distinguish_parent_and_child(
     repository_case: RepositoryCase,
 ) -> None:

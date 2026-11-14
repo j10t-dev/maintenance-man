@@ -192,27 +192,29 @@ class Blocked:
 
 @dataclass(frozen=True, slots=True)
 class ApplyFailed:
-    """Application failed and was reported; partial changes may remain."""
+    """Application failed and was reported; partial changes may remain.
+
+    discardable is False when jj could not read or compare the working copy.
+    """
+
+    discardable: bool = True
 
 
 type ApplyOutcome = Applied | Blocked | ApplyFailed
 
 
 def apply_finding(
-    project: ProjectConfig, group: FindingGroup, *, emit: Emit
+    project: ProjectConfig, group: FindingGroup, repo: JjRepository, *, emit: Emit
 ) -> ApplyOutcome:
     """Apply one group in the project directory; Blocked means nothing changed,
-    ApplyFailed means the failure was emitted and partial changes may remain."""
+    ApplyFailed means the failure was emitted and partial changes may remain.
+
+    For a package-command group, Applied means the commands succeeded and the
+    working copy's files differ from the commit read before them. A Gradle group
+    follows the Gradle adapter's own catalogue check.
+    """
     if group.gradle_target is None:
-        applied = _apply_update(
-            project.package_manager,
-            group.pkg_name,
-            group.installed_version,
-            group.target_version,
-            project.path,
-            emit=emit,
-        )
-        return Applied() if applied else ApplyFailed()
+        return _apply_package_commands(project, group, repo, emit=emit)
     return _apply_gradle_target(project, group.gradle_target, emit=emit)
 
 
@@ -236,14 +238,14 @@ def process_findings(
                 group.pkg_name, group.installed_version, group.target_version
             )
         )
-        outcome = apply_finding(project_config, group, emit=emit)
+        outcome = apply_finding(project_config, group, repo, emit=emit)
         if isinstance(outcome, Blocked):
             group.record(outcome.block)
             save_scan_results(scan_result.project, scan_result)
             emit(FindingsBlocked(((group.pkg_name, outcome.block.reason),)))
             continue
         step = (
-            FindingStep("apply")
+            FindingStep("apply", discardable=outcome.discardable)
             if isinstance(outcome, ApplyFailed)
             else _test_and_commit(group, project_config, repo, flow, emit)
         )
@@ -304,6 +306,36 @@ def _group(
         kind=kind,
         gradle_target=gradle_target,
     )
+
+
+def _apply_package_commands(
+    project: ProjectConfig, group: FindingGroup, repo: JjRepository, *, emit: Emit
+) -> ApplyOutcome:
+    try:
+        before = repo.resolve_revision(revision="@")
+        if not _apply_update(
+            project.package_manager,
+            group.pkg_name,
+            group.installed_version,
+            group.target_version,
+            project.path,
+            emit=emit,
+        ):
+            return ApplyFailed()
+        changed = repo.has_file_changes_since(revision=before)
+    except RevisionError as exc:
+        emit(FindingStepFailed("inspect", str(exc)))
+        return ApplyFailed(discardable=False)
+    if changed:
+        return Applied()
+    emit(
+        FindingStepFailed(
+            "package command",
+            f"Package commands for {group.pkg_name} changed no files; it may be "
+            f"transitive or already at {group.target_version}. Run mm scan again.",
+        )
+    )
+    return ApplyFailed()
 
 
 def _apply_gradle_target(
