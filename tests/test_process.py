@@ -200,6 +200,34 @@ def test_run_shell_command_strips_the_host_virtualenv(tmp_path, monkeypatch):
     run_shell_command('test -z "${VIRTUAL_ENV:-}"', tmp_path, timeout=30, label="env")
 
 
+_PRINT_FORCE_COLOR = "import os; print(os.environ.get('FORCE_COLOR'))"
+
+
+def test_captured_child_runs_without_force_color(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    completed = run_captured(
+        [sys.executable, "-c", _PRINT_FORCE_COLOR], tmp_path, timeout=30, label="env"
+    )
+    assert completed.stdout == "None\n"
+
+
+def test_logged_child_keeps_force_color(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    completed = run_logged(
+        [sys.executable, "-c", _PRINT_FORCE_COLOR],
+        tmp_path,
+        timeout=30,
+        label="env",
+        capture=True,
+    )
+    assert completed.stdout == "1\n"
+
+
+def test_run_shell_command_keeps_force_color(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    run_shell_command('test "$FORCE_COLOR" = 1', tmp_path, timeout=30, label="env")
+
+
 def test_run_shell_command_launch_failure_raises_selected_error(tmp_path):
     missing = tmp_path / "missing"
     with pytest.raises(

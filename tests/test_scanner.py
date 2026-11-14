@@ -1209,6 +1209,9 @@ def test_scan_dates_bun_updates_with_bun_info_in_the_project(
 _UV_LIST = ("uv", "pip", "list", "--outdated", "--format", "json")
 _MVN_UPDATES = (
     "mvn",
+    "-B",
+    "-ntp",
+    "-Dstyle.color=never",
     "versions:display-dependency-updates",
     "-DprocessDependencyManagement=false",
     "-Dversions.outputLineWidth=1000",
@@ -1222,9 +1225,29 @@ _MVN_UPDATES = (
             "uv", "pypi", [(("uv", "sync", "--locked"), ""), (_UV_LIST, "[]")], id="uv"
         ),
         pytest.param(
-            "bun", "npm", [(("bun", "outdated", "--no-progress"), "")], id="bun"
+            "bun",
+            "npm",
+            [
+                (
+                    ("bun", "outdated", "--no-progress"),
+                    "bun outdated v1.4.2 (744846f84)\n",
+                )
+            ],
+            id="bun",
         ),
-        pytest.param("mvn", "central", [(_MVN_UPDATES, "")], id="mvn"),
+        pytest.param(
+            "mvn",
+            "central",
+            [
+                (
+                    _MVN_UPDATES,
+                    "[INFO] --- versions:2.25.1:display-dependency-updates"
+                    " (default-cli) @ demo ---\n"
+                    "[INFO] \n",
+                )
+            ],
+            id="mvn",
+        ),
     ],
 )
 def test_non_gradle_scan_filters_through_one_publication_context(

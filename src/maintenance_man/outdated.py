@@ -1,11 +1,16 @@
 import re
 import subprocess
-from collections.abc import Collection
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, StrictStr, TypeAdapter, ValidationError
 
+from maintenance_man.bun_dependencies import (
+    BunDependencyError,
+    registry_declared_bun_names,
+    resolved_bun_versions,
+)
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import UpdateFinding, classify_semver
 from maintenance_man.process import run_captured
@@ -50,30 +55,51 @@ class _UvRow(BaseModel):
 
 
 def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
-    """Run `bun outdated` without progress output and parse the table output."""
-    cmd = ["bun", "outdated", "--no-progress"]
-    completed = _run(cmd, project, timeout=120, label="bun outdated", ok_codes=None)
+    """Run `bun outdated` and return updates of registry-declared packages.
 
-    if completed.returncode != 0 and not completed.stdout.strip():
-        msg = (
-            f"bun outdated failed (exit {completed.returncode}): "
-            f"{completed.stderr.strip()}"
-        )
+    Raises OutdatedCheckError when the command fails or writes to standard error,
+    when its output is not the banner and pipe table, or when a reported current
+    version differs from the one `bun pm ls` resolves.
+    """
+    cmd = ["bun", "outdated", "--no-progress"]
+    completed = _run(cmd, project, timeout=120, label="bun outdated")
+    if error_lines := _non_blank_lines(completed.stderr):
+        msg = f"bun outdated: unexpected standard error: {error_lines[0]!r}"
         raise OutdatedCheckError(msg)
-    if not completed.stdout.strip():
+    rows = _parse_bun_report(completed.stdout)
+    if not rows:
         return []
 
-    return [
-        _finding(package, current, latest)
-        for package, current, latest in _parse_bun_table(completed.stdout)
-        if current != latest
-    ]
+    declared, resolved = _read_bun_dependencies(Path(project.path))
+    findings = []
+    for name, current, latest in rows:
+        if name not in declared:
+            continue
+        if current != (resolved_version := resolved.get(name)):
+            msg = (
+                f"bun outdated: {name} is at {current}, "
+                f"but bun pm ls resolves {resolved_version or 'nothing'}"
+            )
+            raise OutdatedCheckError(msg)
+        if current != latest:
+            findings.append(_finding(name, current, latest))
+    return findings
 
 
 def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
-    """Run `mvn versions:display-dependency-updates` and parse text output."""
+    """Run `mvn versions:display-dependency-updates` and return the updates listed
+    in each execution's Dependencies section.
+
+    Raises OutdatedCheckError when the output holds no execution of the goal, when
+    a line inside an execution is not part of its report, when a section of
+    newer versions lists no row, or when a section, no-updates or row line appears
+    outside an execution.
+    """
     cmd = [
         "mvn",
+        "-B",
+        "-ntp",
+        "-Dstyle.color=never",
         "versions:display-dependency-updates",
         "-DprocessDependencyManagement=false",
         "-Dversions.outputLineWidth=1000",
@@ -82,28 +108,17 @@ def mvn_outdated(project: ProjectConfig) -> list[UpdateFinding]:
         cmd, project, timeout=300, label="mvn versions:display-dependency-updates"
     )
 
-    return [
-        _finding(**match.groupdict())
-        for line in completed.stdout.splitlines()
-        if (match := _MVN_UPDATE_RE.match(line))
-    ]
+    report = _MavenReport()
+    for line in completed.stdout.splitlines():
+        report.read(line)
+    return report.finish()
 
 
 def _run(
-    cmd: list[str],
-    project: ProjectConfig,
-    *,
-    timeout: int,
-    label: str,
-    **options: Collection[int] | None,
+    cmd: list[str], project: ProjectConfig, *, timeout: int, label: str
 ) -> subprocess.CompletedProcess[str]:
     return run_captured(
-        cmd,
-        project.path,
-        timeout=timeout,
-        label=label,
-        error=OutdatedCheckError,
-        **options,
+        cmd, project.path, timeout=timeout, label=label, error=OutdatedCheckError
     )
 
 
@@ -116,25 +131,153 @@ def _finding(name: str, installed: str, latest: str) -> UpdateFinding:
     )
 
 
-def _parse_bun_table(output: str) -> list[tuple[str, str, str]]:
-    """Parse bun outdated table output into (package, current, latest) rows."""
-    lines = (line.strip() for line in output.strip().splitlines())
-    table_lines = (line for line in lines if line.startswith("|") and "---" not in line)
-
-    rows = []
-    for line in table_lines:
-        cells = [c.strip() for c in line.split("|") if c.strip()]
-        if len(cells) < 4 or cells[0].lower() == "package":
-            continue
-        rows.append((re.sub(r"\s*\(\w+\)$", "", cells[0]), cells[1], cells[3]))
-    return rows
+def _non_blank_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-_MVN_UPDATE_RE = re.compile(
-    r"^\[INFO\]\s+"
-    r"(?P<name>\S+:\S+)"
-    r"\s+\.+\s+"
-    r"(?P<installed>\S+)"
-    r"\s+->\s+"
-    r"(?P<latest>\S+)"
+def _parse_bun_report(stdout: str) -> list[tuple[str, str, str]]:
+    """(package, current, latest) for each row of the table after the banner."""
+    lines = _non_blank_lines(stdout)
+    if not lines:
+        msg = "bun outdated: unrecognised output: no banner"
+        raise OutdatedCheckError(msg)
+    banner, *table = lines
+    if not banner.startswith("bun outdated v"):
+        raise _unrecognised_bun_line(banner)
+    if not table:
+        return []
+    if len(table) < 5:
+        msg = "bun outdated: unrecognised output: table shorter than five lines"
+        raise OutdatedCheckError(msg)
+    for separator in (table[0], table[2], table[-1]):
+        if not _BUN_SEPARATOR_RE.fullmatch(separator):
+            raise _unrecognised_bun_line(separator)
+    if _bun_cells(table[1])[:4] != ["Package", "Current", "Update", "Latest"]:
+        raise _unrecognised_bun_line(table[1])
+    return [_parse_bun_row(line) for line in table[3:-1]]
+
+
+def _parse_bun_row(line: str) -> tuple[str, str, str]:
+    cells = _bun_cells(line)
+    if (
+        not line.startswith("|")
+        or _BUN_SEPARATOR_RE.fullmatch(line)
+        or len(cells) < 4
+        or not all((cells[0], cells[1], cells[3]))
+    ):
+        raise _unrecognised_bun_line(line)
+    return re.sub(r"\s*\(\w+\)$", "", cells[0]), cells[1], cells[3]
+
+
+def _bun_cells(line: str) -> list[str]:
+    return [
+        cell.strip() for cell in line.removeprefix("|").removesuffix("|").split("|")
+    ]
+
+
+def _unrecognised_bun_line(line: str) -> OutdatedCheckError:
+    return OutdatedCheckError(f"bun outdated: unrecognised output line: {line!r}")
+
+
+def _read_bun_dependencies(project_path: Path) -> tuple[set[str], dict[str, str]]:
+    try:
+        return (
+            registry_declared_bun_names(project_path),
+            resolved_bun_versions(project_path),
+        )
+    except BunDependencyError as e:
+        raise OutdatedCheckError(str(e)) from e
+
+
+_BUN_SEPARATOR_RE = re.compile(r"[|-]+")
+
+
+@dataclass
+class _MavenSection:
+    name: str
+    line: str
+    rows: int = 0
+
+
+@dataclass
+class _MavenReport:
+    """Reads the report line by line. Outside an execution of the goal, section,
+    no-updates and row lines raise and other lines are ignored; inside one, every
+    line must start with [INFO] and belong to the report."""
+
+    findings: list[UpdateFinding] = field(default_factory=list)
+    saw_execution: bool = False
+    in_execution: bool = False
+    section: _MavenSection | None = None
+
+    def read(self, line: str) -> None:
+        is_info = line.startswith("[INFO]")
+        text = line.removeprefix("[INFO]").strip()
+        if self.in_execution and is_info and text.startswith("---"):
+            self._close_section()
+            self.in_execution = False
+        if self.in_execution:
+            self._read_execution_line(line, text, is_info=is_info)
+        else:
+            self._read_outside_line(line, text, is_info=is_info)
+
+    def finish(self) -> list[UpdateFinding]:
+        self._close_section()
+        if not self.saw_execution:
+            msg = f"{_MVN_ERROR}: no display-dependency-updates execution"
+            raise OutdatedCheckError(msg)
+        return self.findings
+
+    def _read_outside_line(self, line: str, text: str, *, is_info: bool) -> None:
+        if is_info and _MVN_EXECUTION_RE.match(text):
+            self.in_execution = True
+            self.saw_execution = True
+        elif any(
+            pattern.match(text)
+            for pattern in (_MVN_NO_UPDATES_RE, _MVN_SECTION_RE, _MVN_ROW_RE)
+        ):
+            raise _unrecognised_maven_line(line)
+
+    def _read_execution_line(self, line: str, text: str, *, is_info: bool) -> None:
+        if not is_info:
+            raise _unrecognised_maven_line(line)
+        if self.section is not None:
+            if row := _MVN_ROW_RE.match(text):
+                self._add_row(self.section, row)
+                return
+            self._close_section()
+        if not text or _MVN_NO_UPDATES_RE.match(text):
+            return
+        if section := _MVN_SECTION_RE.match(text):
+            self.section = _MavenSection(section["section"], line)
+            return
+        raise _unrecognised_maven_line(line)
+
+    def _add_row(self, section: _MavenSection, row: re.Match[str]) -> None:
+        section.rows += 1
+        if section.name == "Dependencies":
+            self.findings.append(_finding(**row.groupdict()))
+
+    def _close_section(self) -> None:
+        if self.section is not None and not self.section.rows:
+            raise _unrecognised_maven_line(self.section.line)
+        self.section = None
+
+
+def _unrecognised_maven_line(line: str) -> OutdatedCheckError:
+    return OutdatedCheckError(f"{_MVN_ERROR} line: {line!r}")
+
+
+_MVN_ERROR = "mvn versions:display-dependency-updates: unrecognised output"
+_MVN_EXECUTION_RE = re.compile(
+    r"^--- \S+:display-dependency-updates \([^)]*\) @ .+ ---$"
+)
+_MVN_NO_UPDATES_RE = re.compile(
+    r"^No dependencies in (?P<section>.+) have newer versions\.$"
+)
+_MVN_SECTION_RE = re.compile(
+    r"^The following dependencies in (?P<section>.+) have newer versions:$"
+)
+_MVN_ROW_RE = re.compile(
+    r"^(?P<name>\S+:\S+)\s+\.+\s+(?P<installed>\S+)\s+->\s+(?P<latest>\S+)$"
 )

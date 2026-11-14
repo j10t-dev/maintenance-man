@@ -1,10 +1,9 @@
 import json
 import subprocess
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
+from maintenance_man.bun_dependencies import BunDependencyError
 from maintenance_man.models.config import ProjectConfig
 from maintenance_man.models.scan import SemverTier, UpdateFinding
 from maintenance_man.outdated import (
@@ -33,6 +32,9 @@ def _fake_commands(
         "mvn": (
             (
                 "mvn",
+                "-B",
+                "-ntp",
+                "-Dstyle.color=never",
                 "versions:display-dependency-updates",
                 "-DprocessDependencyManagement=false",
                 "-Dversions.outputLineWidth=1000",
@@ -203,160 +205,380 @@ def test_given_wrongly_shaped_uv_output_when_uv_outdated_runs_then_outdated_chec
         uv_outdated(project)
 
 
-class TestBunOutdated:
-    def test_empty_output_disables_progress(self):
-        result = completed([], returncode=0, stdout="", stderr="")
-        project = make_project(Path("/tmp/fake"), package_manager="bun")
+_BUN_BANNER = "bun outdated v1.4.2 (744846f84)\n"
+_BUN_TABLE = (
+    "bun outdated v1.4.2 (744846f84)\n"
+    "|---------------------------------------|\n"
+    "| Package   | Current | Update | Latest |\n"
+    "|-----------|---------|--------|--------|\n"
+    "| is-number | 6.0.0   | 6.0.0  | 7.0.0  |\n"
+    "|---------------------------------------|\n"
+)
+_BUN_ROW = "| is-number | 6.0.0   | 6.0.0  | 7.0.0  |"
 
-        commands = _fake_commands(project, result)
-        with patch("maintenance_man.outdated.run_captured", commands):
-            updates = bun_outdated(project)
 
-        assert updates == []
-        assert commands.calls[0][0] == ("bun", "outdated", "--no-progress")
+def _bun_lookup(expected_path, value):
+    def lookup(project_path):
+        assert project_path == expected_path
+        if value is None:
+            pytest.fail("bun dependency lookup called")
+        if isinstance(value, Exception):
+            raise value
+        return value
 
-    def test_command_failure_raises(self):
-        result = completed([], returncode=1, stdout="", stderr="error")
-        project = make_project(Path("/tmp/fake"), package_manager="bun")
+    return lookup
 
-        with (
-            patch(
-                "maintenance_man.outdated.run_captured", _fake_commands(project, result)
-            ),
-            pytest.raises(OutdatedCheckError),
-        ):
-            bun_outdated(project)
+
+def _run_bun_outdated(tmp_path, monkeypatch, stdout, declared, resolved, stderr=""):
+    monkeypatch.setattr(
+        "maintenance_man.outdated.registry_declared_bun_names",
+        _bun_lookup(tmp_path, declared),
+    )
+    monkeypatch.setattr(
+        "maintenance_man.outdated.resolved_bun_versions",
+        _bun_lookup(tmp_path, resolved),
+    )
+    project = make_project(tmp_path, package_manager="bun")
+    commands = _fake_commands(project, completed(stdout=stdout, stderr=stderr))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+    return bun_outdated(project), commands
 
 
 @pytest.mark.parametrize(
-    ("manager", "stdout", "expected", "expected_call"),
+    ("stdout", "declared", "resolved", "expected"),
     [
-        (
-            "bun",
-            "| Package    | Current | Update  | Latest  |\n"
-            "|------------|---------|---------|---------|  \n"
-            "| lodash     | 4.17.20 | 4.17.21 | 4.17.21 |\n"
-            "| express    | 4.18.0  | 4.18.3  | 5.0.0   |\n",
-            [
-                UpdateFinding(
-                    pkg_name="lodash",
-                    installed_version="4.17.20",
-                    latest_version="4.17.21",
-                    semver_tier=SemverTier.PATCH,
-                ),
-                UpdateFinding(
-                    pkg_name="express",
-                    installed_version="4.18.0",
-                    latest_version="5.0.0",
-                    semver_tier=SemverTier.MAJOR,
-                ),
-            ],
-            (
-                ("bun", "outdated", "--no-progress"),
-                Path("/tmp/fake"),
-                {
-                    "timeout": 120,
-                    "label": "bun outdated",
-                    "error": OutdatedCheckError,
-                    "ok_codes": None,
-                },
-            ),
+        pytest.param(_BUN_BANNER, None, None, [], id="banner-only"),
+        pytest.param(
+            _BUN_TABLE,
+            {"is-number"},
+            {"is-number": "6.0.0"},
+            [_finding("is-number", "6.0.0", "7.0.0", SemverTier.MAJOR)],
+            id="declared-row",
         ),
-        (
-            "bun",
-            "| Package           | Current | Update | Latest |\n"
-            "|-------------------|---------|--------|--------|\n"
-            "| typescript (peer) | 5.9.3   | 6.0.2  | 6.0.2  |\n"
-            "| eslint (dev)      | 8.0.0   | 9.0.0  | 9.0.0  |\n",
-            [
-                UpdateFinding(
-                    pkg_name="typescript",
-                    installed_version="5.9.3",
-                    latest_version="6.0.2",
-                    semver_tier=SemverTier.MAJOR,
-                ),
-                UpdateFinding(
-                    pkg_name="eslint",
-                    installed_version="8.0.0",
-                    latest_version="9.0.0",
-                    semver_tier=SemverTier.MAJOR,
-                ),
-            ],
-            (
-                ("bun", "outdated", "--no-progress"),
-                Path("/tmp/fake"),
-                {
-                    "timeout": 120,
-                    "label": "bun outdated",
-                    "error": OutdatedCheckError,
-                    "ok_codes": None,
-                },
-            ),
-        ),
-        (
-            "mvn",
-            "[INFO] The following dependencies in Dependencies have newer versions:\n"
-            "[INFO]   org.apache.commons:commons-lang3 ......... 3.10 -> 3.14.0\n"
-            "[INFO]   org.slf4j:slf4j-api .................. 2.0.9 -> 2.0.16\n"
-            "[INFO] \n",
-            [
-                UpdateFinding(
-                    pkg_name="org.apache.commons:commons-lang3",
-                    installed_version="3.10",
-                    latest_version="3.14.0",
-                    semver_tier=SemverTier.MINOR,
-                ),
-                UpdateFinding(
-                    pkg_name="org.slf4j:slf4j-api",
-                    installed_version="2.0.9",
-                    latest_version="2.0.16",
-                    semver_tier=SemverTier.PATCH,
-                ),
-            ],
-            (
-                (
-                    "mvn",
-                    "versions:display-dependency-updates",
-                    "-DprocessDependencyManagement=false",
-                    "-Dversions.outputLineWidth=1000",
-                ),
-                Path("/tmp/fake"),
-                {
-                    "timeout": 300,
-                    "label": "mvn versions:display-dependency-updates",
-                    "error": OutdatedCheckError,
-                },
-            ),
-        ),
-        (
-            "mvn",
-            "[INFO] No dependencies in Dependencies have newer versions.\n",
-            [],
-            (
-                (
-                    "mvn",
-                    "versions:display-dependency-updates",
-                    "-DprocessDependencyManagement=false",
-                    "-Dversions.outputLineWidth=1000",
-                ),
-                Path("/tmp/fake"),
-                {
-                    "timeout": 300,
-                    "label": "mvn versions:display-dependency-updates",
-                    "error": OutdatedCheckError,
-                },
-            ),
+        pytest.param(_BUN_TABLE, set(), {}, [], id="undeclared-row"),
+        pytest.param(
+            _BUN_TABLE.replace(_BUN_ROW, "| eslint (dev) | 9.0.0 | 9.0.0 | 9.1.0 |"),
+            {"eslint"},
+            {"eslint": "9.0.0"},
+            [_finding("eslint", "9.0.0", "9.1.0", SemverTier.MINOR)],
+            id="dev-suffix",
         ),
     ],
-    ids=["bun-table", "bun-qualifiers", "mvn-updates", "mvn-none"],
 )
-def test_given_outdated_output_when_parsed_then_findings_match(
-    manager, stdout, expected, expected_call, monkeypatch
+def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_returned(
+    tmp_path, monkeypatch, stdout, declared, resolved, expected
 ):
-    project = make_project(Path("/tmp/fake"), package_manager=manager)
-    outdated = {"bun": bun_outdated, "mvn": mvn_outdated}[manager]
+    updates, commands = _run_bun_outdated(
+        tmp_path, monkeypatch, stdout, declared, resolved
+    )
+
+    assert updates == expected
+    assert commands.calls == [
+        (
+            ("bun", "outdated", "--no-progress"),
+            tmp_path,
+            {"timeout": 120, "label": "bun outdated", "error": OutdatedCheckError},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "declared", "resolved", "prefix"),
+    [
+        pytest.param(
+            _BUN_BANNER,
+            "warn: something\n",
+            None,
+            None,
+            "bun outdated: unexpected standard error: 'warn: something'",
+            id="standard-error",
+        ),
+        pytest.param(
+            "", "", None, None, "bun outdated: unrecognised output", id="empty"
+        ),
+        pytest.param(
+            _BUN_TABLE,
+            "",
+            {"is-number"},
+            {"is-number": "6.0.1"},
+            "bun outdated: is-number is at 6.0.0, but bun pm ls resolves 6.0.1",
+            id="resolved-differs",
+        ),
+        pytest.param(
+            _BUN_TABLE,
+            "",
+            {"is-number"},
+            {},
+            "bun outdated: is-number is at 6.0.0, but bun pm ls resolves nothing",
+            id="unresolved",
+        ),
+        pytest.param(
+            _BUN_BANNER + "┌───────────┬─────────┬────────┬────────┐\n"
+            "│ Package   │ Current │ Update │ Latest │\n"
+            "├───────────┼─────────┼────────┼────────┤\n"
+            "│ is-number │ 6.0.0   │ 6.0.0  │ 7.0.0  │\n"
+            "└───────────┴─────────┴────────┴────────┘\n",
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '┌",
+            id="box-drawing",
+        ),
+        pytest.param(
+            "\x1b[1mbun outdated\x1b[0m v1.4.2\n",
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '\\x1b[1m",
+            id="ansi-banner",
+        ),
+        pytest.param(
+            _BUN_TABLE.replace("| Package ", "| Name "),
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '| Name",
+            id="wrong-header",
+        ),
+        pytest.param(
+            _BUN_TABLE.replace(_BUN_ROW, "| is-number | 6.0.0 |"),
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '| is-number | 6.0.0 |'",
+            id="short-row",
+        ),
+        pytest.param(
+            _BUN_TABLE.replace(_BUN_ROW, "|           | 6.0.0   | 6.0.0  | 7.0.0  |"),
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '|",
+            id="empty-package-cell",
+        ),
+        pytest.param(
+            _BUN_TABLE.replace(_BUN_ROW, "| is-number |         | 6.0.0  | 7.0.0  |"),
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '|",
+            id="empty-current-cell",
+        ),
+        pytest.param(
+            _BUN_TABLE.replace(_BUN_ROW, "| is-number | 6.0.0   | 6.0.0  |        |"),
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '|",
+            id="empty-latest-cell",
+        ),
+        pytest.param(
+            _BUN_BANNER + "|---------------------------------------|\n"
+            "| Package   | Current | Update | Latest |\n"
+            "|-----------|---------|--------|--------|\n",
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output",
+            id="header-without-row",
+        ),
+        pytest.param(
+            _BUN_BANNER + "|---------------------------------------|\n"
+            f"{_BUN_ROW}\n"
+            "|---------------------------------------|\n",
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output",
+            id="row-without-header",
+        ),
+        pytest.param(
+            _BUN_TABLE + "1 update available\n",
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output line: '1 update available'",
+            id="trailing-line",
+        ),
+        pytest.param(
+            _BUN_TABLE,
+            "",
+            BunDependencyError("Failed to read package.json: gone"),
+            None,
+            "Failed to read package.json: gone",
+            id="manifest-error",
+        ),
+    ],
+)
+def test_given_unrecognised_bun_report_when_bun_outdated_runs_then_outdated_check_error(
+    tmp_path, monkeypatch, stdout, stderr, declared, resolved, prefix
+):
+    with pytest.raises(OutdatedCheckError) as caught:
+        _run_bun_outdated(tmp_path, monkeypatch, stdout, declared, resolved, stderr)
+
+    assert str(caught.value).startswith(prefix)
+
+
+_MVN_HEADER = (
+    "[INFO] --- versions:2.25.1:display-dependency-updates (default-cli) @ child ---\n"
+)
+_MVN_MULTI_MODULE = (
+    "[INFO] ----------------------------< probe:parent >----------------------------\n"
+    "[INFO] Building parent 1                                                  [1/2]\n"
+    "[INFO]   from pom.xml\n"
+    "[INFO] --------------------------------[ pom ]---------------------------------\n"
+    "[INFO] \n"
+    "[INFO] --- versions:2.25.1:display-dependency-updates (default-cli) @ parent ---\n"
+    "[INFO] \n"
+    "[INFO] ----------------------------< probe:child >-----------------------------\n"
+    "[INFO] Building child 1                                                   [2/2]\n"
+    "[INFO]   from child/pom.xml\n"
+    "[INFO] --------------------------------[ jar ]---------------------------------\n"
+    "[INFO] \n"
+    "[INFO] --- versions:2.25.1:display-dependency-updates (default-cli) @ child ---\n"
+    "[INFO] The following dependencies in Dependencies have newer versions:\n"
+    "[INFO]   org.slf4j:slf4j-api ........ 2.0.0 -> 2.1.0-alpha1\n"
+    "[INFO] \n"
+    "[INFO] ------------------------------------------------------------------------\n"
+    "[INFO] Reactor Summary for parent 1:\n"
+)
+_MVN_SECTION = "[INFO] The following dependencies in Dependencies have newer versions:"
+_MVN_ROW = "[INFO]   org.slf4j:slf4j-api ........ 2.0.0 -> 2.1.0-alpha1"
+_MVN_RULE = (
+    "[INFO] ------------------------------------------------------------------------"
+)
+_MVN_ERROR = "mvn versions:display-dependency-updates: unrecognised output"
+_SLF4J_FINDING = _finding(
+    "org.slf4j:slf4j-api", "2.0.0", "2.1.0-alpha1", SemverTier.MINOR
+)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        pytest.param(_MVN_MULTI_MODULE, [_SLF4J_FINDING], id="multi-module"),
+        pytest.param(
+            _MVN_HEADER + f"{_MVN_SECTION}\n{_MVN_ROW}\n[INFO] \n"
+            f"{_MVN_RULE}\n[INFO] BUILD SUCCESS\n",
+            [_SLF4J_FINDING],
+            id="single-module",
+        ),
+        pytest.param(
+            _MVN_HEADER
+            + "[INFO] No dependencies in Dependencies have newer versions.\n[INFO] \n",
+            [],
+            id="no-updates",
+        ),
+        pytest.param(
+            _MVN_HEADER
+            + "[INFO] The following dependencies in Plugin Dependencies have newer"
+            " versions:\n"
+            "[INFO]   org.a:b .... 1.0 -> 2.0\n"
+            "[INFO] \n",
+            [],
+            id="other-section",
+        ),
+        pytest.param(_MVN_HEADER, [], id="header-only"),
+    ],
+)
+def test_given_maven_report_when_mvn_outdated_runs_then_dependency_updates_are_returned(
+    tmp_path, monkeypatch, stdout, expected
+):
+    project = make_project(tmp_path, package_manager="mvn")
     commands = _fake_commands(project, completed(stdout=stdout))
     monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
 
-    assert outdated(project) == expected
-    assert commands.calls == [expected_call]
+    assert mvn_outdated(project) == expected
+    assert commands.calls == [
+        (
+            (
+                "mvn",
+                "-B",
+                "-ntp",
+                "-Dstyle.color=never",
+                "versions:display-dependency-updates",
+                "-DprocessDependencyManagement=false",
+                "-Dversions.outputLineWidth=1000",
+            ),
+            tmp_path,
+            {
+                "timeout": 300,
+                "label": "mvn versions:display-dependency-updates",
+                "error": OutdatedCheckError,
+            },
+        )
+    ]
+
+
+_OTHER_EXECUTION = "[INFO] --- other:1.0:report (default-cli) @ child ---"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "quoted"),
+    [
+        pytest.param(
+            _MVN_HEADER + f"{_MVN_SECTION}\n[INFO] \n",
+            _MVN_SECTION,
+            id="section-without-row",
+        ),
+        pytest.param(
+            _MVN_HEADER + f"{_MVN_SECTION}\n", _MVN_SECTION, id="section-at-end"
+        ),
+        pytest.param(
+            _MVN_HEADER + f"{_MVN_SECTION}\n{_MVN_ROW}\n[INFO] something else\n",
+            "[INFO] something else",
+            id="unknown-line-after-row",
+        ),
+        pytest.param(
+            _MVN_HEADER + "[INFO] Checking for updates\n",
+            "[INFO] Checking for updates",
+            id="unknown-info-line",
+        ),
+        pytest.param(
+            _MVN_HEADER + "[WARNING] The POM is invalid\n",
+            "[WARNING] The POM is invalid",
+            id="warning-line",
+        ),
+        pytest.param(
+            _MVN_HEADER + f"[INFO] \n{_MVN_ROW}\n", _MVN_ROW, id="row-without-section"
+        ),
+        pytest.param(
+            _MVN_HEADER + f"{_MVN_SECTION}\n{_MVN_ROW}\n[INFO] \n"
+            f"{_OTHER_EXECUTION}\n{_MVN_SECTION}\n{_MVN_ROW}\n",
+            _MVN_SECTION,
+            id="section-in-other-execution",
+        ),
+        pytest.param(
+            _MVN_HEADER.removeprefix("[INFO] ") + f"{_MVN_SECTION}\n{_MVN_ROW}\n",
+            _MVN_SECTION,
+            id="unprefixed-header",
+        ),
+        pytest.param(
+            _MVN_HEADER + "--- end ---\n", "--- end ---", id="unprefixed-rule"
+        ),
+    ],
+)
+def test_given_unrecognised_maven_line_when_mvn_outdated_runs_then_it_is_quoted(
+    tmp_path, monkeypatch, stdout, quoted
+):
+    project = make_project(tmp_path, package_manager="mvn")
+    commands = _fake_commands(project, completed(stdout=stdout))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+
+    with pytest.raises(OutdatedCheckError) as caught:
+        mvn_outdated(project)
+
+    assert str(caught.value) == f"{_MVN_ERROR} line: {quoted!r}"
+
+
+def test_given_no_maven_execution_when_mvn_outdated_runs_then_outdated_check_error(
+    tmp_path, monkeypatch
+):
+    project = make_project(tmp_path, package_manager="mvn")
+    commands = _fake_commands(project, completed(stdout="[INFO] BUILD SUCCESS\n"))
+    monkeypatch.setattr("maintenance_man.outdated.run_captured", commands)
+
+    with pytest.raises(OutdatedCheckError) as caught:
+        mvn_outdated(project)
+
+    assert str(caught.value) == f"{_MVN_ERROR}: no display-dependency-updates execution"

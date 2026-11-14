@@ -100,8 +100,11 @@ def run_captured(
 ) -> subprocess.CompletedProcess[str]:
     """Run *cmd* without a shell, capturing text output with stdin closed.
 
-    ``ok_codes=None`` returns every completed status to the caller.
+    ``ok_codes=None`` returns every completed status to the caller.  The child
+    runs without ``FORCE_COLOR`` so that its output carries no colour codes.
     """
+    env = project_env()
+    env.pop("FORCE_COLOR", None)
     try:
         completed = subprocess.run(
             list(cmd),
@@ -110,7 +113,7 @@ def run_captured(
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=timeout,
-            env=project_env(),
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         msg = f"{label} timed out after {timeout}s{_where(cwd)}"
