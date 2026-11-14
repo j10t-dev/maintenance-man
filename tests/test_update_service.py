@@ -49,6 +49,7 @@ from tests.support.projects import (
     make_project,
     seed_gradle_project,
     seed_project,
+    write_bun_manifest,
 )
 from tests.support.repository import (
     MANAGED,
@@ -553,7 +554,7 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
     android = seed_gradle_project(tmp_path, "android")
     web = make_project(tmp_path / "web", package_manager="bun", test_unit="true")
     web_repo = copy_jj_repository(web.path)
-    write_file(web_repo, "package.json", "{}\n")
+    write_bun_manifest(web_repo, {"pkg-a": "1.0.0"})
     commit_to_main(web_repo, "bun project")
     scan = make_scan_result(
         vulns=[], updates=[make_update(pkg_name="pkg-a")], package_manager="bun"
@@ -569,6 +570,10 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
         (cwd / "deps-pkg-a.txt").write_text(command[-1], encoding="utf-8")
 
     monkeypatch.setattr(updater, "run_logged", run_bun)
+    monkeypatch.setattr(
+        "maintenance_man.package_managers.resolved_bun_versions",
+        lambda _path: {"pkg-a": "1.0.0"},
+    )
     emit = RecordingEmit()
 
     batch = update_service.update_projects(

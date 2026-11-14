@@ -1,5 +1,6 @@
 """Project configuration, saved scans and activity defaults for tests."""
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,11 @@ def seed_project(
     scan.project = name
     save_scan_results(name, scan)
     return repo, project
+
+
+def write_bun_manifest(repo: JjRepository, versions: dict[str, str]) -> None:
+    """Write a package.json declaring *versions* under dependencies."""
+    write_file(repo, "package.json", json.dumps({"dependencies": versions}) + "\n")
 
 
 def seed_gradle_project(tmp_path: Path, name: str, **overrides: Any) -> ProjectConfig:

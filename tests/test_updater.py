@@ -55,7 +55,7 @@ from tests.support.findings import (
 )
 from tests.support.gradle import catalogue_apply_runner
 from tests.support.process import completed
-from tests.support.projects import make_project
+from tests.support.projects import make_project, write_bun_manifest
 from tests.support.repository import (
     MANAGED,
     commit_descriptions,
@@ -63,7 +63,6 @@ from tests.support.repository import (
     copy_jj_repository,
     fail_repository_method,
     operation_id,
-    write_file,
 )
 
 _ROOM = make_gradle_target()
@@ -114,14 +113,23 @@ class ProcessorDeps(TypedDict):
     phase: MagicMock
 
 
+_PROCESSED_VERSIONS = dict.fromkeys(
+    ("pkg-a", "pkg-b", "pkg-c", "some-pkg", "requests"), "1.0.0"
+)
+
+
 @pytest.fixture()
 def processor_vcs(
     monkeypatch: pytest.MonkeyPatch, project_config: ProjectConfig
 ) -> ProcessorDeps:
     """Use real repository transitions while substituting package/test commands."""
     repo = copy_jj_repository(Path(project_config.path))
-    write_file(repo, "package.json", "{}\n")
+    write_bun_manifest(repo, _PROCESSED_VERSIONS)
     commit_to_main(repo, "add package manifest")
+    monkeypatch.setattr(
+        "maintenance_man.package_managers.resolved_bun_versions",
+        lambda _path: _PROCESSED_VERSIONS,
+    )
 
     def run_package(cmd, cwd, **kwargs):
         dep = Path(cwd) / "dep.txt"
@@ -247,7 +255,7 @@ def test_given_package_commands_when_applied_then_first_failure_stops_and_is_rep
     monkeypatch.setattr("maintenance_man.updater.run_logged", run)
     emit = RecordingEmit()
 
-    applied = _apply_update(manager, pkg, version, tmp_path, emit=emit)
+    applied = _apply_update(manager, pkg, "1.0.0", version, tmp_path, emit=emit)
 
     assert applied is (failing_call is None)
     assert calls == expected_calls
@@ -261,7 +269,7 @@ def test_given_package_commands_when_applied_then_first_failure_stops_and_is_rep
     [
         ("uv", "Failed to read"),
         ("gradle", "Gradle updates are applied through the Gradle adapter"),
-        ("bun", "package.json is missing"),
+        ("bun", "Failed to read"),
     ],
 )
 def test_given_unpreparable_update_when_applied_then_prepare_failure_and_no_command(
@@ -276,7 +284,9 @@ def test_given_unpreparable_update_when_applied_then_prepare_failure_and_no_comm
     )
     emit = RecordingEmit()
 
-    applied = _apply_update(package_manager, "pkg", "1.0.0", tmp_path, emit=emit)
+    applied = _apply_update(
+        package_manager, "pkg", "1.0.0", "1.0.1", tmp_path, emit=emit
+    )
 
     assert applied is False
     failures = emit.of_type(FindingStepFailed)

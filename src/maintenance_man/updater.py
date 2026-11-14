@@ -207,6 +207,7 @@ def apply_finding(
         applied = _apply_update(
             project.package_manager,
             group.pkg_name,
+            group.installed_version,
             group.target_version,
             project.path,
             emit=emit,
@@ -385,6 +386,7 @@ def _discard(repo: JjRepository, emit: Emit) -> bool:
 def _apply_update(
     package_manager: PackageManager,
     pkg_name: str,
+    installed: str,
     version: str,
     project_path: Path,
     *,
@@ -392,7 +394,9 @@ def _apply_update(
 ) -> bool:
     """Apply a single package update. Returns True on success."""
     try:
-        commands = update_commands(package_manager, pkg_name, version, project_path)
+        commands = update_commands(
+            package_manager, pkg_name, installed, version, project_path
+        )
     except UpdateCommandError as e:
         emit(FindingStepFailed("prepare", str(e)))
         return False

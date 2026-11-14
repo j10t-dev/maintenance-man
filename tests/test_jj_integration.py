@@ -15,14 +15,13 @@ from maintenance_man.storage import load_scan_results, save_scan_results
 from maintenance_man.vcs import JjRepository
 from tests.fakes import RecordingEmit
 from tests.support.findings import make_scan_result, make_update
-from tests.support.projects import make_config, make_project
+from tests.support.projects import make_config, make_project, write_bun_manifest
 from tests.support.repository import (
     MANAGED,
     commit_file,
     commit_to_main,
     copy_jj_repository,
     run_jj,
-    write_file,
 )
 
 FAILS_B = "test ! -e deps/pkg-b || test -e repair.txt"
@@ -42,6 +41,10 @@ def applied(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         (Path(cwd) / "deps" / package).write_text(version, encoding="utf-8")
 
     monkeypatch.setattr(updater, "run_logged", run)
+    monkeypatch.setattr(
+        "maintenance_man.package_managers.resolved_bun_versions",
+        lambda _path: dict.fromkeys(("pkg-a", "pkg-b", "pkg-c"), "1.0.0"),
+    )
     return packages
 
 
@@ -199,7 +202,7 @@ def _bun_project(
     tmp_path: Path, name: str, test_unit: str, packages: str = "abc"
 ) -> tuple[JjRepository, ProjectConfig]:
     repo = copy_jj_repository(tmp_path / name)
-    write_file(repo, "package.json", "{}\n")
+    write_bun_manifest(repo, {f"pkg-{x}": "1.0.0" for x in packages})
     commit_to_main(repo, "add manifest")
     scan = make_scan_result(
         vulns=[],

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from maintenance_man import dependency_age, paths, scanner
+from maintenance_man import bun_dependencies, dependency_age, paths, scanner
 from maintenance_man.gradle import GradleError
 from maintenance_man.gradle_inventory import inventory_scopes, load_inventory
 from maintenance_man.gradle_resolution import (
@@ -1321,6 +1321,22 @@ def _stub_advisories(monkeypatch, vulnerabilities: list[VulnFinding]) -> None:
     _stub_outdated(monkeypatch, lambda _project: [])
 
 
+def _bun_project_files(
+    monkeypatch, project_path: Path, dependencies: dict[str, str], resolved: str
+) -> FakeCommands:
+    (project_path / "package.json").write_text(
+        json.dumps({"dependencies": dependencies}), encoding="utf-8"
+    )
+    commands = FakeCommands()
+    commands.add(
+        ("bun", "pm", "ls"),
+        cwd=project_path,
+        result=completed(stdout=f"{project_path} node_modules\n└── {resolved}\n"),
+    )
+    monkeypatch.setattr(bun_dependencies, "run_captured", commands)
+    return commands
+
+
 def _advisories(pkg_name: str, installed: str, *fix_lists: str) -> list[VulnFinding]:
     return [
         make_vuln(
@@ -1374,6 +1390,10 @@ def test_given_trivy_fix_lists_when_scanned_then_one_known_fix_is_saved(
     expected_fixes,
 ):
     _stub_advisories(monkeypatch, _advisories(pkg_name, installed, *fix_lists))
+    if manager == "bun":
+        _bun_project_files(
+            monkeypatch, tmp_path, {pkg_name: installed}, f"{pkg_name}@{installed}"
+        )
     project = ProjectConfig(path=tmp_path, package_manager=manager, scan_secrets=False)
 
     result = scan_project("demo", project)
@@ -1392,11 +1412,77 @@ def test_given_package_at_two_installed_versions_when_scanned_then_no_fix_is_sav
             *_advisories("lodash", "2.0.0", "2.0.1"),
         ],
     )
+    if manager == "bun":
+        _bun_project_files(monkeypatch, tmp_path, {"lodash": "^3.0.0"}, "lodash@3.0.0")
     project = ProjectConfig(path=tmp_path, package_manager=manager, scan_secrets=False)
 
     result = scan_project("demo", project)
 
     assert [v.fixed_version for v in result.vulnerabilities] == [None, None]
+
+
+@pytest.mark.parametrize(
+    ("dependencies", "resolved", "expected_fix"),
+    [
+        pytest.param({"zod": "^3.0.0"}, "zod@3.0.0", "3.0.1", id="declared"),
+        pytest.param({"other": "1.0.0"}, "other@1.0.0", None, id="undeclared"),
+        pytest.param({"zod": "file:../zod"}, "zod@3.0.0", None, id="file-source"),
+        pytest.param({"zod": "^4.0.0"}, "zod@4.0.0", None, id="nested-copy"),
+    ],
+)
+def test_given_bun_declaration_when_scanned_then_only_registry_direct_fixes_are_kept(
+    mm_home, tmp_path, monkeypatch, dependencies, resolved, expected_fix
+):
+    _stub_advisories(monkeypatch, _advisories("zod", "3.0.0", "3.0.1"))
+    _bun_project_files(monkeypatch, tmp_path, dependencies, resolved)
+    project = ProjectConfig(path=tmp_path, package_manager="bun", scan_secrets=False)
+
+    result = scan_project("demo", project)
+
+    assert [v.fixed_version for v in result.vulnerabilities] == [expected_fix]
+
+
+def test_given_bun_direct_and_nested_copies_when_scanned_then_direct_keeps_its_fix(
+    mm_home, tmp_path, monkeypatch
+):
+    _stub_advisories(
+        monkeypatch,
+        [
+            *_advisories("lodash", "1.0.0", "1.0.1"),
+            *_advisories("lodash", "2.0.0", "2.0.1"),
+        ],
+    )
+    _bun_project_files(monkeypatch, tmp_path, {"lodash": "^1.0.0"}, "lodash@1.0.0")
+    project = ProjectConfig(path=tmp_path, package_manager="bun", scan_secrets=False)
+
+    result = scan_project("demo", project)
+
+    assert [v.fixed_version for v in result.vulnerabilities] == ["1.0.1", None]
+
+
+def test_given_bun_scan_without_advisories_when_scanned_then_bun_pm_ls_is_not_run(
+    mm_home, tmp_path, monkeypatch
+):
+    _stub_advisories(monkeypatch, [])
+    commands = FakeCommands()
+    monkeypatch.setattr(bun_dependencies, "run_captured", commands)
+    project = ProjectConfig(path=tmp_path, package_manager="bun", scan_secrets=False)
+
+    scan_project("demo", project)
+
+    assert commands.calls == []
+
+
+def test_given_bun_advisory_without_manifest_when_scanned_then_scan_fails_unsaved(
+    mm_home, tmp_path, monkeypatch
+):
+    _stub_advisories(monkeypatch, _advisories("zod", "3.0.0", "3.0.1"))
+    project = ProjectConfig(path=tmp_path, package_manager="bun", scan_secrets=False)
+
+    with pytest.raises(ScanError, match=r"^Failed to read"):
+        scan_project("demo", project)
+
+    assert not (mm_home / "scan-results" / "demo.json").exists()
 
 
 def test_given_uv_fix_lists_when_scanned_then_every_advisory_gets_the_target(

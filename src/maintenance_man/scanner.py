@@ -9,6 +9,11 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from maintenance_man import paths
+from maintenance_man.bun_dependencies import (
+    BunDependencyError,
+    registry_declared_bun_names,
+    resolved_bun_versions,
+)
 from maintenance_man.clock import Clock, utc_now
 from maintenance_man.dependency_age import (
     PublicationLookupContext,
@@ -220,8 +225,11 @@ def _check_outdated(
 
 def _select_fixes(vulns: list[VulnFinding], project: ProjectConfig) -> None:
     """Rewrite each advisory's fix to its package's target, or to none."""
+    eligible = vulns
+    if project.package_manager == "bun" and vulns:
+        eligible = _bun_eligible(vulns, Path(project.path))
     by_package: dict[str, list[VulnFinding]] = {}
-    for vuln in vulns:
+    for vuln in eligible:
         by_package.setdefault(vuln.pkg_name, []).append(vuln)
     for group in by_package.values():
         fixes: list[str | None] = [None] * len(group)
@@ -233,6 +241,25 @@ def _select_fixes(vulns: list[VulnFinding], project: ProjectConfig) -> None:
             )
         for vuln, fix in zip(group, fixes, strict=True):
             vuln.fixed_version = fix
+
+
+def _bun_eligible(vulns: list[VulnFinding], project_path: Path) -> list[VulnFinding]:
+    """Advisories on a registry-declared package at its resolved version; every
+    other advisory loses its fix."""
+    try:
+        declared = registry_declared_bun_names(project_path)
+        resolved = resolved_bun_versions(project_path)
+    except BunDependencyError as e:
+        raise ScanError(str(e)) from e
+    eligible: list[VulnFinding] = []
+    for vuln in vulns:
+        if vuln.pkg_name in declared and (
+            resolved.get(vuln.pkg_name) == vuln.installed_version
+        ):
+            eligible.append(vuln)
+        else:
+            vuln.fixed_version = None
+    return eligible
 
 
 _OUTDATED: dict[

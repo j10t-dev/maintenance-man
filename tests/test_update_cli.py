@@ -29,7 +29,7 @@ from tests.support.findings import (
     make_vuln,
 )
 from tests.support.process import completed, missing_tool
-from tests.support.projects import write_config
+from tests.support.projects import write_bun_manifest, write_config
 from tests.support.repository import (
     MANAGED,
     commit_file,
@@ -39,7 +39,6 @@ from tests.support.repository import (
     fail_repository_method,
     operation_id,
     push_peer_main,
-    write_file,
 )
 
 _VULN = make_vuln(pkg_name="v1")
@@ -165,7 +164,8 @@ def _use_real_mixed_processor(
     scan_result.project = "outdated"
     save_scan_results(scan_result.project, scan_result)
     repo = JjRepository(deps.project_paths["outdated"])
-    write_file(repo, "package.json", "{}\n")
+    versions = {"some-pkg": "1.0.0", "pkg-a": "1.0.0"}
+    write_bun_manifest(repo, versions)
     commit_to_main(repo, "test: add package manifest")
 
     def run_package(cmd, cwd, **kwargs):
@@ -179,6 +179,10 @@ def _use_real_mixed_processor(
     phase = MagicMock(return_value=None)
     monkeypatch.setattr(
         "maintenance_man.services.update.process_findings", updater.process_findings
+    )
+    monkeypatch.setattr(
+        "maintenance_man.package_managers.resolved_bun_versions",
+        lambda _path: versions,
     )
     monkeypatch.setattr("maintenance_man.updater.run_logged", package)
     monkeypatch.setattr("maintenance_man.updater.run_shell_command", phase)
