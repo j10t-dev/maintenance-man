@@ -26,4 +26,4 @@ Preconditions: a separate fresh launch. The helper creates a tracked synthetic c
 
 - A failed test here is deliberate fixture behaviour. The recipe fails if mm returns success before the repair.
 - `--continue` requires the saved paused resolve state and a committed repair. Do not replace this entry point with a fresh `mm update`.
-- Application failures, commit failures, missing bookmarks, VCS conflicts, several pending findings and non-uv adapters are unproved by this single-unit-failure recipe.
+- Application failures, commit failures, missing bookmarks, VCS conflicts, several pending findings and non-uv adapters are unproved by this single-unit-failure recipe. The update flow's no-change apply failure is proved by `--journey noop` in [update.md](update.md); the resolve flow's is not.

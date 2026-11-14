@@ -5,7 +5,7 @@ import re
 import shutil
 import tempfile
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Set
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import files
@@ -379,7 +379,7 @@ def select_gradle_candidates(
         and finding.gradle_target is not None
     }
     security_candidates, security_withheld = _build_security_proposals(
-        catalogue, candidates, linked, blocked
+        catalogue, candidates, conflicting, linked, blocked
     )
     candidates.update(security_candidates)
     withheld.extend(security_withheld)
@@ -517,6 +517,7 @@ def _security_only_proposal(
 def _build_security_proposals(
     catalogue: Catalogue,
     candidates: Mapping[str, GradleCandidate],
+    conflicting: Set[str],
     linked: dict[str, list[_VulnerabilityLink]],
     blocked: Mapping[str, GradleBlock],
 ) -> tuple[dict[str, GradleCandidate], list[CandidateWithheld]]:
@@ -544,6 +545,12 @@ def _build_security_proposals(
         if not direct:
             continue
         indices = tuple(index for index, _, _ in direct)
+        if key in conflicting:
+            # The caller withholds a conflicting group with every advisory on it.
+            proposals[key] = candidates[key].model_copy(
+                update={"vulnerability_indices": indices}
+            )
+            continue
         if key in candidates:
             proposals[key], unfixed = _link_known_fixed(candidates[key], direct)
             withheld.extend(unfixed)

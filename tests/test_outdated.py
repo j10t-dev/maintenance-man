@@ -205,6 +205,7 @@ def test_given_wrongly_shaped_uv_output_when_uv_outdated_runs_then_outdated_chec
         uv_outdated(project)
 
 
+_BUN_LINE_ERROR = "bun outdated: unrecognised output line: "
 _BUN_BANNER = "bun outdated v1.4.2 (744846f84)\n"
 _BUN_TABLE = (
     "bun outdated v1.4.2 (744846f84)\n"
@@ -283,7 +284,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
 
 
 @pytest.mark.parametrize(
-    ("stdout", "stderr", "declared", "resolved", "prefix"),
+    ("stdout", "stderr", "declared", "resolved", "message"),
     [
         pytest.param(
             _BUN_BANNER,
@@ -294,7 +295,12 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             id="standard-error",
         ),
         pytest.param(
-            "", "", None, None, "bun outdated: unrecognised output", id="empty"
+            "",
+            "",
+            None,
+            None,
+            "bun outdated: unrecognised output: no banner",
+            id="empty",
         ),
         pytest.param(
             _BUN_TABLE,
@@ -321,7 +327,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '┌",
+            _BUN_LINE_ERROR + repr("┌───────────┬─────────┬────────┬────────┐"),
             id="box-drawing",
         ),
         pytest.param(
@@ -329,7 +335,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '\\x1b[1m",
+            _BUN_LINE_ERROR + repr("\x1b[1mbun outdated\x1b[0m v1.4.2"),
             id="ansi-banner",
         ),
         pytest.param(
@@ -337,7 +343,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '| Name",
+            _BUN_LINE_ERROR + repr("| Name   | Current | Update | Latest |"),
             id="wrong-header",
         ),
         pytest.param(
@@ -345,7 +351,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '| is-number | 6.0.0 |'",
+            _BUN_LINE_ERROR + repr("| is-number | 6.0.0 |"),
             id="short-row",
         ),
         pytest.param(
@@ -353,7 +359,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '|",
+            _BUN_LINE_ERROR + repr("|           | 6.0.0   | 6.0.0  | 7.0.0  |"),
             id="empty-package-cell",
         ),
         pytest.param(
@@ -361,7 +367,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '|",
+            _BUN_LINE_ERROR + repr("| is-number |         | 6.0.0  | 7.0.0  |"),
             id="empty-current-cell",
         ),
         pytest.param(
@@ -369,7 +375,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '|",
+            _BUN_LINE_ERROR + repr("| is-number | 6.0.0   | 6.0.0  |        |"),
             id="empty-latest-cell",
         ),
         pytest.param(
@@ -379,7 +385,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output",
+            "bun outdated: unrecognised output: table shorter than five lines",
             id="header-without-row",
         ),
         pytest.param(
@@ -389,7 +395,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output",
+            "bun outdated: unrecognised output: table shorter than five lines",
             id="row-without-header",
         ),
         pytest.param(
@@ -397,7 +403,7 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             "",
             None,
             None,
-            "bun outdated: unrecognised output line: '1 update available'",
+            _BUN_LINE_ERROR + repr("1 update available"),
             id="trailing-line",
         ),
         pytest.param(
@@ -411,12 +417,12 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
     ],
 )
 def test_given_unrecognised_bun_report_when_bun_outdated_runs_then_outdated_check_error(
-    tmp_path, monkeypatch, stdout, stderr, declared, resolved, prefix
+    tmp_path, monkeypatch, stdout, stderr, declared, resolved, message
 ):
     with pytest.raises(OutdatedCheckError) as caught:
         _run_bun_outdated(tmp_path, monkeypatch, stdout, declared, resolved, stderr)
 
-    assert str(caught.value).startswith(prefix)
+    assert str(caught.value) == message
 
 
 _MVN_HEADER = (

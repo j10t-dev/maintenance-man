@@ -142,7 +142,7 @@ def test_given_captured_report_when_parsed_then_every_advisory_is_read():
     assert Counter(v.pkg_name for v in vulns) == {"jinja2": 12, "urllib3": 26}
     _select_fixes(vulns, make_project(Path("/tmp/fake"), package_manager="uv"))
     assert {v.fixed_version for v in vulns if v.pkg_name == "urllib3"} == {"2.8.0"}
-    assert len({v.fixed_version for v in vulns if v.pkg_name == "jinja2"} - {None}) <= 1
+    assert {v.fixed_version for v in vulns if v.pkg_name == "jinja2"} == {"3.1.6"}
 
 
 def _demo_finding(fixed_version: str | None) -> VulnFinding:

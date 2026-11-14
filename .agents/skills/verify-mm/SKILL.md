@@ -1,6 +1,6 @@
 ---
 name: verify-mm
-description: Drive and prove Maintenance Man's real interactive CLI update, local sync and failed-update recovery using an isolated MM_HOME, disposable jj repositories and a PTY.
+description: Drive and prove Maintenance Man's real interactive CLI update, local sync, failed-update recovery and the failed no-change apply using an isolated MM_HOME, disposable jj repositories and a PTY.
 ---
 
 # Verify mm

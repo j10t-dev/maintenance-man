@@ -850,6 +850,47 @@ def test_conflicting_ordinary_proposals_for_one_group_are_withheld(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "versions",
+    [("2.1.0", "1.5.0"), ("1.5.0", "2.1.0")],
+    ids=["fixing-first", "fixing-last"],
+)
+def test_given_conflicting_proposals_when_advisory_is_direct_then_conflict_reason(
+    tmp_path, versions
+):
+    catalogue, resolution = resolution_graph(tmp_path, BASE_EDGES)
+    finding = VulnFinding(
+        vuln_id="CVE-2030-1",
+        pkg_name="g:parent",
+        installed_version="1.0.0",
+        fixed_version="2.0.0",
+        severity=Severity.HIGH,
+        title="example",
+        description="example",
+        status="affected",
+    )
+    discovered = [
+        build_update_findings(
+            catalogue,
+            [
+                ReportProposal(
+                    kind="library", alias="a", coordinate="g:parent", version=version
+                )
+            ],
+        )[0]
+        for version in versions
+    ]
+
+    result = select_gradle_candidates(catalogue, resolution, [finding], discovered)
+
+    assert result.candidates == ()
+    assert list(result.withheld) == [
+        CandidateWithheld(
+            group_key="ref:a", block=_CONFLICT, vulnerability_indices=(0,)
+        )
+    ]
+
+
 def test_native_batch_deduplicates_consuming_projects_and_validates_plugins_at_root(
     tmp_path,
 ):

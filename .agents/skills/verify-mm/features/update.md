@@ -8,6 +8,7 @@ Choose saved dependency findings, apply them in an isolated workspace, run the p
 - `update-cancel` accepts `none` without changing dependencies or running tests.
 - `update-apply` installs the requested version and runs configured tests.
 - `update-promote` advances local main and removes completed scan rows without publishing.
+- `update-noop` fails a finding in `apply` when its package commands change no files, and leaves local main where it was.
 - `update-batch` applies all or a named subset, with optional exclusions.
 
 ## How to get to it (user POV)
