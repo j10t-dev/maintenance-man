@@ -216,6 +216,18 @@ _BUN_TABLE = (
     "|---------------------------------------|\n"
 )
 _BUN_ROW = "| is-number | 6.0.0   | 6.0.0  | 7.0.0  |"
+# Captured from bun 1.4.2: a separator follows every row but the last.
+_BUN_ROW_SEPARATOR = "|-----------------------|---------|--------|--------|"
+_BUN_TWO_ROWS = (
+    "bun outdated v1.4.2 (744846f84)\n"
+    "|---------------------------------------------------|\n"
+    "| Package               | Current | Update | Latest |\n"
+    f"{_BUN_ROW_SEPARATOR}\n"
+    "| commander             | 15.0.0  | 15.0.0 | 15.1.0 |\n"
+    f"{_BUN_ROW_SEPARATOR}\n"
+    "| @oxlint/plugins (dev) | 1.82.0  | 1.82.0 | 1.93.0 |\n"
+    "|---------------------------------------------------|\n"
+)
 
 
 def _bun_lookup(expected_path, value):
@@ -263,6 +275,16 @@ def _run_bun_outdated(tmp_path, monkeypatch, stdout, declared, resolved, stderr=
             {"eslint": "9.0.0"},
             [_finding("eslint", "9.0.0", "9.1.0", SemverTier.MINOR)],
             id="dev-suffix",
+        ),
+        pytest.param(
+            _BUN_TWO_ROWS,
+            {"commander", "@oxlint/plugins"},
+            {"commander": "15.0.0", "@oxlint/plugins": "1.82.0"},
+            [
+                _finding("commander", "15.0.0", "15.1.0", SemverTier.MINOR),
+                _finding("@oxlint/plugins", "1.82.0", "1.93.0", SemverTier.MINOR),
+            ],
+            id="separator-between-rows",
         ),
     ],
 )
@@ -397,6 +419,25 @@ def test_given_bun_report_when_bun_outdated_runs_then_declared_updates_are_retur
             None,
             "bun outdated: unrecognised output: table shorter than five lines",
             id="row-without-header",
+        ),
+        pytest.param(
+            _BUN_TWO_ROWS.replace(f"{_BUN_ROW_SEPARATOR}\n| @oxlint", "| @oxlint"),
+            "",
+            None,
+            None,
+            _BUN_LINE_ERROR
+            + repr("| @oxlint/plugins (dev) | 1.82.0  | 1.82.0 | 1.93.0 |"),
+            id="rows-without-separator",
+        ),
+        pytest.param(
+            _BUN_TWO_ROWS.replace(
+                "| 1.93.0 |\n", f"| 1.93.0 |\n{_BUN_ROW_SEPARATOR}\n"
+            ),
+            "",
+            None,
+            None,
+            _BUN_LINE_ERROR + repr(_BUN_ROW_SEPARATOR),
+            id="separator-after-last-row",
         ),
         pytest.param(
             _BUN_TABLE + "1 update available\n",

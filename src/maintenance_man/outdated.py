@@ -149,12 +149,16 @@ def _parse_bun_report(stdout: str) -> list[tuple[str, str, str]]:
     if len(table) < 5:
         msg = "bun outdated: unrecognised output: table shorter than five lines"
         raise OutdatedCheckError(msg)
-    for separator in (table[0], table[2], table[-1]):
+    # After the header bun prints a separator before every row.
+    body = table[2:-1]
+    for separator in (table[0], table[-1], *body[0::2]):
         if not _BUN_SEPARATOR_RE.fullmatch(separator):
             raise _unrecognised_bun_line(separator)
     if _bun_cells(table[1])[:4] != ["Package", "Current", "Update", "Latest"]:
         raise _unrecognised_bun_line(table[1])
-    return [_parse_bun_row(line) for line in table[3:-1]]
+    if len(body) % 2:
+        raise _unrecognised_bun_line(body[-1])
+    return [_parse_bun_row(line) for line in body[1::2]]
 
 
 def _parse_bun_row(line: str) -> tuple[str, str, str]:
