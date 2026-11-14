@@ -742,6 +742,61 @@ def test_direct_security_fix_is_retained_pending_native_proof(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("proposed", "fixed_in", "linked"),
+    [
+        pytest.param("1.0.5", "2.0.0", False, id="below-fix"),
+        pytest.param("2.0.0", "2.0.0", True, id="at-fix"),
+        pytest.param("2.1.0", "1.0.3, 2.0.0", True, id="above-every-listed"),
+        pytest.param("1.5.0", "1.0.3, 2.0.0", False, id="between-two-listed"),
+        pytest.param("2.0.0", "2.0.0-jre", False, id="qualifier-differs"),
+    ],
+)
+def test_given_ordinary_proposal_when_selected_then_advisory_links_only_if_known_fixed(
+    tmp_path, proposed, fixed_in, linked
+):
+    catalogue, resolution = resolution_graph(tmp_path, BASE_EDGES)
+    finding = VulnFinding(
+        vuln_id="CVE-2030-1",
+        pkg_name="g:parent",
+        installed_version="1.0.0",
+        fixed_version=fixed_in,
+        severity=Severity.HIGH,
+        title="example",
+        description="example",
+        status="affected",
+    )
+    discovered = build_update_findings(
+        catalogue,
+        [
+            ReportProposal(
+                kind="library", alias="a", coordinate="g:parent", version=proposed
+            )
+        ],
+    )
+
+    result = select_gradle_candidates(catalogue, resolution, [finding], discovered)
+
+    assert [
+        (c.target.group_key, c.target.target_version, c.vulnerability_indices)
+        for c in result.candidates
+    ] == [("ref:a", proposed, (0,) if linked else ())]
+    reason = (
+        f"proposed {proposed} is not known to fix this advisory (fixed in {fixed_in})"
+    )
+    assert list(result.withheld) == (
+        []
+        if linked
+        else [
+            CandidateWithheld(
+                group_key=None,
+                block=GradleBlock(kind="mapping", reason=reason),
+                vulnerability_indices=(0,),
+            )
+        ]
+    )
+
+
 def test_given_no_fix_advisory_on_same_owner_when_selected_then_fixed_one_qualifies(
     tmp_path,
 ):

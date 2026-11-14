@@ -22,6 +22,7 @@ from maintenance_man.dependency_age import (
     member_module,
     publication_request,
 )
+from maintenance_man.fix_versions import is_known_fixed
 from maintenance_man.gradle import (
     Catalogue,
     CatalogueEntry,
@@ -457,7 +458,7 @@ def _link_vulnerabilities(
 
 
 def _withheld_finding(index: int, reason: str) -> CandidateWithheld:
-    """Withhold one advisory that names no single catalogue owner."""
+    """Withhold one advisory without blocking any catalogue group."""
     return CandidateWithheld(
         group_key=None,
         block=GradleBlock(kind="mapping", reason=reason),
@@ -544,9 +545,8 @@ def _build_security_proposals(
             continue
         indices = tuple(index for index, _, _ in direct)
         if key in candidates:
-            proposals[key] = candidates[key].model_copy(
-                update={"vulnerability_indices": indices}
-            )
+            proposals[key], unfixed = _link_known_fixed(candidates[key], direct)
+            withheld.extend(unfixed)
             continue
         proposal = _security_only_proposal(catalogue, key, direct, indices)
         if isinstance(proposal, CandidateWithheld):
@@ -554,6 +554,28 @@ def _build_security_proposals(
         else:
             proposals[key] = proposal
     return proposals, withheld
+
+
+def _link_known_fixed(
+    candidate: GradleCandidate,
+    direct: list[_VulnerabilityLink],
+) -> tuple[GradleCandidate, list[CandidateWithheld]]:
+    version = candidate.target.target_version
+    indices: list[int] = []
+    withheld: list[CandidateWithheld] = []
+    for index, finding, _ in direct:
+        if is_known_fixed(version, finding.fixed_version, "gradle"):
+            indices.append(index)
+        else:
+            withheld.append(
+                _withheld_finding(
+                    index,
+                    f"proposed {version} is not known to fix this advisory "
+                    f"(fixed in {finding.fixed_version})",
+                )
+            )
+    linked = candidate.model_copy(update={"vulnerability_indices": tuple(indices)})
+    return linked, withheld
 
 
 def _split_by_directness(
