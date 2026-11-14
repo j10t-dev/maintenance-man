@@ -1,6 +1,7 @@
 import json
 import re
 import shutil
+from collections import Counter
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ from maintenance_man.scanner import (
     ScanError,
     _parse_trivy,
     _parse_uv_audit_vulns,
+    _select_fixes,
     scan_gradle,
     scan_project,
 )
@@ -96,9 +98,12 @@ def test_given_uv_audit_exiting_one_with_findings_when_run_then_findings_are_ret
         "- GHSA-r9hx-vwmv-q579: ReDoS\n\n"
         "  Fixed in: 65.5.1\n"
     )
+    found = "Found 1 known vulnerability and no adverse project statuses in 1 package\n"
     monkeypatch.setattr(
         "maintenance_man.process.subprocess.run",
-        lambda argv, **kwargs: completed(argv, returncode=1, stdout=output),
+        lambda argv, **kwargs: completed(
+            argv, returncode=1, stdout=output, stderr=found
+        ),
     )
 
     findings = scanner._run_uv_audit(tmp_path)
@@ -108,68 +113,167 @@ def test_given_uv_audit_exiting_one_with_findings_when_run_then_findings_are_ret
     ]
 
 
+_UV_FOUND_NONE = (
+    "Found no known vulnerabilities and no adverse project statuses in 23 packages\n"
+)
+_UV_ONE_ADVISORY = (
+    "\nVulnerabilities:\n\n"
+    "demo 1.0.0 has 1 known vulnerability:\n\n"
+    "- GHSA-aaaa-bbbb-cccc: Example title\n\n"
+    "  Fixed in: 1.0.1, 2.0.0\n\n"
+    "  Advisory information: https://example.test/advisory\n"
+)
+_UV_FOUND_ONE = (
+    "Found 1 known vulnerability and no adverse project statuses in 2 packages\n"
+)
+_UV_SECOND_PACKAGE_HEADER = "\nother 2.0.0 has 1 known vulnerability:\n\n"
+
+
+def test_given_captured_report_when_parsed_then_every_advisory_is_read():
+    stdout = (FIXTURES_DIR / "uv-audit" / "urllib3-jinja2.stdout.txt").read_text(
+        encoding="utf-8"
+    )
+    stderr = (FIXTURES_DIR / "uv-audit" / "urllib3-jinja2.stderr.txt").read_text(
+        encoding="utf-8"
+    )
+
+    vulns = _parse_uv_audit_vulns(stdout, stderr)
+
+    assert Counter(v.pkg_name for v in vulns) == {"jinja2": 12, "urllib3": 26}
+    _select_fixes(vulns, make_project(Path("/tmp/fake"), package_manager="uv"))
+    assert {v.fixed_version for v in vulns if v.pkg_name == "urllib3"} == {"2.8.0"}
+    assert len({v.fixed_version for v in vulns if v.pkg_name == "jinja2"} - {None}) <= 1
+
+
+def _demo_finding(fixed_version: str | None) -> VulnFinding:
+    return VulnFinding(
+        vuln_id="GHSA-aaaa-bbbb-cccc",
+        pkg_name="demo",
+        installed_version="1.0.0",
+        fixed_version=fixed_version,
+        severity=Severity.UNKNOWN,
+        title="Example title",
+        description="Example title",
+        status="affected",
+        primary_url="https://example.test/advisory",
+    )
+
+
 @pytest.mark.parametrize(
-    ("output", "expected"),
+    ("stdout", "stderr", "expected"),
     [
+        pytest.param("", _UV_FOUND_NONE, [], id="no-advisories"),
         pytest.param(
-            "Found 1 known vulnerability and no adverse project statuses in "
-            "1 package\n\n"
-            "Vulnerabilities:\n\n"
-            "setuptools 65.5.0 has 1 known vulnerability:\n\n"
-            "- GHSA-r9hx-vwmv-q579: pypa/setuptools vulnerable to Regular "
-            "Expression Denial of Service (ReDoS)\n\n"
-            "  Fixed in: 65.5.1\n\n"
-            "  Advisory information: https://nvd.nist.gov/vuln/detail/"
-            "CVE-2022-40897\n",
-            [
-                (
-                    "setuptools",
-                    "65.5.0",
-                    "GHSA-r9hx-vwmv-q579",
-                    "65.5.1",
-                    "https://nvd.nist.gov/vuln/detail/CVE-2022-40897",
-                )
-            ],
-            id="vulnerability",
+            _UV_ONE_ADVISORY,
+            _UV_FOUND_ONE,
+            [_demo_finding("1.0.1, 2.0.0")],
+            id="advisory-with-fix-list",
         ),
         pytest.param(
-            "setuptools 65.5.0 has 1 known vulnerability:\n\n"
-            "- GHSA-r9hx-vwmv-q579: real vulnerability\n\n"
-            "- note: this is not another vulnerability\n\n"
-            "  Fixed in: 65.5.1\n",
-            [("setuptools", "65.5.0", "GHSA-r9hx-vwmv-q579", "65.5.1", None)],
-            id="non-advisory-bullet",
-        ),
-        pytest.param(
-            "- GHSA-xxxx: orphan\n"
-            "  Fixed in: 1.0\n"
-            "requests 2.0 has 1 known vulnerability:\n"
-            "- CVE-1: bad\n",
-            [("requests", "2.0", "CVE-1", None, None)],
-            id="advisory-before-package",
+            _UV_ONE_ADVISORY.replace("  Fixed in: 1.0.1, 2.0.0\n\n", ""),
+            _UV_FOUND_ONE,
+            [_demo_finding(None)],
+            id="advisory-without-fix",
         ),
     ],
 )
-def test_given_uv_audit_output_when_parsed_then_advisories_belong_to_their_package(
-    output, expected
+def test_given_complete_uv_audit_report_when_parsed_then_findings_are_returned(
+    stdout, stderr, expected
 ):
-    vulns = _parse_uv_audit_vulns(output)
-
-    assert [
-        (v.pkg_name, v.installed_version, v.vuln_id, v.fixed_version, v.primary_url)
-        for v in vulns
-    ] == expected
-
-
-_AUDIT_HEADER = "Found 2 known vulnerabilities in 2 packages\n\nVulnerabilities:\n\n"
+    assert _parse_uv_audit_vulns(stdout, stderr) == expected
 
 
 @pytest.mark.parametrize(
-    ("output", "expected_message"),
+    ("stdout", "stderr", "expected_message"),
+    [
+        pytest.param(
+            _UV_ONE_ADVISORY,
+            "Resolved 4 packages in 1ms\n",
+            'uv audit: standard error has no "Found ... known vulnerabilities" line',
+            id="no-found-line",
+        ),
+        pytest.param(
+            _UV_ONE_ADVISORY,
+            "Found 2 known vulnerabilities and no adverse project statuses in "
+            "2 packages\n",
+            "uv audit: reports 2 advisories, parsed 1",
+            id="fewer-parsed-than-reported",
+        ),
+        pytest.param(
+            _UV_ONE_ADVISORY,
+            _UV_FOUND_NONE,
+            "uv audit: reports 0 advisories, parsed 1",
+            id="advisory-when-none-reported",
+        ),
+        pytest.param(
+            "Adverse statuses:\n",
+            _UV_FOUND_NONE,
+            "uv audit: unexpected output line: 'Adverse statuses:'",
+            id="unknown-line",
+        ),
+        pytest.param(
+            _UV_ONE_ADVISORY.replace("  Fixed in: 1.0.1, 2.0.0", "  Patched in: 1.0.1"),
+            _UV_FOUND_ONE,
+            "uv audit: unexpected output line: '  Patched in: 1.0.1'",
+            id="unknown-advisory-detail",
+        ),
+        pytest.param(
+            "\nVulnerabilities:\n\n- GHSA-aaaa-bbbb-cccc: Example title\n",
+            _UV_FOUND_ONE,
+            "uv audit: unexpected output line: '- GHSA-aaaa-bbbb-cccc: Example title'",
+            id="advisory-before-package",
+        ),
+        pytest.param(
+            _UV_ONE_ADVISORY.replace(
+                "  Fixed in: 1.0.1, 2.0.0\n",
+                "  Fixed in: 1.0.1, 2.0.0\n  Fixed in: 3.0.0\n",
+            ),
+            _UV_FOUND_ONE,
+            "uv audit: unexpected output line: '  Fixed in: 3.0.0'",
+            id="second-fix-list",
+        ),
+        pytest.param(
+            _UV_ONE_ADVISORY.replace("  Fixed in: 1.0.1, 2.0.0\n\n", "")
+            + _UV_SECOND_PACKAGE_HEADER
+            + "  Fixed in: 1.0.1\n",
+            _UV_FOUND_ONE,
+            "uv audit: unexpected output line: '  Fixed in: 1.0.1'",
+            id="fix-list-before-advisory",
+        ),
+        pytest.param(
+            _UV_ONE_ADVISORY
+            + _UV_SECOND_PACKAGE_HEADER
+            + "  Advisory information: https://example.test/advisory\n",
+            _UV_FOUND_ONE,
+            "uv audit: unexpected output line: "
+            "'  Advisory information: https://example.test/advisory'",
+            id="url-before-advisory",
+        ),
+    ],
+)
+def test_given_incomplete_or_unrecognised_uv_audit_report_when_parsed_then_scan_fails(
+    stdout, stderr, expected_message
+):
+    with pytest.raises(ScanError) as error:
+        _parse_uv_audit_vulns(stdout, stderr)
+
+    assert str(error.value) == expected_message
+
+
+_AUDIT_HEADER = "Vulnerabilities:\n\n"
+
+
+def _found(count: int) -> str:
+    return f"Found {count} known vulnerabilities in 2 packages\n"
+
+
+@pytest.mark.parametrize(
+    ("output", "stderr", "expected_message"),
     [
         pytest.param(
             _AUDIT_HEADER + "setuptools 65.5.0 has 2 known vulnerabilities:\n\n"
             "- GHSA-r9hx-vwmv-q579: ReDoS\n\n  Fixed in: 65.5.1\n",
+            _found(1),
             "uv audit: setuptools declares 2 advisories, parsed 1",
             id="fewer-parsed-than-declared",
         ),
@@ -178,6 +282,7 @@ _AUDIT_HEADER = "Found 2 known vulnerabilities in 2 packages\n\nVulnerabilities:
             "- CVE-2026-1: One\n\n  Fixed in: 2.0.1\n\n"
             "urllib3 1.0.0 has 1 known vulnerability:\n\n"
             "- GHSA-x: Two\n\n  Fixed in: 1.0.1\n",
+            _found(2),
             "uv audit: requests declares 2 advisories, parsed 1",
             id="first-package-mismatch",
         ),
@@ -186,16 +291,17 @@ _AUDIT_HEADER = "Found 2 known vulnerabilities in 2 packages\n\nVulnerabilities:
             "- CVE-2026-1: One\n\n  Fixed in: 2.0.1\n\n"
             "urllib3 1.0.0 has 1 known vulnerability:\n\n"
             "- GHSA-x: Two\n- GHSA-y: Three\n\n  Fixed in: 1.0.1\n",
+            _found(3),
             "uv audit: urllib3 declares 1 advisories, parsed 2",
             id="second-package-mismatch",
         ),
     ],
 )
 def test_given_uv_audit_text_when_counts_differ_then_scan_error_names_package(
-    output, expected_message
+    output, stderr, expected_message
 ):
     with pytest.raises(ScanError, match=f"^{re.escape(expected_message)}$"):
-        _parse_uv_audit_vulns(output)
+        _parse_uv_audit_vulns(output, stderr)
 
 
 def test_given_uv_audit_advisory_with_unfamiliar_prefix_when_parsed_then_kept():
@@ -204,7 +310,7 @@ def test_given_uv_audit_advisory_with_unfamiliar_prefix_when_parsed_then_kept():
         "- MAL-2026-1: Malicious package\n\n  Fixed in: 1.0.1\n"
     )
 
-    assert _parse_uv_audit_vulns(output) == [
+    assert _parse_uv_audit_vulns(output, _found(1)) == [
         VulnFinding(
             vuln_id="MAL-2026-1",
             pkg_name="left-pad",
@@ -213,27 +319,6 @@ def test_given_uv_audit_advisory_with_unfamiliar_prefix_when_parsed_then_kept():
             severity=Severity.UNKNOWN,
             title="Malicious package",
             description="Malicious package",
-            status="affected",
-        )
-    ]
-
-
-def test_given_uv_audit_advisory_with_fix_versions_when_parsed_then_list_is_stored():
-    output = (
-        "urllib3 1.26.5 has 1 known vulnerability:\n\n"
-        "- GHSA-34jh-p97f-mpxf: Cookie header leaks on redirect\n\n"
-        "  Fixed in: 2.0.7, 1.26.18\n"
-    )
-
-    assert _parse_uv_audit_vulns(output) == [
-        VulnFinding(
-            vuln_id="GHSA-34jh-p97f-mpxf",
-            pkg_name="urllib3",
-            installed_version="1.26.5",
-            fixed_version="2.0.7, 1.26.18",
-            severity=Severity.UNKNOWN,
-            title="Cookie header leaks on redirect",
-            description="Cookie header leaks on redirect",
             status="affected",
         )
     ]
@@ -318,8 +403,14 @@ def test_given_manager_when_scanned_then_its_scanners_run(
 ):
     commands = FakeCommands()
     for argv in expected_commands:
-        stdout = "" if argv[0] == "uv" else _TRIVY_OUTPUT
-        commands.add(argv, cwd=tmp_path, result=completed(stdout=stdout))
+        if argv[0] == "uv":
+            result = completed(
+                stderr="Found no known vulnerabilities and no adverse project "
+                "statuses in 1 package\n"
+            )
+        else:
+            result = completed(stdout=_TRIVY_OUTPUT)
+        commands.add(argv, cwd=tmp_path, result=result)
     required = []
     monkeypatch.setattr(
         scanner, "require_tool", lambda name, hint: required.append(name)

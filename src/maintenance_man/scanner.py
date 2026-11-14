@@ -372,22 +372,26 @@ def _run_uv_audit(project_path: Path) -> list[VulnFinding]:
         "uv audit --locked",
         ok_codes={0, 1},
     )
-    return _parse_uv_audit_vulns(completed.stdout)
+    return _parse_uv_audit_vulns(completed.stdout, completed.stderr)
 
 
-def _parse_uv_audit_vulns(output: str) -> list[VulnFinding]:
-    """Parse uv audit's human-readable vulnerability output.
+def _parse_uv_audit_vulns(stdout: str, stderr: str) -> list[VulnFinding]:
+    """Parse uv audit's human-readable vulnerability report.
 
-    Each package header declares its advisory count. A package whose parsed
-    advisories differ from that count raises ``ScanError`` instead of
-    returning a partial list.
+    Raises ``ScanError`` instead of returning a partial list when standard
+    output holds a line outside the recognised forms or out of position, when
+    a package's parsed advisories differ from the count its header declares,
+    or when standard error has no ``Found`` line or its total differs from the
+    advisories parsed.
     """
     findings: list[VulnFinding] = []
     package: tuple[str, str] | None = None
     declared = parsed = 0
     current: VulnFinding | None = None
 
-    for line in output.splitlines():
+    for line in stdout.splitlines():
+        if not line.strip() or line == "Vulnerabilities:":
+            continue
         if match := _UV_AUDIT_PACKAGE_RE.match(line):
             if package is not None:
                 _check_declared(package[0], declared, parsed)
@@ -407,19 +411,46 @@ def _parse_uv_audit_vulns(output: str) -> list[VulnFinding]:
             findings.append(current)
             parsed += 1
         elif current is None:
-            continue
-        elif match := _UV_AUDIT_FIXED_RE.match(line):
-            current.fixed_version = match.group("versions")
-        elif match := _UV_AUDIT_URL_RE.match(line):
-            current.primary_url = match.group("url")
+            raise _unexpected_line(line)
+        else:
+            _read_advisory_detail(current, line)
     if package is not None:
         _check_declared(package[0], declared, parsed)
+    _check_reported(stderr, len(findings))
     return findings
+
+
+def _read_advisory_detail(current: VulnFinding, line: str) -> None:
+    if (match := _UV_AUDIT_FIXED_RE.match(line)) and current.fixed_version is None:
+        current.fixed_version = match.group("versions")
+    elif match := _UV_AUDIT_URL_RE.match(line):
+        current.primary_url = match.group("url")
+    else:
+        raise _unexpected_line(line)
+
+
+def _unexpected_line(line: str) -> ScanError:
+    return ScanError(f"uv audit: unexpected output line: {line!r}")
 
 
 def _check_declared(package: str, declared: int, parsed: int) -> None:
     if declared != parsed:
         msg = f"uv audit: {package} declares {declared} advisories, parsed {parsed}"
+        raise ScanError(msg)
+
+
+def _check_reported(stderr: str, parsed: int) -> None:
+    found = next(
+        (m for line in stderr.splitlines() if (m := _UV_AUDIT_FOUND_RE.match(line))),
+        None,
+    )
+    if found is None:
+        msg = 'uv audit: standard error has no "Found ... known vulnerabilities" line'
+        raise ScanError(msg)
+    count = found.group("count")
+    reported = 0 if count == "no" else int(count)
+    if reported != parsed:
+        msg = f"uv audit: reports {reported} advisories, parsed {parsed}"
         raise ScanError(msg)
 
 
@@ -430,6 +461,7 @@ _UV_AUDIT_PACKAGE_RE = re.compile(
 _UV_AUDIT_VULN_RE = re.compile(r"^-\s+(?P<id>[A-Z]+-[^:]+):\s+(?P<title>.+)$")
 _UV_AUDIT_FIXED_RE = re.compile(r"^\s+Fixed in:\s+(?P<versions>\S+(?:,\s+\S+)*)\s*$")
 _UV_AUDIT_URL_RE = re.compile(r"^\s+Advisory information:\s+(?P<url>\S+)\s*$")
+_UV_AUDIT_FOUND_RE = re.compile(r"^Found (?P<count>no|\d+) known vulnerabilit")
 
 
 def scan_secrets(
