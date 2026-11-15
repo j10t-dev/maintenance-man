@@ -337,8 +337,7 @@ def _test_and_commit(
     flow: Workflow,
     emit: Emit,
 ) -> FindingStep:
-    project_path = project.path
-    failed_phase = run_test_phases(project, project_path, emit=emit)
+    failed_phase = run_test_phases(project, project.path, emit=emit)
     if failed_phase is not None:
         return FindingStep(failed_phase)
 
