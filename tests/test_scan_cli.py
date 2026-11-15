@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from maintenance_man import cli, scanner
+from maintenance_man import finding_selection, scan_table, scanner
 from maintenance_man.cli import ExitCode
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.scan import (
@@ -175,7 +175,7 @@ def _scan(
 def test_given_scan_result_when_piped_then_each_finding_is_one_whole_record(
     capsys: pytest.CaptureFixture[str], result: ScanResult, expected: list[str]
 ) -> None:
-    cli._print_scan_result(result)
+    scan_table.print_scan_result(result)
 
     assert capsys.readouterr().out.splitlines() == [
         f"vulnerable\t{record}" for record in expected
@@ -302,7 +302,7 @@ def test_given_scan_result_when_rendered_on_terminal_then_columns_follow_the_wid
 ) -> None:
     stream = terminal_stdout(monkeypatch, width)
 
-    cli._print_scan_result(result)
+    scan_table.print_scan_result(result)
 
     assert _unwrap_footer(stream.getvalue().splitlines()) == expected
 
@@ -313,7 +313,7 @@ def test_numbered_findings_print_bracketed_values_literally(
     vuln = make_vuln(pkg_name="a[b]", vuln_id="CVE-[x]")
     update = make_update(pkg_name="u[p]")
 
-    cli._print_numbered_findings([vuln], [update])
+    finding_selection.print_numbered_findings([vuln], [update])
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -344,7 +344,7 @@ def test_numbered_findings_name_the_gradle_target_that_owns_each_row(
         fixed_version="2.8.5",
     )
 
-    cli._print_numbered_findings(
+    finding_selection.print_numbered_findings(
         [
             advisory.model_copy(update={"gradle_target": make_gradle_target()}),
             advisory.model_copy(update={"gradle_target": ksp}),

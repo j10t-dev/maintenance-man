@@ -1,18 +1,14 @@
-import functools
 import sys
 import time
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Annotated, Literal, NoReturn, get_args
+from typing import Annotated, NoReturn, get_args
 
 import cyclopts
-from rich.text import Text
 
-from maintenance_man import __version__, output, paths, vcs_workflow
-from maintenance_man.clock import utc_now
+from maintenance_man import __version__, output, paths
 from maintenance_man.config import (
     ConfigError,
     ProjectNotFoundError,
@@ -22,46 +18,16 @@ from maintenance_man.config import (
     resolve_project,
 )
 from maintenance_man.deployer import BuildError
+from maintenance_man.event_renderer import EventRenderer
+from maintenance_man.finding_selection import choose_findings
 from maintenance_man.gradle import GradleError
 from maintenance_man.models.activity import ActivityEvent, ProjectActivity
 from maintenance_man.models.config import MmConfig, ProjectConfig
-from maintenance_man.models.events import (
-    BlockersStillFailing,
-    DeployStep,
-    DeployStepFinished,
-    Event,
-    FindingFailed,
-    FindingPassed,
-    FindingsBlocked,
-    FindingStarted,
-    FindingStepFailed,
-    HealthChecked,
-    MissingTestConfig,
-    OperationFailed,
-    Outcome,
-    ProcessingStarted,
-    ProjectSkipped,
-    ProjectStarted,
-    Promoted,
-    PromotionFailed,
-    ResolvePaused,
-    ScanReported,
-    SkipReason,
-    Status,
-    SyncCompleted,
-    TestCommandStarted,
-)
-from maintenance_man.models.scan import (
-    GradleBlock,
-    ScanResult,
-    SecretFinding,
-    UpdateFinding,
-    UpdateResult,
-    VulnFinding,
-    sort_vulns_by_severity,
-)
+from maintenance_man.models.events import Outcome, Status
+from maintenance_man.models.scan import ScanResult, UpdateResult
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError, require_tool
+from maintenance_man.scan_table import print_scan_result
 from maintenance_man.scanner import ScanError
 from maintenance_man.services import WorkflowError
 from maintenance_man.services import deploy as deploy_service
@@ -115,200 +81,7 @@ _OVERVIEW_HEADERS = (
     "deployed",
 )
 _NARROW_OVERVIEW = ("project", "vulns", "updates", "secrets")
-_NARROW_TERMINAL_WIDTH = 70
-
-
-type _Flow = Literal["scan", "update", "resolve", "deploy"]
-
-
-@dataclass(slots=True)
-class _Renderer:
-    batch: bool
-    project: str = ""
-    flow: _Flow = "update"
-
-    @functools.singledispatchmethod
-    def __call__(self, event: Event) -> None:
-        raise NotImplementedError(type(event))
-
-    @__call__.register
-    def _render_project_skipped(self, event: ProjectSkipped) -> None:
-        if event.reason in _DEPLOY_SKIPS:
-            status, reason = _DEPLOY_SKIPS[event.reason]
-            output.outcome(event.project, "deploy", status, "deploy", reason=reason)
-            return
-        match event.reason:
-            case SkipReason.PATH_MISSING if self.flow == "deploy":
-                output.outcome(
-                    event.project,
-                    "deploy",
-                    "failed",
-                    "deploy",
-                    reason=f"path does not exist: {event.detail}",
-                )
-            case SkipReason.PATH_MISSING:
-                output.diagnostic(
-                    "warning", f"{event.project} · path does not exist: {event.detail}"
-                )
-            case SkipReason.FLOW_CONFLICT:
-                output.diagnostic("warning", f"{event.project} · {event.detail}")
-            case SkipReason.NO_SCAN_RESULTS if not self.batch:
-                output.notice(f"No scan results for {event.project}")
-            case SkipReason.NOTHING_TO_DO:
-                output.notice(f"Nothing to {event.detail} in {event.project}")
-            case SkipReason.CORRUPT_SCAN_RESULTS:
-                output.diagnostic(
-                    "warning",
-                    f"{event.project} · corrupt scan results; "
-                    f"run mm scan {event.project}",
-                )
-
-    @__call__.register
-    def _render_operation_failed(self, event: OperationFailed) -> None:
-        output.diagnostic(
-            "error", f"{event.project} · {event.operation} · {event.error}"
-        )
-
-    @__call__.register
-    def _render_promotion(self, event: Promoted | PromotionFailed) -> None:
-        match event:
-            case PromotionFailed(project=project, error=error):
-                output.outcome(
-                    project, "promotion", "failed", _LOCAL_MAIN, reason=error
-                )
-            case Promoted():
-                output.outcome(self.project, "promotion", "passed", _LOCAL_MAIN)
-
-    @__call__.register
-    def _render_scan_reported(self, event: ScanReported) -> None:
-        result = event.result
-        if self.flow == "scan" or output.terminal():
-            _print_scan_result(result, elapsed_s=event.elapsed_s)
-        else:
-            _print_blocked_findings(result, self.flow)
-        if result.has_findings or self.batch:
-            return
-        if event.elapsed_s is None:
-            output.notice(f"No findings in {result.project}")
-        else:
-            output.notice(
-                f"No findings in {result.project} · scanned in {event.elapsed_s:.1f}s"
-            )
-
-    @__call__.register
-    def _render_missing_test_config(self, event: MissingTestConfig) -> None:
-        output.diagnostic(
-            "error",
-            f"{event.project} · no test configuration · automatic updates need "
-            "test_unit, test_integration or test_component",
-        )
-
-    @__call__.register
-    def _render_processing_started(self, event: ProcessingStarted) -> None:
-        output.heading(
-            self.project, f"{event.vulns} vulnerabilities · {event.updates} updates"
-        )
-
-    @__call__.register
-    def _render_resolve_paused(self, event: ResolvePaused) -> None:
-        output.notice("Resolve paused")
-        output.diagnostic("hint", f"mm resolve {event.project} --continue")
-
-    @__call__.register
-    def _render_findings_blocked(self, event: FindingsBlocked) -> None:
-        for package, reason in event.findings:
-            output.outcome(self.project, self.flow, "blocked", package, reason=reason)
-
-    @__call__.register
-    def _render_blockers_still_failing(self, event: BlockersStillFailing) -> None:
-        output.diagnostic(
-            "error", f"{event.phase} · still blocking: {', '.join(event.pkgs)}"
-        )
-
-    @__call__.register
-    def _render_sync_completed(self, event: SyncCompleted) -> None:
-        if event.action == vcs_workflow.SyncAction.UNCHANGED:
-            output.outcome(event.project, "sync", "unchanged", "main")
-        else:
-            output.outcome(event.project, "sync", "passed", "main", reason=event.action)
-
-    @__call__.register
-    def _render_project_started(self, event: ProjectStarted) -> None:
-        self.project = event.project
-        if self.flow == "deploy":
-            output.heading(event.project)
-
-    @__call__.register
-    def _render_finding_started(self, event: FindingStarted) -> None:
-        if output.stderr_terminal():
-            output.notice(f"Updating {event.pkg} {event.installed} → {event.target}")
-
-    @__call__.register
-    def _render_test_command_started(self, event: TestCommandStarted) -> None:
-        if output.is_verbose():
-            output.notice(f"$ {event.command}")
-
-    @__call__.register
-    def _render_finding_step_failed(self, event: FindingStepFailed) -> None:
-        prefix = f"{self.project} · " if self.project else ""
-        output.diagnostic("error", f"{prefix}{event.step} · {event.error}")
-
-    @__call__.register
-    def _render_finding_outcome(self, event: FindingPassed | FindingFailed) -> None:
-        match event:
-            case FindingFailed(phase=phase):
-                status, reason = "failed", f"{phase} failed"
-            case FindingPassed(already_applied=applied):
-                status, reason = "passed", "already applied" if applied else ""
-        output.outcome(
-            self.project,
-            self.flow,
-            status,
-            event.pkg,
-            installed=event.installed,
-            target=event.target,
-            reason=reason,
-        )
-
-    @__call__.register
-    def _render_deploy_step_finished(self, event: DeployStepFinished) -> None:
-        word = event.step.value
-        if event.error is None:
-            output.outcome(event.project, word, "passed", word)
-            return
-        output.outcome(event.project, word, "failed", word, reason=event.error)
-        if event.step is DeployStep.BUILD:
-            output.outcome(
-                event.project, "deploy", "skipped", "deploy", reason="build failed"
-            )
-
-    @__call__.register
-    def _render_health_checked(self, event: HealthChecked) -> None:
-        if event.is_up:
-            output.outcome(event.project, "health", "passed", "healthcheck")
-        else:
-            output.outcome(
-                event.project,
-                "health",
-                "failed",
-                "healthcheck",
-                reason=event.error or "not healthy",
-            )
-
-
-_DEPLOY_SKIPS: dict[SkipReason, tuple[Status, str]] = {
-    SkipReason.NOT_DEPLOYABLE: ("skipped", "not deployable"),
-    SkipReason.UNCHANGED: (
-        "unchanged",
-        "unchanged since last deploy · use --force to redeploy",
-    ),
-    SkipReason.BLOCKED: (
-        "blocked",
-        "could not resolve main revision · use --force to deploy anyway",
-    ),
-}
 _STATUS_ORDER: tuple[Status, ...] = get_args(Status.__value__)
-_LOCAL_MAIN = "local main"
 _HEALTHCHECK_UNCONFIGURED = "--check: no healthcheck_url configured in [defaults]"
 
 
@@ -406,7 +179,7 @@ def scan(
             project,
             proj_config,
             minimum_age_days=cfg.defaults.min_version_age_days,
-            emit=_Renderer(batch=False, project=project, flow="scan"),
+            emit=EventRenderer(batch=False, project=project, flow="scan"),
         )
         sys.exit(
             _scan_exit_code(
@@ -418,7 +191,7 @@ def scan(
         )
 
     started = time.monotonic()
-    summary = scan_service.scan_all(cfg, emit=_Renderer(batch=True, flow="scan"))
+    summary = scan_service.scan_all(cfg, emit=EventRenderer(batch=True, flow="scan"))
     _notice_projects(
         summary.clean,
         "findings",
@@ -460,8 +233,8 @@ def update(
         result = update_service.update_project(
             name,
             proj_config,
-            choose=_choose_findings,
-            emit=_Renderer(batch=False, project=name),
+            choose=choose_findings,
+            emit=EventRenderer(batch=False, project=name),
         )
         _print_result_totals(result.results, result.blocked)
         sys.exit(
@@ -470,7 +243,7 @@ def update(
             else ExitCode.UPDATE_FAILED
         )
 
-    batch = update_service.update_projects(cfg, targets, emit=_Renderer(batch=True))
+    batch = update_service.update_projects(cfg, targets, emit=EventRenderer(batch=True))
     results = [result for project in batch.projects for result in project.results]
     blocked = sum(project.blocked for project in batch.projects)
     if results or blocked:
@@ -493,7 +266,7 @@ def sync(
         Project names to sync. No names syncs all configured projects.
     """
     cfg = _reset_output_and_load_config(config, require_projects=True)
-    outcome = scan_service.sync_projects(cfg, projects, emit=_Renderer(batch=True))
+    outcome = scan_service.sync_projects(cfg, projects, emit=EventRenderer(batch=True))
     sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
 
@@ -541,7 +314,7 @@ def deploy(
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
     batch = not project
-    renderer = _Renderer(batch=batch, flow="deploy")
+    renderer = EventRenderer(batch=batch, flow="deploy")
 
     if batch:
         if check and not cfg.defaults.healthcheck_url:
@@ -604,7 +377,7 @@ def test(
 
     output.heading(project)
     failed_phase = run_test_phases(
-        proj_config, proj_config.path, emit=_Renderer(batch=False)
+        proj_config, proj_config.path, emit=EventRenderer(batch=False)
     )
 
     if failed_phase is None:
@@ -688,7 +461,7 @@ def _print_project_detail(cfg: MmConfig, scan_results: dict[str, ScanResult]) ->
         if result is None:
             unscanned.append(name)
         elif result.has_findings:
-            _print_scan_result(result)
+            print_scan_result(result)
         else:
             clean.append(name)
     _notice_projects(clean, "findings")
@@ -710,7 +483,7 @@ def _print_project_overview(
         pipe_rows.append(pipe_row)
 
     visible, footer_parts = _hidden_columns(_OVERVIEW_HEADERS, rows)
-    if output.terminal() and output.console().width < _NARROW_TERMINAL_WIDTH:
+    if output.terminal() and output.console().width < output.NARROW_TERMINAL_WIDTH:
         hidden = [
             _OVERVIEW_HEADERS[i]
             for i in visible
@@ -896,92 +669,6 @@ def _scan_exit_code(summary: ScanSummary) -> ExitCode:
             return ExitCode.OK
 
 
-def _print_numbered_findings(
-    vulns: list[VulnFinding], updates: list[UpdateFinding]
-) -> list[VulnFinding | UpdateFinding]:
-    numbered: list[VulnFinding | UpdateFinding] = [
-        *sort_vulns_by_severity(vulns),
-        *updates,
-    ]
-    rows = []
-    for finding in numbered:
-        owner = ""
-        if isinstance(finding, VulnFinding):
-            kind = "! vuln"
-            risk = f"{finding.severity.value.lower()} · {finding.vuln_id}"
-            if finding.gradle_target is not None:
-                target = finding.gradle_target
-                owner = (
-                    f" via {target.display_name} "
-                    f"{target.members[0].installed_version} → {target.target_version}"
-                )
-        else:
-            kind = "~ update"
-            risk = finding.semver_tier.value
-        rows.append(
-            (
-                kind,
-                risk,
-                f"{finding.installed_version} → {finding.target_version}",
-                finding.pkg_name + owner,
-            )
-        )
-    output.choices(rows)
-    return numbered
-
-
-def _parse_selection(
-    text: str,
-    numbered: list[VulnFinding | UpdateFinding],
-    vulns: list[VulnFinding],
-    updates: list[UpdateFinding],
-) -> tuple[list[VulnFinding], list[UpdateFinding]] | None:
-    """The chosen findings for a keyword or comma-separated numbers, else None."""
-    choice = text.strip().lower()
-    keywords = {
-        "all": (vulns, updates),
-        "none": ([], []),
-        "vulns": (vulns, []),
-        "updates": ([], updates),
-    }
-    if choice in keywords:
-        return keywords[choice]
-    try:
-        indices = [int(part) for part in choice.split(",")]
-    except ValueError:
-        return None
-    if not all(1 <= index <= len(numbered) for index in indices):
-        return None
-    selected = [numbered[index - 1] for index in dict.fromkeys(indices)]
-    return (
-        [finding for finding in selected if isinstance(finding, VulnFinding)],
-        [finding for finding in selected if isinstance(finding, UpdateFinding)],
-    )
-
-
-def _choose_findings(
-    selectable_vulns: list[VulnFinding],
-    selectable_updates: list[UpdateFinding],
-) -> tuple[list[VulnFinding], list[UpdateFinding]]:
-    numbered = _print_numbered_findings(selectable_vulns, selectable_updates)
-    parts = [
-        "all",
-        *(["vulns"] if selectable_vulns else []),
-        *(["updates"] if selectable_updates else []),
-        "1,2,...",
-        "none",
-    ]
-    message = f"Select updates [{'/'.join(parts)}]"
-    while True:
-        text = output.prompt(message, default="all")
-        selection = _parse_selection(
-            text, numbered, selectable_vulns, selectable_updates
-        )
-        if selection is not None:
-            return selection
-        output.diagnostic("error", f"Invalid selection: {text}")
-
-
 @app.command
 def resolve(
     project: str,
@@ -1011,140 +698,6 @@ def resolve(
         project,
         proj_config,
         continue_=continue_,
-        emit=_Renderer(batch=False, project=project, flow="resolve"),
+        emit=EventRenderer(batch=False, project=project, flow="resolve"),
     )
     sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)
-
-
-def _print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> None:
-    found = [
-        *map(_vulnerability_row, sort_vulns_by_severity(result.vulnerabilities)),
-        *map(_secret_row, result.secrets),
-        *map(_update_row, result.updates),
-    ]
-    if not found:
-        return
-    rows, pipe_rows = zip(*found, strict=True)
-    output.heading(result.project, f"{len(rows)} findings")
-    headers = ["kind", "severity", "versions", "package / detail"]
-    visible = (
-        [0, 1, 2, 3] if output.console().width >= _NARROW_TERMINAL_WIDTH else [0, 3]
-    )
-    output.records(
-        result.project,
-        [headers[index] for index in visible],
-        [[row[index] for index in visible] for row in rows],
-        pipe_rows=pipe_rows,
-        footer="hidden: severity, versions · pipe for full records"
-        if len(visible) < len(headers)
-        else "",
-    )
-    if elapsed_s is not None:
-        output.notice(f"Scanned {result.project} in {elapsed_s:.1f}s")
-
-
-type _FindingRow = tuple[list[str | Text], list[str]]
-
-
-def _vulnerability_row(vuln: VulnFinding) -> _FindingRow:
-    kind = "vuln" if vuln.actionable else "advisory"
-    blocked = isinstance(vuln.state, GradleBlock)
-    reason = vuln.state.reason if blocked else ""
-    versions = (
-        f"{vuln.installed_version} → {vuln.fixed_version}"
-        if vuln.fixed_version
-        else "no fix"
-    )
-    row = [
-        output.literal(
-            "! blocked" if blocked else f"! {kind}",
-            "yellow" if kind == "advisory" or blocked else "red",
-        ),
-        vuln.severity.value.lower(),
-        versions,
-        " · ".join(filter(None, [vuln.pkg_name, vuln.vuln_id, reason])),
-    ]
-    pipe_row = [
-        kind,
-        vuln.pkg_name,
-        vuln.installed_version,
-        vuln.fixed_version or "-",
-        vuln.severity.value,
-        vuln.vuln_id,
-        vuln.published_date.isoformat() if vuln.published_date else "-",
-        "blocked" if blocked else vuln.status,
-        reason or "-",
-    ]
-    return row, pipe_row
-
-
-def _secret_row(secret: SecretFinding) -> _FindingRow:
-    row = [
-        output.literal("! secret", "yellow"),
-        secret.severity.value.lower(),
-        "-",
-        f"{secret.file} · {secret.title}",
-    ]
-    pipe_row = [
-        "secret",
-        secret.file,
-        "-",
-        "-",
-        secret.severity.value,
-        secret.rule_id,
-        "-",
-        "found",
-        secret.title,
-    ]
-    return row, pipe_row
-
-
-def _update_row(update: UpdateFinding) -> _FindingRow:
-    blocked = isinstance(update.state, GradleBlock)
-    reason = update.state.reason if blocked else ""
-    age = (
-        f"{(utc_now() - update.published_date).days}d old"
-        if update.published_date
-        else ""
-    )
-    row = [
-        output.literal(
-            "! blocked" if blocked else "~ update", "yellow" if blocked else ""
-        ),
-        update.semver_tier.value,
-        f"{update.installed_version} → {update.latest_version}",
-        " · ".join(filter(None, [update.pkg_name, age, reason])),
-    ]
-    pipe_row = [
-        "update",
-        update.pkg_name,
-        update.installed_version,
-        update.latest_version,
-        update.semver_tier.value,
-        "-",
-        update.published_date.isoformat() if update.published_date else "-",
-        "blocked" if blocked else "available",
-        reason or "-",
-    ]
-    return row, pipe_row
-
-
-def _print_blocked_findings(result: ScanResult, flow: str) -> None:
-    """Piped update and resolve runs record each blocked package once."""
-    for finding in result.blocked_findings:
-        if not isinstance(finding.state, GradleBlock):
-            continue
-        target = (
-            finding.latest_version
-            if isinstance(finding, UpdateFinding)
-            else finding.fixed_version or "-"
-        )
-        output.outcome(
-            result.project,
-            flow,
-            "blocked",
-            finding.pkg_name,
-            installed=finding.installed_version,
-            target=target,
-            reason=finding.state.reason,
-        )

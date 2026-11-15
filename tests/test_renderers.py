@@ -5,6 +5,7 @@ from rich.text import Text
 
 from maintenance_man import cli
 from maintenance_man import output as maintenance_output
+from maintenance_man.event_renderer import EventRenderer, Flow
 from maintenance_man.models import events
 from maintenance_man.models.events import (
     BlockersStillFailing,
@@ -249,11 +250,11 @@ def test_given_event_when_rendered_in_pipe_then_records_and_diagnostics_split_by
     capsys: pytest.CaptureFixture[str],
     batch: bool,
     event: Event,
-    flow: cli._Flow,
+    flow: Flow,
     stdout: str,
     stderr: str,
 ) -> None:
-    cli._Renderer(batch=batch, project="api", flow=flow)(event)
+    EventRenderer(batch=batch, project="api", flow=flow)(event)
 
     captured = capsys.readouterr()
     assert captured.out == stdout
@@ -263,7 +264,7 @@ def test_given_event_when_rendered_in_pipe_then_records_and_diagnostics_split_by
 def test_given_step_failure_without_project_when_rendered_then_error_omits_project(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    cli._Renderer(batch=False)(FindingStepFailed("commit", "boom"))
+    EventRenderer(batch=False)(FindingStepFailed("commit", "boom"))
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -303,7 +304,7 @@ def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
 ) -> None:
     maintenance_output.reset_invocation_output(verbose=verbose)
 
-    renderer = cli._Renderer(batch=False, project="api")
+    renderer = EventRenderer(batch=False, project="api")
     renderer(events.TestCommandStarted("uv run pytest"))
 
     captured = capsys.readouterr()
@@ -337,7 +338,7 @@ def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    cli._Renderer(batch=False, project="api")(event)
+    EventRenderer(batch=False, project="api")(event)
 
     assert Text.from_ansi(stream.getvalue()).plain == f"{expected}\n"
 
@@ -347,7 +348,7 @@ def test_given_processing_heading_when_finding_rendered_then_heading_is_not_repe
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    renderer = cli._Renderer(batch=False, project="api")
+    renderer = EventRenderer(batch=False, project="api")
     renderer(ProcessingStarted(2, 1))
     renderer(FindingPassed("pkg", False, "1.0", "1.1"))
 
@@ -362,7 +363,7 @@ def test_given_no_project_when_finding_rendered_on_terminal_then_no_heading_prin
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    cli._Renderer(batch=False)(FindingPassed("pkg", False, "1.0", "1.1"))
+    EventRenderer(batch=False)(FindingPassed("pkg", False, "1.0", "1.1"))
 
     assert Text.from_ansi(stream.getvalue()).plain.splitlines() == [
         "  ✓ passed    pkg                       1.0 → 1.1"
@@ -390,7 +391,7 @@ def test_given_finding_started_when_rendered_then_only_a_stderr_terminal_shows_p
     monkeypatch.setattr("sys.stdout", stdout)
     monkeypatch.setattr("sys.stderr", stderr)
 
-    cli._Renderer(batch=False, project="api")(FindingStarted("pkg", "1.0", "2.0"))
+    EventRenderer(batch=False, project="api")(FindingStarted("pkg", "1.0", "2.0"))
 
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == expected
@@ -417,9 +418,9 @@ def _blocked_scan() -> ScanResult:
 
 @pytest.mark.parametrize("flow", ["update", "resolve"])
 def test_given_blocked_findings_when_saved_scan_reported_in_pipe_then_one_outcome_each(
-    flow: cli._Flow, capsys: pytest.CaptureFixture[str]
+    flow: Flow, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cli._Renderer(batch=False, flow=flow)(ScanReported(_blocked_scan()))
+    EventRenderer(batch=False, flow=flow)(ScanReported(_blocked_scan()))
 
     captured = capsys.readouterr()
     assert captured.out == (
@@ -432,7 +433,7 @@ def test_given_update_flow_when_saved_scan_reported_on_terminal_then_findings_pr
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    cli._Renderer(batch=False)(ScanReported(_blocked_scan()))
+    EventRenderer(batch=False)(ScanReported(_blocked_scan()))
 
     lines = stream.getvalue().splitlines()
     assert lines[0] == "api · 2 findings"
@@ -462,7 +463,7 @@ def test_given_update_flow_when_saved_scan_reported_on_terminal_then_findings_pr
 def test_given_event_when_rendered_then_only_single_project_runs_print_the_notice(
     capsys: pytest.CaptureFixture[str], event: Event, batch: bool, stderr: str
 ) -> None:
-    cli._Renderer(batch=batch, project="api", flow="scan")(event)
+    EventRenderer(batch=batch, project="api", flow="scan")(event)
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -478,9 +479,9 @@ def test_given_event_when_rendered_then_only_single_project_runs_print_the_notic
     ],
 )
 def test_given_missing_project_path_when_rendered_then_only_deploy_records_a_failure(
-    capsys: pytest.CaptureFixture[str], flow: cli._Flow, stdout: str, stderr: str
+    capsys: pytest.CaptureFixture[str], flow: Flow, stdout: str, stderr: str
 ) -> None:
-    cli._Renderer(batch=True, flow=flow)(
+    EventRenderer(batch=True, flow=flow)(
         ProjectSkipped("api", SkipReason.PATH_MISSING, "/x")
     )
 
@@ -543,7 +544,7 @@ def test_given_project_events_when_rendered_on_terminal_then_one_heading_per_pro
 ) -> None:
     stream = terminal_stdout(monkeypatch, width=120)
 
-    renderer = cli._Renderer(batch=True)
+    renderer = EventRenderer(batch=True)
     for step in steps:
         renderer(step)
 
@@ -552,11 +553,11 @@ def test_given_project_events_when_rendered_on_terminal_then_one_heading_per_pro
 
 @pytest.mark.parametrize(("flow", "expected"), [("deploy", ["api"]), ("update", [])])
 def test_given_terminal_when_project_starts_then_only_deploy_prints_heading(
-    monkeypatch: pytest.MonkeyPatch, flow: cli._Flow, expected: list[str]
+    monkeypatch: pytest.MonkeyPatch, flow: Flow, expected: list[str]
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    cli._Renderer(batch=True, flow=flow)(ProjectStarted("api"))
+    EventRenderer(batch=True, flow=flow)(ProjectStarted("api"))
 
     assert Text.from_ansi(stream.getvalue()).plain.splitlines() == expected
 
@@ -581,13 +582,13 @@ def test_given_unchanged_outcome_when_rendered_on_terminal_then_subject_is_separ
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    cli._Renderer(batch=True)(event)
+    EventRenderer(batch=True)(event)
 
     assert Text.from_ansi(stream.getvalue()).plain.splitlines() == expected
 
 
 def test_given_every_event_class_when_rendered_then_a_handler_is_registered():
-    registered = set(cli._Renderer.__dict__["__call__"].dispatcher.registry)
+    registered = set(EventRenderer.__dict__["__call__"].dispatcher.registry)
     event_classes = {
         value
         for value in vars(events).values()
@@ -598,7 +599,7 @@ def test_given_every_event_class_when_rendered_then_a_handler_is_registered():
 
 
 def test_given_corrupt_scan_skip_when_rendered_then_warning_names_the_rescan(capsys):
-    cli._Renderer(batch=True, flow="update")(
+    EventRenderer(batch=True, flow="update")(
         ProjectSkipped("api", SkipReason.CORRUPT_SCAN_RESULTS, "update_status")
     )
 

@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from maintenance_man import cli
 from maintenance_man.cli import ExitCode
+from maintenance_man.finding_selection import choose_findings, parse_selection
 from maintenance_man.models.events import Outcome
 from maintenance_man.models.scan import (
     Failed,
@@ -66,7 +66,7 @@ _UPDATES = [make_update(pkg_name="u1"), make_update(SemverTier.MINOR, pkg_name="
     ],
 )
 def test_given_reply_when_selection_parsed_then_chosen_findings_or_none(text, expected):
-    selected = cli._parse_selection(text, [_VULN, *_UPDATES], [_VULN], _UPDATES)
+    selected = parse_selection(text, [_VULN, *_UPDATES], [_VULN], _UPDATES)
 
     names = (
         None
@@ -120,7 +120,7 @@ def test_given_numeric_reply_when_choosing_findings_then_choices_and_prompt_on_s
 ) -> None:
     monkeypatch.setattr("sys.stdin", StringIO(reply))
 
-    chosen = cli._choose_findings(vulns, updates)
+    chosen = choose_findings(vulns, updates)
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -138,7 +138,7 @@ def test_given_invalid_reply_when_choosing_findings_then_error_precedes_next_pro
 ) -> None:
     monkeypatch.setattr("sys.stdin", StringIO("bogus\nnone\n"))
 
-    chosen = cli._choose_findings([make_vuln()], [make_update()])
+    chosen = choose_findings([make_vuln()], [make_update()])
 
     captured = capsys.readouterr()
     assert chosen == ([], [])

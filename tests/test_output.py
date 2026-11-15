@@ -12,8 +12,9 @@ import pytest
 from rich.cells import cell_len
 
 from maintenance_man import output
-from maintenance_man.cli import ExitCode, _print_scan_result
+from maintenance_man.cli import ExitCode
 from maintenance_man.models.scan import GradleBlock, ScanResult
+from maintenance_man.scan_table import print_scan_result
 from maintenance_man.storage import save_scan_results
 from tests.support.cli import TerminalStream, run_mm, terminal_stdout
 from tests.support.findings import make_update, make_vuln
@@ -211,7 +212,7 @@ def test_given_maven_finding_when_terminal_renders_then_kind_remains_visible(
     stream = terminal_stdout(monkeypatch, width)
     vuln = make_vuln(pkg_name="org.springframework.boot:spring-boot-starter-web")
 
-    _print_scan_result(_scanned_result(project="api", vulnerabilities=[vuln]))
+    print_scan_result(_scanned_result(project="api", vulnerabilities=[vuln]))
 
     lines = stream.getvalue().splitlines()
     assert any("! vuln" in line and "org." in line for line in lines)

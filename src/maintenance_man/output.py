@@ -20,6 +20,9 @@ from rich.text import Text
 from maintenance_man.clock import utc_now
 from maintenance_man.models.events import Status
 
+type Cell = str | Text
+NARROW_TERMINAL_WIDTH = 70
+
 
 def reset_invocation_output(*, verbose: bool) -> None:
     """Reset headings and consoles and set the invocation's child-log policy."""
@@ -47,7 +50,7 @@ def heading(name: str, metadata: str = "") -> None:
 def records(
     group: str,
     headers: Sequence[str],
-    rows: Sequence[Sequence[str | Text]],
+    rows: Sequence[Sequence[Cell]],
     *,
     pipe_rows: Sequence[Sequence[str]],
     footer: str = "",
@@ -104,7 +107,7 @@ _MAX_FIXED_COLUMN_WIDTH = 24
 
 def project_records(
     headers: Sequence[str],
-    rows: Sequence[Sequence[str | Text]],
+    rows: Sequence[Sequence[Cell]],
     pipe_rows: Sequence[Sequence[str]],
     *,
     footer: str = "",
