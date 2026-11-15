@@ -126,7 +126,7 @@ def _run_report_task(
     under the mm home, and yield that directory once the catalogue is proven
     unchanged. The directory is removed on exit; when the task or the caller
     raises, that exception propagates and a removal failure is ignored."""
-    root = Path(project.path)
+    root = project.path
     before = catalogue_digest(root)
     home = paths.mm_home()
     try:

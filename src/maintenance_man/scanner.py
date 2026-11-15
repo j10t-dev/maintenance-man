@@ -72,7 +72,7 @@ def scan_project(
         ScanError: If trivy exits with non-zero status.
         FileNotFoundError: If the project path does not exist.
     """
-    project_path = Path(project.path)
+    project_path = project.path
     if not project_path.exists():
         msg = f"Project path does not exist: {project_path}"
         raise FileNotFoundError(msg)
@@ -123,7 +123,7 @@ def _requested_secrets(project: ProjectConfig) -> list[SecretFinding]:
     """Run the secrets scan only when the project asks for it."""
     if not project.scan_secrets:
         return []
-    return scan_secrets(Path(project.path), project.scan_skip_dirs)
+    return scan_secrets(project.path, project.scan_skip_dirs)
 
 
 def _prepare_gradle_scan_findings(
@@ -227,7 +227,7 @@ def _select_fixes(vulns: list[VulnFinding], project: ProjectConfig) -> None:
     """Rewrite each advisory's fix to its package's target, or to none."""
     eligible = vulns
     if project.package_manager == "bun" and vulns:
-        eligible = _bun_eligible(vulns, Path(project.path))
+        eligible = _bun_eligible(vulns, project.path)
     by_package: dict[str, list[VulnFinding]] = {}
     for vuln in eligible:
         by_package.setdefault(vuln.pkg_name, []).append(vuln)

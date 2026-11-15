@@ -81,12 +81,12 @@ def consolidate_vulns(vulns: list[VulnFinding]) -> list[FindingGroup]:
         by_pkg.setdefault(v.pkg_name, []).append(v)
 
     return [
-        _group(
-            group,
+        FindingGroup(
             pkg_name=pkg,
             installed_version=group[0].installed_version,
             target_version=_shared_fix(pkg, group),
             detail=", ".join(v.vuln_id for v in group),
+            originals=group,
         )
         for pkg, group in by_pkg.items()
     ]
@@ -159,12 +159,12 @@ def group_findings(
         ),
         *(_target_group(target, rows) for target, rows in targets.values()),
         *(
-            _group(
-                [update],
+            FindingGroup(
                 pkg_name=update.pkg_name,
                 installed_version=update.installed_version,
                 target_version=update.latest_version,
                 detail=update.detail,
+                originals=[update],
                 kind="update",
             )
             for update in sort_updates_by_risk(
@@ -231,7 +231,7 @@ def process_findings(
     Update discards a failed group and continues; resolve keeps it and stops.
     """
     results: list[UpdateResult] = []
-    repo = JjRepository(Path(project_config.path))
+    repo = JjRepository(project_config.path)
     for group in groups:
         emit(
             FindingStarted(
@@ -276,35 +276,14 @@ def process_findings(
 def _target_group(
     target: GradleUpdateTarget, rows: list[VulnFinding | UpdateFinding]
 ) -> FindingGroup:
-    return _group(
-        rows,
+    return FindingGroup(
         pkg_name=target.display_name,
         installed_version=target.members[0].installed_version,
         target_version=target.target_version,
         detail=", ".join(dict.fromkeys(row.detail for row in rows)),
+        originals=rows,
         kind="vuln" if any(isinstance(row, VulnFinding) for row in rows) else "update",
         gradle_target=target,
-    )
-
-
-def _group(
-    rows: Sequence[VulnFinding | UpdateFinding],
-    *,
-    pkg_name: str,
-    installed_version: str,
-    target_version: str,
-    detail: str,
-    kind: UpdateKind = "vuln",
-    gradle_target: GradleUpdateTarget | None = None,
-) -> FindingGroup:
-    return FindingGroup(
-        pkg_name=pkg_name,
-        installed_version=installed_version,
-        target_version=target_version,
-        detail=detail,
-        originals=rows,
-        kind=kind,
-        gradle_target=gradle_target,
     )
 
 
@@ -358,7 +337,7 @@ def _test_and_commit(
     flow: Workflow,
     emit: Emit,
 ) -> FindingStep:
-    project_path = Path(project_config.path)
+    project_path = project_config.path
     failed_phase = run_test_phases(project_config, project_path, emit=emit)
     if failed_phase is not None:
         return FindingStep(failed_phase)

@@ -508,10 +508,7 @@ def _print_deploy_summary(results: Sequence[deploy_service.DeployResult]) -> Non
     if not results:
         output.notice("No projects have deploy_command configured")
         return
-    counts = Counter(
-        "failed" if "failed" in (r.build_status, r.deploy_status) else r.deploy_status
-        for r in results
-    )
+    counts = Counter("failed" if r.failed else r.deploy_status for r in results)
     output.summary(
         {status: counts[status] for status in _STATUS_ORDER if counts[status]}
     )
@@ -558,10 +555,7 @@ def deploy(
             emit=renderer,
         )
         _print_deploy_summary(results)
-        any_failed = any(
-            "failed" in (result.build_status, result.deploy_status)
-            for result in results
-        )
+        any_failed = any(result.failed for result in results)
         sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
 
     assert project is not None

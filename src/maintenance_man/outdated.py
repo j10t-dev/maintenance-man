@@ -24,7 +24,7 @@ class OutdatedCheckError(Exception):
 def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     """Run `uv pip list --outdated --format json` and parse results."""
     _run(["uv", "sync", "--locked"], project, timeout=300, label="uv sync --locked")
-    venv_python = Path(project.path) / ".venv" / "bin" / "python"
+    venv_python = project.path / ".venv" / "bin" / "python"
     cmd = ["uv", "pip", "list", "--outdated", "--format", "json"]
     if venv_python.exists():
         cmd += ["--python", str(venv_python)]
@@ -32,7 +32,7 @@ def uv_outdated(project: ProjectConfig) -> list[UpdateFinding]:
 
     try:
         entries = TypeAdapter(list[_UvRow]).validate_json(completed.stdout)
-        direct_deps = get_uv_direct_dep_names(Path(project.path))
+        direct_deps = get_uv_direct_dep_names(project.path)
         return [
             _finding(entry.name, entry.version, entry.latest_version)
             for entry in entries
@@ -70,7 +70,7 @@ def bun_outdated(project: ProjectConfig) -> list[UpdateFinding]:
     if not rows:
         return []
 
-    declared, resolved = _read_bun_dependencies(Path(project.path))
+    declared, resolved = _read_bun_dependencies(project.path)
     findings = []
     for name, current, latest in rows:
         if name not in declared:

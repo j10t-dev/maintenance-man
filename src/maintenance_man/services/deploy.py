@@ -34,6 +34,11 @@ class DeployResult:
     build_status: Literal["passed", "failed", "skipped"]
     deploy_status: Status
 
+    @property
+    def failed(self) -> bool:
+        """Whether the build or the deploy failed."""
+        return "failed" in (self.build_status, self.deploy_status)
+
 
 def deploy_project(
     name: str,

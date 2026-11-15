@@ -137,7 +137,7 @@ def apply_gradle_update(
     may already have begun.  Age and routing eligibility are decided by
     ``mm scan``; this function has no VCS side effects.
     """
-    root = Path(project.path)
+    root = project.path
     before = _checked_catalogue(project, target, expected_version=None)
     if isinstance(before, GradleBlock):
         return before
@@ -224,7 +224,7 @@ def discover_gradle_updates(project: ProjectConfig) -> list[UpdateFinding]:
     age judgement.  Raises GradleError for wrapper failures, report collisions,
     malformed reports and any catalogue mutation by the discovery task.
     """
-    root = Path(project.path)
+    root = project.path
     catalogue_path = root / GRADLE_CATALOGUE_RELPATH
     catalogue = parse_catalogue(catalogue_path)
     before = catalogue_digest(root)
@@ -744,7 +744,7 @@ def _checked_catalogue(
     if shape is not None:
         return shape
     try:
-        catalogue = parse_catalogue(Path(project.path) / GRADLE_CATALOGUE_RELPATH)
+        catalogue = parse_catalogue(project.path / GRADLE_CATALOGUE_RELPATH)
     except GradleError as e:
         return GradleBlock(kind="stale", reason=f"{e}; rescan required")
     return _catalogue_block(catalogue, target, expected_version) or catalogue
