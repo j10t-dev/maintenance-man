@@ -3,8 +3,8 @@ import groovy.json.JsonSlurper
 import groovy.xml.XmlParser
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 import org.gradle.api.GradleException
+import org.gradle.api.file.RegularFile
 import org.gradle.api.artifacts.repositories.MavenArtifactRepository
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.artifacts.result.ResolvedArtifactResult
@@ -30,15 +30,7 @@ def repositoryRows = { repositories, projectPath, domain ->
     }
 }
 def atomicJson = { File directory, String name, Object value ->
-    if (Files.isSymbolicLink(directory.toPath()) ||
-        Files.isSymbolicLink(new File(directory, '.mm-owned').toPath()) ||
-        !new File(directory, '.mm-owned').isFile()) {
-        throw new GradleException('mm output ownership was lost')
-    }
     def destination = new File(directory, name)
-    if (Files.isSymbolicLink(destination.toPath())) {
-        throw new GradleException('mm output is a symlink')
-    }
     def temporary = Files.createTempFile(directory.toPath(), '.mm-report-', '.json')
     try {
         Files.writeString(temporary, JsonOutput.toJson(value))
@@ -65,12 +57,31 @@ gradle.projectsEvaluated {
             throw new GradleException("Reserved task name already exists: ${name}")
         }
     }
-    def directory = new File(root.projectDir, '.mm-gradle-inventory')
+    def reportLocation = gradle.startParameter.projectProperties['mm.reportDirectory']
+    if (reportLocation == null) {
+        throw new GradleException('mm.reportDirectory is required')
+    }
+    def directory = new File(reportLocation)
+    root.allprojects { project ->
+        project.tasks.matching { it.name == 'cyclonedxDirectBom' }.configureEach { task ->
+            if (task.hasProperty('jsonOutput')) {
+                def relative = project.path == ':' ? 'root' :
+                    'projects/' + project.path.substring(1).replace(':', '/')
+                task.jsonOutput.set(new File(directory, "direct/${relative}.json"))
+                task.xmlOutput.set(null as RegularFile)
+                task.xmlOutput.convention(null as RegularFile)
+            }
+        }
+    }
+    root.tasks.matching { it.name == 'cyclonedxBom' }.configureEach { task ->
+        if (task.hasProperty('jsonOutput')) {
+            task.jsonOutput.set(new File(directory, 'bom.json'))
+            task.xmlOutput.set(null as RegularFile)
+            task.xmlOutput.convention(null as RegularFile)
+        }
+    }
     def readCandidateRequests = {
         def inputFile = new File(directory, 'candidate-requests.json')
-        if (Files.isSymbolicLink(inputFile.toPath())) {
-            throw new GradleException('Candidate request is a symlink')
-        }
         def input = new JsonSlurper().parse(inputFile)
         if (input.schema_version != 1 || !(input.requests instanceof List)) {
             throw new GradleException('Unsupported candidate request schema')
@@ -81,9 +92,8 @@ gradle.projectsEvaluated {
         def exact = { String value -> value ==~ /[A-Za-z0-9][A-Za-z0-9._+-]*/ }
         def results = []
         readCandidateRequests().findAll { it.project_path == project.path }.each { request ->
-            def row = [request_id: request.request_id, group_key: request.group_key,
-                       alias: request.alias, project_path: request.project_path, kind: request.kind,
-                       selected_version: null, implementation: null, reason: null]
+            def row = [request_id: request.request_id, selected_version: null,
+                       implementation: null, reason: null]
             try {
                 if (!(request.kind in ['library', 'plugin']) ||
                     !exact(request.installed_version) || !exact(request.candidate_version) ||
@@ -200,9 +210,8 @@ gradle.projectsEvaluated {
         doLast {
             def results = projectResults.values().collectMany { it }
             readCandidateRequests().findAll { !projectResults.containsKey(it.project_path) }.each { request ->
-                results.add([request_id: request.request_id, group_key: request.group_key,
-                             alias: request.alias, project_path: request.project_path, kind: request.kind,
-                             selected_version: null, implementation: null,
+                results.add([request_id: request.request_id, selected_version: null,
+                             implementation: null,
                              reason: 'Native metadata validation failed (unknown project)'])
             }
             atomicJson(directory, 'candidate-validation.json',
@@ -310,8 +319,6 @@ gradle.projectsEvaluated {
             if (!root.allprojects.any { it.tasks.findByName('cyclonedxDirectBom')?.enabled }) {
                 errors.add('No enabled CycloneDX direct tasks')
             }
-            def catalogue = new File(root.projectDir, 'gradle/libs.versions.toml')
-            def digest = MessageDigest.getInstance('SHA-256').digest(catalogue.bytes).encodeHex().toString()
             def localProjects = root.allprojects.findAll { project ->
                 selected.any { it.project_path == project.path }
             }.sort { it.path }.collect { project ->
@@ -322,7 +329,7 @@ gradle.projectsEvaluated {
             atomicJson(directory, 'report.json', [schema_version: 1, root_project: root.path,
                 producer_versions: [gradle: gradle.gradleVersion,
                     cyclonedx: cdxVersions.size() == 1 ? cdxVersions.first() : 'unknown', report: '2'],
-                catalogue_digest: digest, repositories: repositories.unique(),
+                repositories: repositories.unique(),
                 selected_scopes: selected, scopes: scopes, local_projects: localProjects,
                 selection_errors: errors])
         }

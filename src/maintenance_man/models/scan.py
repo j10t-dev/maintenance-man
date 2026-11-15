@@ -1,17 +1,28 @@
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum, auto
-from typing import Any, Literal
+from typing import Annotated, Literal
 
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+
+from maintenance_man.models.config import PackageManager
 
 
 class Severity(StrEnum):
-    CRITICAL = "CRITICAL"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
+    """Declared from least to most severe."""
+
     UNKNOWN = "UNKNOWN"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+    @property
+    def rank(self) -> int:
+        """Higher is more severe; UNKNOWN ranks lowest."""
+        return list(Severity).index(self)
 
 
 class SemverTier(StrEnum):
@@ -41,19 +52,44 @@ def classify_semver(installed: str, latest: str) -> SemverTier:
             return SemverTier.PATCH
 
 
-class UpdateStatus(StrEnum):
-    FAILED = "failed"
-    READY = "ready"
-    COMPLETED = "completed"
-
-
 class Workflow(StrEnum):
     UPDATE = "update"
     RESOLVE = "resolve"
 
 
+WORKFLOW_BOOKMARKS: Mapping[Workflow, str] = {
+    Workflow.UPDATE: "mm/update-dependencies",
+    Workflow.RESOLVE: "mm/resolve-dependencies",
+}
+
+
 type GradleKind = Literal["library", "plugin"]
 type GradleBlockKind = Literal["age", "mapping", "conflict", "stale"]
+type UpdateKind = Literal["vuln", "update"]
+
+
+@dataclass(slots=True)
+class UpdateResult:
+    """Outcome of one dependency update attempt."""
+
+    pkg_name: str
+    kind: UpdateKind
+    passed: bool
+    failed_phase: str | None = None
+
+
+def normalise_alias(name: str) -> str:
+    """Gradle treats '-', '_' and '.' as equivalent alias separators."""
+    return name.replace("_", "-").replace(".", "-")
+
+
+def group_key_for(kind: str, alias: str, version_ref: str | None) -> str:
+    """Stable identity of the catalogue version a finding edits: the version
+    reference when one exists, else the entry itself.
+    """
+    if version_ref is not None:
+        return f"ref:{normalise_alias(version_ref)}"
+    return f"{kind}:{normalise_alias(alias)}"
 
 
 class GradleMember(BaseModel):
@@ -75,40 +111,63 @@ class GradleUpdateTarget(BaseModel):
     @property
     def group_key(self) -> str:
         """Stable identity used to group findings into one update attempt."""
-        if self.version_ref is not None:
-            return f"ref:{self.version_ref}"
         member = self.members[0]
-        return f"{member.kind}:{member.alias}"
+        return group_key_for(member.kind, member.alias, self.version_ref)
 
     @property
     def display_name(self) -> str:
         return self.version_ref or self.members[0].coordinate
 
 
+class Ready(BaseModel):
+    """The flow applied and tested the change; it awaits promotion to main."""
+
+    lifecycle: Literal["ready"] = "ready"
+    flow: Workflow
+
+
+class Failed(BaseModel):
+    """The flow's change failed in *phase* and awaits a retry."""
+
+    lifecycle: Literal["failed"] = "failed"
+    flow: Workflow
+    phase: str
+
+
 class GradleBlock(BaseModel):
     """Policy state that withholds an automatic change. Not a failure."""
 
+    lifecycle: Literal["blocked"] = "blocked"
     kind: GradleBlockKind
     reason: str
 
 
-class VulnFinding(BaseModel):
-    vuln_id: str
+type FindingState = Annotated[
+    Ready | Failed | GradleBlock, Field(discriminator="lifecycle")
+]
+
+
+class _FindingBase(BaseModel):
+    """Fields shared by vulnerability and update findings; a pending finding has
+    no state."""
+
+    model_config = ConfigDict(extra="forbid")
+
     pkg_name: str
     installed_version: str
+    published_date: datetime | None = None
+    state: FindingState | None = None
+    gradle_target: GradleUpdateTarget | None = None
+
+
+class VulnFinding(_FindingBase):
+    vuln_id: str
     fixed_version: str | None = None
     severity: Severity
     title: str
     description: str
     status: str
     primary_url: str | None = None
-    published_date: datetime | None = None
-    update_status: UpdateStatus | None = None
-    failed_phase: str | None = None
-    flow: Workflow | None = None
-    gradle_target: GradleUpdateTarget | None = None
-    blocked_reason: str | None = None
-    gradle_block_kind: GradleBlockKind | None = None
     gradle_scopes: tuple[str, ...] = ()
 
     @property
@@ -117,9 +176,15 @@ class VulnFinding(BaseModel):
 
     @property
     def target_version(self) -> str:
-        if self.fixed_version is None:
-            raise ValueError("No fixed version available")
-        return self.fixed_version
+        """The version this finding is fixed by: the advisory fix, or the saved
+        catalogue target.
+        """
+        if self.fixed_version is not None:
+            return self.fixed_version
+        if self.gradle_target is not None:
+            return self.gradle_target.target_version
+        msg = "No fixed version available"
+        raise ValueError(msg)
 
     @property
     def detail(self) -> str:
@@ -133,18 +198,9 @@ class SecretFinding(BaseModel):
     severity: Severity
 
 
-class UpdateFinding(BaseModel):
-    pkg_name: str
-    installed_version: str
+class UpdateFinding(_FindingBase):
     latest_version: str
     semver_tier: SemverTier
-    published_date: datetime | None = None
-    update_status: UpdateStatus | None = None
-    failed_phase: str | None = None
-    flow: Workflow | None = None
-    gradle_target: GradleUpdateTarget | None = None
-    blocked_reason: str | None = None
-    gradle_block_kind: GradleBlockKind | None = None
 
     @property
     def target_version(self) -> str:
@@ -156,39 +212,36 @@ class UpdateFinding(BaseModel):
 
 
 class ScanResult(BaseModel):
-    project: str
+    """The last explicit scan's findings and their pending lifecycle;
+    resolve_repair_base holds the resolve tip a committed repair sits on until
+    that repair is saved as Ready."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_name: str
+    package_manager: PackageManager
     scanned_at: datetime
-    trivy_target: str
     vulnerabilities: list[VulnFinding] = []
     secrets: list[SecretFinding] = []
     updates: list[UpdateFinding] = []
-    gradle_resolution: dict[str, Any] | None = None
+    resolve_repair_base: str | None = None
 
     @property
     def has_actionable_vulns(self) -> bool:
         return any(v.actionable for v in self.vulnerabilities)
 
     @property
-    def has_updates(self) -> bool:
-        return bool(self.updates)
+    def has_findings(self) -> bool:
+        return bool(self.findings or self.secrets)
+
+    @property
+    def findings(self) -> tuple[VulnFinding | UpdateFinding, ...]:
+        return (*self.vulnerabilities, *self.updates)
 
     @property
     def blocked_findings(self) -> list[VulnFinding | UpdateFinding]:
-        """Findings withheld by current policy. Orthogonal to update lifecycle."""
-        return [
-            f
-            for f in (*self.vulnerabilities, *self.updates)
-            if f.blocked_reason is not None
-        ]
-
-
-_SEVERITY_ORDER: dict[Severity, int] = {
-    Severity.CRITICAL: 0,
-    Severity.HIGH: 1,
-    Severity.MEDIUM: 2,
-    Severity.LOW: 3,
-    Severity.UNKNOWN: 4,
-}
+        """Findings withheld by current policy."""
+        return [f for f in self.findings if isinstance(f.state, GradleBlock)]
 
 
 def _fix_version_key(v: VulnFinding) -> Version:
@@ -206,22 +259,16 @@ def sort_vulns_by_severity(vulns: list[VulnFinding]) -> list[VulnFinding]:
     then fix version descending.  This keeps all vulns for a package together
     so the "fix" marker is easy to follow.
     """
-    # Build a lookup of worst (lowest ordinal) severity per package.
     worst: dict[str, int] = {}
     for v in vulns:
-        order = _SEVERITY_ORDER[v.severity]
-        if v.pkg_name not in worst or order < worst[v.pkg_name]:
-            worst[v.pkg_name] = order
+        worst[v.pkg_name] = min(worst.get(v.pkg_name, 0), -v.severity.rank)
 
     def _key(v: VulnFinding) -> tuple[int, str, int]:
         return (
             worst[v.pkg_name],
             v.pkg_name,
-            _SEVERITY_ORDER[v.severity],
+            -v.severity.rank,
         )
 
-    # Two-pass stable sort: version desc first, then the composite key.
-    # The stable sort preserves version-desc ordering within each
-    # (package, severity) group.
     by_version = sorted(vulns, key=_fix_version_key, reverse=True)
     return sorted(by_version, key=_key)

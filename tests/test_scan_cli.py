@@ -1,286 +1,502 @@
-from datetime import datetime, timezone
-from io import StringIO
+import re
+from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from rich.console import Console
 
-from maintenance_man import cli
-from maintenance_man.cli import ExitCode, _print_scan_result, _scan_exit_code, app
+from maintenance_man import finding_selection, scan_table, scanner
+from maintenance_man.cli import ExitCode
 from maintenance_man.gradle import GradleError
-from maintenance_man.models.gradle import (
-    CandidateWithheld,
-    CompleteResolution,
-    FailedAttempt,
-    GradleCandidate,
-    GradleSnapshot,
-    ResolutionReport,
-    WithheldAttempt,
-)
 from maintenance_man.models.scan import (
-    GradleMember,
-    GradleUpdateTarget,
+    GradleBlock,
     ScanResult,
-    SemverTier,
+    SecretFinding,
     Severity,
     UpdateFinding,
     VulnFinding,
 )
-from tests.conftest import make_scan_result, make_update
+from tests.support.cli import run_mm, terminal_stdout
+from tests.support.findings import (
+    make_gradle_member,
+    make_gradle_target,
+    make_scan_result,
+    make_update,
+    make_vuln,
+)
+from tests.support.process import missing_tool
+from tests.support.projects import write_config
+
+_SECRET = SecretFinding(
+    file="secrets.env",
+    rule_id="generic-api-key",
+    title="API Key",
+    severity=Severity.HIGH,
+)
+_ADVISORY = {"fixed_version": None, "status": "affected"}
 
 
-def _make_vulnerable_result() -> ScanResult:
-    return ScanResult(
-        project="vulnerable",
-        scanned_at=datetime.now(tz=timezone.utc),
-        trivy_target="tests/fixtures/vulnerable-project",
-        vulnerabilities=[
-            VulnFinding(
-                vuln_id="CVE-2024-0001",
-                pkg_name="some-pkg",
-                installed_version="1.0.0",
-                fixed_version="1.0.1",
-                severity=Severity.HIGH,
-                title="Test vulnerability",
-                description="A test vulnerability",
-                status="fixed",
+def _scan(
+    vulns: list[VulnFinding] | None = None,
+    updates: list[UpdateFinding] | None = None,
+    secrets: list[SecretFinding] | None = None,
+) -> ScanResult:
+    return make_scan_result(vulns=vulns or [], updates=updates or [], secrets=secrets)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        pytest.param(
+            _scan(vulns=[make_vuln()]),
+            ["vuln\tsome-pkg\t1.0.0\t1.0.1\tHIGH\tCVE-2024-0001\t-\tfixed\t-"],
+            id="vulnerability",
+        ),
+        pytest.param(
+            _scan(vulns=[make_vuln(**_ADVISORY)]),
+            [
+                "advisory\tsome-pkg\t1.0.0\t-\tHIGH\tCVE-2024-0001\t-\taffected\t-",
+            ],
+            id="advisory",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(
+                        state=GradleBlock(
+                            kind="mapping", reason="Cannot identify catalogue entry"
+                        )
+                    ),
+                    make_vuln(
+                        pkg_name="unfixed-pkg",
+                        vuln_id="CVE-2024-0002",
+                        state=GradleBlock(kind="mapping", reason="No published fix"),
+                        **_ADVISORY,
+                    ),
+                ]
             ),
-        ],
-    )
-
-
-def _make_clean_result() -> ScanResult:
-    return ScanResult(
-        project="clean",
-        scanned_at=datetime.now(tz=timezone.utc),
-        trivy_target="tests/fixtures/clean-project",
-    )
-
-
-def _make_updates_only_result() -> ScanResult:
-    return ScanResult(
-        project="outdated",
-        scanned_at=datetime.now(tz=timezone.utc),
-        trivy_target="tests/fixtures/clean-project",
-        updates=[
-            UpdateFinding(
-                pkg_name="axios",
-                installed_version="1.6.0",
-                latest_version="1.7.2",
-                semver_tier=SemverTier.MINOR,
+            [
+                "vuln\tsome-pkg\t1.0.0\t1.0.1\tHIGH\tCVE-2024-0001\t-\tblocked\t"
+                "Cannot identify catalogue entry",
+                "advisory\tunfixed-pkg\t1.0.0\t-\tHIGH\tCVE-2024-0002\t-\tblocked\t"
+                "No published fix",
+            ],
+            id="blocked-vulnerability-and-advisory",
+        ),
+        pytest.param(
+            _scan(secrets=[_SECRET]),
+            ["secret\tsecrets.env\t-\t-\tHIGH\tgeneric-api-key\t-\tfound\tAPI Key"],
+            id="secret",
+        ),
+        pytest.param(
+            _scan(
+                updates=[
+                    make_update(
+                        pkg_name="ksp",
+                        installed_version="2.3.10",
+                        latest_version="2.3.12",
+                        state=GradleBlock(kind="age", reason="no publication date"),
+                    ),
+                    make_update(),
+                ]
             ),
-        ],
+            [
+                "update\tksp\t2.3.10\t2.3.12\tpatch\t-\t-\tblocked\t"
+                "no publication date",
+                "update\tpkg-a\t1.0.0\t1.0.1\tpatch\t-\t-\tavailable\t-",
+            ],
+            id="blocked-and-available-updates",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(
+                        vuln_id=vuln_id,
+                        pkg_name="requests",
+                        installed_version="2.25.0",
+                        fixed_version=fixed,
+                    )
+                    for vuln_id, fixed in (("CVE-OLD", "2.32.4"), ("CVE-NEW", "2.32.4"))
+                ]
+            ),
+            [
+                "vuln\trequests\t2.25.0\t2.32.4\tHIGH\tCVE-OLD\t-\tfixed\t-",
+                "vuln\trequests\t2.25.0\t2.32.4\tHIGH\tCVE-NEW\t-\tfixed\t-",
+            ],
+            id="one-package-shows-one-fix",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(
+                        vuln_id="CVE-LOW", pkg_name="low-pkg", severity=Severity.LOW
+                    ),
+                    make_vuln(
+                        vuln_id="CVE-CRIT",
+                        pkg_name="crit-pkg",
+                        severity=Severity.CRITICAL,
+                    ),
+                    make_vuln(vuln_id="CVE-HIGH", pkg_name="high-pkg"),
+                ]
+            ),
+            [
+                "vuln\tcrit-pkg\t1.0.0\t1.0.1\tCRITICAL\tCVE-CRIT\t-\tfixed\t-",
+                "vuln\thigh-pkg\t1.0.0\t1.0.1\tHIGH\tCVE-HIGH\t-\tfixed\t-",
+                "vuln\tlow-pkg\t1.0.0\t1.0.1\tLOW\tCVE-LOW\t-\tfixed\t-",
+            ],
+            id="severity-order",
+        ),
+        pytest.param(
+            _scan(
+                vulns=[
+                    make_vuln(
+                        pkg_name="org.example:shared",
+                        installed_version=version,
+                        severity=Severity.UNKNOWN,
+                        **_ADVISORY,
+                    )
+                    for version in ("1.0", "2.0")
+                ]
+            ),
+            [
+                "advisory\torg.example:shared\t1.0\t-\tUNKNOWN\tCVE-2024-0001\t-\t"
+                "affected\t-",
+                "advisory\torg.example:shared\t2.0\t-\tUNKNOWN\tCVE-2024-0001\t-\t"
+                "affected\t-",
+            ],
+            id="gradle-installed-versions-stay-separate",
+        ),
+        pytest.param(
+            _scan(vulns=[make_vuln(pkg_name="a[b]", vuln_id="CVE-[x]")]),
+            ["vuln\ta[b]\t1.0.0\t1.0.1\tHIGH\tCVE-[x]\t-\tfixed\t-"],
+            id="brackets-stay-literal",
+        ),
+    ],
+)
+def test_given_scan_result_when_piped_then_each_finding_is_one_whole_record(
+    capsys: pytest.CaptureFixture[str], result: ScanResult, expected: list[str]
+) -> None:
+    scan_table.print_scan_result(result)
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"vulnerable\t{record}" for record in expected
+    ]
+
+
+_MIXED_SCAN = _scan(
+    vulns=[
+        make_vuln(
+            state=GradleBlock(kind="mapping", reason="Cannot identify catalogue entry")
+        ),
+        make_vuln(
+            pkg_name="unfixed-pkg",
+            vuln_id="CVE-2024-0002",
+            state=GradleBlock(kind="mapping", reason="No published fix"),
+            **_ADVISORY,
+        ),
+    ],
+    updates=[
+        make_update(
+            pkg_name="org.x:[lib]",
+            installed_version="unknown",
+            latest_version="2.0",
+            state=GradleBlock(kind="mapping", reason="cannot render [catalogue]"),
+        ),
+        make_update(),
+    ],
+)
+
+
+def _unwrap_footer(lines: list[str]) -> list[str]:
+    """Join a footer that the terminal wrapped, so wrap position is not pinned."""
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith("hidden:")), None
     )
+    if start is None:
+        return lines
+    return [*lines[:start], " ".join(" ".join(lines[start:]).split())]
+
+
+@pytest.mark.parametrize(
+    ("width", "result", "expected"),
+    [
+        pytest.param(
+            220,
+            _MIXED_SCAN,
+            [
+                "vulnerable · 4 findings",
+                "  kind       severity  versions       package / detail",
+                "  ! blocked  high      1.0.0 → 1.0.1  some-pkg · CVE-2024-0001 · "
+                "Cannot identify catalogue entry",
+                "  ! blocked  high      no fix         unfixed-pkg · CVE-2024-0002 · "
+                "No published fix",
+                "  ! blocked  patch     unknown → 2.0  org.x:[lib] · "
+                "cannot render [catalogue]",
+                "  ~ update   patch     1.0.0 → 1.0.1  pkg-a",
+            ],
+            id="wide-shows-every-column-and-the-full-reason",
+        ),
+        pytest.param(
+            80,
+            _MIXED_SCAN,
+            [
+                "vulnerable · 4 findings",
+                "  kind       severity  versions       package / detail",
+                "  ! blocked  high      1.0.0 → 1.0.1  some-pkg · CVE-2024-0001 · "
+                "Cannot identif…",
+                "  ! blocked  high      no fix         unfixed-pkg · CVE-2024-0002 · "
+                "No publishe…",
+                "  ! blocked  patch     unknown → 2.0  org.x:[lib] · "
+                "cannot render [catalogue]",
+                "  ~ update   patch     1.0.0 → 1.0.1  pkg-a",
+            ],
+            id="eighty-columns-ends-long-detail-in-an-ellipsis",
+        ),
+        pytest.param(
+            40,
+            _MIXED_SCAN,
+            [
+                "vulnerable · 4 findings",
+                "  kind       package / detail",
+                "  ! blocked  some-pkg · CVE-2024-0001 ·…",
+                "  ! blocked  unfixed-pkg · CVE-2024-000…",
+                "  ! blocked  org.x:[lib] · cannot rende…",
+                "  ~ update   pkg-a",
+                "hidden: severity, versions · pipe for full records",
+            ],
+            id="narrow-hides-severity-and-versions-but-keeps-kind",
+        ),
+        pytest.param(
+            120,
+            _scan(
+                vulns=[
+                    make_vuln(
+                        vuln_id="CVE-A",
+                        pkg_name="org.example:shared",
+                        installed_version="1.0",
+                        severity=Severity.LOW,
+                        **_ADVISORY,
+                    ),
+                    make_vuln(
+                        vuln_id="CVE-B",
+                        pkg_name="org.example:shared",
+                        installed_version="1.0",
+                        fixed_version="1.1",
+                    ),
+                ]
+            ),
+            [
+                "vulnerable · 2 findings",
+                "  kind        severity  versions   package / detail",
+                "  ! vuln      high      1.0 → 1.1  org.example:shared · CVE-B",
+                "  ! advisory  low       no fix     org.example:shared · CVE-A",
+            ],
+            id="fixed-vulnerability-and-advisory-kinds",
+        ),
+    ],
+)
+def test_given_scan_result_when_rendered_on_terminal_then_columns_follow_the_width(
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    result: ScanResult,
+    expected: list[str],
+) -> None:
+    stream = terminal_stdout(monkeypatch, width)
+
+    scan_table.print_scan_result(result)
+
+    assert _unwrap_footer(stream.getvalue().splitlines()) == expected
+
+
+def test_numbered_findings_print_bracketed_values_literally(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vuln = make_vuln(pkg_name="a[b]", vuln_id="CVE-[x]")
+    update = make_update(pkg_name="u[p]")
+
+    finding_selection.print_numbered_findings([vuln], [update])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "a[b]" in captured.err
+    assert "CVE-[x]" in captured.err
+    assert "u[p]" in captured.err
+
+
+def test_numbered_findings_name_the_gradle_target_that_owns_each_row(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ksp = make_gradle_target(
+        version_ref="ksp",
+        members=[
+            make_gradle_member(
+                kind="plugin",
+                alias="ksp",
+                coordinate="com.google.devtools.ksp",
+                installed_version="2.3.10",
+            )
+        ],
+        target_version="2.3.12",
+    )
+    advisory = make_vuln(
+        vuln_id="CVE-1",
+        pkg_name="androidx.room:room-runtime",
+        installed_version="2.8.4",
+        fixed_version="2.8.5",
+    )
+
+    finding_selection.print_numbered_findings(
+        [
+            advisory.model_copy(update={"gradle_target": make_gradle_target()}),
+            advisory.model_copy(update={"gradle_target": ksp}),
+        ],
+        [make_update(pkg_name="room", gradle_target=make_gradle_target())],
+    )
+
+    unwrapped = " ".join(capsys.readouterr().err.split())
+    rows = re.split(r" (?=\d+ [!~] )", unwrapped)
+    assert rows == [
+        "1 ! vuln high · CVE-1 2.8.4 → 2.8.5 androidx.room:room-runtime"
+        " via room 2.8.4 → 2.8.5",
+        "2 ! vuln high · CVE-1 2.8.4 → 2.8.5 androidx.room:room-runtime"
+        " via ksp 2.3.10 → 2.3.12",
+        "3 ~ update patch 1.0.0 → 1.0.1 room",
+    ]
 
 
 @pytest.fixture(autouse=True)
 def _mock_trivy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent all CLI tests from calling real Trivy."""
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.cli.prune_stale_bookmarks", lambda _path: True)
 
     def _fake_scan(
-        name: str, project_config: object, min_version_age_days: int = 7
+        name: str,
+        project_config: object,
+        min_version_age_days: int = 7,
+        **kwargs: object,
     ) -> ScanResult:
         match name:
             case "vulnerable":
-                return _make_vulnerable_result()
-            case "clean":
-                return _make_clean_result()
+                result = make_scan_result(updates=[])
             case "outdated":
-                return _make_updates_only_result()
-            case "no-tests" | "deployable" | "deploy-only" | "no-deploy":
-                return _make_clean_result()
+                result = make_scan_result(vulns=[])
+            case "deployable":
+                result = make_scan_result()
             case _:
-                raise FileNotFoundError(f"Unknown project: {name}")
+                result = make_scan_result(vulns=[], updates=[])
+        result.project_name = name
+        return result
 
-    monkeypatch.setattr("maintenance_man.cli.scan_project", _fake_scan)
-
-
-class TestScanSingleProject:
-    def test_scan_project_with_vulns_exits_2(self, mm_home_with_projects: Path):
-        """mm scan vulnerable — has vulns, should exit 2."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "vulnerable"])
-        assert exc_info.value.code == 2
-
-    def test_scan_project_with_vulns_shows_findings(
-        self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Output should contain vulnerability information."""
-        with pytest.raises(SystemExit):
-            app(["scan", "vulnerable"])
-        output = capsys.readouterr().out
-        assert "CVE-" in output or "vuln" in output.lower()
-
-    def test_scan_clean_project_exits_0(self, mm_home_with_projects: Path):
-        """mm scan clean — clean, should exit 0."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "clean"])
-        assert exc_info.value.code == 0
-
-    def test_scan_unknown_project_exits_1(self, mm_home_with_projects: Path):
-        """mm scan nonexistent — should exit 1."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "nonexistent"])
-        assert exc_info.value.code == 1
+    monkeypatch.setattr("maintenance_man.services.scan.scan_project", _fake_scan)
 
 
-class TestScanAllProjects:
-    def test_scan_all_exits_worst_case(self, mm_home_with_projects: Path):
-        """mm scan (no args) — should exit 2 if any project has vulns."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan"])
-        # vulnerable has vulns, so worst case is 2
-        assert exc_info.value.code == 2
+def _two_project_config(mm_home, tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    mm_home.mkdir(parents=True, exist_ok=True)
+    write_config(
+        mm_home,
+        f'[projects.first]\npath = "{first}"\npackage_manager = "bun"\n'
+        f'[projects.second]\npath = "{second}"\npackage_manager = "uv"\n'
+        "scan_secrets = false\n",
+    )
+    results = mm_home / "scan-results"
+    results.mkdir(exist_ok=True)
+    (results / "first.json").write_bytes(b"previous first result")
+    return results
 
 
-class TestScanUpdatesExitCodes:
-    def test_scan_updates_only_exits_3(self, mm_home_with_projects: Path):
-        """mm scan outdated — updates only, no vulns, should exit 3."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "outdated"])
-        assert exc_info.value.code == 3
-
-    def test_scan_updates_output_shows_update_rows(
-        self, mm_home_with_projects: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Output should contain update information."""
-        with pytest.raises(SystemExit):
-            app(["scan", "outdated"])
-        output = capsys.readouterr().out
-        assert "UPDATE" in output or "update" in output.lower()
-        assert "axios" in output
-
-    def test_scan_clean_still_exits_0(self, mm_home_with_projects: Path):
-        """Clean project (no vulns, no updates) still exits 0."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "clean"])
-        assert exc_info.value.code == 0
-
-    def test_scan_vulns_and_updates_exits_2(self, mm_home_with_projects: Path):
-        """If project has both vulns and updates, exit 2 (vulns take precedence)."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan", "vulnerable"])
-        assert exc_info.value.code == 2
-
-
-class TestScanAllWithUpdates:
-    def test_scan_all_updates_takes_precedence_over_clean(
-        self, mm_home_with_projects: Path
-    ):
-        """mm scan (all) — worst case includes updates, but vulns override."""
-        with pytest.raises(SystemExit) as exc_info:
-            app(["scan"])
-        # vulnerable has vulns → exit 2 takes precedence
-        assert exc_info.value.code == 2
-
-
-def test_blocked_gradle_candidates_are_shown_not_treated_as_clean(capsys):
-    result = make_scan_result(
-        vulns=[],
-        updates=[
-            make_update(
-                pkg_name="ksp",
-                installed_version="2.3.10",
-                latest_version="2.3.12",
-                blocked_reason=(
-                    "no Maven Central publication date for "
-                    "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin "
-                    "2.3.12"
-                ),
-                gradle_block_kind="age",
-            )
-        ],
+def test_given_two_clean_projects_when_batch_scanned_then_one_notice_names_both(
+    mm_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _two_project_config(mm_home, tmp_path)
+    monkeypatch.setattr(
+        "maintenance_man.services.scan.scan_project",
+        lambda name, project, days: ScanResult(
+            project_name=name,
+            package_manager=project.package_manager,
+            scanned_at=datetime(2026, 1, 15, 12, tzinfo=UTC),
+        ),
     )
 
-    _print_scan_result(result)
-    out = capsys.readouterr().out
+    assert run_mm("scan") == ExitCode.OK
 
-    assert "clean" not in out
-    assert "ksp" in out
-    assert "1 blocked" in out
-    assert "no Maven Central publication date" in out
-
-
-def test_blocked_update_candidates_still_exit_updates_found():
-    """A ScanResult whose only update is blocked must still reach
-    UPDATES_FOUND: has_updates counts blocked candidates (they stay in
-    ``updates``), and that count is what drives the exit code — not whether
-    any update happens to be eligible.
-    """
-    result = make_scan_result(
-        vulns=[],
-        updates=[
-            make_update(
-                pkg_name="ksp",
-                installed_version="2.3.10",
-                latest_version="2.3.12",
-                blocked_reason="no Maven Central publication date",
-                gradle_block_kind="age",
-            )
-        ],
-    )
-
-    assert result.has_updates is True
-    assert _scan_exit_code(result.has_actionable_vulns, result.has_updates) == (
-        ExitCode.UPDATES_FOUND
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines()[-1].startswith(
+        "2 projects have no findings: first, second · scanned in "
     )
 
 
-def test_gradle_scan_failure_exits_error(mm_home_with_gradle, monkeypatch):
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
+def test_batch_scan_without_trivy_scans_uv_and_exits_error(
+    mm_home, tmp_path, monkeypatch
+):
+    results = _two_project_config(mm_home, tmp_path)
+    (results / "first.json").unlink()
+    monkeypatch.setattr(
+        "maintenance_man.services.scan.scan_project", scanner.scan_project
+    )
+    monkeypatch.setattr("maintenance_man.scanner.require_tool", missing_tool("trivy"))
+    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda path: [])
+    for name, (_, source) in scanner._OUTDATED.items():
+        monkeypatch.setitem(scanner._OUTDATED, name, (lambda project: [], source))
+    assert run_mm("scan") == ExitCode.ERROR
+    assert not (results / "first.json").exists()
+    assert (results / "second.json").is_file()
 
-    def _boom(name, proj_config, min_age_days):
-        raise GradleError("./gradlew cyclonedxBom failed (exit 1): boom")
 
-    monkeypatch.setattr("maintenance_man.cli._scan_one", _boom)
-
-    with pytest.raises(SystemExit) as exc:
-        app(["scan", "android"])
-
-    assert exc.value.code == ExitCode.ERROR
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (("scan", "vulnerable"), 2),
+        (("scan", "clean"), 0),
+        (("scan",), 2),
+        (("scan", "outdated"), 3),
+        (("scan", "deployable"), 2),
+    ],
+)
+def test_given_saved_project_when_scanned_then_exit_code_reflects_findings(
+    mm_home_with_projects: Path, argv: tuple[str, ...], expected: int
+) -> None:
+    assert run_mm(*argv) == expected
 
 
 def test_gradle_scan_failure_in_all_project_scan_exits_error_after_others(
     mm_home_with_gradle, monkeypatch, capsys
 ):
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
     scanned: list[str] = []
 
-    def _scan(name, proj_config, min_age_days):
+    def _scan(name, proj_config, *, minimum_age_days, emit):
         scanned.append(name)
         if proj_config.package_manager == "gradle":
-            raise GradleError("boom")
+            msg = "boom"
+            raise GradleError(msg)
         return make_scan_result(vulns=[], updates=[])
 
-    monkeypatch.setattr("maintenance_man.cli._scan_one", _scan)
+    monkeypatch.setattr("maintenance_man.services.scan.scan_one", _scan)
 
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-
-    assert exc.value.code == ExitCode.ERROR
+    assert run_mm("scan") == ExitCode.ERROR
     assert "clean" in scanned or len(scanned) > 1
-    assert "boom" in capsys.readouterr().out
+    assert "boom" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("all_projects", [False, True])
+@pytest.mark.parametrize("scope", [("sample",), ()], ids=["single", "batch"])
 @pytest.mark.parametrize("with_updates", [False, True])
-@pytest.mark.parametrize("manager", ["gradle", "bun"])
 @pytest.mark.parametrize("with_vulnerability", [False, True])
 def test_scan_blocked_no_fix_vulnerability_exit(
     mm_home,
     tmp_path,
     monkeypatch,
-    all_projects,
+    scope,
     with_updates,
-    manager,
     with_vulnerability,
 ):
     mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
-        f'[projects.sample]\npath = "{tmp_path}"\npackage_manager = "{manager}"\n'
+    write_config(
+        mm_home,
+        f'[projects.sample]\npath = "{tmp_path}"\npackage_manager = "bun"\n',
     )
     result = make_scan_result(
         vulns=[
@@ -293,554 +509,20 @@ def test_scan_blocked_no_fix_vulnerability_exit(
                 title="No fix",
                 description="No published fix",
                 status="affected",
-                blocked_reason="no fixed version",
-                gradle_block_kind="mapping",
+                state=GradleBlock(kind="mapping", reason="no fixed version"),
             )
         ]
         if with_vulnerability
         else [],
         updates=[
-            make_update(blocked_reason="no publication date", gradle_block_kind="age")
+            make_update(state=GradleBlock(kind="age", reason="no publication date"))
         ]
         if with_updates
         else [],
     )
     assert not result.has_actionable_vulns
-    monkeypatch.setattr("maintenance_man.cli.scan_project", lambda *args: result)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"] if all_projects else ["scan", "sample"])
-    expected = (
-        2 if manager == "gradle" and with_vulnerability else (3 if with_updates else 0)
-    )
-    assert exc.value.code == expected
-
-
-def test_all_scan_real_wrapper_launch_error_preserves_results_and_scans_next(
-    mm_home, gradle_project, monkeypatch
-):
-    from maintenance_man.gradle import GRADLE_INVENTORY_RELPATH
-    from maintenance_man.scanner import scan_project
-
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scan_project)
-
-    root = Path(gradle_project.path)
-    (root / "gradlew").write_text("#!/definitely/missing/mm-interpreter\n")
-    mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
-        f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
-        f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n"
-    )
-    results = mm_home / "scan-results"
-    results.mkdir()
-    (results / "android.json").write_bytes(b"previous scan results\n")
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
-    monkeypatch.setattr("maintenance_man.scanner._check_outdated", lambda *args: [])
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
-    assert (results / "android.json").read_bytes() == b"previous scan results\n"
-    assert (results / "remaining.json").is_file()
-    assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-
-
-_GRADLE_SCAN_CLI_MODULES = [
-    ("androidx.room", "room-runtime", "2.8.4"),
-    ("androidx.room", "room-compiler", "2.8.4"),
-    ("com.squareup.okhttp3", "okhttp", "4.12.0"),
-    ("com.google.code.gson", "gson", "2.11.0"),
-    ("androidx.compose.ui", "ui", "1.9.0"),
-    ("org.jetbrains", "annotations", "23.0.0"),
-]
-
-
-def _gradle_report_json_for_fixture_bom(root: Path) -> str:
-    """A resolution report covering every fixtures/gradle/bom.json component.
-
-    mmGradleReport now captures the resolution graph alongside the inventory
-    in one combined command, so any test that fakes a real ``bom.json`` must
-    also fake a matching ``report.json`` for the adapter's inventory-to-scope
-    cross-check to accept it.
-    """
-    import hashlib
-    import json
-
-    from maintenance_man.gradle import GRADLE_CATALOGUE_RELPATH
-
-    components: list[dict[str, object]] = [
-        {"id": "root", "kind": "root", "module": None, "variants": []}
-    ]
-    for index, (group, artifact, version) in enumerate(_GRADLE_SCAN_CLI_MODULES):
-        components.append(
-            {
-                "id": f"c{index}",
-                "kind": "module",
-                "module": {"group": group, "artifact": artifact, "version": version},
-                "variants": ["runtime"],
-            }
-        )
-    scope = {
-        "project_path": ":",
-        "domain": "project",
-        "configuration": "runtimeClasspath",
-    }
-    return json.dumps(
-        {
-            "schema_version": 1,
-            "root_project": ":",
-            "producer_versions": {
-                "gradle": "8.14.3",
-                "cyclonedx": "3.4.1",
-                "report": "1",
-            },
-            "catalogue_digest": hashlib.sha256(
-                (root / GRADLE_CATALOGUE_RELPATH).read_bytes()
-            ).hexdigest(),
-            "repositories": [],
-            "selected_scopes": [scope],
-            "scopes": [
-                {
-                    "scope": scope,
-                    "components": components,
-                    "edges": [],
-                    "unresolved": [],
-                }
-            ],
-            "selection_errors": [],
-        }
-    )
-
-
-@pytest.mark.parametrize(
-    "phase",
-    ["inventory-mkdir", "inventory-marker", "inventory-cleanup", "report-cleanup"],
-)
-def test_all_scan_owned_filesystem_error_preserves_results_and_processes_remaining(
-    mm_home, gradle_project, monkeypatch, phase
-):
-    import subprocess
-
-    from maintenance_man.gradle import (
-        GRADLE_INVENTORY_MARKER_RELPATH,
-        GRADLE_INVENTORY_RELPATH,
-        GRADLE_REPORT_MARKER_RELPATH,
-        GRADLE_UPDATE_REPORT_RELPATH,
-    )
-    from maintenance_man.scanner import _check_outdated, scan_project
-    from tests.conftest import GRADLE_FIXTURES
-
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scan_project)
-    root = Path(gradle_project.path)
-    mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
-        f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
-        "scan_secrets = false\n"
-        f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n"
-    )
-    results = mm_home / "scan-results"
-    results.mkdir()
-    (results / "android.json").write_bytes(b"old result bytes")
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
     monkeypatch.setattr(
-        "maintenance_man.scanner._check_outdated",
-        lambda name, project, *args: (
-            []
-            if project.package_manager == "uv"
-            else _check_outdated(name, project, *args)
-        ),
+        "maintenance_man.services.scan.scan_project", lambda *args, **kwargs: result
     )
-    if phase == "inventory-mkdir":
-        mkdir = Path.mkdir
-
-        def fail(path, *args, **kwargs):
-            if path == root / GRADLE_INVENTORY_RELPATH:
-                raise PermissionError("mkdir denied")
-            return mkdir(path, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "mkdir", fail)
-    elif phase == "inventory-marker":
-        write = Path.write_bytes
-
-        def fail(path, content):
-            if path == root / GRADLE_INVENTORY_MARKER_RELPATH:
-                raise PermissionError("marker denied")
-            return write(path, content)
-
-        monkeypatch.setattr(Path, "write_bytes", fail)
-    elif phase == "inventory-cleanup":
-
-        def fail(*args, **kwargs):
-            raise PermissionError("inventory cleanup denied")
-
-        monkeypatch.setattr("maintenance_man.gradle.shutil.rmtree", fail)
-    else:
-        from maintenance_man.gradle_resolution import parse_resolution_report
-
-        resolution = parse_resolution_report(
-            (GRADLE_FIXTURES / "resolution/empty.json").read_text()
-        )
-        monkeypatch.setattr(
-            "maintenance_man.scanner._run_gradle_scan",
-            lambda *args: ([], resolution),
-        )
-        unlink = Path.unlink
-
-        def fail(path, *args, **kwargs):
-            if path == root / GRADLE_UPDATE_REPORT_RELPATH:
-                raise PermissionError("cleanup denied")
-            return unlink(path, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "unlink", fail)
-    commands = []
-
-    def run(cmd, **kwargs):
-        commands.append(cmd)
-        if phase == "inventory-cleanup":
-            from maintenance_man.gradle import GRADLE_INVENTORY_BOM_RELPATH
-
-            if cmd[1] == "mmGradleReport":
-                (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
-                    (GRADLE_FIXTURES / "bom.json").read_bytes()
-                )
-                (root / GRADLE_INVENTORY_BOM_RELPATH).parent.joinpath(
-                    "report.json"
-                ).write_text(_gradle_report_json_for_fixture_bom(root))
-            else:
-                assert cmd[:2] == ["trivy", "sbom"]
-                return subprocess.CompletedProcess(
-                    cmd, 0, stdout='{"Results": []}', stderr=""
-                )
-        else:
-            assert phase == "report-cleanup"
-            assert cmd[1] == "versionCatalogUpdate"
-            (root / GRADLE_UPDATE_REPORT_RELPATH).write_bytes(
-                (GRADLE_FIXTURES / "updates-clean.toml").read_bytes()
-            )
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
-    assert (results / "android.json").read_bytes() == b"old result bytes"
-    assert (results / "remaining.json").is_file()
-    if phase == "inventory-cleanup":
-        assert (root / GRADLE_INVENTORY_MARKER_RELPATH).is_file()
-    else:
-        assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-    if phase == "report-cleanup":
-        assert (root / GRADLE_REPORT_MARKER_RELPATH).is_file()
-    elif phase != "inventory-cleanup":
-        assert commands == []
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "report-false",
-        "trivy-root",
-        "trivy-results",
-        "trivy-row",
-        "trivy-launch",
-        "trivy-decode",
-        "wrapper-decode",
-    ],
-)
-def test_all_scan_malformed_gradle_output_preserves_results_and_continues(
-    mm_home, gradle_project, monkeypatch, failure
-):
-    import json
-    import subprocess
-
-    from maintenance_man.gradle import (
-        GRADLE_INVENTORY_BOM_RELPATH,
-        GRADLE_INVENTORY_RELPATH,
-        GRADLE_REPORT_MARKER_RELPATH,
-        GRADLE_UPDATE_REPORT_RELPATH,
-    )
-    from maintenance_man.scanner import _check_outdated, scan_project
-    from tests.conftest import GRADLE_FIXTURES
-
-    root = Path(gradle_project.path)
-    mm_home.mkdir(parents=True, exist_ok=True)
-    (mm_home / "config.toml").write_text(
-        f'[projects.android]\npath = "{root}"\npackage_manager = "gradle"\n'
-        "scan_secrets = false\n"
-        f'[projects.remaining]\npath = "{root}"\npackage_manager = "uv"\n'
-        "scan_secrets = false\n"
-    )
-    results = mm_home / "scan-results"
-    results.mkdir()
-    (results / "android.json").write_bytes(b"old result bytes")
-    monkeypatch.setattr("maintenance_man.cli.scan_project", scan_project)
-    monkeypatch.setattr("maintenance_man.cli.check_trivy_available", lambda: None)
-    monkeypatch.setattr("maintenance_man.scanner._run_uv_audit", lambda *args: [])
-    monkeypatch.setattr(
-        "maintenance_man.scanner._check_outdated",
-        lambda name, project, *args: (
-            []
-            if project.package_manager == "uv"
-            else _check_outdated(name, project, *args)
-        ),
-    )
-    if failure == "report-false":
-        from maintenance_man.gradle_resolution import parse_resolution_report
-
-        resolution = parse_resolution_report(
-            (GRADLE_FIXTURES / "resolution/empty.json").read_text()
-        )
-        monkeypatch.setattr(
-            "maintenance_man.scanner._run_gradle_scan",
-            lambda *args: ([], resolution),
-        )
-
-    def run(cmd, **kwargs):
-        if cmd[1] == "mmGradleReport":
-            if failure == "wrapper-decode":
-                raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
-            (root / GRADLE_INVENTORY_BOM_RELPATH).write_bytes(
-                (GRADLE_FIXTURES / "bom.json").read_bytes()
-            )
-            (root / GRADLE_INVENTORY_BOM_RELPATH).parent.joinpath(
-                "report.json"
-            ).write_text(_gradle_report_json_for_fixture_bom(root))
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[1] == "versionCatalogUpdate":
-            assert failure == "report-false"
-            (root / GRADLE_UPDATE_REPORT_RELPATH).write_text("libraries = false\n")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        assert cmd[:2] == ["trivy", "sbom"]
-        if failure == "trivy-launch":
-            raise FileNotFoundError("missing interpreter")
-        if failure == "trivy-decode":
-            raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
-        payload = {
-            "trivy-root": [],
-            "trivy-results": {"Results": False},
-            "trivy-row": {"Results": [None]},
-        }[failure]
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(payload), stderr=""
-        )
-
-    monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(SystemExit) as exc:
-        app(["scan"])
-    assert exc.value.code == ExitCode.ERROR
-    assert (results / "android.json").read_bytes() == b"old result bytes"
-    assert (results / "remaining.json").is_file()
-    assert not (root / GRADLE_INVENTORY_RELPATH).exists()
-    assert not (root / GRADLE_UPDATE_REPORT_RELPATH).exists()
-    assert not (root / GRADLE_REPORT_MARKER_RELPATH).exists()
-
-
-def test_gradle_advisories_collapse_without_losing_saved_cves(monkeypatch):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
-    scope = ":app/project/debugRuntimeClasspath"
-    findings = [
-        VulnFinding(
-            vuln_id=advisory,
-            pkg_name="org.example:shared",
-            installed_version="1.0",
-            severity=severity,
-            title=advisory,
-            description="",
-            status="affected",
-            gradle_scopes=(scope,),
-        )
-        for advisory, severity in (("CVE-A", Severity.LOW), ("CVE-B", Severity.HIGH))
-    ]
-    result = ScanResult(
-        project="android",
-        scanned_at=datetime.now(timezone.utc),
-        trivy_target="/fixture",
-        vulnerabilities=findings,
-    )
-    cli._print_gradle_advisories(result)
-    rendered = output.getvalue()
-    assert rendered.count("org.example:shared") == 1
-    assert "HIGH" in rendered
-    assert "2" in rendered
-    assert "debugRuntimeClasspath" in rendered
-    assert [
-        row["vuln_id"] for row in result.model_dump(mode="json")["vulnerabilities"]
-    ] == ["CVE-A", "CVE-B"]
-
-
-def test_gradle_advisories_keep_installed_versions_separate(monkeypatch):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
-    result = ScanResult(
-        project="android",
-        scanned_at=datetime.now(timezone.utc),
-        trivy_target="/fixture",
-        vulnerabilities=[
-            VulnFinding(
-                vuln_id="CVE-A",
-                pkg_name="org.example:shared",
-                installed_version=version,
-                severity=Severity.UNKNOWN,
-                title="",
-                description="",
-                status="affected",
-            )
-            for version in ("1.0", "2.0")
-        ],
-    )
-    cli._print_gradle_advisories(result)
-    assert output.getvalue().count("org.example:shared") == 2
-
-
-def _summary_run(blocks=(), attempts=(), residuals=()):
-    return SimpleNamespace(
-        selection_blocks=tuple(blocks),
-        attempts=tuple(attempts),
-        accepted_snapshot=SimpleNamespace(findings=tuple(residuals)),
-    )
-
-
-def _summary_attempt(state, reference="shared", reason="too young"):
-    target = GradleUpdateTarget(
-        version_ref=reference,
-        target_version="2.0",
-        members=[
-            GradleMember(
-                kind="library",
-                alias="shared",
-                coordinate="g:shared",
-                installed_version="1.0",
-            )
-        ],
-    )
-    candidate = GradleCandidate(target=target, origins=frozenset({"ordinary"}))
-    if state == "withheld":
-        return WithheldAttempt(candidate=candidate, reason=reason)
-    if state == "failed":
-        baseline = GradleSnapshot(
-            tree_id="tree",
-            context_identity="context",
-            inventory_digest="bom",
-            inventory_modules=(),
-            findings=(),
-            resolution=CompleteResolution(
-                report=ResolutionReport(
-                    schema_version=1,
-                    root_project=":",
-                    producer_versions={
-                        "gradle": "9.6.1",
-                        "cyclonedx": "3.4.1",
-                        "report": "1",
-                    },
-                    catalogue_digest="catalogue",
-                    repositories=(),
-                    selected_scopes=(),
-                    scopes=(),
-                )
-            ),
-        )
-        return FailedAttempt(candidate=candidate, reason=reason, baseline=baseline)
-    return SimpleNamespace(
-        state=state, reason=reason, candidate=SimpleNamespace(target=target)
-    )
-
-
-def test_gradle_retry_summary_renders_persisted_selection_blocks(monkeypatch):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
-    blocks = [
-        CandidateWithheld(
-            group_key=group,
-            coordinate="g:shared",
-            installed_version="1.0",
-            reason=reason,
-            advisory_ids=frozenset({advisory}),
-        )
-        for group, reason, advisory in (
-            ("ref:first", "too young", "CVE-A"),
-            ("ref:first", "too young", "CVE-B"),
-            ("ref:second", "too young", "CVE-C"),
-            ("ref:first", "unsupported routing", "CVE-D"),
-        )
-    ]
-    # Round-trip selection records to demonstrate the retry needs no preparation output.
-    loaded = [
-        CandidateWithheld.model_validate_json(block.model_dump_json())
-        for block in blocks
-    ]
-    run = _summary_run(loaded, (_summary_attempt("completed"),), (object(),))
-    cli._print_gradle_run_summary(run)
-    text = output.getvalue()
-    assert "Verified: 1; withheld: 3; failed: 0; residual advisories: 1" in text
-    assert text.count("WITHHELD TARGET") == 3
-    assert text.count("ref:first") == 2
-    assert text.count("ref:second") == 1
-    assert text.count("too young") == 2
-    assert text.count("unsupported routing") == 1
-
-
-def test_gradle_summary_keeps_unknown_versions_and_collapses_duplicate_reasons(
-    monkeypatch,
-):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
-    blocks = [
-        CandidateWithheld(
-            group_key=None,
-            coordinate="g:unowned",
-            installed_version=version,
-            reason="ambiguous owner",
-            advisory_ids=frozenset({advisory}),
-        )
-        for version, advisory in (("1.0", "CVE-A"), ("1.0", "CVE-B"), ("2.0", "CVE-C"))
-    ]
-    cli._print_gradle_run_summary(_summary_run(blocks))
-    text = output.getvalue()
-    assert "withheld: 2" in text
-    assert text.count("RESIDUAL PACKAGE") == 2
-    assert text.count("g:unowned@1.0") == 1
-    assert text.count("g:unowned@2.0") == 1
-    assert text.count("ambiguous owner") == 2
-
-
-def test_gradle_summary_deduplicates_selection_and_attempt_but_retains_failures(
-    monkeypatch,
-):
-    output = StringIO()
-    monkeypatch.setattr(
-        cli, "console", Console(file=output, width=180, color_system=None)
-    )
-    block = CandidateWithheld(
-        group_key="ref:shared",
-        coordinate="g:shared",
-        installed_version="1.0",
-        reason="too young",
-    )
-    run = _summary_run(
-        (block,),
-        (
-            _summary_attempt("withheld"),
-            _summary_attempt("failed", "broken", "unit tests failed"),
-            _summary_attempt("applying", "interrupted"),
-            _summary_attempt("ready", "accepted"),
-        ),
-    )
-    cli._print_gradle_run_summary(run)
-    text = output.getvalue()
-    assert "Verified: 1; withheld: 1; failed: 2; residual advisories: 0" in text
-    assert text.count("WITHHELD TARGET") == 1
-    assert text.count("too young") == 1
-    assert "shared -> 2.0" in text
-    assert "FAILED broken -> 2.0" in text
-    assert "unit tests failed" in text
+    expected = 3 if with_updates else 0
+    assert run_mm("scan", *scope) == expected

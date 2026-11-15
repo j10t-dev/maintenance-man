@@ -1,0 +1,4 @@
+warning: `uv audit` is experimental and may change without warning. Pass `--preview-features audit-command` to disable this warning.
+Using CPython 3.13.15
+Resolved 4 packages in 1ms
+Found 38 known vulnerabilities and no adverse project statuses in 3 packages
