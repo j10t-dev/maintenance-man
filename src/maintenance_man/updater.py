@@ -106,13 +106,13 @@ def sort_updates_by_risk(updates: list[UpdateFinding]) -> list[UpdateFinding]:
 
 
 def run_test_phases(
-    project_config: ProjectConfig, project_path: Path, *, emit: Emit
+    project: ProjectConfig, project_path: Path, *, emit: Emit
 ) -> str | None:
     """Run configured test phases sequentially and return the failed phase.
 
     Stops on first failure. Returns ``None`` if all phases pass.
     """
-    for phase_name, command in project_config.test_phases:
+    for phase_name, command in project.test_phases:
         emit(TestCommandStarted(command))
         try:
             run_shell_command(
@@ -220,7 +220,7 @@ def apply_finding(
 
 def process_findings(
     groups: Sequence[FindingGroup],
-    project_config: ProjectConfig,
+    project: ProjectConfig,
     *,
     flow: Workflow,
     scan_result: ScanResult,
@@ -231,23 +231,23 @@ def process_findings(
     Update discards a failed group and continues; resolve keeps it and stops.
     """
     results: list[UpdateResult] = []
-    repo = JjRepository(project_config.path)
+    repo = JjRepository(project.path)
     for group in groups:
         emit(
             FindingStarted(
                 group.pkg_name, group.installed_version, group.target_version
             )
         )
-        outcome = apply_finding(project_config, group, repo, emit=emit)
+        outcome = apply_finding(project, group, repo, emit=emit)
         if isinstance(outcome, Blocked):
             group.record(outcome.block)
-            save_scan_results(scan_result.project, scan_result)
+            save_scan_results(scan_result.project_name, scan_result)
             emit(FindingsBlocked(((group.pkg_name, outcome.block.reason),)))
             continue
         step = (
             FindingStep("apply", discardable=outcome.discardable)
             if isinstance(outcome, ApplyFailed)
-            else _test_and_commit(group, project_config, repo, flow, emit)
+            else _test_and_commit(group, project, repo, flow, emit)
         )
         if step.failed_phase is None:
             group.record(Ready(flow=flow))
@@ -261,7 +261,7 @@ def process_findings(
                 )
             )
             group.record(Failed(flow=flow, phase=step.failed_phase))
-        save_scan_results(scan_result.project, scan_result)
+        save_scan_results(scan_result.project_name, scan_result)
         results.append(
             UpdateResult(group.pkg_name, group.kind, step.passed, step.failed_phase)
         )
@@ -332,13 +332,13 @@ def _apply_gradle_target(
 
 def _test_and_commit(
     group: FindingGroup,
-    project_config: ProjectConfig,
+    project: ProjectConfig,
     repo: JjRepository,
     flow: Workflow,
     emit: Emit,
 ) -> FindingStep:
-    project_path = project_config.path
-    failed_phase = run_test_phases(project_config, project_path, emit=emit)
+    project_path = project.path
+    failed_phase = run_test_phases(project, project_path, emit=emit)
     if failed_phase is not None:
         return FindingStep(failed_phase)
 

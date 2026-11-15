@@ -58,7 +58,7 @@ def make_scan_result(
     update by default and no secrets.
     """
     return ScanResult(
-        project="vulnerable",
+        project_name="vulnerable",
         package_manager=package_manager,
         scanned_at=datetime.now(tz=UTC),
         vulnerabilities=vulns if vulns is not None else [make_vuln()],

@@ -121,7 +121,7 @@ def project_records(
 
 
 def outcome(
-    project: str,
+    project_name: str,
     operation: str,
     status: Status,
     subject: str,
@@ -134,12 +134,20 @@ def outcome(
     if not terminal():
         sys.stdout.write(
             _pipe_line(
-                (project, operation, status, subject, installed, target, reason or "-")
+                (
+                    project_name,
+                    operation,
+                    status,
+                    subject,
+                    installed,
+                    target,
+                    reason or "-",
+                )
             )
         )
         return
-    if project:
-        heading(project)
+    if project_name:
+        heading(project_name)
     symbol, style = _STATES[status]
     versions = f"{installed} → {target}" if installed != "-" or target != "-" else ""
     text = Text("  ")

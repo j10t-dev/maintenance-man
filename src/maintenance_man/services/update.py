@@ -56,7 +56,7 @@ type FindingChooser = Callable[
 
 @dataclass(frozen=True, slots=True)
 class ProjectUpdate:
-    project: str
+    project_name: str
     outcome: Outcome
     results: tuple[UpdateResult, ...]
     blocked: int = 0
@@ -76,43 +76,50 @@ class BatchUpdate:
 
 
 def update_project(
-    name: str,
+    project_name: str,
     project: ProjectConfig,
     *,
     choose: FindingChooser | None,
     emit: Emit,
 ) -> ProjectUpdate:
-    scan_result = flows.load_validated_scan(name, project, Workflow.UPDATE, emit=emit)
+    scan_result = flows.load_validated_scan(
+        project_name, project, Workflow.UPDATE, emit=emit
+    )
     if scan_result is None:
-        return ProjectUpdate(name, Outcome.SUCCEEDED, ())
+        return ProjectUpdate(project_name, Outcome.SUCCEEDED, ())
     if not flows.has_work(scan_result, Workflow.UPDATE):
         emit(ScanReported(scan_result))
         return ProjectUpdate(
-            name, Outcome.SUCCEEDED, (), blocked=len(scan_result.blocked_findings)
+            project_name,
+            Outcome.SUCCEEDED,
+            (),
+            blocked=len(scan_result.blocked_findings),
         )
-    if flows.report_missing_test_config(name, project, emit=emit):
-        return ProjectUpdate(name, Outcome.FAILED, ())
+    if flows.report_missing_test_config(project_name, project, emit=emit):
+        return ProjectUpdate(project_name, Outcome.FAILED, ())
     try:
-        workspace = _enter_update_workspace(name, project, scan_result)
+        workspace = _enter_update_workspace(project_name, project, scan_result)
     except RevisionError as exc:
         raise UpdateSetupError(str(exc)) from exc
 
-    work_config = project.model_copy(update={"path": workspace})
+    workspace_project = project.model_copy(update={"path": workspace})
     results: tuple[UpdateResult, ...] = ()
     cleaned = True
     try:
         emit(ScanReported(scan_result))
-        results = _process_selected(scan_result, work_config, choose=choose, emit=emit)
+        results = _process_selected(
+            scan_result, workspace_project, choose=choose, emit=emit
+        )
     finally:
         try:
-            remove_workspace(repo=JjRepository(project.path), project=name)
+            remove_workspace(repo=JjRepository(project.path), project_name=project_name)
         except RevisionError as exc:
-            emit(OperationFailed("workspace cleanup", name, str(exc)))
+            emit(OperationFailed("workspace cleanup", project_name, str(exc)))
             cleaned = False
 
-    outcome = _finish_update(project.path, scan_result, name, emit=emit)
+    outcome = _finish_update(project.path, scan_result, project_name, emit=emit)
     return ProjectUpdate(
-        name,
+        project_name,
         outcome if cleaned else Outcome.FAILED,
         results,
         blocked=len(scan_result.blocked_findings),
@@ -121,28 +128,32 @@ def update_project(
 
 def update_projects(
     cfg: MmConfig,
-    names: Sequence[str],
+    project_names: Sequence[str],
     *,
     emit: Emit,
 ) -> BatchUpdate:
     projects: list[ProjectUpdate] = []
     had_errors = False
-    for name in names:
-        project = cfg.projects[name]
-        if report_missing_path(name, project, emit=emit):
+    for project_name in project_names:
+        project = cfg.projects[project_name]
+        if report_missing_path(project_name, project, emit=emit):
             had_errors = True
             continue
-        emit(ProjectStarted(name))
+        emit(ProjectStarted(project_name))
         try:
-            result = update_project(name, project, choose=None, emit=emit)
+            result = update_project(project_name, project, choose=None, emit=emit)
         except FlowConflictError as exc:
-            emit(ProjectSkipped(name, SkipReason.FLOW_CONFLICT, str(exc)))
+            emit(ProjectSkipped(project_name, SkipReason.FLOW_CONFLICT, str(exc)))
             had_errors = True
         except CorruptScanResultsError as exc:
-            emit(ProjectSkipped(name, SkipReason.CORRUPT_SCAN_RESULTS, exc.detail))
+            emit(
+                ProjectSkipped(
+                    project_name, SkipReason.CORRUPT_SCAN_RESULTS, exc.detail
+                )
+            )
             had_errors = True
         except UpdateSetupError as exc:
-            emit(OperationFailed("update setup", name, str(exc)))
+            emit(OperationFailed("update setup", project_name, str(exc)))
             had_errors = True
         else:
             projects.append(result)
@@ -151,14 +162,18 @@ def update_projects(
 
 def resolve_update_targets(
     cfg: MmConfig,
-    names: Sequence[str],
+    project_names: Sequence[str],
     *,
     negate: bool,
 ) -> tuple[Literal["single", "batch"], list[str]]:
-    ordered = config_module.ordered_unique_project_names(cfg, names)
+    ordered = config_module.ordered_unique_project_names(cfg, project_names)
     if negate:
         excluded = set(ordered)
-        return "batch", [name for name in sorted(cfg.projects) if name not in excluded]
+        return "batch", [
+            project_name
+            for project_name in sorted(cfg.projects)
+            if project_name not in excluded
+        ]
     if not ordered:
         return "batch", sorted(cfg.projects)
     if len(ordered) == 1:
@@ -167,13 +182,13 @@ def resolve_update_targets(
 
 
 def _enter_update_workspace(
-    project: str,
-    project_config: ProjectConfig,
+    project_name: str,
+    project: ProjectConfig,
     scan_result: ScanResult,
 ) -> Path:
     bookmark = WORKFLOW_BOOKMARKS[Workflow.UPDATE]
-    repo = JjRepository(project_config.path)
-    remove_workspace(repo=repo, project=project)
+    repo = JjRepository(project.path)
+    remove_workspace(repo=repo, project_name=project_name)
 
     if flows.has_owned(scan_result, Workflow.UPDATE, Ready, Failed):
         if not repo.bookmark_exists(bookmark=bookmark):
@@ -183,26 +198,26 @@ def _enter_update_workspace(
             )
             raise UpdateSetupError(msg)
         workspace_revision = bookmark
-        _require_sdk_in_workspace(project, project_config, repo, workspace_revision)
+        _require_sdk_in_workspace(project_name, project, repo, workspace_revision)
     else:
         ensure_main_bookmark(repo=repo)
-        _require_sdk_in_workspace(project, project_config, repo, "main")
+        _require_sdk_in_workspace(project_name, project, repo, "main")
         repo.set_bookmark(bookmark=bookmark, revision="main", allow_backwards=True)
         workspace_revision = "main"
 
     try:
         workspace_path = create_workspace(
-            repo=repo, project=project, revision=workspace_revision
+            repo=repo, project_name=project_name, revision=workspace_revision
         )
         JjRepository(workspace_path).new_change(revision=bookmark)
     except RevisionError:
-        remove_workspace(repo=repo, project=project)
+        remove_workspace(repo=repo, project_name=project_name)
         raise
     return workspace_path
 
 
 def _require_sdk_in_workspace(
-    name: str, project: ProjectConfig, repo: JjRepository, revision: str
+    project_name: str, project: ProjectConfig, repo: JjRepository, revision: str
 ) -> None:
     """Refuse a workspace checkout that would lack its local.properties."""
     if not local_properties_required(project.path):
@@ -212,13 +227,15 @@ def _require_sdk_in_workspace(
     ):
         return
     raise UpdateSetupError(
-        workspace_environment_reason(project.path, workspace_path_for_project(name))
+        workspace_environment_reason(
+            project.path, workspace_path_for_project(project_name)
+        )
     )
 
 
 def _process_selected(
     scan_result: ScanResult,
-    work_config: ProjectConfig,
+    project: ProjectConfig,
     *,
     choose: FindingChooser | None,
     emit: Emit,
@@ -252,7 +269,7 @@ def _process_selected(
     results = (
         process_findings(
             findings,
-            work_config,
+            project,
             flow=Workflow.UPDATE,
             scan_result=scan_result,
             emit=emit,
@@ -278,17 +295,18 @@ def _with_shared_targets[F: VulnFinding | UpdateFinding](
 
 
 def _finish_update(
-    project_path: Path, scan_result: ScanResult, name: str, *, emit: Emit
+    project_path: Path, scan_result: ScanResult, project_name: str, *, emit: Emit
 ) -> Outcome:
     if flows.has_owned(scan_result, Workflow.UPDATE, Failed):
         emit(
             PromotionFailed(
-                name,
+                project_name,
                 "failed updates remain pending · "
-                f"rerun mm update {name} or repair with mm resolve {name}",
+                f"rerun mm update {project_name} "
+                f"or repair with mm resolve {project_name}",
             )
         )
         return Outcome.FAILED
     return flows.finalise_local_changes(
-        project_path, scan_result, name, Workflow.UPDATE, emit=emit
+        project_path, scan_result, project_name, Workflow.UPDATE, emit=emit
     )

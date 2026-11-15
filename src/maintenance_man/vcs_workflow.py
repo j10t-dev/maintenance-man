@@ -95,35 +95,35 @@ def current_label(*, repo: JjRepository) -> str:
         return "unknown"
 
 
-def _workspace_name(project: str) -> str:
-    return f"mm-{sanitise_project_name(project)}"
+def _workspace_name(project_name: str) -> str:
+    return f"mm-{sanitise_project_name(project_name)}"
 
 
-def _safe_workspace_path(project: str) -> Path:
+def _safe_workspace_path(project_name: str) -> Path:
     try:
-        return vcs.workspace_path_for_project(project)
+        return vcs.workspace_path_for_project(project_name)
     except (OSError, ValueError) as exc:
         msg = f"Cannot inspect workspace path: {exc}"
         raise RevisionError(msg) from exc
 
 
-def create_workspace(*, repo: JjRepository, project: str, revision: str) -> Path:
-    workspace_path = _safe_workspace_path(project)
+def create_workspace(*, repo: JjRepository, project_name: str, revision: str) -> Path:
+    workspace_path = _safe_workspace_path(project_name)
     try:
         workspace_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         msg = f"Cannot prepare workspace path: {exc}"
         raise RevisionError(msg) from exc
     repo.add_workspace(
-        name=_workspace_name(project), path=workspace_path, revision=revision
+        name=_workspace_name(project_name), path=workspace_path, revision=revision
     )
     return workspace_path
 
 
-def remove_workspace(*, repo: JjRepository, project: str) -> None:
+def remove_workspace(*, repo: JjRepository, project_name: str) -> None:
     names = repo.workspace_names()
-    workspace_name = _workspace_name(project)
-    workspace_path = _safe_workspace_path(project)
+    workspace_name = _workspace_name(project_name)
+    workspace_path = _safe_workspace_path(project_name)
     if workspace_name in names:
         repo.forget_workspace(name=workspace_name)
     try:

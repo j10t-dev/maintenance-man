@@ -110,7 +110,7 @@ def cli_deps(
         if project_name == "vulnerable":
             continue
         project_scan = deepcopy(scan_result)
-        project_scan.project = project_name
+        project_scan.project_name = project_name
         project_scan.package_manager = projects[project_name].package_manager
         save_scan_results(project_name, project_scan)
     monkeypatch.setattr(processor_path, FakeFindingProcessor(outcomes))

@@ -31,9 +31,9 @@ def test_scan_all_continues_after_failure_and_summarises_results(
         projects[name] = make_project(path)
     cfg = make_config(projects=projects)
     first = make_scan_result(updates=[])
-    first.project = "first"
+    first.project_name = "first"
     third = make_scan_result(vulns=[], updates=[])
-    third.project = "third"
+    third.project_name = "third"
 
     def fake_scan(name, project, minimum_age_days):
         del project, minimum_age_days

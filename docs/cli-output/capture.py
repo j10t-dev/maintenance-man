@@ -50,7 +50,7 @@ def _build_home(scratch: Path) -> Path:
         encoding="utf-8",
     )
     scan = ScanResult(
-        project="api-gateway",
+        project_name="api-gateway",
         package_manager="uv",
         scanned_at=datetime.now(tz=UTC),
         vulnerabilities=[

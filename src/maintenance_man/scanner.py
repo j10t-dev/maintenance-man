@@ -58,7 +58,7 @@ class ScanError(Exception):
 
 
 def scan_project(
-    name: str,
+    project_name: str,
     project: ProjectConfig,
     min_version_age_days: int = 7,
     *,
@@ -66,7 +66,7 @@ def scan_project(
 ) -> ScanResult:
     """Run Trivy and outdated checks against a project and return parsed results.
 
-    Also writes the results JSON to ~/.mm/scan-results/<name>.json.
+    Also writes the results JSON to ~/.mm/scan-results/<project_name>.json.
 
     Raises:
         ScanError: If trivy exits with non-zero status.
@@ -108,14 +108,14 @@ def scan_project(
                 )
 
     scan_result = ScanResult(
-        project=name,
+        project_name=project_name,
         package_manager=project.package_manager,
         scanned_at=utc_now(),
         vulnerabilities=vulns,
         secrets=secrets,
         updates=updates,
     )
-    save_scan_results(name, scan_result)
+    save_scan_results(project_name, scan_result)
     return scan_result
 
 

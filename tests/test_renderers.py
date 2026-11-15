@@ -46,7 +46,7 @@ def _pipe_scan() -> ScanResult:
             )
         ]
     )
-    scan.project = "api"
+    scan.project_name = "api"
     return scan
 
 
@@ -254,7 +254,7 @@ def test_given_event_when_rendered_in_pipe_then_records_and_diagnostics_split_by
     stdout: str,
     stderr: str,
 ) -> None:
-    EventRenderer(batch=batch, project="api", flow=flow)(event)
+    EventRenderer(batch=batch, project_name="api", flow=flow)(event)
 
     captured = capsys.readouterr()
     assert captured.out == stdout
@@ -304,7 +304,7 @@ def test_given_test_command_when_rendered_then_only_verbose_runs_echo_it(
 ) -> None:
     maintenance_output.reset_invocation_output(verbose=verbose)
 
-    renderer = EventRenderer(batch=False, project="api")
+    renderer = EventRenderer(batch=False, project_name="api")
     renderer(events.TestCommandStarted("uv run pytest"))
 
     captured = capsys.readouterr()
@@ -338,7 +338,7 @@ def test_given_event_when_rendered_on_terminal_then_layout_is_aligned(
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    EventRenderer(batch=False, project="api")(event)
+    EventRenderer(batch=False, project_name="api")(event)
 
     assert Text.from_ansi(stream.getvalue()).plain == f"{expected}\n"
 
@@ -348,7 +348,7 @@ def test_given_processing_heading_when_finding_rendered_then_heading_is_not_repe
 ) -> None:
     stream = terminal_stdout(monkeypatch)
 
-    renderer = EventRenderer(batch=False, project="api")
+    renderer = EventRenderer(batch=False, project_name="api")
     renderer(ProcessingStarted(2, 1))
     renderer(FindingPassed("pkg", False, "1.0", "1.1"))
 
@@ -391,7 +391,7 @@ def test_given_finding_started_when_rendered_then_only_a_stderr_terminal_shows_p
     monkeypatch.setattr("sys.stdout", stdout)
     monkeypatch.setattr("sys.stderr", stderr)
 
-    EventRenderer(batch=False, project="api")(FindingStarted("pkg", "1.0", "2.0"))
+    EventRenderer(batch=False, project_name="api")(FindingStarted("pkg", "1.0", "2.0"))
 
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == expected
@@ -399,13 +399,13 @@ def test_given_finding_started_when_rendered_then_only_a_stderr_terminal_shows_p
 
 def _clean_scan() -> ScanResult:
     scan = make_scan_result(vulns=[], updates=[])
-    scan.project = "api"
+    scan.project_name = "api"
     return scan
 
 
 def _blocked_scan() -> ScanResult:
     scan = make_scan_result(vulns=[], updates=[])
-    scan.project = "api"
+    scan.project_name = "api"
     scan.updates = [
         make_update(
             pkg_name="blocked-pkg",
@@ -463,7 +463,7 @@ def test_given_update_flow_when_saved_scan_reported_on_terminal_then_findings_pr
 def test_given_event_when_rendered_then_only_single_project_runs_print_the_notice(
     capsys: pytest.CaptureFixture[str], event: Event, batch: bool, stderr: str
 ) -> None:
-    EventRenderer(batch=batch, project="api", flow="scan")(event)
+    EventRenderer(batch=batch, project_name="api", flow="scan")(event)
 
     captured = capsys.readouterr()
     assert captured.out == ""

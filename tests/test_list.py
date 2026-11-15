@@ -117,7 +117,7 @@ class TestListCommand:
 
 
 _COUNTS_SCAN = ScanResult(
-    project="app",
+    project_name="app",
     package_manager="uv",
     scanned_at=datetime(2026, 3, 20, tzinfo=UTC),
     vulnerabilities=[_VULN, _VULN],
@@ -199,7 +199,7 @@ class TestListFindings:
 
 
 _OLD_SHAPE_SCAN = (
-    '{"project": "vulnerable", "package_manager": "uv", '
+    '{"project_name": "vulnerable", "package_manager": "uv", '
     '"scanned_at": "2026-01-15T12:00:00Z", '
     '"vulnerabilities": [], "updates": [], "secrets": [], "update_status": null}'
 )
@@ -246,7 +246,10 @@ def test_given_saved_findings_when_listed_with_detail_then_records_print(
     list_project_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result = ScanResult(
-        project="myapp", package_manager="uv", scanned_at=_NOW, vulnerabilities=[_VULN]
+        project_name="myapp",
+        package_manager="uv",
+        scanned_at=_NOW,
+        vulnerabilities=[_VULN],
     )
     save_scan_results("myapp", result)
 
@@ -268,7 +271,7 @@ def test_given_clean_and_unscanned_projects_when_detail_listed_then_notices_name
         f'[projects.unscanned]\npath = "{tmp_path}"\npackage_manager = "uv"\n',
     )
     save_scan_results(
-        "clean", ScanResult(project="clean", package_manager="uv", scanned_at=_NOW)
+        "clean", ScanResult(project_name="clean", package_manager="uv", scanned_at=_NOW)
     )
 
     assert run_mm("list", "--detail") == 0

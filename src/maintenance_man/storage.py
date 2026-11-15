@@ -21,9 +21,9 @@ class NoScanResultsError(Exception):
 class CorruptScanResultsError(Exception):
     """A scan file that exists but cannot be used; the project needs a rescan."""
 
-    def __init__(self, project: str, detail: str) -> None:
-        super().__init__(f"corrupt scan results for {project}: {detail}")
-        self.project = project
+    def __init__(self, project_name: str, detail: str) -> None:
+        super().__init__(f"corrupt scan results for {project_name}: {detail}")
+        self.project_name = project_name
         self.detail = detail
 
 
@@ -88,7 +88,7 @@ def load_activity(path: Path) -> dict[str, ProjectActivity]:
 
 def record_activity(
     path: Path,
-    project: str,
+    project_name: str,
     event_type: Literal["build", "deploy"],
     *,
     success: bool,
@@ -98,7 +98,7 @@ def record_activity(
     """Record an event, ignoring persistence and data-validation failures."""
     try:
         activity = load_activity(path)
-        proj = activity.get(project, ProjectActivity())
+        proj = activity.get(project_name, ProjectActivity())
         event = ActivityEvent(
             timestamp=utc_now(),
             success=success,
@@ -109,7 +109,7 @@ def record_activity(
             proj.last_build = event
         else:
             proj.last_deploy = event
-        activity[project] = proj
+        activity[project_name] = proj
         serialised = {k: v.model_dump(mode="json") for k, v in activity.items()}
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(path, json.dumps(serialised, indent=2))

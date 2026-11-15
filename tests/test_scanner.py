@@ -445,7 +445,7 @@ class TestScanProject:
         result = scan_project("vulnerable", project)
 
         assert isinstance(result, ScanResult)
-        assert result.project == "vulnerable"
+        assert result.project_name == "vulnerable"
         assert result.scanned_at is not None
         assert len(result.vulnerabilities) > 0
         assert result.has_actionable_vulns is True
@@ -465,7 +465,7 @@ class TestScanProject:
         result = scan_project("clean", project)
 
         assert isinstance(result, ScanResult)
-        assert result.project == "clean"
+        assert result.project_name == "clean"
         assert result.vulnerabilities == []
         assert result.has_actionable_vulns is False
 

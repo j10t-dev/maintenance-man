@@ -161,8 +161,8 @@ def _use_real_mixed_processor(
     from maintenance_man import updater
 
     scan_result = make_scan_result(package_manager="bun")
-    scan_result.project = "outdated"
-    save_scan_results(scan_result.project, scan_result)
+    scan_result.project_name = "outdated"
+    save_scan_results(scan_result.project_name, scan_result)
     repo = JjRepository(deps.project_paths["outdated"])
     versions = {"some-pkg": "1.0.0", "pkg-a": "1.0.0"}
     write_bun_manifest(repo, versions)
@@ -213,7 +213,7 @@ class TestSharedCommandPrerequisites:
 
 
 _OLD_SHAPE_SCAN = (
-    '{"project": "vulnerable", "scanned_at": "2026-01-15T12:00:00Z", '
+    '{"project_name": "vulnerable", "scanned_at": "2026-01-15T12:00:00Z", '
     '"vulnerabilities": [], "updates": [], "secrets": [], "update_status": null}'
 )
 

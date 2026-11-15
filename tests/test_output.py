@@ -26,7 +26,7 @@ _LONG_NAME = "a-project-with-a-long-name-that-must-survive"
 def _scanned_result(**overrides: object) -> ScanResult:
     return ScanResult.model_validate(
         {
-            "project": _LONG_NAME,
+            "project_name": _LONG_NAME,
             "package_manager": "uv",
             "scanned_at": datetime(2026, 1, 15, 12, tzinfo=UTC),
         }
@@ -212,7 +212,7 @@ def test_given_maven_finding_when_terminal_renders_then_kind_remains_visible(
     stream = terminal_stdout(monkeypatch, width)
     vuln = make_vuln(pkg_name="org.springframework.boot:spring-boot-starter-web")
 
-    print_scan_result(_scanned_result(project="api", vulnerabilities=[vuln]))
+    print_scan_result(_scanned_result(project_name="api", vulnerabilities=[vuln]))
 
     lines = stream.getvalue().splitlines()
     assert any("! vuln" in line and "org." in line for line in lines)

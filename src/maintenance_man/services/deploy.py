@@ -30,7 +30,7 @@ from maintenance_man.vcs_workflow import current_label
 
 @dataclass(slots=True)
 class DeployResult:
-    project: str
+    project_name: str
     build_status: Literal["passed", "failed", "skipped"]
     deploy_status: Status
 
@@ -41,7 +41,7 @@ class DeployResult:
 
 
 def deploy_project(
-    name: str,
+    project_name: str,
     project: ProjectConfig,
     *,
     healthcheck_url: str | None,
@@ -50,34 +50,34 @@ def deploy_project(
     emit: Emit,
 ) -> DeployResult:
     if not project.deployable:
-        emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
-        return DeployResult(name, "skipped", "skipped")
+        emit(ProjectSkipped(project_name, SkipReason.NOT_DEPLOYABLE))
+        return DeployResult(project_name, "skipped", "skipped")
     if not project.deploy_command:
         msg = (
-            f"No deploy_command configured for {name}. "
-            f"Add deploy_command to [projects.{name}] in ~/.mm/config.toml."
+            f"No deploy_command configured for {project_name}. "
+            f"Add deploy_command to [projects.{project_name}] in ~/.mm/config.toml."
         )
         raise WorkflowError(msg)
 
     skip, current_id = should_deploy(
-        name,
+        project_name,
         project.path,
         load_activity(paths.activity_path()),
         force=force,
     )
     if skip is SkipReason.UNCHANGED:
-        emit(ProjectSkipped(name, SkipReason.UNCHANGED))
-        return DeployResult(name, "skipped", "unchanged")
+        emit(ProjectSkipped(project_name, SkipReason.UNCHANGED))
+        return DeployResult(project_name, "skipped", "unchanged")
     if skip is SkipReason.BLOCKED:
         msg = (
-            f"Could not resolve main revision for {name}; refusing to deploy "
+            f"Could not resolve main revision for {project_name}; refusing to deploy "
             "unverified state (use --force to override)."
         )
         raise WorkflowError(msg)
 
-    emit(ProjectStarted(name))
+    emit(ProjectStarted(project_name))
     return _run_steps(
-        name,
+        project_name,
         project,
         current_id,
         build=build,
@@ -97,28 +97,30 @@ def deploy_all(
     results: list[DeployResult] = []
     healthcheck_url = cfg.defaults.healthcheck_url if check else None
 
-    for name, project in sorted(cfg.projects.items()):
+    for project_name, project in sorted(cfg.projects.items()):
         if not project.deployable:
-            emit(ProjectSkipped(name, SkipReason.NOT_DEPLOYABLE))
-            results.append(DeployResult(name, "skipped", "skipped"))
+            emit(ProjectSkipped(project_name, SkipReason.NOT_DEPLOYABLE))
+            results.append(DeployResult(project_name, "skipped", "skipped"))
             continue
         if not project.deploy_command:
             continue
-        if report_missing_path(name, project, emit=emit):
-            results.append(DeployResult(name, "skipped", "failed"))
+        if report_missing_path(project_name, project, emit=emit):
+            results.append(DeployResult(project_name, "skipped", "failed"))
             continue
 
-        skip, current_id = should_deploy(name, project.path, activity, force=force)
+        skip, current_id = should_deploy(
+            project_name, project.path, activity, force=force
+        )
         if skip is not None:
-            emit(ProjectSkipped(name, skip))
+            emit(ProjectSkipped(project_name, skip))
             status = "unchanged" if skip is SkipReason.UNCHANGED else "blocked"
-            results.append(DeployResult(name, "skipped", status))
+            results.append(DeployResult(project_name, "skipped", status))
             continue
 
-        emit(ProjectStarted(name))
+        emit(ProjectStarted(project_name))
         results.append(
             _run_steps(
-                name,
+                project_name,
                 project,
                 current_id,
                 build=True,
@@ -131,7 +133,7 @@ def deploy_all(
 
 
 def should_deploy(
-    name: str,
+    project_name: str,
     project_path: Path,
     activity: Mapping[str, ProjectActivity],
     *,
@@ -148,20 +150,20 @@ def should_deploy(
     if current_id is None:
         return SkipReason.BLOCKED, None
 
-    project_activity = activity.get(name)
+    project_activity = activity.get(project_name)
     last = project_activity.last_deploy if project_activity else None
     if last is not None and last.success and last.commit_id == current_id:
         return SkipReason.UNCHANGED, current_id
     return None, current_id
 
 
-def build_project(name: str, project: ProjectConfig) -> None:
+def build_project(project_name: str, project: ProjectConfig) -> None:
     """Run a configured build and record its result."""
-    _run_recorded(name, project, DeployStep.BUILD, None)
+    _run_recorded(project_name, project, DeployStep.BUILD, None)
 
 
 def _run_recorded(
-    name: str, project: ProjectConfig, step: DeployStep, commit_id: str | None
+    project_name: str, project: ProjectConfig, step: DeployStep, commit_id: str | None
 ) -> None:
     """Run the step's configured command and record its result; a failure is
     recorded, then re-raised. An interrupt records nothing."""
@@ -172,7 +174,7 @@ def _run_recorded(
     def record(success: bool) -> None:
         record_activity(
             paths.activity_path(),
-            name,
+            project_name,
             "build" if build else "deploy",
             success=success,
             branch=current_label(repo=JjRepository(project.path)),
@@ -184,7 +186,7 @@ def _run_recorded(
             command,
             project.path,
             timeout=600,
-            label=f"{'Build' if build else 'Deploy'} for {name}",
+            label=f"{'Build' if build else 'Deploy'} for {project_name}",
             error=BuildError if build else DeployError,
         )
     except BuildError, DeployError:
@@ -194,7 +196,7 @@ def _run_recorded(
 
 
 def _run_steps(
-    name: str,
+    project_name: str,
     project: ProjectConfig,
     commit_id: str | None,
     *,
@@ -205,22 +207,22 @@ def _run_steps(
     build_status: Literal["passed", "failed", "skipped"] = "skipped"
     if build and project.build_command:
         try:
-            build_project(name, project)
+            build_project(project_name, project)
         except BuildError as exc:
-            emit(DeployStepFinished(name, DeployStep.BUILD, str(exc)))
-            return DeployResult(name, "failed", "skipped")
+            emit(DeployStepFinished(project_name, DeployStep.BUILD, str(exc)))
+            return DeployResult(project_name, "failed", "skipped")
         build_status = "passed"
-        emit(DeployStepFinished(name, DeployStep.BUILD))
+        emit(DeployStepFinished(project_name, DeployStep.BUILD))
 
     try:
-        _run_recorded(name, project, DeployStep.DEPLOY, commit_id)
+        _run_recorded(project_name, project, DeployStep.DEPLOY, commit_id)
     except DeployError as exc:
-        emit(DeployStepFinished(name, DeployStep.DEPLOY, str(exc)))
-        return DeployResult(name, build_status, "failed")
-    emit(DeployStepFinished(name, DeployStep.DEPLOY))
+        emit(DeployStepFinished(project_name, DeployStep.DEPLOY, str(exc)))
+        return DeployResult(project_name, build_status, "failed")
+    emit(DeployStepFinished(project_name, DeployStep.DEPLOY))
 
     if healthcheck_url:
-        result = check_health(healthcheck_url, name)
-        emit(HealthChecked(name, result.is_up, result.error))
+        result = check_health(healthcheck_url, project_name)
+        emit(HealthChecked(project_name, result.is_up, result.error))
 
-    return DeployResult(name, build_status, "passed")
+    return DeployResult(project_name, build_status, "passed")

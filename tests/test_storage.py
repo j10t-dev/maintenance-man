@@ -58,7 +58,7 @@ def test_save_creates_directory_and_round_trips():
         pytest.param(
             json.dumps(
                 {
-                    "project": "api",
+                    "project_name": "api",
                     "package_manager": "uv",
                     "scanned_at": "2026-01-15T12:00:00Z",
                     "vulnerabilities": [],
@@ -83,7 +83,7 @@ def test_save_creates_directory_and_round_trips():
         pytest.param(
             json.dumps(
                 {
-                    "project": "api",
+                    "project_name": "api",
                     "scanned_at": "2026-01-15T12:00:00Z",
                     "vulnerabilities": [],
                     "updates": [],
@@ -110,7 +110,7 @@ def test_given_unusable_scan_file_when_loaded_then_corrupt_error_names_the_cause
     with pytest.raises(CorruptScanResultsError) as raised:
         load_scan_results("api")
 
-    assert raised.value.project == "api"
+    assert raised.value.project_name == "api"
     assert str(raised.value).startswith("corrupt scan results for api: ")
     assert detail in raised.value.detail
 

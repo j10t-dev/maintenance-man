@@ -218,7 +218,7 @@ class ScanResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    project: str
+    project_name: str
     package_manager: PackageManager
     scanned_at: datetime
     vulnerabilities: list[VulnFinding] = []

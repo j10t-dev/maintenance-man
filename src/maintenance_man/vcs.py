@@ -16,8 +16,8 @@ class RevisionError(Exception):
 _READ_ONLY = ("--ignore-working-copy",)
 
 
-def workspace_path_for_project(project: str) -> Path:
-    return paths.project_file(paths.workspaces_dir(), project)
+def workspace_path_for_project(project_name: str) -> Path:
+    return paths.project_file(paths.workspaces_dir(), project_name)
 
 
 _COMMIT_ID = re.compile(r"[0-9a-f]{40,64}")

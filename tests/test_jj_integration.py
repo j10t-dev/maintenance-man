@@ -95,7 +95,7 @@ def test_given_main_moved_sideways_when_promoting_then_work_stays_pending_until_
     assert second.outcome is Outcome.FAILED
     assert emit.of_type(OperationFailed) == []
     failures = emit.of_type(PromotionFailed)
-    assert [event.project for event in failures] == ["api"]
+    assert [event.project_name for event in failures] == ["api"]
     assert failures[0].error.endswith(
         f" · rebase with jj rebase -b {MANAGED} -d main, then rerun"
     )
@@ -184,7 +184,7 @@ def test_given_cleanup_failure_when_batch_updated_then_next_project_promotes(
         emit=emit,
     )
 
-    assert [item.project for item in batch.projects] == ["api", "web"]
+    assert [item.project_name for item in batch.projects] == ["api", "web"]
     assert [item.outcome for item in batch.projects] == [
         Outcome.FAILED,
         Outcome.SUCCEEDED,
@@ -194,7 +194,7 @@ def test_given_cleanup_failure_when_batch_updated_then_next_project_promotes(
     assert [
         event.operation
         for event in emit.of_type(OperationFailed)
-        if event.project == "api"
+        if event.project_name == "api"
     ] == ["workspace cleanup"]
 
 
@@ -209,7 +209,7 @@ def _bun_project(
         updates=[make_update(pkg_name=f"pkg-{x}") for x in packages],
         package_manager="bun",
     )
-    scan.project = name
+    scan.project_name = name
     save_scan_results(name, scan)
     return repo, make_project(repo.path, package_manager="bun", test_unit=test_unit)
 

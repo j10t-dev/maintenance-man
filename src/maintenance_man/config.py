@@ -69,30 +69,32 @@ def _validation_messages(config_path: Path, error: ValidationError) -> list[str]
     ]
 
 
-def resolve_project(config: MmConfig, name: str) -> ProjectConfig:
+def resolve_project(config: MmConfig, project_name: str) -> ProjectConfig:
     """Look up a project by name and validate its path exists on disk."""
-    project = _configured_project(config, name)
+    project = _configured_project(config, project_name)
 
     if not project.path.exists():
-        msg = f"Project '{name}' path does not exist: {project.path}"
+        msg = f"Project '{project_name}' path does not exist: {project.path}"
         raise ProjectNotFoundError(msg)
 
     return project
 
 
-def ordered_unique_project_names(config: MmConfig, names: Sequence[str]) -> list[str]:
+def ordered_unique_project_names(
+    config: MmConfig, project_names: Sequence[str]
+) -> list[str]:
     """Return configured project names once each, in their requested order."""
-    for name in names:
-        _configured_project(config, name)
-    return list(dict.fromkeys(names))
+    for project_name in project_names:
+        _configured_project(config, project_name)
+    return list(dict.fromkeys(project_names))
 
 
-def _configured_project(config: MmConfig, name: str) -> ProjectConfig:
+def _configured_project(config: MmConfig, project_name: str) -> ProjectConfig:
     try:
-        return config.projects[name]
+        return config.projects[project_name]
     except KeyError:
         msg = (
-            f"Unknown project '{name}'. "
+            f"Unknown project '{project_name}'. "
             f"Known projects: {', '.join(config.projects) or '(none)'}"
         )
         raise UnknownProjectError(msg) from None

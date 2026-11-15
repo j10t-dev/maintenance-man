@@ -37,41 +37,41 @@ class FlowConflictError(WorkflowError):
 
 
 def load_validated_scan(
-    project: str,
-    project_config: ProjectConfig,
+    project_name: str,
+    project: ProjectConfig,
     workflow: Workflow,
     *,
     emit: Emit,
 ) -> ScanResult | None:
     try:
-        scan_result = load_scan_results(project)
+        scan_result = load_scan_results(project_name)
     except NoScanResultsError:
-        emit(ProjectSkipped(project, SkipReason.NO_SCAN_RESULTS))
+        emit(ProjectSkipped(project_name, SkipReason.NO_SCAN_RESULTS))
         return None
 
-    if scan_result.package_manager != project_config.package_manager:
+    if scan_result.package_manager != project.package_manager:
         detail = (
             f"saved under {scan_result.package_manager}, but the project is "
-            f"configured as {project_config.package_manager}"
+            f"configured as {project.package_manager}"
         )
-        raise CorruptScanResultsError(project, detail)
+        raise CorruptScanResultsError(project_name, detail)
 
-    _assert_no_conflicting_flow(scan_result, workflow, project)
+    _assert_no_conflicting_flow(scan_result, workflow, project_name)
 
     if not scan_result.has_actionable_vulns and not scan_result.updates:
-        emit(ProjectSkipped(project, SkipReason.NOTHING_TO_DO, workflow.value))
+        emit(ProjectSkipped(project_name, SkipReason.NOTHING_TO_DO, workflow.value))
         return None
     return scan_result
 
 
 def report_missing_test_config(
-    name: str, project: ProjectConfig, *, emit: Emit
+    project_name: str, project: ProjectConfig, *, emit: Emit
 ) -> bool:
     """Emit MissingTestConfig and return True when the project has no configured
     test phase."""
     if project.test_phases:
         return False
-    emit(MissingTestConfig(name))
+    emit(MissingTestConfig(project_name))
     return True
 
 
@@ -107,7 +107,7 @@ def has_work(scan_result: ScanResult, flow: Workflow) -> bool:
 
 
 def complete_ready_findings(
-    scan_result: ScanResult, name: str, *, flow: Workflow
+    scan_result: ScanResult, project_name: str, *, flow: Workflow
 ) -> None:
     """Remove the flow's Ready findings, then persist the scan."""
     scan_result.vulnerabilities = [
@@ -118,13 +118,13 @@ def complete_ready_findings(
     scan_result.updates = [
         finding for finding in scan_result.updates if not is_owned(finding, flow, Ready)
     ]
-    save_scan_results(name, scan_result)
+    save_scan_results(project_name, scan_result)
 
 
 def finalise_local_changes(
     project_path: Path,
     scan_result: ScanResult,
-    name: str,
+    project_name: str,
     flow: Workflow,
     *,
     emit: Emit,
@@ -146,7 +146,7 @@ def finalise_local_changes(
     except RevisionError as exc:
         emit(
             PromotionFailed(
-                name,
+                project_name,
                 f"{exc} · rebase with jj rebase -b {bookmark} -d main, then rerun",
             )
         )
@@ -154,14 +154,14 @@ def finalise_local_changes(
     try:
         refresh_working_copy_from_main(repo=repo)
     except RevisionError as exc:
-        emit(OperationFailed("workspace refresh", name, str(exc)))
+        emit(OperationFailed("workspace refresh", project_name, str(exc)))
         return Outcome.FAILED
-    complete_ready_findings(scan_result, name, flow=flow)
+    complete_ready_findings(scan_result, project_name, flow=flow)
     emit(Promoted())
     try:
         repo.delete_bookmark(bookmark=bookmark)
     except RevisionError as exc:
-        emit(OperationFailed("bookmark cleanup", name, str(exc)))
+        emit(OperationFailed("bookmark cleanup", project_name, str(exc)))
         return Outcome.FAILED
     return Outcome.SUCCEEDED
 
@@ -169,7 +169,7 @@ def finalise_local_changes(
 def _assert_no_conflicting_flow(
     scan_result: ScanResult,
     active_flow: Workflow,
-    project: str,
+    project_name: str,
 ) -> None:
     """Update may not touch resolve-owned work; resolve takes over update-owned work."""
     if active_flow is Workflow.RESOLVE:
@@ -182,7 +182,7 @@ def _assert_no_conflicting_flow(
     ]
     if conflicts:
         msg = (
-            f"Cannot run {active_flow.value} on {project}: {len(conflicts)} "
+            f"Cannot run {active_flow.value} on {project_name}: {len(conflicts)} "
             f"finding(s) owned by the '{conflicts[0].flow.value}' flow. Complete or "
             "abandon that flow first."
         )

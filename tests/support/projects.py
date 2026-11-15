@@ -63,7 +63,7 @@ def seed_project(
     """Copy a jj repository and persist the supplied scan under its project name."""
     project = make_project(tmp_path / name, test_unit=test_unit)
     repo = copy_jj_repository(project.path)
-    scan.project = name
+    scan.project_name = name
     save_scan_results(name, scan)
     return repo, project
 
@@ -93,7 +93,7 @@ def seed_gradle_project(tmp_path: Path, name: str, **overrides: Any) -> ProjectC
         updates=[make_update(pkg_name="room", gradle_target=make_gradle_target())],
         package_manager="gradle",
     )
-    scan.project = name
+    scan.project_name = name
     save_scan_results(name, scan)
     return project
 

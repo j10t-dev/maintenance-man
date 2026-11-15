@@ -179,7 +179,7 @@ def _seed_config_and_scan(run: Path) -> None:
     scan = make_scan_result(
         vulns=[], updates=[make_update(pkg_name="mm-proof-dep")], secrets=[]
     )
-    scan.project = "fixture"
+    scan.project_name = "fixture"
     (home / "scan-results").mkdir()
     (home / "scan-results" / "fixture.json").write_text(
         scan.model_dump_json(indent=2), encoding="utf-8"

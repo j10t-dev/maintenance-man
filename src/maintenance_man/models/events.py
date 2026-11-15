@@ -36,12 +36,12 @@ class Event:
 
 @dataclass(frozen=True, slots=True)
 class ProjectStarted(Event):
-    project: str
+    project_name: str
 
 
 @dataclass(frozen=True, slots=True)
 class ProjectSkipped(Event):
-    project: str
+    project_name: str
     reason: SkipReason
     detail: str | None = None
 
@@ -51,13 +51,13 @@ class OperationFailed(Event):
     operation: str
     """The step that failed, in the reader's words, such as 'workspace cleanup'."""
 
-    project: str
+    project_name: str
     error: str
 
 
 @dataclass(frozen=True, slots=True)
 class PromotionFailed(Event):
-    project: str
+    project_name: str
     error: str
 
 
@@ -69,7 +69,7 @@ class ScanReported(Event):
 
 @dataclass(frozen=True, slots=True)
 class MissingTestConfig(Event):
-    project: str
+    project_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +85,7 @@ class Promoted(Event):
 
 @dataclass(frozen=True, slots=True)
 class ResolvePaused(Event):
-    project: str
+    project_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +101,7 @@ class BlockersStillFailing(Event):
 
 @dataclass(frozen=True, slots=True)
 class SyncCompleted(Event):
-    project: str
+    project_name: str
     action: str
 
 
@@ -109,14 +109,14 @@ class SyncCompleted(Event):
 class DeployStepFinished(Event):
     """A build or deploy step ended; an error means it failed."""
 
-    project: str
+    project_name: str
     step: DeployStep
     error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class HealthChecked(Event):
-    project: str
+    project_name: str
     is_up: bool
     error: str | None
 

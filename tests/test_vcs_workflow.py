@@ -443,11 +443,11 @@ def test_workspace_policy_creates_and_removes_registered_path(
 ) -> None:
     repo = repository_case.repo
 
-    created = create_workspace(repo=repo, project="owner/project", revision="main")
+    created = create_workspace(repo=repo, project_name="owner/project", revision="main")
     assert created == tmp_path / ".mm" / "workspaces" / "owner_project"
     assert "mm-owner_project" in repo.workspace_names()
 
-    remove_workspace(repo=repo, project="owner/project")
+    remove_workspace(repo=repo, project_name="owner/project")
     assert not created.exists()
     assert "mm-owner_project" not in repo.workspace_names()
 
@@ -457,7 +457,7 @@ def test_workspace_removal_absence_is_noop(
 ) -> None:
     repo = repository_case.repo
 
-    remove_workspace(repo=repo, project="missing")
+    remove_workspace(repo=repo, project_name="missing")
 
     assert repo.workspace_names() == frozenset({"default"})
 
@@ -470,7 +470,7 @@ def test_workspace_removal_deletes_known_unregistered_path(
     workspace.mkdir(parents=True)
     (workspace / "keep.txt").write_text("obsolete", encoding="utf-8")
 
-    remove_workspace(repo=repo, project="recovery")
+    remove_workspace(repo=repo, project_name="recovery")
 
     assert not workspace.exists()
     assert repo.workspace_names() == frozenset({"default"})
@@ -490,7 +490,7 @@ def test_workspace_removal_rejects_final_symlink_and_preserves_sibling(
     with pytest.raises(
         RevisionError, match=r"Cannot remove workspace path .*: \[Errno None\] None: "
     ) as caught:
-        remove_workspace(repo=repo, project="project-a")
+        remove_workspace(repo=repo, project_name="project-a")
 
     assert isinstance(caught.value.__cause__, OSError)
     assert keep.read_text(encoding="utf-8") == "recovery"
@@ -502,11 +502,11 @@ _PATH_FAILURE = OSError("path resolution failed")
 
 
 def _create_recovery_workspace(repo: JjRepository) -> None:
-    create_workspace(repo=repo, project="recovery", revision="main")
+    create_workspace(repo=repo, project_name="recovery", revision="main")
 
 
 def _remove_recovery_workspace(repo: JjRepository) -> None:
-    remove_workspace(repo=repo, project="recovery")
+    remove_workspace(repo=repo, project_name="recovery")
 
 
 @pytest.mark.parametrize(

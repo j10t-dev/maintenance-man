@@ -445,19 +445,19 @@ def test_batch_reports_success_conflict_and_missing_path(
     )
 
     assert result.had_errors is True
-    assert [project.project for project in result.projects] == ["a"]
+    assert [project.project_name for project in result.projects] == ["a"]
     assert ProjectStarted("a") in emit.events
     assert ProjectStarted("b") in emit.events
     missing = ProjectSkipped("c", SkipReason.PATH_MISSING, str(projects["c"].path))
     assert missing in emit.events
     assert emit.events.index(ProjectStarted("b")) < emit.events.index(missing)
     assert not any(
-        isinstance(event, ProjectStarted) and event.project == "c"
+        isinstance(event, ProjectStarted) and event.project_name == "c"
         for event in emit.events
     )
     assert any(
         isinstance(event, ProjectSkipped)
-        and event.project == "b"
+        and event.project_name == "b"
         and event.reason is SkipReason.FLOW_CONFLICT
         and event.detail is not None
         and "owned by the 'resolve' flow" in event.detail
@@ -559,7 +559,7 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
     scan = make_scan_result(
         vulns=[], updates=[make_update(pkg_name="pkg-a")], package_manager="bun"
     )
-    scan.project = "web"
+    scan.project_name = "web"
     save_scan_results("web", scan)
     monkeypatch.setattr(gradle, "run_gradle", catalogue_apply_task())
     monkeypatch.setattr(updater, "run_shell_command", lambda *_, **__: None)
@@ -582,7 +582,7 @@ def test_given_bun_and_gradle_projects_when_batch_updated_then_both_promote(
         emit=emit,
     )
 
-    assert [(item.project, item.outcome) for item in batch.projects] == [
+    assert [(item.project_name, item.outcome) for item in batch.projects] == [
         ("web", Outcome.SUCCEEDED),
         ("android", Outcome.SUCCEEDED),
     ]

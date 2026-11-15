@@ -33,19 +33,19 @@ def publications_dir() -> Path:
     return mm_home() / "publications"
 
 
-def sanitise_project_name(name: str) -> str:
-    return name.replace("/", "_").replace("\\", "_").replace("..", "_")
+def sanitise_project_name(project_name: str) -> str:
+    return project_name.replace("/", "_").replace("\\", "_").replace("..", "_")
 
 
-def project_file(directory: Path, project: str, suffix: str = "") -> Path:
-    """Return *project*'s file or directory inside *directory*.
+def project_file(directory: Path, project_name: str, suffix: str = "") -> Path:
+    """Return *project_name*'s file or directory inside *directory*.
 
     Raises ValueError when the sanitised name is empty or the result's parent
     is not *directory*. The final component is not resolved.
     """
-    name = sanitise_project_name(project)
-    candidate = directory / f"{name}{suffix}"
-    if not name or candidate.parent.resolve() != directory.resolve():
-        msg = f"Invalid project name: {project!r}"
+    safe_name = sanitise_project_name(project_name)
+    candidate = directory / f"{safe_name}{suffix}"
+    if not safe_name or candidate.parent.resolve() != directory.resolve():
+        msg = f"Invalid project name: {project_name!r}"
         raise ValueError(msg)
     return candidate

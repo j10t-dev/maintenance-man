@@ -116,8 +116,8 @@ def _hint_for(exc: Exception) -> str | None:
     match exc:
         case UnknownProjectError():
             return "mm list"
-        case CorruptScanResultsError(project=project):
-            return f"mm scan {project}"
+        case CorruptScanResultsError(project_name=project_name):
+            return f"mm scan {project_name}"
         case _:
             return None
 
@@ -160,7 +160,7 @@ def init() -> None:
 
 @app.command
 def scan(
-    project: str | None = None,
+    project_name: Annotated[str | None, cyclopts.Parameter(name="project")] = None,
     *,
     config: ConfigOption = None,
 ) -> None:
@@ -168,18 +168,18 @@ def scan(
 
     Parameters
     ----------
-    project: str | None
+    project_name: str | None
         Project name to scan. Scans all if omitted.
     """
     cfg = _reset_output_and_load_config(config, require_projects=True)
 
-    if project:
-        proj_config = resolve_project(cfg, project)
+    if project_name:
+        project = resolve_project(cfg, project_name)
         result = scan_service.scan_one(
+            project_name,
             project,
-            proj_config,
             minimum_age_days=cfg.defaults.min_version_age_days,
-            emit=EventRenderer(batch=False, project=project, flow="scan"),
+            emit=EventRenderer(batch=False, project_name=project_name, flow="scan"),
         )
         sys.exit(
             _scan_exit_code(
@@ -202,7 +202,7 @@ def scan(
 
 @app.command
 def update(
-    *projects: str,
+    *project_names: Annotated[str, cyclopts.Parameter(name="projects")],
     negate: Annotated[bool, cyclopts.Parameter(name=("--negate", "-n"))] = False,
     config: ConfigOption = None,
     verbose: VerboseOption = False,
@@ -211,7 +211,7 @@ def update(
 
     Parameters
     ----------
-    projects: str
+    project_names: str
         Project names to update. No names batch-updates all configured projects.
         With -n/--negate, names are exclusions. One name keeps the interactive
         single-project flow.
@@ -219,7 +219,9 @@ def update(
         Treat all positional project names as exclusions.
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose, require_projects=True)
-    mode, targets = update_service.resolve_update_targets(cfg, projects, negate=negate)
+    mode, targets = update_service.resolve_update_targets(
+        cfg, project_names, negate=negate
+    )
 
     if not targets:
         output.notice("No target projects")
@@ -228,13 +230,13 @@ def update(
     require_tool("jj", JJ_INSTALL_HINT)
 
     if mode == "single":
-        name = targets[0]
-        proj_config = resolve_project(cfg, name)
+        project_name = targets[0]
+        project = resolve_project(cfg, project_name)
         result = update_service.update_project(
-            name,
-            proj_config,
+            project_name,
+            project,
             choose=choose_findings,
-            emit=EventRenderer(batch=False, project=name),
+            emit=EventRenderer(batch=False, project_name=project_name),
         )
         _print_result_totals(result.results, result.blocked)
         sys.exit(
@@ -244,8 +246,10 @@ def update(
         )
 
     batch = update_service.update_projects(cfg, targets, emit=EventRenderer(batch=True))
-    results = [result for project in batch.projects for result in project.results]
-    blocked = sum(project.blocked for project in batch.projects)
+    results = [
+        result for project_update in batch.projects for result in project_update.results
+    ]
+    blocked = sum(project_update.blocked for project_update in batch.projects)
     if results or blocked:
         _print_result_totals(results, blocked)
     else:
@@ -255,18 +259,20 @@ def update(
 
 @app.command
 def sync(
-    *projects: str,
+    *project_names: Annotated[str, cyclopts.Parameter(name="projects")],
     config: ConfigOption = None,
 ) -> None:
     """Sync local main with remote for one, many, or all configured projects.
 
     Parameters
     ----------
-    projects: str
+    project_names: str
         Project names to sync. No names syncs all configured projects.
     """
     cfg = _reset_output_and_load_config(config, require_projects=True)
-    outcome = scan_service.sync_projects(cfg, projects, emit=EventRenderer(batch=True))
+    outcome = scan_service.sync_projects(
+        cfg, project_names, emit=EventRenderer(batch=True)
+    )
     sys.exit(ExitCode.SYNC_FAILED if outcome is Outcome.FAILED else ExitCode.OK)
 
 
@@ -289,7 +295,7 @@ def _print_deploy_summary(results: Sequence[deploy_service.DeployResult]) -> Non
 
 @app.command
 def deploy(
-    project: str | None = None,
+    project_name: Annotated[str | None, cyclopts.Parameter(name="project")] = None,
     *,
     build: bool = False,
     check: bool = False,
@@ -301,7 +307,7 @@ def deploy(
 
     Parameters
     ----------
-    project: str | None
+    project_name: str | None
         Project name to deploy. Deploys all if omitted.
     build: bool
         Run build_command before deploying. Silently skips if no build_command
@@ -313,7 +319,7 @@ def deploy(
         could not be resolved.
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
-    batch = not project
+    batch = not project_name
     renderer = EventRenderer(batch=batch, flow="deploy")
 
     if batch:
@@ -331,11 +337,11 @@ def deploy(
         any_failed = any(result.failed for result in results)
         sys.exit(ExitCode.DEPLOY_FAILED if any_failed else ExitCode.OK)
 
-    assert project is not None
-    proj_config = resolve_project(cfg, project)
+    assert project_name is not None
+    project = resolve_project(cfg, project_name)
     result = deploy_service.deploy_project(
+        project_name,
         project,
-        proj_config,
         healthcheck_url=cfg.defaults.healthcheck_url if check else None,
         build=build,
         force=force,
@@ -352,7 +358,7 @@ def deploy(
 
 @app.command
 def test(
-    project: str,
+    project_name: Annotated[str, cyclopts.Parameter(name="project")],
     *,
     config: ConfigOption = None,
     verbose: VerboseOption = False,
@@ -364,32 +370,36 @@ def test(
 
     Parameters
     ----------
-    project: str
+    project_name: str
         Project name to test.
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
-    proj_config = resolve_project(cfg, project)
-    if not proj_config.test_phases:
+    project = resolve_project(cfg, project_name)
+    if not project.test_phases:
         _fatal(
-            f"No test configuration for {project}",
-            hint=f"add test_unit to [projects.{project}] in {_config_file(config)}",
+            f"No test configuration for {project_name}",
+            hint=(
+                f"add test_unit to [projects.{project_name}] in {_config_file(config)}"
+            ),
         )
 
-    output.heading(project)
+    output.heading(project_name)
     failed_phase = run_test_phases(
-        proj_config, proj_config.path, emit=EventRenderer(batch=False)
+        project, project.path, emit=EventRenderer(batch=False)
     )
 
     if failed_phase is None:
-        output.outcome(project, "test", "passed", "tests")
+        output.outcome(project_name, "test", "passed", "tests")
         sys.exit(ExitCode.OK)
-    output.outcome(project, "test", "failed", "tests", reason=f"{failed_phase} failed")
+    output.outcome(
+        project_name, "test", "failed", "tests", reason=f"{failed_phase} failed"
+    )
     sys.exit(ExitCode.TEST_FAILED)
 
 
 @app.command
 def build(
-    project: str,
+    project_name: Annotated[str, cyclopts.Parameter(name="project")],
     *,
     config: ConfigOption = None,
     verbose: VerboseOption = False,
@@ -398,27 +408,28 @@ def build(
 
     Parameters
     ----------
-    project: str
+    project_name: str
         Project name to build.
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
-    proj_config = resolve_project(cfg, project)
+    project = resolve_project(cfg, project_name)
 
-    if not proj_config.build_command:
+    if not project.build_command:
         _fatal(
-            f"No build_command configured for {project}",
+            f"No build_command configured for {project_name}",
             hint=(
-                f"add build_command to [projects.{project}] in {_config_file(config)}"
+                f"add build_command to [projects.{project_name}] "
+                f"in {_config_file(config)}"
             ),
         )
 
-    output.heading(project)
+    output.heading(project_name)
     try:
-        deploy_service.build_project(project, proj_config)
+        deploy_service.build_project(project_name, project)
     except BuildError as exc:
-        output.outcome(project, "build", "failed", "build", reason=str(exc))
+        output.outcome(project_name, "build", "failed", "build", reason=str(exc))
         sys.exit(ExitCode.BUILD_FAILED)
-    output.outcome(project, "build", "passed", "build")
+    output.outcome(project_name, "build", "passed", "build")
     sys.exit(ExitCode.OK)
 
 
@@ -438,13 +449,15 @@ def list_projects(
     cfg = _reset_output_and_load_config(config, require_projects=True)
 
     scan_results: dict[str, ScanResult] = {}
-    for name in cfg.projects:
+    for project_name in cfg.projects:
         try:
-            scan_results[name] = load_scan_results(name)
+            scan_results[project_name] = load_scan_results(project_name)
         except NoScanResultsError:
             pass
         except CorruptScanResultsError:
-            output.diagnostic("warning", f"corrupt scan results for {name}; skipped")
+            output.diagnostic(
+                "warning", f"corrupt scan results for {project_name}; skipped"
+            )
 
     if detail:
         _print_project_detail(cfg, scan_results)
@@ -456,14 +469,14 @@ def list_projects(
 def _print_project_detail(cfg: MmConfig, scan_results: dict[str, ScanResult]) -> None:
     clean = []
     unscanned = []
-    for name in sorted(cfg.projects):
-        result = scan_results.get(name)
+    for project_name in sorted(cfg.projects):
+        result = scan_results.get(project_name)
         if result is None:
-            unscanned.append(name)
+            unscanned.append(project_name)
         elif result.has_findings:
             print_scan_result(result)
         else:
-            clean.append(name)
+            clean.append(project_name)
     _notice_projects(clean, "findings")
     _notice_projects(unscanned, "saved scan")
 
@@ -475,9 +488,12 @@ def _print_project_overview(
 ) -> None:
     rows: list[list[str]] = []
     pipe_rows: list[list[str]] = []
-    for name, project in sorted(cfg.projects.items()):
+    for project_name, project in sorted(cfg.projects.items()):
         row, pipe_row = _project_row(
-            name, project, scan_results.get(name), activity.get(name)
+            project_name,
+            project,
+            scan_results.get(project_name),
+            activity.get(project_name),
         )
         rows.append(row)
         pipe_rows.append(pipe_row)
@@ -508,7 +524,7 @@ def _print_project_overview(
 
 
 def _project_row(
-    name: str,
+    project_name: str,
     project: ProjectConfig,
     result: ScanResult | None,
     events: ProjectActivity | None,
@@ -529,7 +545,7 @@ def _project_row(
         _activity_status(deployed) if project.deployable else "not deployable"
     )
     row = [
-        name,
+        project_name,
         project.package_manager,
         *counts,
         output.timestamp(result.scanned_at) if result else "never",
@@ -537,7 +553,7 @@ def _project_row(
         _activity_cell(deployed) if project.deployable else deploy_status,
     ]
     pipe_row = [
-        name,
+        project_name,
         project.package_manager,
         *counts,
         result.scanned_at.isoformat() if result else "never",
@@ -581,7 +597,7 @@ def _hidden_columns(
 
 @app.command
 def todo(
-    project: str | None = None,
+    project_name: Annotated[str | None, cyclopts.Parameter(name="project")] = None,
     *,
     config: ConfigOption = None,
 ) -> None:
@@ -589,25 +605,30 @@ def todo(
 
     Parameters
     ----------
-    project: str | None
+    project_name: str | None
         Project name. Shows all projects if omitted.
     """
     cfg = _reset_output_and_load_config(config)
 
-    if project:
-        proj_config = resolve_project(cfg, project)
-        _print_project_todo(project, _read_todo(proj_config.path))
+    if project_name:
+        project = resolve_project(cfg, project_name)
+        _print_project_todo(project_name, _read_todo(project.path))
         return
 
     if not cfg.projects:
         _exit_without_projects(config)
 
-    todos = {name: _read_todo(cfg.projects[name].path) for name in sorted(cfg.projects)}
-    empty = [name for name, content in todos.items() if not content.strip()]
+    todos = {
+        project_name: _read_todo(cfg.projects[project_name].path)
+        for project_name in sorted(cfg.projects)
+    }
+    empty = [
+        project_name for project_name, content in todos.items() if not content.strip()
+    ]
     _notice_projects(empty, "TODO items")
-    for name, content in todos.items():
+    for project_name, content in todos.items():
         if content.strip():
-            _print_project_todo(name, content)
+            _print_project_todo(project_name, content)
 
 
 def _read_todo(project_path: Path) -> str:
@@ -616,14 +637,14 @@ def _read_todo(project_path: Path) -> str:
     return todo_path.read_text() if todo_path.exists() else ""
 
 
-def _print_project_todo(name: str, content: str) -> None:
+def _print_project_todo(project_name: str, content: str) -> None:
     if not content.strip():
-        output.notice(f"No TODO items in {name}")
+        output.notice(f"No TODO items in {project_name}")
         return
     lines = content.splitlines()
-    output.heading(name, "TODO.md")
+    output.heading(project_name, "TODO.md")
     output.records(
-        name,
+        project_name,
         (),
         [[line] for line in lines],
         pipe_rows=[[str(index), line] for index, line in enumerate(lines, 1)],
@@ -636,10 +657,11 @@ def _exit_without_projects(config: Path | None) -> NoReturn:
     sys.exit(ExitCode.OK)
 
 
-def _notice_projects(names: Sequence[str], what: str, suffix: str = "") -> None:
-    if names:
+def _notice_projects(project_names: Sequence[str], what: str, suffix: str = "") -> None:
+    if project_names:
         output.notice(
-            f"{len(names)} projects have no {what}: {', '.join(names)}{suffix}"
+            f"{len(project_names)} projects have no {what}: "
+            f"{', '.join(project_names)}{suffix}"
         )
 
 
@@ -671,7 +693,7 @@ def _scan_exit_code(summary: ScanSummary) -> ExitCode:
 
 @app.command
 def resolve(
-    project: str,
+    project_name: Annotated[str, cyclopts.Parameter(name="project")],
     continue_: Annotated[bool, cyclopts.Parameter(name="--continue")] = False,
     config: ConfigOption = None,
     verbose: VerboseOption = False,
@@ -686,18 +708,18 @@ def resolve(
 
     Parameters
     ----------
-    project: str
+    project_name: str
         Project name (required).
     continue_: bool
         Re-test a paused, manually fixed finding on the resolve branch.
     """
     cfg = _reset_output_and_load_config(config, verbose=verbose)
-    proj_config = resolve_project(cfg, project)
+    project = resolve_project(cfg, project_name)
     require_tool("jj", JJ_INSTALL_HINT)
     outcome = resolve_service.resolve_project(
+        project_name,
         project,
-        proj_config,
         continue_=continue_,
-        emit=EventRenderer(batch=False, project=project, flow="resolve"),
+        emit=EventRenderer(batch=False, project_name=project_name, flow="resolve"),
     )
     sys.exit(ExitCode.OK if outcome is Outcome.SUCCEEDED else ExitCode.UPDATE_FAILED)

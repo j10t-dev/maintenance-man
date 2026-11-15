@@ -37,14 +37,14 @@ class ScanSummary:
 
 
 def scan_one(
-    name: str,
+    project_name: str,
     project: ProjectConfig,
     *,
     minimum_age_days: int,
     emit: Emit,
 ) -> ScanResult:
     started = time.monotonic()
-    result = scan_project(name, project, minimum_age_days)
+    result = scan_project(project_name, project, minimum_age_days)
     emit(ScanReported(result, time.monotonic() - started))
     return result
 
@@ -53,24 +53,24 @@ def scan_all(cfg: MmConfig, *, emit: Emit) -> ScanSummary:
     results: list[ScanResult] = []
     clean: list[str] = []
     had_error = False
-    for name, project in cfg.projects.items():
-        if report_missing_path(name, project, emit=emit):
+    for project_name, project in cfg.projects.items():
+        if report_missing_path(project_name, project, emit=emit):
             had_error = True
             continue
         try:
             result = scan_one(
-                name,
+                project_name,
                 project,
                 minimum_age_days=cfg.defaults.min_version_age_days,
                 emit=emit,
             )
         except SCAN_ERRORS as exc:
-            emit(OperationFailed("scan", name, str(exc)))
+            emit(OperationFailed("scan", project_name, str(exc)))
             had_error = True
             continue
         results.append(result)
         if not result.has_findings:
-            clean.append(name)
+            clean.append(project_name)
     return ScanSummary(
         any(result.has_actionable_vulns for result in results),
         any(result.updates for result in results),
@@ -81,22 +81,22 @@ def scan_all(cfg: MmConfig, *, emit: Emit) -> ScanSummary:
 
 def sync_projects(
     cfg: MmConfig,
-    names: Sequence[str],
+    project_names: Sequence[str],
     *,
     emit: Emit,
 ) -> Outcome:
-    targets = ordered_unique_project_names(cfg, names) or sorted(cfg.projects)
+    targets = ordered_unique_project_names(cfg, project_names) or sorted(cfg.projects)
     failed = False
-    for name in targets:
-        project = cfg.projects[name]
-        if report_missing_path(name, project, emit=emit):
+    for project_name in targets:
+        project = cfg.projects[project_name]
+        if report_missing_path(project_name, project, emit=emit):
             failed = True
             continue
         try:
             action = sync_main(repo=JjRepository(project.path))
         except RevisionError as exc:
-            emit(OperationFailed("sync", name, str(exc)))
+            emit(OperationFailed("sync", project_name, str(exc)))
             failed = True
         else:
-            emit(SyncCompleted(name, action.value))
+            emit(SyncCompleted(project_name, action.value))
     return Outcome.FAILED if failed else Outcome.SUCCEEDED

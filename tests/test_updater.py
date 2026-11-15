@@ -92,7 +92,7 @@ def _scan_result_for(
     project_config: ProjectConfig, updates: list[UpdateFinding]
 ) -> ScanResult:
     return ScanResult(
-        project="demo",
+        project_name="demo",
         package_manager=project_config.package_manager,
         scanned_at=datetime.now(tz=UTC),
         updates=updates,
@@ -1067,7 +1067,7 @@ def test_given_rows_of_one_target_when_processed_then_one_change_marks_both_read
     update = make_update(pkg_name="room", gradle_target=_ROOM)
     rows = [vuln, update]
     scan = make_scan_result(vulns=[vuln], updates=[update])
-    scan.project = "demo"
+    scan.project_name = "demo"
 
     results = _process(
         group_findings(rows), gradle_project, gradle_processor, scan=scan
@@ -1105,7 +1105,7 @@ def test_given_two_owner_targets_when_one_fails_then_statuses_stay_independent(
     ]
     gradle_processor["phase"].side_effect = [None, ProcessError("unit failed")]
     scan = make_scan_result(vulns=rows, updates=[])
-    scan.project = "demo"
+    scan.project_name = "demo"
 
     _process(group_findings(rows), gradle_project, gradle_processor, scan=scan)
 
@@ -1138,7 +1138,7 @@ def test_given_drifted_target_when_processed_then_rows_are_blocked_without_effec
         state=_UPDATE_FAILED_UNIT,
     )
     scan = make_scan_result(vulns=[], updates=[row])
-    scan.project = "demo"
+    scan.project_name = "demo"
     emit = RecordingEmit()
     before = operation_id(gradle_processor["repo"])
 

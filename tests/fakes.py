@@ -68,7 +68,7 @@ class FakeFindingProcessor:
             else:
                 assert failed_phase is not None
                 group.record(Failed(flow=flow, phase=failed_phase))
-            save_scan_results(scan_result.project, scan_result)
+            save_scan_results(scan_result.project_name, scan_result)
             results.append(
                 UpdateResult(
                     pkg_name=group.pkg_name,

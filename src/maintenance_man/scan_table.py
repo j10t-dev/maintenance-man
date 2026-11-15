@@ -19,7 +19,7 @@ def print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> Non
     if not found:
         return
     rows, pipe_rows = zip(*found, strict=True)
-    output.heading(result.project, f"{len(rows)} findings")
+    output.heading(result.project_name, f"{len(rows)} findings")
     headers = ["kind", "severity", "versions", "package / detail"]
     visible = (
         [0, 1, 2, 3]
@@ -27,7 +27,7 @@ def print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> Non
         else [0, 3]
     )
     output.records(
-        result.project,
+        result.project_name,
         [headers[index] for index in visible],
         [[row[index] for index in visible] for row in rows],
         pipe_rows=pipe_rows,
@@ -36,7 +36,7 @@ def print_scan_result(result: ScanResult, elapsed_s: float | None = None) -> Non
         else "",
     )
     if elapsed_s is not None:
-        output.notice(f"Scanned {result.project} in {elapsed_s:.1f}s")
+        output.notice(f"Scanned {result.project_name} in {elapsed_s:.1f}s")
 
 
 type _FindingRow = tuple[list[output.Cell], list[str]]
@@ -136,7 +136,7 @@ def print_blocked_findings(result: ScanResult, flow: str) -> None:
             else finding.fixed_version or "-"
         )
         output.outcome(
-            result.project,
+            result.project_name,
             flow,
             "blocked",
             finding.pkg_name,
