@@ -36,7 +36,7 @@ mm update -n api worker   # batch update all except api and worker
 mm update api -n worker   # same exclusion mode; flag position does not matter
 ```
 
-`mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed. `mm scan` also fails a project when `bun outdated`, Maven or `uv audit` output is not in a shape mm recognises, or when `uv audit` reports a different number of advisories than mm read.
+`mm scan` fails a project when its vulnerability scan or outdated check fails, and keeps that project's previously saved result. Scanning several projects continues with the rest, then exits with the error code if any project failed. `mm scan` also fails a project when `bun outdated`, Maven or `uv audit` output is not in a shape mm recognises, or when `uv audit` reports a different number of advisories than mm read. A configured project whose path does not exist also fails the scan, as it fails sync, update and deploy.
 
 mm saves one fix per package. For each advisory it takes the lowest listed fix above the installed version, and for the package the highest of those. That version is saved only on the advisories it is known to fix, meaning it equals one of the advisory's listed fixes or is at or above every one of them. Versions are compared only when their qualifiers match, such as `-jre` or `.Final`; uv versions follow PEP 440. A package whose advisories name more than one installed version gets no fix. An advisory mm cannot fix is listed without a fix. Completing an advisory is provisional: the next `mm scan` is the proof.
 

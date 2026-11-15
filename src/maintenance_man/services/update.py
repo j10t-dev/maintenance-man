@@ -32,7 +32,7 @@ from maintenance_man.models.scan import (
     VulnFinding,
     Workflow,
 )
-from maintenance_man.services import WorkflowError, flows
+from maintenance_man.services import WorkflowError, flows, report_missing_path
 from maintenance_man.services.flows import FlowConflictError
 from maintenance_man.storage import CorruptScanResultsError
 from maintenance_man.updater import group_findings, process_findings
@@ -129,8 +129,7 @@ def update_projects(
     had_errors = False
     for name in names:
         project = cfg.projects[name]
-        if not project.path.exists():
-            emit(ProjectSkipped(name, SkipReason.PATH_MISSING, str(project.path)))
+        if report_missing_path(name, project, emit=emit):
             had_errors = True
             continue
         emit(ProjectStarted(name))

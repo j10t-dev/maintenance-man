@@ -9,15 +9,14 @@ from maintenance_man.models.events import (
     Emit,
     OperationFailed,
     Outcome,
-    ProjectSkipped,
     ScanReported,
-    SkipReason,
     SyncCompleted,
 )
 from maintenance_man.models.scan import ScanResult
 from maintenance_man.outdated import OutdatedCheckError
 from maintenance_man.process import ToolNotFoundError
 from maintenance_man.scanner import ScanError, scan_project
+from maintenance_man.services import report_missing_path
 from maintenance_man.vcs import JjRepository, RevisionError
 from maintenance_man.vcs_workflow import sync_main
 
@@ -55,8 +54,8 @@ def scan_all(cfg: MmConfig, *, emit: Emit) -> ScanSummary:
     clean: list[str] = []
     had_error = False
     for name, project in cfg.projects.items():
-        if not project.path.exists():
-            emit(ProjectSkipped(name, SkipReason.PATH_MISSING, str(project.path)))
+        if report_missing_path(name, project, emit=emit):
+            had_error = True
             continue
         try:
             result = scan_one(
@@ -90,8 +89,7 @@ def sync_projects(
     failed = False
     for name in targets:
         project = cfg.projects[name]
-        if not project.path.exists():
-            emit(ProjectSkipped(name, SkipReason.PATH_MISSING, str(project.path)))
+        if report_missing_path(name, project, emit=emit):
             failed = True
             continue
         try:

@@ -22,7 +22,7 @@ from maintenance_man.models.events import (
     Status,
 )
 from maintenance_man.process import run_shell_command
-from maintenance_man.services import WorkflowError
+from maintenance_man.services import WorkflowError, report_missing_path
 from maintenance_man.storage import load_activity, record_activity
 from maintenance_man.vcs import JjRepository, RevisionError
 from maintenance_man.vcs_workflow import current_label
@@ -99,8 +99,7 @@ def deploy_all(
             continue
         if not project.deploy_command:
             continue
-        if not project.path.exists():
-            emit(ProjectSkipped(name, SkipReason.PATH_MISSING, str(project.path)))
+        if report_missing_path(name, project, emit=emit):
             results.append(DeployResult(name, "skipped", "failed"))
             continue
 

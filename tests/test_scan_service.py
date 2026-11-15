@@ -63,7 +63,7 @@ def test_scan_all_continues_after_failure_and_summarises_results(
     )
 
 
-def test_scan_all_skips_missing_path_without_error(tmp_path: Path) -> None:
+def test_scan_all_counts_missing_path_as_error(tmp_path: Path) -> None:
     missing = tmp_path / "missing"
     cfg = make_config(projects={"ghost": make_project(missing)})
     recorded = RecordingEmit()
@@ -73,7 +73,7 @@ def test_scan_all_skips_missing_path_without_error(tmp_path: Path) -> None:
     assert recorded.events == [
         ProjectSkipped("ghost", SkipReason.PATH_MISSING, str(missing))
     ]
-    assert summary == scan_service.ScanSummary(False, False, False)
+    assert summary == scan_service.ScanSummary(False, False, True)
 
 
 def test_sync_projects_deduplicates_names_and_emits_success(
